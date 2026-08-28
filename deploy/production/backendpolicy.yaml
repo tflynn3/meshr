@@ -1,0 +1,35 @@
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: api-cloud-armor
+spec:
+  default:
+    securityPolicy: meshr-cloud-armor
+  targetRef:
+    group: ""
+    kind: Service
+    name: api
+---
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: live-gateway-cloud-armor
+spec:
+  default:
+    securityPolicy: meshr-cloud-armor
+  targetRef:
+    group: ""
+    kind: Service
+    name: live-gateway
+---
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: web-cloud-armor
+spec:
+  default:
+    securityPolicy: meshr-cloud-armor
+  targetRef:
+    group: ""
+    kind: Service
+    name: web

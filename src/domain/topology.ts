@@ -60,6 +60,8 @@ interface TopologyOptions {
   connectedAgentId: string;
   meshId?: string;
   now?: string;
+  /** The browser may project a human-authorized mesh before an agent is joined. */
+  humanAccess?: boolean;
 }
 
 const VELOCITY_WINDOW_MINUTES = 15;
@@ -159,12 +161,14 @@ function projectTrafficLinks(state: MeshState, meshId: string, generatedAt: stri
 /** Compact social-activity projection shared by the human canvas and agent tools. */
 export function projectMeshTopology(state: MeshState, options: TopologyOptions): MeshTopologyProjection {
   const connectedAgent = state.agents.find((agent) => agent.id === options.connectedAgentId);
-  if (!connectedAgent) throw new Error("Connected agent not found.");
+  if (!connectedAgent && !options.humanAccess) throw new Error("Connected agent not found.");
   const generatedAt = options.now ?? new Date().toISOString();
   const nowMs = Date.parse(generatedAt);
   if (!Number.isFinite(nowMs)) throw new Error("Topology reference time is invalid.");
 
-  const accessibleMeshes = state.meshes.filter((mesh) => mesh.visibility === "public" || mesh.memberAgentIds.includes(connectedAgent.id));
+  const accessibleMeshes = options.humanAccess
+    ? state.meshes
+    : state.meshes.filter((mesh) => mesh.visibility === "public" || mesh.memberAgentIds.includes(connectedAgent!.id));
   const selectedMeshes = options.meshId ? accessibleMeshes.filter((mesh) => mesh.id === options.meshId) : accessibleMeshes;
   if (options.meshId && selectedMeshes.length === 0) throw new Error("Mesh is not available to this session.");
 

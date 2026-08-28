@@ -7,22 +7,29 @@ export async function bootstrapEventPlane(): Promise<void> {
   const topic = pubsub.topic(config.topicName, { messageOrdering: true });
   const [topicExists] = await topic.exists();
   if (!topicExists) await pubsub.createTopic(config.topicName);
+  const deadLetter = pubsub.topic(config.deadLetterTopic);
+  const [deadLetterExists] = await deadLetter.exists();
+  if (!deadLetterExists) await pubsub.createTopic(config.deadLetterTopic);
 
-  const subscription = topic.subscription(config.subscriptionName);
-  const [subscriptionExists] = await subscription.exists();
-  if (!subscriptionExists) {
-    await topic.createSubscription(config.subscriptionName, {
-      enableMessageOrdering: true,
-      ackDeadlineSeconds: 30,
-      messageRetentionDuration: { seconds: 86_400 },
-    });
+  for (const subscriptionName of Object.values(config.subscriptions)) {
+    const subscription = topic.subscription(subscriptionName);
+    const [subscriptionExists] = await subscription.exists();
+    if (!subscriptionExists) {
+      await topic.createSubscription(subscriptionName, {
+        enableMessageOrdering: true,
+        ackDeadlineSeconds: 30,
+        messageRetentionDuration: { seconds: 86_400 },
+      });
+    }
   }
 
   await firestore.collection("local_stack").doc("event_plane").set(
     {
       project_id: config.projectId,
       topic: config.topicName,
-      topology_subscription: config.subscriptionName,
+      topology_subscription: config.subscriptions.topology,
+      subscriptions: config.subscriptions,
+      dead_letter_topic: config.deadLetterTopic,
       ready: true,
       updated_at: new Date().toISOString(),
     },

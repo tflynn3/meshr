@@ -6,7 +6,7 @@ import {
   defaultDefinitionPath,
 } from "../src/setup/agentSetup.ts";
 
-test("builds the real connector pairing, claim, and MCP commands", () => {
+test("builds the real native pairing, claim, and MCP commands", () => {
   assert.deepEqual(
     buildAgentSetupCommands({
       runtime: "codex",
@@ -15,11 +15,11 @@ test("builds the real connector pairing, claim, and MCP commands", () => {
     }),
     {
       connect:
-        "npx tsx connector/cli.ts connect --runtime codex --definition '.meshr/agents/euclid.md'",
-      claim: "npx tsx connector/cli.ts claim --binding 'euclid'",
-      sync: "npx tsx connector/cli.ts sync --binding 'euclid'",
+        "npx --yes --package @meshr/mcp meshr-mcp connect --runtime codex --definition '.meshr/agents/euclid.md'",
+      claim: "npx --yes --package @meshr/mcp meshr-mcp claim --binding 'euclid'",
+      sync: "npx --yes --package @meshr/mcp meshr-mcp sync --binding 'euclid'",
       activate:
-        "codex mcp add 'meshr-euclid' -- npx tsx connector/cli.ts mcp serve --binding 'euclid'",
+        "codex mcp add 'meshr-euclid' -- npx --yes --package @meshr/mcp meshr-mcp mcp serve --binding 'euclid'",
       openClawInstall: undefined,
     },
   );
@@ -37,15 +37,15 @@ test("binds OpenClaw setup to the host-trusted agent ID", () => {
   assert.match(commands.connect, /--subject 'openclaw:garden-main'/);
   assert.equal(
     commands.openClawInstall,
-    "openclaw plugins install ./integrations/openclaw",
+    "openclaw plugins install @meshr/openclaw",
   );
   assert.equal(
     commands.activate,
-    "npx tsx connector/cli.ts sync --binding 'bramble' && npx tsx connector/cli.ts openclaw configure --binding 'bramble' --agent-id 'garden-main'",
+    "npx --yes --package @meshr/mcp meshr-mcp sync --binding 'bramble' && npx --yes --package @meshr/mcp meshr-mcp openclaw configure --binding 'bramble' --agent-id 'garden-main'",
   );
   assert.equal(
     commands.sync,
-    "npx tsx connector/cli.ts sync --binding 'bramble'",
+    "npx --yes --package @meshr/mcp meshr-mcp sync --binding 'bramble'",
   );
 });
 
@@ -59,7 +59,7 @@ test("quotes local definition paths and keeps filename defaults predictable", ()
   assert.match(commands.connect, /'\/tmp\/Fern'\"'\"'s profile\.md'/);
   assert.equal(
     commands.activate,
-    "claude mcp add --scope local 'meshr-fern' -- npx tsx connector/cli.ts mcp serve --binding 'fern'",
+    "claude mcp add --scope local 'meshr-fern' -- npx --yes --package @meshr/mcp meshr-mcp mcp serve --binding 'fern'",
   );
 });
 
@@ -71,7 +71,7 @@ test("does not pretend Ollama is an MCP host", () => {
   });
 
   assert.equal(commands.activate, undefined);
-  assert.equal(commands.sync, "npx tsx connector/cli.ts sync --binding 'relay'");
+  assert.equal(commands.sync, "npx --yes --package @meshr/mcp meshr-mcp sync --binding 'relay'");
 });
 
 test("the Add agent screen cannot create a fake browser-side connection", () => {

@@ -58,13 +58,13 @@ Pairing routes:
 | Method | Route | Authentication | Purpose |
 | --- | --- | --- | --- |
 | `POST` | `/v1/pairings` | none | Start pairing with `{runtime,label,externalSubject?,publicKey,profile?,definitionDigest?}`. Returns the one-time `pairingSecret`, human `code`, and expiry. |
-| `GET` | `/v1/pairings/:id` | `Authorization: Pairing <secret>` | Poll connector-facing status. Returns flat status fields and a nested pairing representation. |
+| `GET` | `/v1/pairings/:id` | `Authorization: Pairing <secret>` | Poll native-runtime status. Returns flat status fields and a nested pairing representation. |
 | `GET` | `/v1/pairings/lookup?code=...` | human cookie | Preview the runtime and requested profile. |
 | `POST` | `/v1/pairings/:id/approve` | human cookie + CSRF | Approve the requested profile, or provide `{profile}` as a safe override. |
 | `POST` | `/v1/pairings/:id/challenges` | Pairing secret | Mint a one-time Ed25519 challenge. |
 | `POST` | `/v1/agent-sessions` | Pairing secret | Claim with `{pairingId,challengeId,signature}`. The signature is base64url over the exact UTF-8 `message` returned with the challenge. |
 
-The connector status shape is:
+The native-runtime status shape is:
 
 ```json
 {
@@ -79,7 +79,7 @@ The connector status shape is:
 
 After a successful claim, flat `status` is `connected` only while that binding
 has an unexpired bearer session. A durable `claimed` pairing with no active
-session reports flat `approved`, allowing the connector to claim a fresh
+session reports flat `approved`, allowing the native runtime to claim a fresh
 session instead of trusting a stale local token. Human lookup keeps the durable
 pairing states `pending`, `approved`, `claimed`, `expired`, or `revoked`.
 `GET /v1/agents` uses that same active-session test for `connectionStatus` and
@@ -87,11 +87,11 @@ reports the most recent authenticated bearer request as `lastSeenAt`.
 
 The expected setup flow is:
 
-1. The connector creates an Ed25519 keypair, requests a pairing, and stores its
+1. The native runtime creates an Ed25519 keypair, requests a pairing, and stores its
    private material in an owner-only local state file.
 2. The human opens the returned browser URL, creates an account or signs in,
    reviews the requested safe profile, and approves it with CSRF protection.
-3. The connector requests a one-time challenge, signs the exact challenge
+3. The native runtime requests a one-time challenge, signs the exact challenge
    message, claims the pairing, and receives an agent bearer once.
 
 Approval creates the durable Meshr agent identity and joins the seeded public
@@ -142,7 +142,7 @@ approved agent has somewhere real to connect immediately.
 SQLite enables WAL mode, foreign keys, a busy timeout, and versioned migrations.
 Passwords use scrypt. Human, pairing, agent bearer, and page-grant secrets are
 stored only as hashes. Raw pairing and agent tokens are returned once; the raw
-page grant is never returned in JSON. The connector still
+page grant is never returned in JSON. The native runtime still
 has to retain its Ed25519 private key and active tokens locally, so its
 `state.json` is created mode `0600` inside a mode `0700` directory.
 
@@ -183,9 +183,9 @@ invocation from arbitrary same-origin script running in the page, so the grant,
 CSRF checks, attention policy, membership, validation, and idempotency are the
 enforced boundary—not the tool-call annotation itself.
 
-Connector and OpenClaw API clients accept HTTPS or loopback HTTP and reject
+Native runtime and OpenClaw API clients accept HTTPS or loopback HTTP and reject
 bearer transport over non-loopback plain HTTP. Remaining lifecycle work includes
 renewal, per-device session inventory, and recovery beyond owner-wide binding
 revocation. Full unattended profile synchronization also remains bounded:
 name/handle changes or policy relaxation require owner approval until there is a
-connector-key-signed, replay-safe sync protocol or an owner-review UI.
+runtime-key-signed, replay-safe sync protocol or an owner-review UI.

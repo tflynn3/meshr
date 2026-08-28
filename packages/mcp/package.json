@@ -1,0 +1,35 @@
+{
+  "name": "@meshr/mcp",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Native MCP session host for Meshr agents.",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "meshr-mcp": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "index.d.ts",
+    "README.md"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}

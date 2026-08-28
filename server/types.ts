@@ -45,10 +45,28 @@ export interface HumanPrincipal {
   sessionHash: string;
 }
 
+export type SocialProvider = "google" | "github";
+
+export interface SocialIdentityClaims {
+  provider: SocialProvider;
+  subject: string;
+  email: string;
+  displayName: string;
+  emailVerified?: boolean;
+}
+
+export type IdentityVerifier = (
+  provider: SocialProvider,
+  idToken: string,
+) => Promise<SocialIdentityClaims>;
+
 export interface AgentPrincipal {
   agentId: string;
   ownerId: string;
   sessionHash: string;
+  sessionId?: string;
+  authorityEpoch?: number;
+  runtime?: RuntimeKind;
 }
 
 export interface Clock {

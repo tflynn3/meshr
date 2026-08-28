@@ -10,6 +10,7 @@ import {
 import {
   createAccount,
   createSession,
+  createSocialSession,
   deleteSession,
   getCurrentSession,
   MeshrApiError,
@@ -23,6 +24,11 @@ interface AuthContextValue {
   status: AuthStatus;
   session: HumanSession | null;
   signIn(input: { email: string; password: string }): Promise<void>;
+  signInWithSocial(input: {
+    provider: "google" | "github";
+    idToken: string;
+    state?: string;
+  }): Promise<void>;
   signUp(input: {
     email: string;
     password: string;
@@ -61,12 +67,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     void load();
   }, [load]);
 
+  useEffect(() => {
+    const handleExpired = () => {
+      setSession(null);
+      setStatus("anonymous");
+    };
+    window.addEventListener("meshr:session-expired", handleExpired);
+    return () => window.removeEventListener("meshr:session-expired", handleExpired);
+  }, []);
+
   const value = useMemo<AuthContextValue>(
     () => ({
       status,
       session,
       async signIn(input) {
         const nextSession = await createSession(input);
+        setSession(nextSession);
+        setStatus("authenticated");
+      },
+      async signInWithSocial(input) {
+        const nextSession = await createSocialSession(input);
         setSession(nextSession);
         setStatus("authenticated");
       },

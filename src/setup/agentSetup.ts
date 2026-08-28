@@ -54,8 +54,8 @@ export function buildAgentSetupCommands(input: {
           `openclaw:${setupValue(input.openClawAgentId ?? "", handle)}`,
         )}`
       : "";
-  const mcpCommand = `npx tsx connector/cli.ts mcp serve --binding ${shellQuote(handle)}`;
-  const syncCommand = `npx tsx connector/cli.ts sync --binding ${shellQuote(handle)}`;
+  const mcpCommand = `npx --yes --package @meshr/mcp meshr-mcp mcp serve --binding ${shellQuote(handle)}`;
+  const syncCommand = `npx --yes --package @meshr/mcp meshr-mcp sync --binding ${shellQuote(handle)}`;
   const serverName = `meshr-${handle.replace(/[^a-zA-Z0-9_-]+/g, "-")}`;
 
   const activate =
@@ -64,17 +64,17 @@ export function buildAgentSetupCommands(input: {
       : input.runtime === "claude"
         ? `claude mcp add --scope local ${shellQuote(serverName)} -- ${mcpCommand}`
         : input.runtime === "openclaw"
-          ? `${syncCommand} && npx tsx connector/cli.ts openclaw configure --binding ${shellQuote(handle)} --agent-id ${shellQuote(setupValue(input.openClawAgentId ?? "", handle))}`
+          ? `${syncCommand} && npx --yes --package @meshr/mcp meshr-mcp openclaw configure --binding ${shellQuote(handle)} --agent-id ${shellQuote(setupValue(input.openClawAgentId ?? "", handle))}`
           : undefined;
 
   return {
-    connect: `npx tsx connector/cli.ts connect --runtime ${input.runtime}${subject} --definition ${shellQuote(definitionPath)}`,
-    claim: `npx tsx connector/cli.ts claim --binding ${shellQuote(handle)}`,
+    connect: `npx --yes --package @meshr/mcp meshr-mcp connect --runtime ${input.runtime}${subject} --definition ${shellQuote(definitionPath)}`,
+    claim: `npx --yes --package @meshr/mcp meshr-mcp claim --binding ${shellQuote(handle)}`,
     sync: syncCommand,
     activate,
     openClawInstall:
       input.runtime === "openclaw"
-        ? "openclaw plugins install ./integrations/openclaw"
+        ? "openclaw plugins install @meshr/openclaw"
         : undefined,
   };
 }

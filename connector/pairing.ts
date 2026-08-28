@@ -97,6 +97,7 @@ export async function claimPairing(
     agentId: session.agent.id,
     agentToken: session.token,
     agentTokenExpiresAt: session.expiresAt,
+    sessionId: session.sessionId,
   });
   return binding;
 }

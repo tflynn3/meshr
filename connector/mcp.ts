@@ -1,6 +1,6 @@
 import { McpServer, type RegisteredTool } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
-import { unwatchFile, watchFile } from "node:fs";
+import { sign } from "node:crypto";
 import * as z from "zod/v4";
 import { MeshrApi } from "./api";
 import { ConnectorStateStore } from "./state";
@@ -23,6 +23,9 @@ export interface MeshrMcpServerSession {
 
 export function createMeshrMcpServerSession(
   initialBinding: ConnectorBinding,
+  options: {
+    reloadProfile?: () => Promise<unknown>;
+  } = {},
 ): MeshrMcpServerSession {
   let binding = initialBinding;
   const server = new McpServer(
@@ -69,6 +72,20 @@ export function createMeshrMcpServerSession(
       () => call("get_my_agent"),
     ),
   );
+
+  if (options.reloadProfile) {
+    server.registerTool(
+      "reload_my_profile",
+      {
+        title: "Reload my profile",
+        description:
+          "Re-read this session's paired .meshr definition and apply safe profile changes.",
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: false },
+      },
+      async () => textResult(await options.reloadProfile!()),
+    );
+  }
   register(
     "discover_meshes",
     server.registerTool(
@@ -236,34 +253,68 @@ export async function serveBindingFromState(input: {
   }
   const initialSync = await syncBindingDefinition({ selector: input.selector, store });
   binding = initialSync.binding;
-  const session = createMeshrMcpServerSession(binding);
-  let syncChain = Promise.resolve();
-  watchFile(
-    binding.definitionPath,
-    { interval: 400, persistent: false },
-    (current, previous) => {
-      if (current.mtimeMs === previous.mtimeMs && current.size === previous.size) return;
-      syncChain = syncChain
-        .then(async () => {
-          const result = await syncBindingDefinition({ selector: input.selector, store });
-          if (result.changed) {
-            binding = result.binding;
-            session.updateBinding(binding);
-            process.stderr.write(
-              `[meshr] synced @${result.binding.requestedProfile.handle} from ${result.binding.definitionPath}\n`,
-            );
-          }
-        })
-        .catch((error) => {
-          process.stderr.write(
-            `[meshr] profile sync failed: ${error instanceof Error ? error.message : String(error)}\n`,
-          );
-        });
+  const api = new MeshrApi(binding.serverUrl);
+  const session = createMeshrMcpServerSession(
+    binding,
+    {
+      reloadProfile: async () => {
+        const result = await syncBindingDefinition({ selector: input.selector, store });
+        if (result.changed) {
+          binding = result.binding;
+          session.updateBinding(binding);
+        }
+        return {
+          applied: result.changed,
+          definitionDigest: result.binding.definitionDigest,
+          agent: result.response,
+        };
+      },
     },
   );
-  const stopWatching = () => unwatchFile(binding.definitionPath);
-  process.once("SIGINT", stopWatching);
-  process.once("SIGTERM", stopWatching);
+
+  let stopped = false;
+  let lifecycleWork: Promise<void> = Promise.resolve();
+  const lifecycleTick = async (): Promise<void> => {
+    if (stopped || !binding.agentToken) return;
+    try {
+      await api.heartbeatAgentSession(binding);
+      const expiry = binding.agentTokenExpiresAt ? Date.parse(binding.agentTokenExpiresAt) : 0;
+      if (!binding.sessionId || !Number.isFinite(expiry) || expiry - Date.now() > 120_000) return;
+      const challenge = await api.createChallenge(binding, binding.sessionId);
+      const signature = sign(
+        null,
+        Buffer.from(challenge.message, "utf8"),
+        binding.privateKeyPem,
+      ).toString("base64url");
+      const renewed = await api.renewAgentSession({
+        binding,
+        challengeId: challenge.challengeId,
+        sessionId: binding.sessionId,
+        signature,
+      });
+      binding = await store.patch(input.selector, {
+        status: "connected",
+        agentToken: renewed.token,
+        agentTokenExpiresAt: renewed.expiresAt,
+        sessionId: renewed.sessionId,
+      });
+      session.updateBinding(binding);
+    } catch (error) {
+      process.stderr.write(
+        `[meshr] native session heartbeat/renewal failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+  };
+  const lifecycleTimer = setInterval(() => {
+    lifecycleWork = lifecycleWork.then(lifecycleTick);
+  }, 30_000);
+  lifecycleTimer.unref();
+  const stopLifecycle = () => {
+    stopped = true;
+    clearInterval(lifecycleTimer);
+  };
+  process.once("SIGINT", stopLifecycle);
+  process.once("SIGTERM", stopLifecycle);
   const handle = serveStdio(() => session.server, {
     onerror: (error) => console.error(`[meshr mcp] ${error.message}`),
   });

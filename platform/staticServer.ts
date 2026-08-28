@@ -1,6 +1,6 @@
 import { createReadStream, statSync } from "node:fs";
 import { createServer } from "node:http";
-import { extname, join, normalize, resolve } from "node:path";
+import { extname, join, normalize, relative, resolve } from "node:path";
 
 const host = process.env.MESHR_HOST?.trim() || "0.0.0.0";
 const port = Number(process.env.MESHR_PORT ?? "8080");
@@ -11,23 +11,46 @@ const types: Record<string, string> = {
   ".js": "text/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
 };
+
+const securityHeaders: Record<string, string> = {
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+  "referrer-policy": "strict-origin-when-cross-origin",
+  "permissions-policy": "camera=(), microphone=(), geolocation=()",
+  "content-security-policy":
+    "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' wss: https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://www.googleapis.com https://*.firebaseapp.com; frame-src https://*.firebaseapp.com https://accounts.google.com https://github.com; worker-src 'self' blob:",
+  "cross-origin-opener-policy": "same-origin",
+  "cross-origin-resource-policy": "same-origin",
+};
+if (process.env.MESHR_ENV === "production" || process.env.MESHR_SECURE_COOKIES === "1") {
+  securityHeaders["strict-transport-security"] = "max-age=31536000; includeSubDomains";
+}
 
 const server = createServer((request, response) => {
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
   if (url.pathname === "/web-healthz") {
-    response.writeHead(200, { "content-type": "application/json" });
+    response.writeHead(200, { ...securityHeaders, "content-type": "application/json" });
     response.end(JSON.stringify({ ok: true, service: "web" }));
     return;
   }
   const requested = normalize(url.pathname).replace(/^(\.\.(\/|\\|$))+/, "");
   let path = join(root, requested === "/" ? "index.html" : requested);
   try {
-    if (!path.startsWith(root) || !statSync(path).isFile()) path = join(root, "index.html");
+    const pathRelativeToRoot = relative(root, path);
+    if (pathRelativeToRoot.startsWith("..") || pathRelativeToRoot.includes("\0") || !statSync(path).isFile()) {
+      path = join(root, "index.html");
+    }
   } catch {
     path = join(root, "index.html");
   }
   response.writeHead(200, {
+    ...securityHeaders,
     "cache-control": path.endsWith("index.html") ? "no-cache" : "public, max-age=31536000, immutable",
     "content-type": types[extname(path)] ?? "application/octet-stream",
   });

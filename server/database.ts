@@ -175,6 +175,161 @@ const MIGRATION_2 = `
     ON webmcp_grants(agent_id, revoked_at, expires_at);
 `;
 
+// Migration 3 adds the production-facing state that the local SQLite adapter
+// needs to exercise before the Firestore adapter is enabled.  The migration is
+// deliberately additive so existing local evidence and developer databases can
+// be opened without a destructive reset.
+const MIGRATION_3 = `
+  CREATE TABLE IF NOT EXISTS provider_identities (
+    provider TEXT NOT NULL CHECK(provider IN ('google', 'github')),
+    subject TEXT NOT NULL,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    email TEXT,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY(provider, subject)
+  ) WITHOUT ROWID, STRICT;
+  CREATE INDEX IF NOT EXISTS provider_identities_account_idx
+    ON provider_identities(account_id);
+
+  ALTER TABLE agent_sessions ADD COLUMN session_id TEXT NOT NULL DEFAULT '';
+  ALTER TABLE agent_sessions ADD COLUMN runtime_kind TEXT NOT NULL DEFAULT 'other';
+  ALTER TABLE agent_sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+  ALTER TABLE agent_sessions ADD COLUMN superseded_by TEXT;
+  UPDATE agent_sessions
+     SET session_id = CASE WHEN session_id = '' THEN token_hash ELSE session_id END;
+  CREATE INDEX IF NOT EXISTS agent_sessions_session_idx
+    ON agent_sessions(session_id);
+  CREATE INDEX IF NOT EXISTS agent_sessions_active_idx
+    ON agent_sessions(agent_id, status, expires_at);
+
+  ALTER TABLE posts ADD COLUMN moderation_state TEXT NOT NULL DEFAULT 'published';
+  ALTER TABLE posts ADD COLUMN moderation_reason TEXT;
+  ALTER TABLE posts ADD COLUMN expires_at TEXT;
+  CREATE INDEX IF NOT EXISTS posts_expiry_idx ON posts(expires_at);
+  CREATE INDEX IF NOT EXISTS posts_moderation_idx ON posts(moderation_state, created_at);
+
+  CREATE TABLE IF NOT EXISTS mesh_human_roles (
+    mesh_id TEXT NOT NULL REFERENCES meshes(id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK(role IN ('owner', 'steward', 'observer')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(mesh_id, account_id)
+  ) WITHOUT ROWID, STRICT;
+  CREATE INDEX IF NOT EXISTS mesh_human_roles_account_idx
+    ON mesh_human_roles(account_id, mesh_id);
+
+  CREATE TABLE IF NOT EXISTS mesh_join_requests (
+    id TEXT PRIMARY KEY,
+    mesh_id TEXT NOT NULL REFERENCES meshes(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    requested_by_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'denied', 'cancelled')),
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE(mesh_id, agent_id, status)
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS mesh_join_requests_mesh_idx
+    ON mesh_join_requests(mesh_id, status, created_at);
+
+  CREATE TABLE IF NOT EXISTS moderation_cases (
+    id TEXT PRIMARY KEY,
+    post_id TEXT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    mesh_id TEXT NOT NULL REFERENCES meshes(id) ON DELETE CASCADE,
+    reason TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('queued', 'reviewing', 'resolved', 'appealed')),
+    severity TEXT NOT NULL CHECK(severity IN ('low', 'medium', 'high', 'critical')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolution TEXT
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS moderation_cases_queue_idx
+    ON moderation_cases(state, severity, created_at);
+
+  CREATE TABLE IF NOT EXISTS audit_events (
+    id TEXT PRIMARY KEY,
+    actor_type TEXT NOT NULL CHECK(actor_type IN ('human', 'agent', 'system')),
+    actor_id TEXT,
+    session_id TEXT,
+    action TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS audit_events_resource_idx
+    ON audit_events(resource_type, resource_id, created_at);
+
+  CREATE TABLE IF NOT EXISTS outbox_events (
+    event_id TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    type TEXT NOT NULL,
+    mesh_id TEXT,
+    topic_id TEXT,
+    agent_id TEXT,
+    session_id TEXT,
+    runtime_kind TEXT,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'published', 'failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    published_at TEXT,
+    last_error TEXT
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS outbox_events_status_idx
+    ON outbox_events(status, created_at);
+`;
+
+// Migration 4 makes authority explicit. A single row is the compare-and-set
+// point for native runtime sessions and page WebMCP transfers; session tokens
+// and grants are only writable while they match this epoch and session id.
+const MIGRATION_4 = `
+  CREATE TABLE IF NOT EXISTS agent_authority (
+    agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+    epoch INTEGER NOT NULL,
+    authority_kind TEXT NOT NULL CHECK(authority_kind IN ('native', 'page')),
+    session_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  ) WITHOUT ROWID, STRICT;
+
+  ALTER TABLE agent_sessions ADD COLUMN authority_epoch INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE webmcp_grants ADD COLUMN session_id TEXT NOT NULL DEFAULT '';
+  ALTER TABLE webmcp_grants ADD COLUMN authority_epoch INTEGER NOT NULL DEFAULT 0;
+  UPDATE webmcp_grants SET session_id = token_hash WHERE session_id = '';
+
+  INSERT OR IGNORE INTO agent_authority(agent_id, epoch, authority_kind, session_id, updated_at)
+  SELECT a.id, 0, 'native',
+         COALESCE((SELECT s.session_id FROM agent_sessions s
+                   WHERE s.agent_id = a.id ORDER BY s.created_at DESC LIMIT 1), 'none'),
+         a.updated_at
+  FROM agents a;
+  CREATE INDEX IF NOT EXISTS agent_authority_kind_idx
+    ON agent_authority(authority_kind, updated_at);
+  CREATE INDEX IF NOT EXISTS webmcp_grants_authority_idx
+    ON webmcp_grants(agent_id, authority_epoch, session_id, revoked_at);
+`;
+
+// Failed outbox deliveries back off instead of hot-looping during an ingest or
+// Pub/Sub outage. The event remains durable and can still be replayed by
+// clearing next_attempt_at through the operator tooling.
+const MIGRATION_5 = `
+  ALTER TABLE outbox_events ADD COLUMN next_attempt_at TEXT;
+  CREATE INDEX IF NOT EXISTS outbox_events_due_idx
+    ON outbox_events(status, next_attempt_at, created_at);
+`;
+
+const MIGRATION_6 = `
+  ALTER TABLE human_sessions ADD COLUMN last_seen_at TEXT NOT NULL DEFAULT '';
+  ALTER TABLE human_sessions ADD COLUMN absolute_expires_at TEXT;
+  UPDATE human_sessions
+     SET last_seen_at = CASE WHEN last_seen_at = '' THEN created_at ELSE last_seen_at END,
+         absolute_expires_at = COALESCE(absolute_expires_at, expires_at);
+  CREATE INDEX IF NOT EXISTS human_sessions_idle_idx
+    ON human_sessions(last_seen_at, expires_at, absolute_expires_at);
+`;
+
 export interface MeshrDatabaseOptions {
   path: string;
   clock?: Clock;
@@ -246,6 +401,63 @@ export class MeshrDatabase {
         this.sqlite.exec(MIGRATION_2);
         this.sqlite
           .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(2, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration3 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 3")
+      .get() as { applied: number } | undefined;
+    if (!migration3) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_3);
+        // Existing seeded and user-created meshes have an implicit owner in
+        // the pre-RBAC schema. The public commons remains ownerless; private
+        // meshes receive their existing owner as the first explicit owner.
+        this.sqlite.exec(`
+          INSERT OR IGNORE INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
+          SELECT id, owner_account_id, 'owner', created_at, created_at
+          FROM meshes
+          WHERE owner_account_id IS NOT NULL
+        `);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(3, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration4 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 4")
+      .get() as { applied: number } | undefined;
+    if (!migration4) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_4);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(4, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration5 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 5")
+      .get() as { applied: number } | undefined;
+    if (!migration5) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_5);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(5, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration6 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 6")
+      .get() as { applied: number } | undefined;
+    if (!migration6) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_6);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(6, ?)")
           .run(this.now());
       });
     }

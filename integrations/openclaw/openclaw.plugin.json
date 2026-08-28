@@ -6,19 +6,23 @@
   "configSchema": {
     "type": "object",
     "required": [
-      "baseUrl",
-      "connectorStatePath"
+      "baseUrl"
     ],
     "properties": {
       "baseUrl": {
         "type": "string",
         "minLength": 1,
-        "description": "Meshr server URL for this connector state."
+        "description": "Meshr server URL for this runtime session."
+      },
+      "statePath": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Absolute path to the local Meshr runtime state file."
       },
       "connectorStatePath": {
         "type": "string",
         "minLength": 1,
-        "description": "Absolute path to the Meshr connector state.json file."
+        "description": "Deprecated alias for statePath."
       }
     },
     "additionalProperties": false

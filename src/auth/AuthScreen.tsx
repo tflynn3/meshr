@@ -1,9 +1,36 @@
 import { ArrowRight, Check, WarningCircle } from "@phosphor-icons/react";
-import { useState, type FormEvent } from "react";
-import { MeshrApiError, MeshrUnavailableError } from "./api";
+import { getApps, initializeApp, type FirebaseApp } from "firebase/app";
+import {
+  GithubAuthProvider,
+  GoogleAuthProvider,
+  getAuth,
+  signInWithPopup,
+  signOut as firebaseSignOut,
+  type Auth,
+} from "firebase/auth";
+import { useEffect, useState, type FormEvent } from "react";
+import {
+  createSocialAuthState,
+  getAuthConfig,
+  MeshrApiError,
+  MeshrUnavailableError,
+} from "./api";
 import { useAuth } from "./AuthContext";
 
 type AuthMode = "sign-in" | "sign-up";
+
+let firebaseAuth: Auth | null = null;
+
+function authForFirebase(config: {
+  apiKey: string;
+  authDomain: string;
+  projectId: string;
+}): Auth {
+  if (firebaseAuth) return firebaseAuth;
+  const app: FirebaseApp = getApps()[0] ?? initializeApp(config);
+  firebaseAuth = getAuth(app);
+  return firebaseAuth;
+}
 
 function authErrorMessage(error: unknown, mode: AuthMode): string {
   if (error instanceof MeshrUnavailableError) {
@@ -23,8 +50,22 @@ function authErrorMessage(error: unknown, mode: AuthMode): string {
   return "Something went wrong. Try again.";
 }
 
-export function AuthScreen({ pairingCode }: { pairingCode: string | null }) {
-  const { signIn, signUp } = useAuth();
+export function AuthScreen({
+  pairingCode,
+  socialError,
+}: {
+  pairingCode: string | null;
+  socialError?: string;
+}) {
+  const { signIn, signInWithSocial, signUp } = useAuth();
+  const [socialAuthOnly, setSocialAuthOnly] = useState(
+    import.meta.env.VITE_SOCIAL_AUTH_ONLY === "1",
+  );
+  const [firebaseConfig, setFirebaseConfig] = useState<{
+    apiKey: string;
+    authDomain: string;
+    projectId: string;
+  } | null>(null);
   const [mode, setMode] = useState<AuthMode>("sign-in");
   const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
@@ -32,9 +73,58 @@ export function AuthScreen({ pairingCode }: { pairingCode: string | null }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
+  useEffect(() => {
+    let active = true;
+    void getAuthConfig()
+      .then((config) => {
+        if (active) {
+          setSocialAuthOnly(config.socialOnly);
+          setFirebaseConfig(config.firebase ?? null);
+        }
+      })
+      .catch(() => {
+        // Keep the build-time default if the public config endpoint is unavailable.
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   function switchMode(nextMode: AuthMode) {
     setMode(nextMode);
     setError("");
+  }
+
+  async function startSocial(provider: "google" | "github") {
+    if (submitting) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      if (!firebaseConfig) {
+        throw new MeshrApiError(
+          503,
+          "social_auth_unconfigured",
+          "Social sign in is not configured yet. Try again shortly.",
+        );
+      }
+      const state = await createSocialAuthState();
+      const auth = authForFirebase(firebaseConfig);
+      const oauthProvider =
+        provider === "google" ? new GoogleAuthProvider() : new GithubAuthProvider();
+      // The server-bound state cookie prevents login CSRF while Firebase
+      // handles provider state, PKCE, and Identity Platform token exchange in
+      // the browser. Do not pass our server state as an OAuth provider
+      // parameter: Firebase owns that parameter and validates its own value.
+      const result = await signInWithPopup(auth, oauthProvider);
+      const idToken = await result.user.getIdToken(true);
+      await signInWithSocial({ provider, idToken, state: state.state });
+      await firebaseSignOut(auth);
+      window.location.reload();
+    } catch (caught) {
+      setError(authErrorMessage(caught, mode));
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -68,7 +158,17 @@ export function AuthScreen({ pairingCode }: { pairingCode: string | null }) {
             </span>
           </div>
         )}
-        <div className="auth-tabs" role="tablist" aria-label="Account access">
+        <div className="social-auth-actions" aria-label="Social sign in">
+          <button type="button" className="social-auth-button" onClick={() => void startSocial("google")} disabled={submitting}>
+            Continue with Google
+          </button>
+          <button type="button" className="social-auth-button" onClick={() => void startSocial("github")} disabled={submitting}>
+            Continue with GitHub
+          </button>
+        </div>
+        {socialError && <p className="auth-error" role="alert">{socialError}</p>}
+        {!socialAuthOnly && <p className="auth-divider"><span>or use email</span></p>}
+        {!socialAuthOnly && <div className="auth-tabs" role="tablist" aria-label="Account access">
           <button
             type="button"
             role="tab"
@@ -87,18 +187,20 @@ export function AuthScreen({ pairingCode }: { pairingCode: string | null }) {
           >
             Create account
           </button>
-        </div>
+        </div>}
         <header>
           <h1 id="auth-heading">
-            {mode === "sign-in" ? "Welcome back" : "Join Meshr"}
+            {socialAuthOnly ? "Enter Meshr" : mode === "sign-in" ? "Welcome back" : "Join Meshr"}
           </h1>
           <p>
-            {mode === "sign-in"
+            {socialAuthOnly
+              ? "Sign in to observe and govern your agents and meshes."
+              : mode === "sign-in"
               ? "Sign in to manage your agents and meshes."
               : "Create an account for your agents and meshes."}
           </p>
         </header>
-        <form onSubmit={submit}>
+        {!socialAuthOnly && <form onSubmit={submit}>
           {mode === "sign-up" && (
             <label>
               Name
@@ -155,7 +257,7 @@ export function AuthScreen({ pairingCode }: { pairingCode: string | null }) {
                 : "Create account"}
             {!submitting && <ArrowRight size={17} weight="bold" />}
           </button>
-        </form>
+        </form>}
       </section>
     </main>
   );

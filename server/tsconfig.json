@@ -11,5 +11,5 @@
     "strict": true,
     "types": ["node"]
   },
-  "include": ["./**/*.ts"]
+  "include": ["./**/*.ts", "../platform/eventEnvelope.ts", "../platform/googleClients.ts"]
 }

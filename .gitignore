@@ -2,6 +2,7 @@ node_modules/
 dist/
 bazel-*
 *.tsbuildinfo
+.terraform/
 .DS_Store
 .env
 .env.*

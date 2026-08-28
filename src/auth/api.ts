@@ -5,6 +5,8 @@ export interface HumanUser {
   createdAt: string;
 }
 
+const MESHR_CONTRACT_MAJOR = "1";
+
 export interface HumanSession {
   user: HumanUser;
   csrfToken: string;
@@ -121,6 +123,46 @@ export interface PublicActivitySnapshot {
   links: PublicActivityLink[];
 }
 
+export interface MeshTopicSummary {
+  id: string;
+  meshId: string;
+  name: string;
+  title: string;
+  description: string;
+  tags: string[];
+  activityCount: number;
+  recentActivityCount?: number;
+  participantAgentIds: string[];
+  lastActivityAt?: string | null;
+  createdAt: string;
+}
+
+export interface MeshRoleSummary {
+  accountId: string;
+  role: "owner" | "steward" | "observer";
+  displayName: string;
+  /** Only returned to mesh owners and stewards; public summaries redact it. */
+  email?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Durable mesh projection returned to the authenticated browser. */
+export interface MeshSummary {
+  id: string;
+  ownerId: string;
+  name: string;
+  description: string;
+  visibility: "public" | "unlisted" | "private";
+  joinPolicy: "open" | "approval" | "invite_only";
+  role: "owner" | "steward" | "observer" | null;
+  memberAgentIds: string[];
+  agentCount: number;
+  topics: MeshTopicSummary[];
+  roles: MeshRoleSummary[];
+  createdAt: string;
+}
+
 export interface RequestedAgentProfile {
   name: string;
   handle: string;
@@ -210,6 +252,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       credentials: "include",
       headers: {
         Accept: "application/json",
+        "X-Meshr-Contract-Version": MESHR_CONTRACT_MAJOR,
         ...init.headers,
       },
     });
@@ -219,6 +262,9 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   const payload = await readJson(response);
   if (!response.ok) {
+    if (response.status === 401 && typeof window !== "undefined") {
+      window.dispatchEvent(new Event("meshr:session-expired"));
+    }
     const { code, message } = errorDetails(payload);
     throw new MeshrApiError(response.status, code, message);
   }
@@ -248,6 +294,35 @@ export function createSession(input: {
   });
 }
 
+export function createSocialSession(input: {
+  provider: "google" | "github";
+  idToken: string;
+  state?: string;
+}): Promise<HumanSession> {
+  return request<HumanSession>("/v1/sessions/social", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export function getAuthConfig(): Promise<{
+  socialOnly: boolean;
+  providers: Array<"google" | "github">;
+  identityPlatformConfigured: boolean;
+  firebase?: {
+    apiKey: string;
+    authDomain: string;
+    projectId: string;
+  };
+}> {
+  return request("/v1/config/auth");
+}
+
+export function createSocialAuthState(): Promise<{ state: string }> {
+  return request<{ state: string }>("/v1/auth/state", { method: "POST" });
+}
+
 export function getCurrentSession(): Promise<HumanSession> {
   return request<HumanSession>("/v1/me");
 }
@@ -255,6 +330,91 @@ export function getCurrentSession(): Promise<HumanSession> {
 export async function listOwnedAgents(): Promise<OwnedAgent[]> {
   const response = await request<{ agents: OwnedAgent[] }>("/v1/agents");
   return response.agents;
+}
+
+export async function listMeshes(signal?: AbortSignal): Promise<MeshSummary[]> {
+  const response = await request<{ meshes: MeshSummary[] }>("/v1/meshes", { signal });
+  return response.meshes;
+}
+
+export async function createMesh(
+  input: {
+    name: string;
+    description?: string;
+    visibility: MeshSummary["visibility"];
+    joinPolicy: MeshSummary["joinPolicy"];
+    agentIds?: string[];
+  },
+  csrfToken: string,
+): Promise<{ mesh: MeshSummary; topic: MeshTopicSummary }> {
+  return request<{ mesh: MeshSummary; topic: MeshTopicSummary }>("/v1/meshes", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Meshr-CSRF": csrfToken,
+    },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function getMeshGovernance(meshId: string): Promise<{
+  mesh: MeshSummary;
+  role: MeshRoleSummary["role"] | null;
+  roles: MeshRoleSummary[];
+}> {
+  return request(`/v1/meshes/${encodeURIComponent(meshId)}/governance`);
+}
+
+export async function updateMeshGovernance(
+  meshId: string,
+  input: {
+    name?: string;
+    description?: string;
+    visibility?: MeshSummary["visibility"];
+    joinPolicy?: MeshSummary["joinPolicy"];
+  },
+  csrfToken: string,
+): Promise<{ mesh: MeshSummary }> {
+  return request<{ mesh: MeshSummary }>(
+    `/v1/meshes/${encodeURIComponent(meshId)}/governance`,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Meshr-CSRF": csrfToken,
+      },
+      body: JSON.stringify(input),
+    },
+  );
+}
+
+export async function updateMeshRole(
+  meshId: string,
+  accountId: string,
+  role: MeshRoleSummary["role"],
+  csrfToken: string,
+): Promise<{ meshId: string; accountId: string; role: MeshRoleSummary["role"] }> {
+  return request(`/v1/meshes/${encodeURIComponent(meshId)}/roles/${encodeURIComponent(accountId)}`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Meshr-CSRF": csrfToken,
+    },
+    body: JSON.stringify({ role }),
+  });
+}
+
+export async function removeMeshRole(
+  meshId: string,
+  accountId: string,
+  csrfToken: string,
+): Promise<{ meshId: string; accountId: string; removed: boolean }> {
+  return request(`/v1/meshes/${encodeURIComponent(meshId)}/roles/${encodeURIComponent(accountId)}`, {
+    method: "DELETE",
+    headers: {
+      "X-Meshr-CSRF": csrfToken,
+    },
+  });
 }
 
 export function getPublicActivity(signal?: AbortSignal): Promise<PublicActivitySnapshot> {

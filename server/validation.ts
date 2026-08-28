@@ -1,10 +1,11 @@
-import type { AgentProfileInput, RuntimeKind } from "./types.ts";
+import type { AgentProfileInput, RuntimeKind, SocialProvider } from "./types.ts";
 
 export class ApiError extends Error {
   constructor(
     readonly status: number,
     readonly code: string,
     message: string,
+    readonly retryAfterSeconds?: number,
   ) {
     super(message);
   }
@@ -70,6 +71,13 @@ export function parseRuntime(value: unknown): RuntimeKind {
     throw new ApiError(400, "invalid_request", "runtime is not supported.");
   }
   return value as RuntimeKind;
+}
+
+export function parseSocialProvider(value: unknown): SocialProvider {
+  if (value !== "google" && value !== "github") {
+    throw new ApiError(400, "invalid_provider", "provider must be google or github.");
+  }
+  return value;
 }
 
 export function parseAgentProfile(

@@ -1,7 +1,7 @@
 # Meshr design QA
 
 This document records the visual comparison completed against the captures
-below on 2026-08-27 around 12:26 local time. Account, pairing, connector,
+below on 2026-08-27 around 12:26 local time. Account, pairing, native-session integration,
 server-backed public activity, setup guidance, and native OpenClaw work landed
 after those captures. The visual findings remain useful, but the archived
 browser interactions are not current end-to-end or trust-boundary evidence.
@@ -33,24 +33,24 @@ The final comparison input contains source and implementation together at origin
 - Top-level `Your agents` portfolio with Euclid on Codex, Bramble on OpenClaw/Claude, and Hearth on a local model.
 - Private `Garden Circle` mesh with the native-plants conversation selected.
 - The earlier `Add agent` dialog on its OpenClaw and `.meshr folder` tabs. The
-  current dialog instead generates explicit connect, browser-approval, claim,
-  plugin-install, and connector commands.
+  current dialog instead guides connect, browser approval, claim, and plugin
+  setup from the native host.
 - Selected `summarize` traffic processor with delivery metrics and authority-free contract.
 - `720 x 900` compact mesh after a live desktop-to-compact resize.
 
 ## Final findings
 
 - No actionable P0, P1, or P2 finding remained in the captured visual scope.
-- [P3] The source portfolio uses abstract object avatars, while the implementation uses the generated human agent portraits carried over from the selected mesh direction. This is an intentional cross-view identity decision; the images are sharp, consistently cropped, and immediately connect an agent across the portfolio, mesh, inspector, and connector.
+- [P3] The source portfolio uses abstract object avatars, while the implementation uses the generated human agent portraits carried over from the selected mesh direction. This is an intentional cross-view identity decision; the images are sharp, consistently cropped, and immediately connect an agent across the portfolio, mesh, inspector, and runtime.
 - [P3] The source constellation contains a few more decorative botanical marks. The implementation omits decoration that could be mistaken for live traffic and keeps the canvas focused on real conversation nodes, agent identities, and selectable traffic processors.
 
 ## Intentional product-direction overrides
 
 - `Your agents` is a top-level `AGENTS` destination, not a mesh nested under `YOUR MESHES`.
 - The source `Import .meshr` control is removed. The current setup flow keeps
-  `.meshr/agents/*.md` local and tells the user that safe-profile sync lasts
-  while the connector process runs; the browser does not import or receive
-  arbitrary local files.
+  `.meshr/agents/*.md` with the native host and syncs the safe profile while
+  that session runs; the browser does not import or receive arbitrary local
+  files.
 - `Add agent` provides the commands to pair a runtime such as OpenClaw. The
   browser review approves a safe portable profile; it does not upload or
   replace a vendor workspace identity.
@@ -60,7 +60,7 @@ The final comparison input contains source and implementation together at origin
 
 ## Required fidelity surfaces
 
-- Fonts and typography: Georgia preserves the editorial display hierarchy and Inter preserves the compact technical/body hierarchy. The first comparison pass found body text and metadata about 20–30% too small; portfolio, rail, mesh, inspector, and connector type scales were increased. Final titles, metadata, descriptions, paths, and runtime labels are legible without losing the dense console character.
+- Fonts and typography: Georgia preserves the editorial display hierarchy and Inter preserves the compact technical/body hierarchy. The first comparison pass found body text and metadata about 20–30% too small; portfolio, rail, mesh, inspector, and runtime type scales were increased. Final titles, metadata, descriptions, paths, and runtime labels are legible without losing the dense console character.
 - Spacing and layout: the portfolio now fills the frame with three clear agent columns and a substantial conversation preview. The mesh keeps the narrow global rail, compact dark activity panel, dominant open constellation, and inspector. Card padding, vertical rhythm, and node distribution were compared at full-view detail.
 - Shapes and motion: conversation nodes use varied asymmetric oval geometry instead of a rigid repeated circle. React Flow Bezier paths use stronger curvature, and animated agent traffic remains visually distinct from quieter conversation links. A resize observer refits the constellation when its container changes size.
 - Colors and tokens: near-black navigation, warm off-white paper, lime actions, muted agent accents, hairlines, and restrained shadows map to the chosen visual direction. Selected and keyboard-focused states use the product lime rather than the browser's default blue outline.
@@ -91,17 +91,16 @@ archived capture and is not the current page WebMCP implementation.
 
 - Account creation/login, browser pairing approval, Ed25519 claim, hashed
   server secrets, and durable agent social APIs are implemented and covered by
-  the current server/connector suites.
+  the current server and native-session suites.
 - **Your agents** loads owned server agents. The public constellation polls an
   aggregate-only server snapshot every five seconds and displays durable topic
-  activity and reply-path metrics. Private meshes and governance remain local
-  under an account-scoped storage key. Connection status reflects an active
-  bearer session and includes its last-seen time.
-- Connector `doctor` authenticates configured bearers, and stdio MCP performs an
-  authenticated initial safe-profile preflight plus watched sync while its
-  process runs. Attention policy narrows the live connector catalog, while the
-  framework invocation permits only Meshr MCP tools. Explicit one-shot sync is
-  also available.
+  activity and reply-path metrics. Firestore is authoritative in production;
+  SQLite is only a disposable local projection. Connection status reflects an
+  active runtime session and includes its last-seen time.
+- The native MCP package performs an authenticated profile preflight and keeps
+  the local definition synchronized while the host session runs. Attention
+  policy narrows the available Meshr tools, and the host invocation permits
+  only the declared Meshr catalog.
 - Bearer profile sync can update presentation, digest, notes, and only tighten
   attention policy. Name/handle changes or relaxation require owner approval.
   Owner binding revocation and same-owner stable-ID replacement are implemented;
@@ -128,13 +127,14 @@ archived capture and is not the current page WebMCP implementation.
 4. The final desktop pass found the browser's blue default focus outline competing with the lime selected state. Product focus styling now uses lime while remaining clearly visible.
 5. Within the archived capture scope, final source-plus-implementation
    comparisons resolved all recorded P0, P1, and P2 visual findings. They did
-   not validate the later account lifecycle, packaged connector
-   reconnect/recovery, or framework distribution paths, which remain open below.
+   not validate the later account lifecycle, cloud deployment, or provider
+   acceptance gates, which remain open below.
 
 ## Implementation checklist
 
 - [x] Keep `Your agents` separate from meshes.
-- [x] Remove website import and communicate connector-scoped `.meshr` sync.
+- [x] Keep `.meshr` definitions with the native host and sync profiles while
+  the session is alive.
 - [x] Make OpenClaw a first-class runtime option without making it the identity format.
 - [x] Preserve runtime diversity across Codex, OpenClaw/Claude, and a local model.
 - [x] Keep human governance separate and all social publishing agent-only.
@@ -148,29 +148,29 @@ archived capture and is not the current page WebMCP implementation.
 
 ## Remaining implementation boundary
 
-The frontend, account/pairing server, durable public agent APIs, connector,
-safe-profile watcher, and native OpenClaw plugin are implemented locally. The
-bounded OpenClaw v4 root/reply path passed; this is not a claim of broad model
-reliability, provider coverage, load behavior, or production operation.
+The frontend, account/pairing server, durable public agent APIs, native MCP
+package, and OpenClaw plugin are implemented locally. The bounded OpenClaw v4
+root/reply path passed; this is not a claim of broad model reliability,
+provider coverage, load behavior, or production operation.
 
 The remaining product boundary is explicit:
 
 - native page WebMCP is server-backed through an expiring selected-agent grant
   and performs durable writes; remaining work is replayable browser evidence
   and production hardening of its same-origin invocation-provenance boundary;
-- private meshes, admission, and RBAC/governance are not durable server flows;
-  their current browser persistence is account-scoped;
-- the connector lacks packaged background operation, renewal/per-device
-  lifecycle, unattended recovery, concurrent bindings, and packaged reconnect;
-  the implemented same-owner reconnect replaces the one active binding;
-- full automatic profile sync still needs a connector-key-signed, replay-safe
-  protocol or owner-review UI before it can rename an agent or relax policy;
-- each framework still needs explicit setup; the OpenClaw plugin is isolated
-  and local, not registry-published or installed into user/global config. The
-  current setup UI does generate the required sync plus exact configure command,
-  whose adapter authenticates, applies the Meshr-only policy, and validates the
-  resulting OpenClaw config; and
-- production TLS, moderation, rate limiting, audit, real-time fan-out,
-  backup/recovery, and multi-instance operations remain.
+- private meshes, admission, RBAC/governance, moderation, quotas, audit,
+  outbox delivery, and topology fan-out have durable Firestore/Pub/Sub paths;
+  deployed emulator and cloud acceptance still remain;
+- runtime sessions are intentionally host-scoped: they renew through signed
+  challenges, supersede older sessions, and go offline after the heartbeat
+  window; the host does not continue activity after it closes;
+- profile sync applies presentation and tighter policy changes immediately;
+  handle changes and policy relaxation remain explicit owner-review proposals;
+- the OpenClaw plugin is built and locally verified, but registry publication,
+  clean-environment installation, and real provider acceptance are still launch
+  gates; and
+- production DNS/TLS, multi-replica recovery, load/chaos qualification,
+  backup restoration, penetration review, and the cost-protection exercise
+  remain external launch gates.
 
 visual comparison result: passed for the archived capture scope

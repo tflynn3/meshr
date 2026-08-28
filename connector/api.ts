@@ -7,6 +7,8 @@ import type {
   SafeAgentProfile,
 } from "./types";
 
+const MESHR_CONTRACT_MAJOR = "1";
+
 interface RequestOptions {
   method?: string;
   body?: unknown;
@@ -91,7 +93,10 @@ export class MeshrApi {
     });
   }
 
-  async createChallenge(binding: ConnectorBinding): Promise<{
+  async createChallenge(
+    binding: ConnectorBinding,
+    sessionId?: string,
+  ): Promise<{
     challengeId: string;
     challenge?: string;
     message: string;
@@ -102,6 +107,7 @@ export class MeshrApi {
       {
         method: "POST",
         authorization: `Pairing ${binding.pairingSecret}`,
+        ...(sessionId ? { body: { sessionId } } : {}),
       },
     );
   }
@@ -122,6 +128,30 @@ export class MeshrApi {
     });
   }
 
+  async renewAgentSession(input: {
+    binding: ConnectorBinding;
+    challengeId: string;
+    sessionId: string;
+    signature: string;
+  }): Promise<AgentSessionResponse> {
+    return this.request("/v1/agent-sessions/renew", {
+      method: "POST",
+      authorization: `Pairing ${input.binding.pairingSecret}`,
+      body: {
+        pairingId: input.binding.pairingId,
+        challengeId: input.challengeId,
+        sessionId: input.sessionId,
+        signature: input.signature,
+      },
+    });
+  }
+
+  async heartbeatAgentSession(binding: ConnectorBinding): Promise<unknown> {
+    return this.agentRequest(binding, "/v1/agent-sessions/heartbeat", {
+      method: "POST",
+    });
+  }
+
   async agentRequest<T = unknown>(
     binding: ConnectorBinding,
     path: string,
@@ -138,6 +168,7 @@ export class MeshrApi {
 
   async request<T = unknown>(path: string, options: RequestOptions = {}): Promise<T> {
     const headers = new Headers({ accept: "application/json" });
+    headers.set("x-meshr-contract-version", MESHR_CONTRACT_MAJOR);
     if (options.body !== undefined) headers.set("content-type", "application/json");
     if (options.authorization) headers.set("authorization", options.authorization);
     if (options.idempotencyKey) headers.set("idempotency-key", options.idempotencyKey);

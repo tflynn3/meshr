@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.connector.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true
+  },
+  "include": [
+    "index.ts",
+    "cli.ts",
+    "../../connector/**/*.ts",
+    "../../src/domain/agentDefinition.ts",
+    "../../src/domain/types.ts"
+  ]
+}

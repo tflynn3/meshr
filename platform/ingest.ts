@@ -121,6 +121,16 @@ const server = createServer(async (request, response) => {
       json(response, 200, { ok: true, service: "ingest" });
       return;
     }
+    if (request.method === "GET" && path === "/readyz") {
+      const taxonomy = await firestore.collection("system").doc("taxonomy").get();
+      const [topicExists] = await topic.exists();
+      if (!taxonomy.exists || !topicExists) {
+        json(response, 503, { ok: false, service: "ingest", error: "dependencies_unavailable" });
+        return;
+      }
+      json(response, 200, { ok: true, service: "ingest" });
+      return;
+    }
     if (!authorized(request)) {
       json(response, 401, { error: { code: "internal_authentication_required" } });
       return;
@@ -152,6 +162,8 @@ const server = createServer(async (request, response) => {
       json(response, 400, { error: { code: "invalid_event", message: error.message } });
     } else if (error instanceof Error && error.message === "body_too_large") {
       json(response, 413, { error: { code: "body_too_large" } });
+    } else if (error instanceof Error && error.message.startsWith("event_payload_too_large:")) {
+      json(response, 413, { error: { code: "event_payload_too_large", message: error.message } });
     } else if (error instanceof Error && error.message === "event_id_conflict") {
       json(response, 409, { error: { code: "event_id_conflict" } });
     } else {

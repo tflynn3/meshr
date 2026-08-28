@@ -14,19 +14,29 @@ const configSchema = Type.Object(
   {
     baseUrl: Type.String({
       minLength: 1,
-      description: "Meshr server URL for this connector state.",
+      description: "Meshr server URL for this runtime session.",
     }),
-    connectorStatePath: Type.String({
-      minLength: 1,
-      description: "Absolute path to the Meshr connector state.json file.",
-    }),
+    statePath: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description: "Absolute path to the local Meshr runtime state file.",
+      }),
+    ),
+    // Kept for one release so existing OpenClaw configs upgrade in place.
+    connectorStatePath: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description: "Deprecated alias for statePath.",
+      }),
+    ),
   },
   { additionalProperties: false },
 );
 
 type PluginConfig = {
   baseUrl: string;
-  connectorStatePath: string;
+  statePath?: string;
+  connectorStatePath?: string;
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -34,6 +44,7 @@ type JsonRecord = Record<string, unknown>;
 interface BoundConnector {
   baseUrl: string;
   token: string;
+  sessionId?: string;
   attention: AttentionPolicy;
 }
 
@@ -133,29 +144,29 @@ function optionalInteger(
 
 function assertPrivateStateFile(path: string): void {
   if (!isAbsolute(path)) {
-    throw new Error("connectorStatePath must be an absolute file path.");
+    throw new Error("statePath must be an absolute file path.");
   }
   const resolvedPath = resolve(path);
   if (resolvedPath === "/" || resolvedPath === homedir()) {
-    throw new Error("connectorStatePath must identify a dedicated state file.");
+    throw new Error("statePath must identify a dedicated state file.");
   }
   const stat = statSync(resolvedPath);
   if (!stat.isFile()) {
-    throw new Error("connectorStatePath must identify a regular file.");
+    throw new Error("statePath must identify a regular file.");
   }
   if (stat.size > 5 * 1024 * 1024) {
-    throw new Error("connectorStatePath is unexpectedly large.");
+    throw new Error("statePath is unexpectedly large.");
   }
   if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
-    throw new Error("connectorStatePath must not be readable by group or other users.");
+    throw new Error("statePath must not be readable by group or other users.");
   }
 }
 
-function readConnectorState(path: string): JsonRecord {
+function readRuntimeState(path: string): JsonRecord {
   assertPrivateStateFile(path);
   const parsed: unknown = JSON.parse(readFileSync(resolve(path), "utf8"));
   if (!isRecord(parsed) || parsed.version !== 1 || !Array.isArray(parsed.bindings)) {
-    throw new Error("Unsupported Meshr connector state format.");
+    throw new Error("Unsupported Meshr runtime state format.");
   }
   return parsed;
 }
@@ -217,7 +228,9 @@ function selectConnectorBinding(
   if (!agentId) return null;
 
   const baseUrl = normalizeBaseUrl(config.baseUrl);
-  const state = readConnectorState(config.connectorStatePath);
+  const statePath = config.statePath ?? config.connectorStatePath;
+  if (!statePath) throw new Error("statePath is required.");
+  const state = readRuntimeState(statePath);
   const expectedSubject = `openclaw:${agentId}`;
   const matches = (state.bindings as unknown[]).filter((candidate): candidate is JsonRecord => {
     if (!isRecord(candidate)) return false;
@@ -246,8 +259,24 @@ function selectConnectorBinding(
   return {
     baseUrl,
     token: matches[0].agentToken as string,
+    sessionId:
+      typeof matches[0].sessionId === "string" ? (matches[0].sessionId as string) : undefined,
     attention: readAttentionPolicy(matches[0]),
   };
+}
+
+const heartbeatTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+function keepRuntimeSessionAlive(binding: BoundConnector, agentId: string): void {
+  if (!binding.sessionId || heartbeatTimers.has(agentId)) return;
+  const timer = setInterval(() => {
+    void fetch(binding.baseUrl + "/v1/agent-sessions/heartbeat", {
+      method: "POST",
+      headers: { accept: "application/json", authorization: "Bearer " + binding.token },
+    }).catch(() => undefined);
+  }, 30_000);
+  timer.unref();
+  heartbeatTimers.set(agentId, timer);
 }
 
 class MeshrClient {
@@ -484,6 +513,7 @@ function createBoundTool(
   if (!agentId) return null;
   const binding = selectConnectorBinding(config, agentId);
   if (!binding) return null;
+  keepRuntimeSessionAlive(binding, agentId);
   if (!attentionAllows(binding.attention, spec.attention)) return null;
   const client = new MeshrClient(binding);
 

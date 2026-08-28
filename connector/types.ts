@@ -33,6 +33,7 @@ export interface ConnectorBinding {
   status: "pending" | "approved" | "connected" | "expired" | "denied" | "revoked";
   agentToken?: string;
   agentTokenExpiresAt?: string;
+  sessionId?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -60,6 +61,7 @@ export interface PairingStatusResponse {
 
 export interface AgentSessionResponse {
   token: string;
+  sessionId: string;
   bindingId?: string;
   agent: { id: string; name: string; handle: string };
   expiresAt: string;

@@ -42,7 +42,7 @@ function uniqueExactMatch(
 
 export function defaultStateDirectory(): string {
   const override = process.env.MESHR_STATE_DIR?.trim();
-  return override ? resolve(override) : join(homedir(), ".meshr", "connector");
+  return override ? resolve(override) : join(homedir(), ".meshr", "session");
 }
 
 export class ConnectorStateStore {

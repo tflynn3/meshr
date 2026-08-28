@@ -1628,15 +1628,15 @@ button:focus-visible {
   gap: 8px;
   font-size: 9px;
 }
-.connector-modal {
+.runtime-modal {
   padding: 20px 24px 22px;
 }
-.connector-tabs {
+.runtime-tabs {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 9px;
 }
-.connector-tabs > button {
+.runtime-tabs > button {
   min-height: 68px;
   border: 1px solid #d4d5ce;
   border-radius: 8px;
@@ -1647,23 +1647,23 @@ button:focus-visible {
   text-align: left;
   padding: 0 14px;
 }
-.connector-tabs > button.active {
+.runtime-tabs > button.active {
   border-color: #9fb42d;
   background: #f4f7e2;
 }
-.connector-tabs strong,
-.connector-tabs small {
+.runtime-tabs strong,
+.runtime-tabs small {
   display: block;
 }
-.connector-tabs strong {
+.runtime-tabs strong {
   font-size: 12px;
 }
-.connector-tabs small {
+.runtime-tabs small {
   font-size: 9px;
   color: var(--muted);
   margin-top: 3px;
 }
-.connector-content {
+.runtime-content {
   padding: 17px 0 14px;
 }
 .setup-profile-intro strong,
@@ -1681,7 +1681,7 @@ button:focus-visible {
 }
 .setup-fields {
   display: grid;
-  grid-template-columns: 0.7fr 1.3fr;
+  grid-template-columns: 1fr;
   gap: 10px;
   margin: 10px 0 14px;
 }
@@ -1710,7 +1710,7 @@ button:focus-visible {
   border-color: #9fb42d;
   box-shadow: 0 0 0 3px rgb(159 180 45 / 12%);
 }
-.connector-callout {
+.runtime-callout {
   display: grid;
   grid-template-columns: 30px 1fr;
   gap: 10px;
@@ -1719,27 +1719,27 @@ button:focus-visible {
   border-radius: 7px;
   background: #f6f7ea;
 }
-.connector-callout strong,
-.connector-callout small {
+.runtime-callout strong,
+.runtime-callout small {
   display: block;
 }
-.connector-callout strong {
+.runtime-callout strong {
   font-size: 11px;
 }
-.connector-callout small {
+.runtime-callout small {
   font-size: 9px;
   line-height: 1.45;
   margin-top: 3px;
   color: #69705d;
 }
-.connector-content ol {
+.runtime-content ol {
   list-style: none;
   margin: 16px 0 0;
   padding: 0;
   display: grid;
   gap: 10px;
 }
-.connector-content li {
+.runtime-content li {
   display: grid;
   grid-template-columns: 28px 1fr;
   gap: 9px;
@@ -1748,7 +1748,7 @@ button:focus-visible {
 .setup-steps > li > div {
   min-width: 0;
 }
-.connector-content li > span {
+.runtime-content li > span {
   width: 26px;
   height: 26px;
   border-radius: 50%;
@@ -1758,50 +1758,17 @@ button:focus-visible {
   font-size: 9px;
   font-weight: 700;
 }
-.connector-content li strong,
-.connector-content li small {
+.runtime-content li strong,
+.runtime-content li small {
   display: block;
 }
-.connector-content li strong {
+.runtime-content li strong {
   font-size: 10px;
 }
-.connector-content li small {
+.runtime-content li small {
   font-size: 9px;
   color: var(--muted);
   margin-top: 2px;
-}
-.setup-command {
-  min-height: 43px;
-  margin-top: 9px;
-  border: 1px solid #343d34;
-  border-radius: 7px;
-  background: #202820;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  overflow: hidden;
-}
-.setup-command code {
-  padding: 10px 12px;
-  overflow-wrap: anywhere;
-  color: #eef2dc;
-  font: 500 9px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-.setup-command button {
-  align-self: stretch;
-  border: 0;
-  border-left: 1px solid #3c463c;
-  background: #293229;
-  color: #dce3cb;
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 0 11px;
-  font-size: 8px;
-  font-weight: 700;
-}
-.openclaw-setup {
-  margin-bottom: 14px;
 }
 .definition-sync-note {
   margin-top: 16px;
@@ -1871,6 +1838,41 @@ button:focus-visible {
   border-radius: 10px;
   background: var(--rail);
   object-fit: contain;
+}
+.social-auth-actions {
+  display: grid;
+  gap: 9px;
+}
+.social-auth-button {
+  min-height: 44px;
+  border: 1px solid #c7cbc0;
+  border-radius: 8px;
+  background: #fff;
+  color: #2b3228;
+  font-size: 11px;
+  font-weight: 700;
+}
+.social-auth-button:hover {
+  border-color: #9eb423;
+  background: #f8faed;
+}
+.auth-divider {
+  margin: 20px 0 0;
+  color: #8b9085;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 10px;
+}
+.auth-divider::before,
+.auth-divider::after {
+  content: "";
+  height: 1px;
+  flex: 1;
+  background: #dedfd7;
+}
+.auth-divider span {
+  white-space: nowrap;
 }
 .auth-tabs {
   display: grid;
@@ -2441,7 +2443,7 @@ button:focus-visible {
   .two-fields {
     grid-template-columns: 1fr;
   }
-  .connector-tabs {
+  .runtime-tabs {
     grid-template-columns: 1fr 1fr;
   }
   .setup-fields {

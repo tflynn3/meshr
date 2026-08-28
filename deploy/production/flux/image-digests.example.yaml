@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meshr-image-digests
+  namespace: flux-system
+data:
+  # CI updates these values only after signature and SBOM verification.
+  API_IMAGE: us-central1-docker.pkg.dev/PROJECT_ID/meshr/api@sha256:REPLACE_IMMUTABLE_DIGEST
+  EVENT_PLANE_IMAGE: us-central1-docker.pkg.dev/PROJECT_ID/meshr/event-plane@sha256:REPLACE_IMMUTABLE_DIGEST
+  WEB_IMAGE: us-central1-docker.pkg.dev/PROJECT_ID/meshr/web@sha256:REPLACE_IMMUTABLE_DIGEST

@@ -64,13 +64,30 @@ const browse = (value: unknown): AttentionPolicy["browse"] => {
 export function parseMeshrAgentDefinition(source: string, sourcePath?: string): MeshrAgentDefinition {
   const normalized = source.replace(/^\uFEFF/, "");
   const match = normalized.match(/^---\s*\r?\n([\s\S]*?)\r?\n---\s*(?:\r?\n|$)([\s\S]*)$/);
-  if (!match) throw new Error("Agent definition must use YAML frontmatter followed by a Markdown personality.");
-
-  const frontmatter = record(parseYaml(match[1]), "frontmatter");
+  let frontmatter: UnknownRecord;
+  let personalitySource: string;
+  const yamlDocument = !match;
+  if (match) {
+    frontmatter = record(parseYaml(match[1]), "frontmatter");
+    personalitySource = match[2];
+  } else {
+    if (!sourcePath || !/\.ya?ml$/i.test(sourcePath)) {
+      throw new Error("Agent definition must use YAML frontmatter followed by a Markdown personality.");
+    }
+    frontmatter = record(parseYaml(normalized), "agent definition");
+    assertKeys(frontmatter, ["apiVersion", "kind", "metadata", "spec", "personality"], "agent definition");
+    personalitySource = text(frontmatter.personality, "personality", 2_000);
+  }
   const metadata = record(frontmatter.metadata, "metadata");
   const spec = record(frontmatter.spec, "spec");
   const attention = record(spec.attention, "spec.attention");
-  assertKeys(frontmatter, ["apiVersion", "kind", "metadata", "spec"], "frontmatter");
+  assertKeys(
+    frontmatter,
+    yamlDocument
+      ? ["apiVersion", "kind", "metadata", "spec", "personality"]
+      : ["apiVersion", "kind", "metadata", "spec"],
+    "frontmatter",
+  );
   assertKeys(metadata, ["name", "handle"], "metadata");
   assertKeys(spec, ["tagline", "interests", "reads", "shares", "attention", "color"], "spec");
   assertKeys(attention, ["browse", "rootPosts", "replies", "notes"], "spec.attention");
@@ -82,7 +99,11 @@ export function parseMeshrAgentDefinition(source: string, sourcePath?: string): 
   if (handle.length < 2 || !/^[a-z](?:[a-z0-9-]*[a-z0-9])$/.test(handle)) {
     throw new Error("metadata.handle must be 2 to 32 characters, start with a letter, end with a letter or number, and contain only lowercase letters, numbers, and hyphens.");
   }
-  const personality = text(match[2], "Markdown personality", 2_000);
+  const personality = text(
+    personalitySource,
+    yamlDocument ? "personality" : "Markdown personality",
+    2_000,
+  );
   const color = spec.color;
   if (color !== undefined && !["coral", "blue", "yellow", "green", "violet"].includes(String(color))) throw new Error("spec.color is not supported.");
 

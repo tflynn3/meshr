@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meshr-runtime
+data:
+  MESHR_ENV: production
+  MESHR_STORAGE: firestore
+  MESHR_SOCIAL_AUTH_ONLY: "1"
+  MESHR_SECURE_COOKIES: "1"
+  MESHR_WEBMCP_SESSION_TRANSFER: "1"
+  # Set to protect during a projected 95% budget burn; set to throttle after
+  # session/mesh creation is paused. Normal is the launch default.
+  MESHR_COST_PROTECTION_MODE: normal
+  MESHR_HOST: 0.0.0.0
+  MESHR_WEB_URL: https://meshr.social/
+  MESHR_API_URL: http://api.meshr.svc.cluster.local:8787
+  # Flux substitutes this from the protected flux-system/meshr-runtime-values
+  # ConfigMap during promotion. Keep the example value non-operational.
+  GOOGLE_CLOUD_PROJECT: ${GCP_PROJECT_ID}
+  MESHR_EVENTS_TOPIC: mesh-events
+  MESHR_TOPOLOGY_SUBSCRIPTION: topology-materializer
+  MESHR_MODERATION_SUBSCRIPTION: moderation-worker
+  MESHR_AUDIT_SUBSCRIPTION: audit-worker
+  MESHR_NOTIFICATIONS_SUBSCRIPTION: notification-worker
+  MESHR_DEAD_LETTER_TOPIC: mesh-events-dlq
+  MESHR_ALLOWED_ORIGINS: https://meshr.social,https://staging.meshr.social
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: meshr-runtime
+type: Opaque
+stringData:
+  MESHR_INTERNAL_TOKEN: REPLACE_FROM_SECRET_MANAGER
+  MESHR_IDENTITY_PROJECT_ID: ${GCP_PROJECT_ID}
+  # Web API key emitted by the Identity Platform API-key resource. The
+  # release process injects the value from Secret Manager; never commit it.
+  MESHR_IDENTITY_API_KEY: REPLACE_FROM_SECRET_MANAGER
+  MESHR_IDENTITY_AUTH_DOMAIN: ${GCP_PROJECT_ID}.firebaseapp.com
+  MESHR_EVENT_INGEST_URL: http://ingest.meshr.svc.cluster.local:8080

@@ -1,0 +1,155 @@
+name: Meshr CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+env:
+  REGISTRY: us-central1-docker.pkg.dev
+  IMAGE_REPOSITORY: ${{ vars.GCP_PROJECT_ID }}/meshr
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: 24, cache: npm}
+      - uses: hashicorp/setup-terraform@v3
+      - uses: azure/setup-kubectl@v4
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build:npm
+      - run: npm run test:connector
+      - run: npm run test:live
+      - run: npm run test:openclaw-live
+      - run: cd packages/mcp && npm ci && npm run typecheck && npm run build
+      - run: cd integrations/openclaw && npm ci && npm test
+      - run: terraform fmt -check -recursive infra/opentofu
+      - run: terraform -chdir=infra/opentofu init -backend=false -input=false
+      - run: terraform -chdir=infra/opentofu validate
+      - run: kubectl kustomize deploy/production >/dev/null
+
+  build:
+    needs: verify
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: sigstore/cosign-installer@v3
+      - run: gcloud auth configure-docker "$REGISTRY" --quiet
+      - name: Build signed multi-architecture images
+        env:
+          TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            --file deploy/images/api.Dockerfile \
+            --tag "$REGISTRY/$IMAGE_REPOSITORY/api:$TAG" \
+            --provenance=true --sbom=true --push .
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            --file deploy/images/event-plane.Dockerfile \
+            --tag "$REGISTRY/$IMAGE_REPOSITORY/event-plane:$TAG" \
+            --provenance=true --sbom=true --push .
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            --file deploy/images/web.Dockerfile \
+            --tag "$REGISTRY/$IMAGE_REPOSITORY/web:$TAG" \
+            --provenance=true --sbom=true --push .
+      - name: Sign immutable digests
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes "$REGISTRY/$IMAGE_REPOSITORY/api:${{ github.sha }}"
+          cosign sign --yes "$REGISTRY/$IMAGE_REPOSITORY/event-plane:${{ github.sha }}"
+          cosign sign --yes "$REGISTRY/$IMAGE_REPOSITORY/web:${{ github.sha }}"
+
+  promote:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    environment: production
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: sigstore/cosign-installer@v3
+      - name: Resolve immutable image digests
+        id: resolve
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "$REGISTRY" --quiet
+          for image in api event-plane web; do
+            ref="$REGISTRY/$IMAGE_REPOSITORY/$image:$IMAGE_TAG"
+            digest="$(gcloud artifacts docker images describe "$ref" --format='value(image_summary.digest)')"
+            test -n "$digest"
+            key="${image//-/_}"
+            echo "$key=$digest" >> "$GITHUB_OUTPUT"
+          done
+      - name: Verify signatures and update Flux image pins
+        run: |
+          set -euo pipefail
+          for pair in \
+            "api:$API_DIGEST" \
+            "event-plane:$EVENT_PLANE_DIGEST" \
+            "web:$WEB_DIGEST"; do
+            image="${pair%%:*}"
+            digest="${pair#*:}"
+            immutable="$REGISTRY/$IMAGE_REPOSITORY/$image@$digest"
+            cosign verify "$immutable" \
+              --certificate-identity-regexp='https://github.com/tflynn3/meshr/.github/workflows/.*' \
+              --certificate-oidc-issuer='https://token.actions.githubusercontent.com'
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          path = Path('deploy/production/flux/image-digests.example.yaml')
+          text = path.read_text()
+          images = {
+              'API_IMAGE': f"{os.environ['REGISTRY']}/{os.environ['IMAGE_REPOSITORY']}/api@{os.environ['API_DIGEST']}",
+              'EVENT_PLANE_IMAGE': f"{os.environ['REGISTRY']}/{os.environ['IMAGE_REPOSITORY']}/event-plane@{os.environ['EVENT_PLANE_DIGEST']}",
+              'WEB_IMAGE': f"{os.environ['REGISTRY']}/{os.environ['IMAGE_REPOSITORY']}/web@{os.environ['WEB_DIGEST']}",
+          }
+          lines = text.splitlines()
+          path.write_text('\n'.join(
+              next((f'  {key}: {value}' for key, value in images.items() if line.lstrip().startswith(key + ':')), line)
+              for line in lines
+          ) + '\n')
+          PY
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_REPOSITORY: ${{ env.IMAGE_REPOSITORY }}
+          API_DIGEST: ${{ steps.resolve.outputs.api }}
+          EVENT_PLANE_DIGEST: ${{ steps.resolve.outputs.event_plane }}
+          WEB_DIGEST: ${{ steps.resolve.outputs.web }}
+      - name: Commit verified Flux pins
+        run: |
+          set -euo pipefail
+          git config user.name 'meshr-release[bot]'
+          git config user.email 'meshr-release[bot]@users.noreply.github.com'
+          git add deploy/production/flux/image-digests.example.yaml
+          git diff --cached --quiet && exit 0
+          git commit -m "chore(release): promote verified images [skip ci]"
+          git push origin HEAD:main

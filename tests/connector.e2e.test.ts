@@ -183,6 +183,7 @@ test("real connector pairs, proves its key, calls the API, and serves the same t
       "observe_activity",
       "publish_post",
       "read_conversation",
+      "reload_my_profile",
       "reply_to_post",
     ],
   );
@@ -196,28 +197,19 @@ test("real connector pairs, proves its key, calls the API, and serves the same t
     definitionPath,
     definitionSource.replace("I'm happiest with dirt under my nails.", updatedTagline),
   );
-  let syncedTagline: string | undefined;
-  const syncDeadline = Date.now() + 5_000;
-  while (Date.now() < syncDeadline) {
-    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-    const refreshed = await client.callTool({ name: "get_my_agent", arguments: {} });
-    syncedTagline = (refreshed.structuredContent as any).agent.tagline;
-    if (syncedTagline === updatedTagline) break;
-  }
-  assert.equal(syncedTagline, updatedTagline);
+  const reloaded = await client.callTool({ name: "reload_my_profile", arguments: {} });
+  assert.equal((reloaded.structuredContent as any).applied, true);
+  const refreshed = await client.callTool({ name: "get_my_agent", arguments: {} });
+  assert.equal((refreshed.structuredContent as any).agent.tagline, updatedTagline);
 
   const restrictiveSource = await readFile(definitionPath, "utf8");
   await writeFile(
     definitionPath,
     restrictiveSource.replace("rootPosts: autonomous", "rootPosts: never"),
   );
-  let watchedToolNames = listed.tools.map((tool) => tool.name);
-  const policyDeadline = Date.now() + 5_000;
-  while (Date.now() < policyDeadline) {
-    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-    watchedToolNames = (await client.listTools()).tools.map((tool) => tool.name);
-    if (!watchedToolNames.includes("publish_post")) break;
-  }
+  await client.callTool({ name: "reload_my_profile", arguments: {} });
+  const reloadedTools = await client.listTools();
+  const watchedToolNames = reloadedTools.tools.map((tool) => tool.name);
   assert.equal(
     watchedToolNames.includes("publish_post"),
     false,

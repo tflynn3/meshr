@@ -93,23 +93,26 @@ to host its Kubernetes nodes; it is not used to construct Meshr images.
 | --- | --- | --- |
 | GKE Autopilot | k3d Kubernetes on isolated Colima | Runnable manifests with explicit requests and limits |
 | GCP external load balancer / Gateway | k3d proxy, K3s service load balancer, and Traefik Ingress on `localhost:8080` | Same-origin path routing; not a Cloud Armor or certificate test |
-| Control API | Existing Meshr Node API | Runs in Kubernetes; SQLite remains on a single-replica PVC |
+| Control API | Existing Meshr Node API with Firestore repository | Runs with two replicas; SQLite is an ephemeral projection on `emptyDir` |
 | Firestore | Official Firestore emulator | Event outbox, processed-event ledger, and topology snapshots |
 | Pub/Sub | Official Pub/Sub emulator | Ordered `mesh-events` topic and topology consumer subscription |
 | Agent ingest | `platform/ingest.ts` | Authenticated local endpoint with durable outbox retry |
 | Topology materializer | `platform/materializer.ts` | At-least-once consumer with Firestore deduplication |
 | Topology stream | `platform/liveGateway.ts` | Firestore watch, WebSocket heartbeat, initial snapshot and updates |
-| Identity Platform | Existing local account/session implementation | Functional substitute, not protocol parity |
+| Identity Platform | Development verifier and local account/session implementation | Functional local substitute; deployed token exchange uses Google Cloud Identity Platform |
 | Secret Manager | Kubernetes Secret | Local-only token; never reuse in a deployed environment |
 | Artifact Registry | Bazel OCI archives imported directly into k3d | Same image graph, but no registry push or image-signing test |
 | Cloud Storage traces | Not wired yet | Sampled trace retention remains a later slice |
 | Crossplane and Flux | Not installed in the runtime path yet | Local stack proves workloads/data plane, not managed-resource reconciliation |
 
-The honest storage boundary matters: Firestore is authoritative for the new
-event-plane collections, while the existing social trust API still uses
-SQLite. Until the SQL queries in `server/app.ts` are ported behind a Firestore
-repository, the API must stay at one replica and the local stack is not proof
-of production multi-instance correctness.
+The honest storage boundary matters: in production, Firestore is authoritative
+for identities, sessions, bindings, meshes, memberships, posts, idempotency,
+moderation, audit, and outbox state. The API keeps a disposable SQLite
+projection for cursors and low-latency aggregate reads; it is populated from
+Firestore and is mounted on `emptyDir`, never a production PVC. The local stack
+uses the SQLite adapter for fast fixtures and the Firestore/Pub/Sub emulators
+for the event plane, so it proves behavior and wiring but not managed GCP
+availability, Workload Identity, Gateway, or regional recovery.
 
 ## Routes and ports
 
@@ -172,7 +175,9 @@ git diff --check
 Passing repository tests does not prove the local cluster. Passing the smoke
 test proves the current local cluster path, not GKE Workload Identity, Gateway,
 Certificate Manager, Cloud Armor, Cloudflare, managed-service durability, or a
-physical regional-failure recovery exercise.
+physical regional-failure recovery exercise. The public-launch checklist in
+`docs/LAUNCH_CHECKLIST.md` remains the acceptance source of truth for those
+boundaries.
 
 ## Troubleshooting
 

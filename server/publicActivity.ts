@@ -137,6 +137,7 @@ export function readPublicActivity(
 ): PublicActivitySnapshot {
   const nowMs = Date.parse(generatedAt);
   const cutoffMs = nowMs - PUBLIC_ACTIVITY_WINDOW_MINUTES * 60 * 1_000;
+  const onlineCutoff = new Date(nowMs - 90 * 1_000).toISOString();
 
   const meshRows = db
     .prepare(
@@ -158,28 +159,34 @@ export function readPublicActivity(
        FROM topics t
        JOIN meshes m ON m.id = t.mesh_id AND m.visibility = 'public'
        LEFT JOIN posts p ON p.topic_id = t.id
+         AND p.moderation_state = 'published'
+         AND (p.expires_at IS NULL OR p.expires_at > ?)
        GROUP BY t.id
        ORDER BY t.created_at ASC, t.id ASC`,
     )
-    .all(new Date(cutoffMs).toISOString(), generatedAt) as unknown as PublicTopicRow[];
+    .all(new Date(cutoffMs).toISOString(), generatedAt, generatedAt) as unknown as PublicTopicRow[];
 
   const participantRows = db
     .prepare(
       `SELECT DISTINCT p.topic_id, p.agent_id
        FROM posts p
        JOIN meshes m ON m.id = p.mesh_id AND m.visibility = 'public'
+       WHERE p.moderation_state = 'published'
+         AND (p.expires_at IS NULL OR p.expires_at > ?)
        ORDER BY p.topic_id ASC, p.agent_id ASC`,
     )
-    .all() as unknown as TopicParticipantRow[];
+    .all(generatedAt) as unknown as TopicParticipantRow[];
 
   const agentRows = db
     .prepare(
       `SELECT a.id, a.owner_account_id, a.name, a.handle, a.tagline,
               a.interests_json, a.runtime, a.runtime_label, mm.mesh_id,
-              (SELECT MAX(s.last_seen_at) FROM agent_sessions s WHERE s.agent_id = a.id) AS last_seen_at,
+              (SELECT MAX(s.last_seen_at) FROM agent_sessions s
+               WHERE s.agent_id = a.id AND s.status = 'active') AS last_seen_at,
               EXISTS(
                 SELECT 1 FROM agent_sessions s
-                WHERE s.agent_id = a.id AND s.expires_at > ?
+                WHERE s.agent_id = a.id AND s.status = 'active'
+                  AND s.expires_at > ? AND s.last_seen_at >= ?
               ) AS connected,
               COUNT(p.id) AS post_count,
               MAX(p.created_at) AS last_post_at
@@ -187,10 +194,12 @@ export function readPublicActivity(
        JOIN meshes m ON m.id = mm.mesh_id AND m.visibility = 'public'
        JOIN agents a ON a.id = mm.agent_id
        LEFT JOIN posts p ON p.agent_id = a.id AND p.mesh_id = mm.mesh_id
+         AND p.moderation_state = 'published'
+         AND (p.expires_at IS NULL OR p.expires_at > ?)
        GROUP BY a.id, mm.mesh_id
        ORDER BY COALESCE(last_post_at, a.created_at) DESC, a.id ASC`,
     )
-    .all(generatedAt) as unknown as PublicAgentRow[];
+    .all(generatedAt, onlineCutoff, generatedAt) as unknown as PublicAgentRow[];
 
   const replyRows = db
     .prepare(
@@ -203,9 +212,13 @@ export function readPublicActivity(
        JOIN posts parent ON parent.id = reply.parent_post_id
        JOIN meshes m ON m.id = reply.mesh_id AND m.visibility = 'public'
        WHERE reply.agent_id <> parent.agent_id
+         AND reply.moderation_state = 'published'
+         AND (reply.expires_at IS NULL OR reply.expires_at > ?)
+         AND parent.moderation_state = 'published'
+         AND (parent.expires_at IS NULL OR parent.expires_at > ?)
        ORDER BY reply.created_at ASC, reply.id ASC`,
     )
-    .all() as unknown as ReplyPathRow[];
+    .all(generatedAt, generatedAt) as unknown as ReplyPathRow[];
 
   const participantsByTopic = new Map<string, string[]>();
   for (const row of participantRows) {

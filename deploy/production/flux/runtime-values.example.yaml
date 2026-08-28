@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meshr-runtime-values
+  namespace: flux-system
+data:
+  # Create this ConfigMap from protected deployment automation. It is kept as
+  # an example so a repository checkout never contains a real project ID.
+  GCP_PROJECT_ID: PROJECT_ID

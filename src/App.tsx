@@ -6,7 +6,6 @@ import {
   Brain,
   Check,
   Coffee,
-  CopySimple,
   Cpu,
   DotsThree,
   Eye,
@@ -32,6 +31,7 @@ import {
   X,
 } from "@phosphor-icons/react";
 import {
+  useCallback,
   useEffect,
   useMemo,
   useState,
@@ -43,25 +43,27 @@ import { useAuth } from "./auth/AuthContext";
 import {
   disableWebMcpSession,
   enableWebMcpSession,
+  createMesh,
   getPublicActivity,
+  getMeshGovernance,
   getWebMcpSession,
+  listMeshes,
   listOwnedAgents,
+  updateMeshGovernance,
+  updateMeshRole,
   type HumanUser,
+  type MeshSummary,
   type OwnedAgent,
   type PublicActivitySnapshot,
   type WebMcpSessionStatus,
 } from "./auth/api";
 import { TopologyCanvas } from "./components/TopologyCanvas";
-import { localAgentDefinitions } from "./domain/localAgentDefinitions";
-import { localMeshPortfolio } from "./domain/localMeshPortfolio";
 import { applyPublicActivitySnapshot } from "./domain/publicActivity";
 import { projectMeshTopology, type TrafficLink } from "./domain/topology";
-import { connectedAgentId, currentOwnerId, meshStore } from "./domain/runtime";
+import { connectedAgentId, meshStore } from "./domain/runtime";
 import {
   agentSetupRuntimeDetails,
   agentSetupRuntimes,
-  buildAgentSetupCommands,
-  defaultDefinitionPath,
   type AgentSetupRuntime,
 } from "./setup/agentSetup";
 import type {
@@ -74,6 +76,7 @@ import type {
   RuntimeBinding,
   Topic,
 } from "./domain/types";
+import { createDefaultMeshRolePolicy } from "./domain/types";
 import {
   registerMeshrTools,
   type WebMcpRegistrationStatus,
@@ -81,6 +84,7 @@ import {
 
 type View = { kind: "agents" } | { kind: "mesh"; meshId: string };
 const WEBMCP_SESSION_CHANNEL = "meshr.webmcp.session.v1";
+const DURABLE_STATE_REQUIRED = import.meta.env.VITE_DURABLE_STATE === "1";
 
 function sameWebMcpSession(
   current: WebMcpSessionStatus | null,
@@ -116,7 +120,7 @@ const meshIcons = [
 ];
 const agentColors: Agent["color"][] = ["violet", "green", "blue", "coral", "yellow"];
 
-function ownedAgentToPortfolioAgent(agent: OwnedAgent): Agent {
+function ownedAgentToPortfolioAgent(agent: OwnedAgent, ownerId: string): Agent {
   const colorIndex = [...agent.handle].reduce((sum, character) => sum + character.charCodeAt(0), 0);
   const interests = agent.interests.length ? agent.interests : ["Curiosity"];
   const interestText = interests.slice(0, 2).join(" and ");
@@ -127,7 +131,7 @@ function ownedAgentToPortfolioAgent(agent: OwnedAgent): Agent {
       : undefined;
   return {
     id: agent.id,
-    ownerId: currentOwnerId,
+    ownerId,
     name: agent.name,
     handle: agent.handle,
     initials: agent.name
@@ -149,6 +153,44 @@ function ownedAgentToPortfolioAgent(agent: OwnedAgent): Agent {
     definitionPath: `synced://${agent.handle}`,
     avatarPath,
   };
+}
+
+function accentForMesh(value: string): Agent["color"] {
+  const colors: Agent["color"][] = ["green", "blue", "coral", "yellow", "violet"];
+  const score = [...value].reduce((sum, character) => sum + character.charCodeAt(0), 0);
+  return colors[score % colors.length] ?? "green";
+}
+
+function meshSummaryToModels(summary: MeshSummary): { mesh: Mesh; topics: Topic[] } {
+  const mesh: Mesh = {
+    id: summary.id,
+    ownerId: summary.ownerId,
+    name: summary.name,
+    description: summary.description,
+    visibility: summary.visibility,
+    joinPolicy: summary.joinPolicy,
+    memberAgentIds: summary.memberAgentIds,
+    humanRoleAssignments: summary.roles.map((role) => ({
+      ownerId: role.accountId,
+      role: role.role,
+    })),
+    rolePolicy: createDefaultMeshRolePolicy(),
+    accent: accentForMesh(summary.id),
+  };
+  const topics = summary.topics.map((topic, index) => ({
+    id: topic.id,
+    meshId: topic.meshId,
+    name: topic.name,
+    title: topic.title,
+    description: topic.description,
+    tags: topic.tags,
+    activityCount: topic.activityCount,
+    recentActivityCount: topic.recentActivityCount,
+    participantAgentIds: topic.participantAgentIds,
+    lastActivityAt: topic.lastActivityAt ?? undefined,
+    accent: (["green", "violet", "coral", "yellow", "blue"] as const)[index % 5]!,
+  }));
+  return { mesh, topics };
 }
 
 function ownedAgentRuntime(agent: OwnedAgent): RuntimeBinding {
@@ -237,6 +279,7 @@ export function App() {
   const [governanceOpen, setGovernanceOpen] = useState(false);
   const [toast, setToast] = useState("");
   const [ownedAgents, setOwnedAgents] = useState<OwnedAgent[] | null>(null);
+  const [serverMeshes, setServerMeshes] = useState<MeshSummary[] | null>(null);
   const [publicActivity, setPublicActivity] =
     useState<PublicActivitySnapshot | null>(null);
   const [webMcpSession, setWebMcpSession] =
@@ -246,27 +289,32 @@ export function App() {
     WebMcpRegistrationStatus | "disabled" | "registering" | "error"
   >("registering");
 
-  const owner = state.owners.find(
-    (candidate) => candidate.id === currentOwnerId,
-  )!;
+  const refreshMeshes = useCallback(async (signal?: AbortSignal) => {
+    const next = await listMeshes(signal);
+    setServerMeshes(next);
+    return next;
+  }, []);
+  const refreshOwnedAgents = useCallback(async () => {
+    const next = await listOwnedAgents();
+    setOwnedAgents(next);
+    return next;
+  }, []);
+
+  const accountId = session!.user.id;
+  const owner = state.owners.find((candidate) => candidate.id === accountId) ?? {
+    id: accountId,
+    name: session!.user.displayName,
+  };
   const portfolio = useMemo(
-    () => (ownedAgents ?? []).map(ownedAgentToPortfolioAgent),
-    [ownedAgents],
-  );
-  const privateMeshPortfolio = useMemo(
-    () => localMeshPortfolio(portfolio, state.agents, currentOwnerId),
-    [portfolio, state.agents],
+    () => (ownedAgents ?? []).map((agent) => ownedAgentToPortfolioAgent(agent, accountId)),
+    [accountId, ownedAgents],
   );
   const portfolioState = useMemo(() => {
-    const localAgentIds = new Set(
-      state.agents
-        .filter((agent) => agent.ownerId === currentOwnerId)
-        .map((agent) => agent.id),
-    );
+    const localAgentIds = new Set(portfolio.map((agent) => agent.id));
     return {
       ...state,
       agents: [
-        ...state.agents.filter((agent) => agent.ownerId !== currentOwnerId),
+        ...state.agents.filter((agent) => !portfolio.some((owned) => owned.id === agent.id)),
         ...portfolio,
       ],
       runtimeBindings: [
@@ -275,14 +323,57 @@ export function App() {
       ],
     };
   }, [ownedAgents, portfolio, state]);
+  const durableState = useMemo(() => {
+    if (!serverMeshes) {
+      if (!DURABLE_STATE_REQUIRED) return portfolioState;
+      // A production read outage must not silently reveal the local story
+      // fixture. Keep only the authenticated portfolio shell until the
+      // durable projection is available again.
+      return {
+        ...portfolioState,
+        meshes: [],
+        topics: [],
+        posts: [],
+        subscriptions: [],
+        revision: portfolioState.revision + 1,
+      };
+    }
+    const models = serverMeshes.map(meshSummaryToModels);
+    const ownersById = new Map(
+      portfolioState.owners.map((candidate) => [candidate.id, candidate] as const),
+    );
+    ownersById.set(accountId, owner);
+    for (const summary of serverMeshes) {
+      ownersById.set(summary.ownerId, ownersById.get(summary.ownerId) ?? {
+        id: summary.ownerId,
+        name: summary.roles.find((role) => role.accountId === summary.ownerId)?.displayName ?? "Mesh owner",
+      });
+      for (const role of summary.roles) {
+        ownersById.set(role.accountId, { id: role.accountId, name: role.displayName });
+      }
+    }
+    return {
+      ...portfolioState,
+      owners: [...ownersById.values()].filter((candidate) =>
+        candidate.id === accountId || models.some(({ mesh }) =>
+          mesh.ownerId === candidate.id || mesh.humanRoleAssignments.some((assignment) => assignment.ownerId === candidate.id),
+        ),
+      ),
+      meshes: models.map(({ mesh }) => mesh),
+      topics: models.flatMap(({ topics }) => topics),
+      posts: [],
+      subscriptions: [],
+      revision: portfolioState.revision + 1,
+    };
+  }, [accountId, owner, portfolioState, serverMeshes]);
   const appliedPublicActivity = useMemo(
     () =>
       publicActivity
-        ? applyPublicActivitySnapshot(state, publicActivity, currentOwnerId)
+        ? applyPublicActivitySnapshot(durableState, publicActivity, accountId)
         : null,
-    [publicActivity, state],
+    [accountId, durableState, publicActivity],
   );
-  const activityState = appliedPublicActivity?.state ?? state;
+  const activityState = appliedPublicActivity?.state ?? durableState;
   const selectedMesh =
     view.kind === "mesh"
       ? (activityState.meshes.find((mesh) => mesh.id === view.meshId) ??
@@ -298,8 +389,10 @@ export function App() {
     () => {
       if (!selectedMesh) return null;
       const projection = projectMeshTopology(activityState, {
-        connectedAgentId,
+        connectedAgentId:
+          webMcpSession?.agent?.id ?? portfolio[0]?.id ?? connectedAgentId,
         meshId: selectedMesh.id,
+        humanAccess: true,
       });
       if (!appliedPublicActivity) return projection;
       const serverMesh = publicActivity?.meshes.some(
@@ -312,19 +405,12 @@ export function App() {
       }
       return projection;
     },
-    [activityState, appliedPublicActivity, publicActivity, selectedMesh],
+    [activityState, appliedPublicActivity, portfolio, publicActivity, selectedMesh, webMcpSession],
   );
   const selectedLink =
     topology?.meshes[0]?.trafficLinks.find(
       (link) => link.id === selectedLinkId,
     ) ?? null;
-
-  useEffect(() => {
-    meshStore.syncAgentDefinitions({
-      actingOwnerId: currentOwnerId,
-      definitions: localAgentDefinitions,
-    });
-  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -346,22 +432,72 @@ export function App() {
     };
   }, []);
 
+  // The topology canvas listens to the same-origin live gateway when a mesh
+  // is selected. The existing activity request remains a snapshot fallback
+  // for offline/local development, while live frames wake it immediately so
+  // viewers do not have to chase a chronological firehose.
+  useEffect(() => {
+    const meshId = selectedMesh?.id;
+    if (!meshId || typeof WebSocket === "undefined") return;
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(
+      `${protocol}//${window.location.host}/v1/live?meshId=${encodeURIComponent(meshId)}&contractVersion=1`,
+    );
+    let active = true;
+    socket.onmessage = () => {
+      if (!active) return;
+      void getPublicActivity().then(setPublicActivity).catch(() => {
+        // The next snapshot poll will recover after a transient gateway error.
+      });
+    };
+    socket.onerror = () => socket.close();
+    return () => {
+      active = false;
+      socket.close();
+    };
+  }, [selectedMesh?.id]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+    void refreshMeshes(controller.signal).catch(() => {
+      if (active) {
+        // Keep the read-only fixture shell available while the durable projection recovers.
+        setToast("Could not load your meshes");
+      }
+    });
+    const interval = window.setInterval(() => {
+      void refreshMeshes().catch(() => {
+        // Keep the last durable projection during a transient network failure.
+      });
+    }, 10_000);
+    return () => {
+      active = false;
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [refreshMeshes]);
+
   useEffect(() => {
     let active = true;
-    listOwnedAgents()
-      .then((agents) => {
-        if (active) setOwnedAgents(agents);
-      })
-      .catch(() => {
-        if (active) {
+    let initial = true;
+    const refresh = () => {
+      void refreshOwnedAgents().catch(() => {
+        if (active && initial) {
           setOwnedAgents([]);
           setToast("Could not load connected agents");
         }
+      }).finally(() => {
+        initial = false;
       });
+    };
+    refresh();
+    const interval = window.setInterval(refresh, 5_000);
     return () => {
       active = false;
+      window.clearInterval(interval);
     };
-  }, []);
+  }, [refreshOwnedAgents]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -482,6 +618,11 @@ export function App() {
   }
 
   async function selectWebMcpAgent(agentId: string) {
+    const agent = portfolio.find((candidate) => candidate.id === agentId);
+    const label = agent ? `@${agent.handle}` : "this agent";
+    if (!window.confirm(`Enable page access for ${label}? This takes control from the native session for one hour.`)) {
+      return;
+    }
     setWebMcpBusyAgentId(agentId);
     try {
       const next = await enableWebMcpSession(agentId, session!.csrfToken);
@@ -527,7 +668,7 @@ export function App() {
       {view.kind === "agents" ? (
         <AgentPortfolio
           agents={portfolio}
-          state={portfolioState}
+          state={activityState}
           loading={ownedAgents === null}
           webMcpSession={webMcpSession}
           webMcpBusyAgentId={webMcpBusyAgentId}
@@ -540,9 +681,10 @@ export function App() {
         selectedTopic &&
         topology && (
           <MeshExperience
-            mesh={selectedMesh}
-            portfolio={portfolio}
-            state={activityState}
+          mesh={selectedMesh}
+          portfolio={portfolio}
+          state={activityState}
+          ownerId={accountId}
             topic={selectedTopic}
             trafficLinks={topology.meshes[0]?.trafficLinks ?? []}
             selectedLink={selectedLink}
@@ -560,12 +702,15 @@ export function App() {
       )}
       {createMeshOpen && (
         <CreateMeshDialog
-          ownerId={owner.id}
-          portfolio={privateMeshPortfolio}
+          portfolio={portfolio}
+          csrfToken={session!.csrfToken}
           onClose={() => setCreateMeshOpen(false)}
-          onCreated={(mesh) => {
+          onCreated={(meshId, topicId) => {
             setCreateMeshOpen(false);
-            openMesh(mesh.id);
+            setView({ kind: "mesh", meshId });
+            setSelectedTopicId(topicId);
+            setSelectedLinkId(null);
+            void refreshMeshes().catch(() => setToast("Mesh created; refresh failed"));
           }}
         />
       )}
@@ -575,8 +720,10 @@ export function App() {
       {governanceOpen && selectedMesh && (
         <GovernanceDialog
           mesh={selectedMesh}
-          owners={state.owners}
-          actingOwnerId={owner.id}
+          owners={activityState.owners}
+          actingOwnerId={accountId}
+          csrfToken={session!.csrfToken}
+          onSaved={() => void refreshMeshes().catch(() => setToast("Access saved; refresh failed"))}
           onClose={() => setGovernanceOpen(false)}
         />
       )}
@@ -616,10 +763,14 @@ function MeshRail({
     .map((part) => part[0])
     .join("")
     .toUpperCase();
-  const privateMeshes = meshStore
-    .listMeshesForOwner(owner.id)
-    .map((access) => access.mesh)
-    .filter((mesh) => mesh.visibility !== "public");
+  const privateMeshes = state.meshes.filter(
+    (mesh) =>
+      mesh.visibility !== "public" &&
+      // A joined private/unlisted mesh belongs in the user's rail regardless
+      // of whether they own it. The role controls what they can do after
+      // opening it; it must not hide an observer or steward's mesh.
+      mesh.humanRoleAssignments.some((assignment) => assignment.ownerId === owner.id),
+  );
   const publicMeshes = state.meshes
     .filter((mesh) => mesh.visibility === "public")
     .slice(0, 6);
@@ -917,6 +1068,7 @@ function MeshExperience({
   mesh,
   portfolio,
   state,
+  ownerId,
   topic,
   trafficLinks,
   selectedLink,
@@ -930,6 +1082,7 @@ function MeshExperience({
   mesh: Mesh;
   portfolio: Agent[];
   state: ReturnType<typeof meshStore.getSnapshot>;
+  ownerId: string;
   topic: Topic;
   trafficLinks: TrafficLink[];
   selectedLink: TrafficLink | null;
@@ -992,6 +1145,7 @@ function MeshExperience({
           topic={topic}
           mesh={mesh}
           state={state}
+          ownerId={ownerId}
         />
       )}
     </div>
@@ -1087,10 +1241,12 @@ function ConversationInspector({
   topic,
   mesh,
   state,
+  ownerId,
 }: {
   topic: Topic;
   mesh: Mesh;
   state: ReturnType<typeof meshStore.getSnapshot>;
+  ownerId: string;
 }) {
   const [muted, setMuted] = useState(false);
   const [watching, setWatching] = useState(false);
@@ -1103,7 +1259,7 @@ function ConversationInspector({
     .filter(Boolean) as Agent[];
   const noticing = state.agents.filter(
     (agent) =>
-      agent.ownerId === currentOwnerId &&
+      agent.ownerId === ownerId &&
       topic.participantAgentIds.includes(agent.id),
   );
   const activityLabel = topic.recentActivityCount
@@ -1336,71 +1492,19 @@ function ModalShell({
   );
 }
 
-function SetupCommand({
-  command,
-  label,
-}: {
-  command: string;
-  label: string;
-}) {
-  const [copied, setCopied] = useState(false);
-
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(command);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
-    } catch {
-      setCopied(false);
-    }
-  }
-
-  return (
-    <div className="setup-command">
-      <code>{command}</code>
-      <button onClick={() => void copy()} aria-label={`Copy ${label}`}>
-        {copied ? (
-          <Check size={14} weight="bold" />
-        ) : (
-          <CopySimple size={14} />
-        )}
-        {copied ? "Copied" : "Copy"}
-      </button>
-    </div>
-  );
-}
-
 function ConnectAgentDialog({ onClose }: { onClose: () => void }) {
   const [runtime, setRuntime] = useState<AgentSetupRuntime>("codex");
   const [handle, setHandle] = useState("my-agent");
-  const [definitionPath, setDefinitionPath] = useState(
-    defaultDefinitionPath("my-agent"),
-  );
-  const [openClawAgentId, setOpenClawAgentId] = useState("my-agent");
-  const commands = buildAgentSetupCommands({
-    runtime,
-    handle,
-    definitionPath,
-    openClawAgentId,
-  });
-
-  function updateHandle(nextHandle: string) {
-    const previousDefault = defaultDefinitionPath(handle);
-    setHandle(nextHandle);
-    if (definitionPath === previousDefault) {
-      setDefinitionPath(defaultDefinitionPath(nextHandle));
-    }
-    if (openClawAgentId === handle) setOpenClawAgentId(nextHandle);
-  }
+  const details = agentSetupRuntimeDetails[runtime];
 
   return (
     <ModalShell
       title="Add an agent"
-      subtitle="Start on the machine where your agent runs."
+      subtitle="Bring an agent from the host you already use."
       onClose={onClose}
     >
-      <div className="connector-modal">
-        <div className="connector-tabs" aria-label="Agent runtime">
+      <div className="runtime-modal">
+        <div className="runtime-tabs" aria-label="Agent host">
           {agentSetupRuntimes.map((candidate) => {
             const details = agentSetupRuntimeDetails[candidate];
             const Icon =
@@ -1424,138 +1528,70 @@ function ConnectAgentDialog({ onClose }: { onClose: () => void }) {
             );
           })}
         </div>
-        <section className="connector-content">
+        <section className="runtime-content">
           <div className="setup-profile-intro">
-            <strong>1 · Agent profile</strong>
+            <strong>Agent identity</strong>
             <small>
-              Use a Markdown definition in .meshr/agents with the agent's name,
-              interests, personality, and Meshr behavior.
+              Choose the handle people and other agents will recognize.
             </small>
           </div>
           <div className="setup-fields">
             <label>
-              Handle in definition
+              Agent handle
               <input
                 value={handle}
-                onChange={(event) => updateHandle(event.target.value)}
+                onChange={(event) => setHandle(event.target.value)}
                 spellCheck={false}
               />
             </label>
-            <label>
-              Definition file
-              <input
-                value={definitionPath}
-                onChange={(event) => setDefinitionPath(event.target.value)}
-                spellCheck={false}
-              />
-            </label>
-            {runtime === "openclaw" && (
-              <label>
-                OpenClaw agent ID
-                <input
-                  value={openClawAgentId}
-                  onChange={(event) => setOpenClawAgentId(event.target.value)}
-                  spellCheck={false}
-                />
-              </label>
-            )}
           </div>
 
-          {runtime === "openclaw" && commands.openClawInstall && (
-            <div className="openclaw-setup">
-              <div className="connector-callout">
-                <PawPrint size={22} weight="duotone" />
-                <span>
-                  <strong>OpenClaw uses the native Meshr plugin</strong>
-                  <small>
-                    It is not installed automatically. Install it in the
-                    OpenClaw environment that runs this agent.
-                  </small>
-                </span>
-              </div>
-              <SetupCommand
-                command={commands.openClawInstall}
-                label="plugin install command"
-              />
-            </div>
-          )}
+          <div className="runtime-callout">
+            {runtime === "openclaw" ? (
+              <PawPrint size={22} weight="duotone" />
+            ) : runtime === "ollama" ? (
+              <Cpu size={22} weight="duotone" />
+            ) : (
+              <TerminalWindow size={22} weight="duotone" />
+            )}
+            <span>
+              <strong>{details.label} keeps control of the session</strong>
+              <small>
+                Start the agent in its usual host. Meshr will ask you to
+                approve its identity when it connects.
+              </small>
+            </span>
+          </div>
 
           <ol className="setup-steps">
             <li>
+              <span>1</span>
+              <div>
+                <strong>Start your agent</strong>
+                <small>
+                  Your host sends a one-time connection request for this
+                  handle.
+                </small>
+              </div>
+            </li>
+            <li>
               <span>2</span>
               <div>
-                <strong>Start pairing</strong>
+                <strong>Approve the identity</strong>
                 <small>
-                  Run this beside the definition file. It prints a one-time
-                  approval link.
+                  Review the profile and access before the agent can
+                  participate.
                 </small>
-                <SetupCommand
-                  command={commands.connect}
-                  label="pairing command"
-                />
               </div>
             </li>
             <li>
               <span>3</span>
               <div>
-                <strong>Review it here</strong>
+                <strong>Watch it come online</strong>
                 <small>
-                  Open the link, sign in, and approve only the agent profile
-                  you expect.
+                  It is online while its host is running and disappears when
+                  that session ends.
                 </small>
-              </div>
-            </li>
-            <li>
-              <span>4</span>
-              <div>
-                <strong>Finish the connection</strong>
-                <small>
-                  Back in the terminal, claim the approved connection.
-                </small>
-                <SetupCommand
-                  command={commands.claim}
-                  label="claim command"
-                />
-              </div>
-            </li>
-            <li>
-              <span>5</span>
-              <div>
-                <strong>
-                  {runtime === "codex" || runtime === "claude"
-                    ? `Add Meshr to ${agentSetupRuntimeDetails[runtime].label}`
-                    : runtime === "openclaw"
-                      ? "Enable the native plugin"
-                      : "Choose the agent host"}
-                </strong>
-                {runtime === "codex" || runtime === "claude" ? (
-                  <small>
-                    This registers the bound connector as a local stdio MCP
-                    server. The host starts it when the agent needs Meshr.
-                  </small>
-                ) : runtime === "openclaw" ? (
-                  <small>
-                    Configure the installed plugin with the Meshr server and
-                    connector state path, apply the exact Meshr tool allowlist,
-                    then validate the OpenClaw configuration.
-                  </small>
-                ) : (
-                  <small>
-                    Ollama provides the model, but it does not host MCP tools.
-                    Use this binding from an MCP-capable local agent host; do
-                    not run the stdio server by itself.
-                  </small>
-                )}
-                {commands.activate && (
-                  <SetupCommand
-                    command={commands.activate}
-                    label={
-                      runtime === "openclaw"
-                        ? "sync and OpenClaw configuration command"
-                        : "MCP registration command"
-                    }
-                  />
-                )}
               </div>
             </li>
           </ol>
@@ -1563,25 +1599,23 @@ function ConnectAgentDialog({ onClose }: { onClose: () => void }) {
           <div className="definition-sync-note">
             <FileText size={19} />
             <span>
-              <strong>No import step</strong>
+              <strong>Always in sync</strong>
               <small>
-                The local definition remains the source of truth. Stdio hosts
-                watch it while connected; native and local hosts can run the
-                explicit sync command after an edit. Credentials, memory, and
-                host tool permissions stay local.
+                Your agent's profile stays in sync from its host. Changes appear
+                here automatically while it is connected.
               </small>
             </span>
           </div>
-          {(runtime === "openclaw" || runtime === "ollama") && (
-            <SetupCommand
-              command={commands.sync}
-              label="profile sync command"
-            />
-          )}
           {runtime === "openclaw" && (
             <p className="openclaw-config-note">
-              Point the plugin at your Meshr server and connector state file.
-              Only the paired OpenClaw agent ID receives Meshr tools.
+              OpenClaw agents use the same approval flow and remain attached to
+              their OpenClaw session.
+            </p>
+          )}
+          {runtime === "ollama" && (
+            <p className="openclaw-config-note">
+              Ollama supplies the model while your agent host manages the
+              Meshr connection.
             </p>
           )}
         </section>
@@ -1628,15 +1662,15 @@ function AccessPicker({
 }
 
 function CreateMeshDialog({
-  ownerId,
   portfolio,
+  csrfToken,
   onClose,
   onCreated,
 }: {
-  ownerId: string;
   portfolio: Agent[];
+  csrfToken: string;
   onClose: () => void;
-  onCreated: (mesh: Mesh) => void;
+  onCreated: (meshId: string, topicId: string) => void;
 }) {
   const [name, setName] = useState("");
   const [visibility, setVisibility] = useState<MeshVisibility>("private");
@@ -1645,21 +1679,26 @@ function CreateMeshDialog({
     portfolio.map((agent) => agent.id),
   );
   const [error, setError] = useState("");
-  function submit(event: FormEvent) {
+  const [submitting, setSubmitting] = useState(false);
+  async function submit(event: FormEvent) {
     event.preventDefault();
+    if (submitting) return;
+    setSubmitting(true);
+    setError("");
     try {
-      const { mesh } = meshStore.createMesh({
-        actingOwnerId: ownerId,
+      const result = await createMesh({
         name,
         visibility,
         joinPolicy,
-        initialAgentIds: selectedAgents,
-      });
-      onCreated(mesh);
+        agentIds: selectedAgents,
+      }, csrfToken);
+      onCreated(result.mesh.id, result.topic.id);
     } catch (caught) {
       setError(
         caught instanceof Error ? caught.message : "Could not create mesh.",
       );
+    } finally {
+      setSubmitting(false);
     }
   }
   return (
@@ -1723,9 +1762,9 @@ function CreateMeshDialog({
           <button type="button" onClick={onClose}>
             Cancel
           </button>
-          <button className="primary" disabled={!name.trim()}>
+          <button className="primary" disabled={!name.trim() || submitting}>
             <Plus size={16} />
-            Create mesh
+            {submitting ? "Creating…" : "Create mesh"}
           </button>
         </footer>
       </form>
@@ -1737,11 +1776,15 @@ function GovernanceDialog({
   mesh,
   owners,
   actingOwnerId,
+  csrfToken,
+  onSaved,
   onClose,
 }: {
   mesh: Mesh;
   owners: Owner[];
   actingOwnerId: string;
+  csrfToken: string;
+  onSaved: () => void;
   onClose: () => void;
 }) {
   const [visibility, setVisibility] = useState(mesh.visibility);
@@ -1756,27 +1799,55 @@ function GovernanceDialog({
       ) as Record<string, MeshHumanRole>,
   );
   const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
   const canManage = mesh.humanRoleAssignments.some(
     (assignment) =>
       assignment.ownerId === actingOwnerId && assignment.role === "owner",
   );
-  function save() {
-    meshStore.updateMeshGovernance({
-      actingOwnerId,
-      meshId: mesh.id,
-      visibility,
-      joinPolicy,
-    });
-    Object.entries(roles).forEach(([targetOwnerId, role]) =>
-      meshStore.assignHumanRole({
-        actingOwnerId,
-        meshId: mesh.id,
-        targetOwnerId,
-        role,
-      }),
-    );
-    setSaved(true);
-    window.setTimeout(onClose, 500);
+  useEffect(() => {
+    let active = true;
+    void getMeshGovernance(mesh.id)
+      .then((result) => {
+        if (!active) return;
+        setVisibility(result.mesh.visibility);
+        setJoinPolicy(result.mesh.joinPolicy);
+        setRoles(
+          Object.fromEntries(
+            result.roles.map((assignment) => [assignment.accountId, assignment.role]),
+          ) as Record<string, MeshHumanRole>,
+        );
+      })
+      .catch(() => {
+        // The mesh projection already supplies a usable initial value.
+      });
+    return () => {
+      active = false;
+    };
+  }, [mesh.id]);
+  async function save() {
+    if (saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      await updateMeshGovernance(mesh.id, { visibility, joinPolicy }, csrfToken);
+      for (const [targetOwnerId, role] of Object.entries(roles)) {
+        const currentRole = mesh.humanRoleAssignments.find(
+          (assignment) => assignment.ownerId === targetOwnerId,
+        )?.role;
+        if (currentRole !== role) {
+          await updateMeshRole(mesh.id, targetOwnerId, role, csrfToken);
+        }
+      }
+      setSaved(true);
+      onSaved();
+      window.setTimeout(onClose, 500);
+    } catch (caught) {
+      setSaved(false);
+      setError(caught instanceof Error ? caught.message : "Could not save access.");
+    } finally {
+      setSaving(false);
+    }
   }
   return (
     <ModalShell
@@ -1840,11 +1911,12 @@ function GovernanceDialog({
             </small>
           </span>
         </div>
+        {error && <p className="form-error">{error}</p>}
         <footer className="modal-actions">
           <button onClick={onClose}>Cancel</button>
-          <button className="primary" onClick={save} disabled={!canManage}>
+          <button className="primary" onClick={() => void save()} disabled={!canManage || saving}>
             {saved ? <Check size={16} /> : <Gear size={16} />}
-            {saved ? "Saved" : "Save access"}
+            {saved ? "Saved" : saving ? "Saving…" : "Save access"}
           </button>
         </footer>
       </div>

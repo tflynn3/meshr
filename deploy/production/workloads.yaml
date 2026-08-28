@@ -1,0 +1,299 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels: {app.kubernetes.io/name: api, app.kubernetes.io/part-of: meshr}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app.kubernetes.io/name: api}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: api, app.kubernetes.io/part-of: meshr}
+    spec:
+      serviceAccountName: meshr-api
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: ${API_IMAGE}
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: {name: meshr-runtime}
+            - secretRef: {name: meshr-runtime}
+          env:
+            - name: MESHR_PORT
+              value: "8787"
+            - name: MESHR_PROJECTION_DB_PATH
+              value: /tmp/meshr-projection.db
+          ports: [{name: http, containerPort: 8787}]
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          volumeMounts: [{name: projection, mountPath: /tmp}]
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "1", memory: 512Mi}
+      volumes: [{name: projection, emptyDir: {sizeLimit: 2Gi}}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector: {app.kubernetes.io/name: api}
+  ports: [{name: http, port: 8787, targetPort: http}]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: api}
+spec:
+  minAvailable: 1
+  selector: {matchLabels: {app.kubernetes.io/name: api}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels: {app.kubernetes.io/name: web, app.kubernetes.io/part-of: meshr}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app.kubernetes.io/name: web}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: web, app.kubernetes.io/part-of: meshr}}
+    spec:
+      containers:
+        - name: web
+          image: ${WEB_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /web-healthz, port: http}}
+          livenessProbe: {httpGet: {path: /web-healthz, port: http}, initialDelaySeconds: 10}
+          securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
+          resources: {requests: {cpu: 20m, memory: 32Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web}
+spec:
+  selector: {app.kubernetes.io/name: web}
+  ports: [{name: http, port: 8080, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest
+  labels: {app.kubernetes.io/name: ingest, app.kubernetes.io/part-of: meshr}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app.kubernetes.io/name: ingest}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: ingest, app.kubernetes.io/part-of: meshr}}
+    spec:
+      serviceAccountName: meshr-ingest
+      containers:
+        - name: ingest
+          image: ${EVENT_PLANE_IMAGE}
+          args: ["dist/event-plane.mjs", "ingest"]
+          envFrom: [{configMapRef: {name: meshr-runtime}}, {secretRef: {name: meshr-runtime}}]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
+          securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: ingest}
+spec:
+  selector: {app.kubernetes.io/name: ingest}
+  ports: [{name: http, port: 8080, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: topology-materializer
+  labels: {app.kubernetes.io/name: topology-materializer, app.kubernetes.io/part-of: meshr}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: topology-materializer}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: topology-materializer, app.kubernetes.io/part-of: meshr}}
+    spec:
+      serviceAccountName: meshr-event-plane
+      containers:
+        - name: materializer
+          image: ${EVENT_PLANE_IMAGE}
+          args: ["dist/event-plane.mjs", "materializer"]
+          envFrom: [{configMapRef: {name: meshr-runtime}}, {secretRef: {name: meshr-runtime}}]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
+          securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
+          resources: {requests: {cpu: 150m, memory: 192Mi}, limits: {cpu: "1", memory: 512Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: topology-materializer}
+spec:
+  selector: {app.kubernetes.io/name: topology-materializer}
+  ports: [{name: http, port: 8080, targetPort: http}]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: topology-materializer}
+spec:
+  minReplicas: 1
+  maxReplicas: 3
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: topology-materializer}
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 65}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moderation-worker
+  labels: {app.kubernetes.io/name: moderation-worker, app.kubernetes.io/part-of: meshr}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: moderation-worker}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: moderation-worker, app.kubernetes.io/part-of: meshr}}
+    spec:
+      serviceAccountName: meshr-event-plane
+      containers:
+        - name: moderation-worker
+          image: ${EVENT_PLANE_IMAGE}
+          args: ["dist/event-plane.mjs", "materializer", "moderation"]
+          envFrom: [{configMapRef: {name: meshr-runtime}}, {secretRef: {name: meshr-runtime}}]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
+          securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: moderation-worker}
+spec:
+  minReplicas: 1
+  maxReplicas: 3
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: moderation-worker}
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 65}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit-worker
+  labels: {app.kubernetes.io/name: audit-worker, app.kubernetes.io/part-of: meshr}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: audit-worker}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: audit-worker, app.kubernetes.io/part-of: meshr}}
+    spec:
+      serviceAccountName: meshr-event-plane
+      containers:
+        - name: audit-worker
+          image: ${EVENT_PLANE_IMAGE}
+          args: ["dist/event-plane.mjs", "materializer", "audit"]
+          envFrom: [{configMapRef: {name: meshr-runtime}}, {secretRef: {name: meshr-runtime}}]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
+          securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
+          resources: {requests: {cpu: 75m, memory: 96Mi}, limits: {cpu: 300m, memory: 192Mi}}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: audit-worker}
+spec:
+  minReplicas: 1
+  maxReplicas: 3
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: audit-worker}
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 65}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-worker
+  labels: {app.kubernetes.io/name: notification-worker, app.kubernetes.io/part-of: meshr}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: notification-worker}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: notification-worker, app.kubernetes.io/part-of: meshr}}
+    spec:
+      serviceAccountName: meshr-event-plane
+      containers:
+        - name: notification-worker
+          image: ${EVENT_PLANE_IMAGE}
+          args: ["dist/event-plane.mjs", "materializer", "notifications"]
+          envFrom: [{configMapRef: {name: meshr-runtime}}, {secretRef: {name: meshr-runtime}}]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
+          securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
+          resources: {requests: {cpu: 75m, memory: 96Mi}, limits: {cpu: 300m, memory: 192Mi}}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: notification-worker}
+spec:
+  minReplicas: 1
+  maxReplicas: 3
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: notification-worker}
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 65}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: live-gateway
+  labels: {app.kubernetes.io/name: live-gateway, app.kubernetes.io/part-of: meshr}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app.kubernetes.io/name: live-gateway}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: live-gateway, app.kubernetes.io/part-of: meshr}}
+    spec:
+      serviceAccountName: meshr-event-plane
+      containers:
+        - name: live-gateway
+          image: ${EVENT_PLANE_IMAGE}
+          args: ["dist/event-plane.mjs", "live-gateway"]
+          envFrom: [{configMapRef: {name: meshr-runtime}}, {secretRef: {name: meshr-runtime}}]
+          env: [{name: MESHR_PORT, value: "8080"}]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
+          securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
+          resources: {requests: {cpu: 150m, memory: 192Mi}, limits: {cpu: "1", memory: 512Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: live-gateway}
+spec:
+  selector: {app.kubernetes.io/name: live-gateway}
+  ports: [{name: http, port: 8080, targetPort: http}]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: live-gateway}
+spec:
+  minAvailable: 1
+  selector: {matchLabels: {app.kubernetes.io/name: live-gateway}}

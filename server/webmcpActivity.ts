@@ -144,21 +144,32 @@ export function readWebMcpActivity(
                   COALESCE(SUM(CASE WHEN p.created_at >= ? AND p.created_at <= ? THEN 1 ELSE 0 END), 0) AS recent_message_count,
                   COALESCE(SUM(CASE
                     WHEN p.id IS NOT NULL AND p.parent_post_id IS NULL
-                     AND NOT EXISTS(SELECT 1 FROM posts reply WHERE reply.parent_post_id = p.id)
+                     AND NOT EXISTS(
+                       SELECT 1 FROM posts reply
+                       WHERE reply.parent_post_id = p.id
+                         AND reply.moderation_state = 'published'
+                         AND (reply.expires_at IS NULL OR reply.expires_at > ?)
+                     )
                     THEN 1 ELSE 0 END), 0) AS unreplied_root_count
            FROM topics t
            LEFT JOIN posts p ON p.topic_id = t.id
+             AND p.moderation_state = 'published'
+             AND (p.expires_at IS NULL OR p.expires_at > ?)
            WHERE t.mesh_id = ?
            GROUP BY t.id
            ORDER BY t.created_at ASC, t.id ASC`,
         )
-        .all(cutoff, input.generatedAt, mesh.id) as unknown as TopicRow[];
+        .all(cutoff, input.generatedAt, input.generatedAt, input.generatedAt, mesh.id) as unknown as TopicRow[];
       const participantRows = db
         .prepare(
           `SELECT DISTINCT topic_id, agent_id
-           FROM posts WHERE mesh_id = ? ORDER BY topic_id, agent_id`,
+           FROM posts
+           WHERE mesh_id = ?
+             AND moderation_state = 'published'
+             AND (expires_at IS NULL OR expires_at > ?)
+           ORDER BY topic_id, agent_id`,
         )
-        .all(mesh.id) as unknown as Array<{ topic_id: string; agent_id: string }>;
+        .all(mesh.id, input.generatedAt) as unknown as Array<{ topic_id: string; agent_id: string }>;
       const participantsByTopic = new Map<string, string[]>();
       for (const row of participantRows) {
         const values = participantsByTopic.get(row.topic_id) ?? [];
@@ -173,9 +184,13 @@ export function readWebMcpActivity(
            FROM posts reply
            JOIN posts parent ON parent.id = reply.parent_post_id
            WHERE reply.mesh_id = ? AND reply.agent_id <> parent.agent_id
+             AND reply.moderation_state = 'published'
+             AND (reply.expires_at IS NULL OR reply.expires_at > ?)
+             AND parent.moderation_state = 'published'
+             AND (parent.expires_at IS NULL OR parent.expires_at > ?)
            ORDER BY reply.created_at ASC, reply.id ASC`,
         )
-        .all(mesh.id) as unknown as ReplyRow[];
+        .all(mesh.id, input.generatedAt, input.generatedAt) as unknown as ReplyRow[];
       const groupedLinks = new Map<
         string,
         {

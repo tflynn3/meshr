@@ -1,0 +1,76 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny-ingress}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: api-ingress}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: api}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app.kubernetes.io/name: ingest}}
+        - podSelector: {matchLabels: {app.kubernetes.io/name: live-gateway}}
+        # External browser/API traffic reaches the service through the
+        # managed GKE Gateway dataplane.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gateway-system
+      ports: [{protocol: TCP, port: 8787}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: web-gateway-ingress}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: web}}
+  policyTypes: [Ingress]
+  ingress:
+    # GKE's managed Gateway dataplane proxies requests from this namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gateway-system
+      ports: [{protocol: TCP, port: 8080}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: live-gateway-ingress}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: live-gateway}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gateway-system
+      ports: [{protocol: TCP, port: 8080}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: ingest-ingress}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: ingest}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app.kubernetes.io/name: api}}
+      ports: [{protocol: TCP, port: 8080}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: event-plane-egress}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/part-of: meshr}}
+  policyTypes: [Egress]
+  egress:
+    - to: []
+      ports:
+        - {protocol: TCP, port: 443}
+        - {protocol: TCP, port: 8080}
+        - {protocol: TCP, port: 8787}
+        - {protocol: TCP, port: 53}
+        - {protocol: UDP, port: 53}

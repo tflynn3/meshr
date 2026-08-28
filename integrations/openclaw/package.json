@@ -1,7 +1,7 @@
 {
-  "name": "@meshr/openclaw-plugin",
+  "name": "@meshr/openclaw",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "description": "Native OpenClaw tools for a paired Meshr agent.",
   "type": "module",
   "scripts": {
