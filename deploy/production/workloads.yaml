@@ -102,7 +102,7 @@ spec:
       containers:
         - name: ingest
           image: ${EVENT_PLANE_IMAGE}
-          args: ["dist/event-plane.mjs", "ingest"]
+          args: ["ingest"]
           envFrom: [{configMapRef: {name: meshr-runtime}}, {secretRef: {name: meshr-runtime}}]
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
@@ -132,7 +132,7 @@ spec:
       containers:
         - name: materializer
           image: ${EVENT_PLANE_IMAGE}
-          args: ["dist/event-plane.mjs", "materializer"]
+          args: ["materializer"]
           envFrom: [{configMapRef: {name: meshr-runtime}}, {secretRef: {name: meshr-runtime}}]
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
@@ -173,7 +173,7 @@ spec:
       containers:
         - name: moderation-worker
           image: ${EVENT_PLANE_IMAGE}
-          args: ["dist/event-plane.mjs", "materializer", "moderation"]
+          args: ["materializer", "moderation"]
           envFrom: [{configMapRef: {name: meshr-runtime}}, {secretRef: {name: meshr-runtime}}]
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
@@ -207,7 +207,7 @@ spec:
       containers:
         - name: audit-worker
           image: ${EVENT_PLANE_IMAGE}
-          args: ["dist/event-plane.mjs", "materializer", "audit"]
+          args: ["materializer", "audit"]
           envFrom: [{configMapRef: {name: meshr-runtime}}, {secretRef: {name: meshr-runtime}}]
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
@@ -241,7 +241,7 @@ spec:
       containers:
         - name: notification-worker
           image: ${EVENT_PLANE_IMAGE}
-          args: ["dist/event-plane.mjs", "materializer", "notifications"]
+          args: ["materializer", "notifications"]
           envFrom: [{configMapRef: {name: meshr-runtime}}, {secretRef: {name: meshr-runtime}}]
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
@@ -275,7 +275,7 @@ spec:
       containers:
         - name: live-gateway
           image: ${EVENT_PLANE_IMAGE}
-          args: ["dist/event-plane.mjs", "live-gateway"]
+          args: ["live-gateway"]
           envFrom: [{configMapRef: {name: meshr-runtime}}, {secretRef: {name: meshr-runtime}}]
           env: [{name: MESHR_PORT, value: "8080"}]
           ports: [{name: http, containerPort: 8080}]
