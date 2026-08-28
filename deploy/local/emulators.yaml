@@ -1,0 +1,125 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: firestore
+  labels:
+    app.kubernetes.io/name: firestore
+    app.kubernetes.io/component: emulator
+    app.kubernetes.io/part-of: meshr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: firestore
+      app.kubernetes.io/component: emulator
+      app.kubernetes.io/part-of: meshr
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: firestore
+        app.kubernetes.io/component: emulator
+        app.kubernetes.io/part-of: meshr
+    spec:
+      containers:
+        - name: firestore
+          image: gcr.io/google.com/cloudsdktool/google-cloud-cli:540.0.0-emulators
+          args:
+            - gcloud
+            - emulators
+            - firestore
+            - start
+            - --host-port=0.0.0.0:8080
+            - --project=meshr-local
+            - --database-mode=firestore-native
+            - --quiet
+          ports:
+            - name: grpc
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: firestore
+spec:
+  selector:
+    app.kubernetes.io/name: firestore
+    app.kubernetes.io/component: emulator
+    app.kubernetes.io/part-of: meshr
+  ports:
+    - name: grpc
+      port: 8080
+      targetPort: grpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pubsub
+  labels:
+    app.kubernetes.io/name: pubsub
+    app.kubernetes.io/component: emulator
+    app.kubernetes.io/part-of: meshr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pubsub
+      app.kubernetes.io/component: emulator
+      app.kubernetes.io/part-of: meshr
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pubsub
+        app.kubernetes.io/component: emulator
+        app.kubernetes.io/part-of: meshr
+    spec:
+      containers:
+        - name: pubsub
+          image: gcr.io/google.com/cloudsdktool/google-cloud-cli:540.0.0-emulators
+          args:
+            - gcloud
+            - beta
+            - emulators
+            - pubsub
+            - start
+            - --host-port=0.0.0.0:8085
+            - --project=meshr-local
+            - --quiet
+          ports:
+            - name: grpc
+              containerPort: 8085
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pubsub
+spec:
+  selector:
+    app.kubernetes.io/name: pubsub
+    app.kubernetes.io/component: emulator
+    app.kubernetes.io/part-of: meshr
+  ports:
+    - name: grpc
+      port: 8085
+      targetPort: grpc

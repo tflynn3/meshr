@@ -1,0 +1,137 @@
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_image_layer", "js_run_binary")
+load("@bazel_lib//lib:copy_to_bin.bzl", "copy_to_bin")
+load("@npm//:defs.bzl", "npm_link_all_packages")
+load("@npm//:vite/package_json.bzl", vite_bin = "bin")
+load("//tools/bazel:defs.bzl", "node_bundle")
+
+package(default_visibility = ["//visibility:public"])
+
+npm_link_all_packages(name = "node_modules")
+
+NODE_RUNTIME_DEPS = [
+    ":node_modules/@google-cloud/firestore",
+    ":node_modules/@google-cloud/pubsub",
+    ":node_modules/ws",
+    ":node_modules/yaml",
+    ":node_modules/zod",
+]
+
+NODE_SRCS = glob([
+    "platform/**/*.ts",
+    "server/**/*.ts",
+], exclude = [
+    "server/**/*.test.ts",
+])
+
+js_binary(
+    name = "esbuild_tool",
+    data = [":node_modules/esbuild"],
+    entry_point = "esbuild.mjs",
+)
+
+node_bundle(js_run_binary = js_run_binary, name = "api", entry_point = "server/main.ts", srcs = NODE_SRCS + NODE_RUNTIME_DEPS, tool = ":esbuild_tool")
+node_bundle(js_run_binary = js_run_binary, name = "bootstrap", entry_point = "platform/bootstrap.ts", srcs = NODE_SRCS + NODE_RUNTIME_DEPS, tool = ":esbuild_tool")
+node_bundle(js_run_binary = js_run_binary, name = "ingest", entry_point = "platform/ingest.ts", srcs = NODE_SRCS + NODE_RUNTIME_DEPS, tool = ":esbuild_tool")
+node_bundle(js_run_binary = js_run_binary, name = "materializer", entry_point = "platform/materializer.ts", srcs = NODE_SRCS + NODE_RUNTIME_DEPS, tool = ":esbuild_tool")
+node_bundle(js_run_binary = js_run_binary, name = "live_gateway", entry_point = "platform/liveGateway.ts", srcs = NODE_SRCS + NODE_RUNTIME_DEPS, tool = ":esbuild_tool")
+node_bundle(js_run_binary = js_run_binary, name = "static_server", entry_point = "platform/staticServer.ts", srcs = NODE_SRCS + NODE_RUNTIME_DEPS, tool = ":esbuild_tool")
+node_bundle(js_run_binary = js_run_binary, name = "smoke", entry_point = "scripts/smoke-local-stack.ts", srcs = NODE_RUNTIME_DEPS + ["scripts/smoke-local-stack.ts"], tool = ":esbuild_tool")
+node_bundle(js_run_binary = js_run_binary, name = "event_plane", entry_point = "platform/eventPlane.ts", srcs = NODE_SRCS + NODE_RUNTIME_DEPS, tool = ":esbuild_tool")
+
+js_binary(
+    name = "api_bin",
+    data = NODE_RUNTIME_DEPS,
+    entry_point = ":api",
+)
+
+js_binary(
+    name = "event_plane_bin",
+    data = NODE_RUNTIME_DEPS,
+    entry_point = ":event_plane",
+)
+
+platform(
+    name = "linux_arm64",
+    constraint_values = [
+        "@platforms//cpu:arm64",
+        "@platforms//os:linux",
+    ],
+)
+
+platform(
+    name = "linux_amd64",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
+[
+    js_image_layer(
+        name = "api_{}_layers".format(arch),
+        binary = ":api_bin",
+        platform = ":linux_{}".format(arch),
+        root = "/app",
+    )
+    for arch in ["arm64", "amd64"]
+]
+
+[
+    js_image_layer(
+        name = "event_plane_{}_layers".format(arch),
+        binary = ":event_plane_bin",
+        platform = ":linux_{}".format(arch),
+        root = "/app",
+    )
+    for arch in ["arm64", "amd64"]
+]
+
+WEB_SRCS = glob([
+    "src/**",
+    "public/**",
+]) + [
+    "index.html",
+    "package.json",
+    "tsconfig.app.json",
+    "tsconfig.connector.json",
+    "tsconfig.json",
+    "tsconfig.node.json",
+    "vite.config.ts",
+    "server/tsconfig.json",
+]
+
+copy_to_bin(
+    name = "web_sources",
+    srcs = WEB_SRCS,
+)
+
+vite_bin.vite(
+    name = "web_dist",
+    srcs = [
+        ":web_sources",
+        ":node_modules/@phosphor-icons/react",
+        ":node_modules/@vitejs/plugin-react",
+        ":node_modules/@xyflow/react",
+        ":node_modules/@xyflow/system",
+        ":node_modules/classcat",
+        ":node_modules/d3-color",
+        ":node_modules/d3-dispatch",
+        ":node_modules/d3-drag",
+        ":node_modules/d3-ease",
+        ":node_modules/d3-interpolate",
+        ":node_modules/d3-selection",
+        ":node_modules/d3-timer",
+        ":node_modules/d3-transition",
+        ":node_modules/d3-zoom",
+        ":node_modules/react",
+        ":node_modules/react-dom",
+        ":node_modules/scheduler",
+        ":node_modules/vite",
+        ":node_modules/yaml",
+        ":node_modules/use-sync-external-store",
+        ":node_modules/zustand",
+    ],
+    args = ["build"],
+    chdir = package_name(),
+    out_dirs = ["dist"],
+)

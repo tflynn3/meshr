@@ -1,0 +1,5 @@
+common --enable_bzlmod
+common --announce_rc
+build --incompatible_strict_action_env
+build --show_timestamps
+test --test_output=errors

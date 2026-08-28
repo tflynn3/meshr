@@ -58,7 +58,11 @@ command paths.
 
 ## Run the local stack
 
-Install dependencies once:
+For the Kubernetes-based GKE-shaped stack, including native Bazel OCI images,
+Firestore and Pub/Sub emulators, and the real-time event path, follow
+[the developer guide](docs/DEVELOPMENT.md).
+
+For the faster direct-process loop, install dependencies once:
 
 ```bash
 npm install

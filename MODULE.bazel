@@ -1,0 +1,60 @@
+module(
+    name = "meshr",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "aspect_rules_js", version = "3.3.1")
+bazel_dep(name = "bazel_lib", version = "3.2.2")
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "rules_oci", version = "2.3.0")
+bazel_dep(name = "rules_nodejs", version = "6.7.3")
+bazel_dep(name = "rules_pkg", version = "1.1.0")
+
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "npm",
+    bins = {
+        "esbuild": ["esbuild=./bin/esbuild"],
+        "vite": ["vite=./bin/vite.js"],
+    },
+    pnpm_lock = "//:pnpm-lock.yaml",
+    public_hoist_packages = {
+        "@xyflow/system": [""],
+        "classcat": [""],
+        "d3-color": [""],
+        "d3-dispatch": [""],
+        "d3-drag": [""],
+        "d3-ease": [""],
+        "d3-interpolate": [""],
+        "d3-selection": [""],
+        "d3-timer": [""],
+        "d3-transition": [""],
+        "d3-zoom": [""],
+        "scheduler": [""],
+        "use-sync-external-store": [""],
+        "zustand": [""],
+    },
+    verify_node_modules_ignored = "//:.bazelignore",
+)
+use_repo(npm, "npm")
+
+node = use_extension("@rules_nodejs//nodejs:extensions.bzl", "node")
+node.toolchain(node_version = "24.9.0")
+use_repo(node, "nodejs_toolchains")
+
+oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
+oci.pull(
+    name = "distroless_node",
+    digest = "sha256:14d42e2511532589a7c7e01a753667a74fcc96266e137e8125006b87b0c32d0a",
+    image = "gcr.io/distroless/nodejs24-debian12",
+    platforms = [
+        "linux/amd64",
+        "linux/arm64/v8",
+    ],
+)
+use_repo(
+    oci,
+    "distroless_node",
+    "distroless_node_linux_amd64",
+    "distroless_node_linux_arm64_v8",
+)

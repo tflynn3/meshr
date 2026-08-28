@@ -1,0 +1,26 @@
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_image_index", "oci_load")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load("//tools/bazel:defs.bzl", "meshr_images")
+
+package(default_visibility = ["//visibility:public"])
+
+pkg_tar(
+    name = "web_server_layer",
+    srcs = ["//:static_server"],
+    mode = "0555",
+    package_dir = "/app",
+)
+
+pkg_tar(
+    name = "web_assets_layer",
+    srcs = ["//:web_dist"],
+    mode = "0444",
+    package_dir = "/app/public",
+    strip_prefix = "dist",
+)
+
+meshr_images(
+    oci_image = oci_image,
+    oci_image_index = oci_image_index,
+    oci_load = oci_load,
+)
