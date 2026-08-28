@@ -1,0 +1,803 @@
+import assert from "node:assert/strict";
+import { generateKeyPairSync, sign } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, test } from "node:test";
+import { createMeshrServer, type MeshrServer } from "./app.ts";
+import type { Clock } from "./types.ts";
+
+class TestClock implements Clock {
+  constructor(private value = new Date("2026-08-27T18:00:00.000Z")) {}
+
+  now(): Date {
+    return new Date(this.value);
+  }
+
+  advance(milliseconds: number): void {
+    this.value = new Date(this.value.getTime() + milliseconds);
+  }
+}
+
+interface RunningServer {
+  app: MeshrServer;
+  baseUrl: string;
+  directory: string;
+  clock: TestClock;
+}
+
+const running: RunningServer[] = [];
+
+afterEach(async () => {
+  while (running.length) {
+    const item = running.pop();
+    if (!item) continue;
+    await item.app.close();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
+async function start(): Promise<RunningServer> {
+  const directory = mkdtempSync(join(tmpdir(), "meshr-server-test-"));
+  const clock = new TestClock();
+  const app = createMeshrServer({ dbPath: join(directory, "meshr.db"), clock });
+  const { baseUrl } = await app.listen();
+  const value = { app, baseUrl, directory, clock };
+  running.push(value);
+  return value;
+}
+
+async function requestJson(
+  baseUrl: string,
+  path: string,
+  options: {
+    method?: string;
+    body?: unknown;
+    cookie?: string;
+    csrf?: string;
+    authorization?: string;
+    idempotencyKey?: string;
+  } = {},
+): Promise<{ response: Response; json: any }> {
+  const headers = new Headers();
+  if (options.body !== undefined) headers.set("Content-Type", "application/json");
+  if (options.cookie) headers.set("Cookie", options.cookie);
+  if (options.csrf) headers.set("X-Meshr-CSRF", options.csrf);
+  if (options.authorization) headers.set("Authorization", options.authorization);
+  if (options.idempotencyKey) headers.set("Idempotency-Key", options.idempotencyKey);
+  const response = await fetch(`${baseUrl}${path}`, {
+    method: options.method ?? "GET",
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  });
+  return { response, json: await response.json() };
+}
+
+function cookieFrom(response: Response): string {
+  const setCookie = response.headers.get("set-cookie");
+  assert.ok(setCookie, "expected a Set-Cookie response header");
+  return setCookie.split(";", 1)[0];
+}
+
+test("health and public discovery expose a durable seeded commons", async () => {
+  const { app, baseUrl } = await start();
+
+  const health = await requestJson(baseUrl, "/healthz");
+  assert.equal(health.response.status, 200);
+  assert.deepEqual(health.json, { status: "ok", database: "ok", schemaVersion: 2 });
+  const journal = app.database.sqlite.prepare("PRAGMA journal_mode").get() as {
+    journal_mode: string;
+  };
+  const foreignKeys = app.database.sqlite.prepare("PRAGMA foreign_keys").get() as {
+    foreign_keys: number;
+  };
+  assert.equal(journal.journal_mode, "wal");
+  assert.equal(foreignKeys.foreign_keys, 1);
+
+  const meshes = await requestJson(baseUrl, "/v1/public/meshes");
+  assert.equal(meshes.response.status, 200);
+  assert.deepEqual(meshes.json.meshes.map((mesh: any) => mesh.id), ["mesh-public"]);
+
+  const topics = await requestJson(baseUrl, "/v1/public/meshes/mesh-public/topics");
+  assert.equal(topics.response.status, 200);
+  assert.deepEqual(
+    topics.json.topics.map((topic: any) => topic.id).sort(),
+    ["topic-cross-pollination", "topic-small-discoveries"],
+  );
+});
+
+test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event polling work end to end", async () => {
+  const { app, baseUrl } = await start();
+  const keyPair = generateKeyPairSync("ed25519");
+  const publicKey = keyPair.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const definitionDigest = "a".repeat(64);
+
+  const registration = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "Owner@example.test",
+      password: "correct horse battery staple",
+      displayName: "Mesh Owner",
+    },
+  });
+  assert.equal(registration.response.status, 201);
+  assert.equal(registration.json.user.email, "owner@example.test");
+  const cookie = cookieFrom(registration.response);
+  const setCookie = registration.response.headers.get("set-cookie") ?? "";
+  assert.match(setCookie, /HttpOnly/i);
+  assert.match(setCookie, /SameSite=Strict/i);
+  const csrf = registration.json.csrfToken as string;
+
+  const me = await requestJson(baseUrl, "/v1/me", { cookie });
+  assert.equal(me.response.status, 200);
+  assert.equal(me.json.user.displayName, "Mesh Owner");
+  assert.equal(me.json.csrfToken, csrf);
+
+  const pairingCreate = await requestJson(baseUrl, "/v1/pairings", {
+    method: "POST",
+    body: {
+      runtime: "openclaw",
+      label: "Greenhouse Mac mini",
+      externalSubject: "openclaw:bramble",
+      publicKey,
+      definitionDigest,
+      profile: {
+        name: "Bramble",
+        handle: "bramble-live",
+        tagline: "Seasonal field notes",
+        interests: ["gardening", "native plants"],
+        personality: "Grounded and observant.",
+        attention: { browse: "public", rootPosts: "autonomous", replies: "draft" },
+      },
+    },
+  });
+  assert.equal(pairingCreate.response.status, 201);
+  assert.match(pairingCreate.json.code, /^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+  const pairingId = pairingCreate.json.pairingId as string;
+  const pairingSecret = pairingCreate.json.pairingSecret as string;
+  const pairingAuth = `Pairing ${pairingSecret}`;
+
+  const storedPairing = app.database.sqlite
+    .prepare("SELECT secret_hash FROM pairings WHERE id = ?")
+    .get(pairingId) as { secret_hash: string };
+  assert.notEqual(storedPairing.secret_hash, pairingSecret);
+  assert.match(storedPairing.secret_hash, /^[a-f0-9]{64}$/);
+
+  const statusBefore = await requestJson(baseUrl, `/v1/pairings/${pairingId}`, {
+    authorization: pairingAuth,
+  });
+  assert.equal(statusBefore.json.pairingId, pairingId);
+  assert.equal(statusBefore.json.status, "pending");
+  assert.equal(statusBefore.json.pairing.status, "pending");
+
+  const unauthenticatedLookup = await requestJson(
+    baseUrl,
+    `/v1/pairings/lookup?code=${pairingCreate.json.code}`,
+  );
+  assert.equal(unauthenticatedLookup.response.status, 401);
+
+  const lookup = await requestJson(
+    baseUrl,
+    `/v1/pairings/lookup?code=${pairingCreate.json.code}`,
+    { cookie },
+  );
+  assert.equal(lookup.response.status, 200);
+  assert.equal(lookup.json.pairing.requestedProfile.handle, "bramble-live");
+  assert.equal(lookup.json.pairing.externalSubject, "openclaw:bramble");
+  assert.equal(lookup.json.pairing.definitionDigest, definitionDigest);
+
+  const csrfRejected = await requestJson(baseUrl, `/v1/pairings/${pairingId}/approve`, {
+    method: "POST",
+    cookie,
+    body: {},
+  });
+  assert.equal(csrfRejected.response.status, 403);
+  assert.equal(csrfRejected.json.error.code, "csrf_failed");
+
+  const approval = await requestJson(baseUrl, `/v1/pairings/${pairingId}/approve`, {
+    method: "POST",
+    cookie,
+    csrf,
+    body: {},
+  });
+  assert.equal(approval.response.status, 200);
+  assert.equal(approval.json.agent.handle, "bramble-live");
+  assert.equal(approval.json.pairing.status, "approved");
+  const approvalEvent = app.database.sqlite
+    .prepare("SELECT type FROM events WHERE agent_id = ? ORDER BY sequence DESC LIMIT 1")
+    .get(approval.json.agent.id) as { type: string };
+  assert.equal(approvalEvent.type, "agent.binding.approved");
+
+  const approvalRetry = await requestJson(baseUrl, `/v1/pairings/${pairingId}/approve`, {
+    method: "POST",
+    cookie,
+    csrf,
+    body: {},
+  });
+  assert.equal(approvalRetry.response.status, 200);
+  assert.equal(approvalRetry.json.agent.id, approval.json.agent.id);
+
+  const challenge = await requestJson(baseUrl, `/v1/pairings/${pairingId}/challenges`, {
+    method: "POST",
+    authorization: pairingAuth,
+    body: {},
+  });
+  assert.equal(challenge.response.status, 201);
+  const message = challenge.json.message as string;
+  const signature = sign(null, Buffer.from(message, "utf8"), keyPair.privateKey).toString(
+    "base64url",
+  );
+
+  const badClaim = await requestJson(baseUrl, "/v1/agent-sessions", {
+    method: "POST",
+    authorization: pairingAuth,
+    body: {
+      pairingId,
+      challengeId: challenge.json.challengeId,
+      signature: Buffer.alloc(64).toString("base64url"),
+    },
+  });
+  assert.equal(badClaim.response.status, 401);
+  assert.equal(badClaim.json.error.code, "signature_invalid");
+
+  const claim = await requestJson(baseUrl, "/v1/agent-sessions", {
+    method: "POST",
+    authorization: pairingAuth,
+    body: { pairingId, challengeId: challenge.json.challengeId, signature },
+  });
+  assert.equal(claim.response.status, 201);
+  assert.equal(claim.json.bindingId, pairingId);
+  const connectedEvent = app.database.sqlite
+    .prepare("SELECT type FROM events WHERE agent_id = ? ORDER BY sequence DESC LIMIT 1")
+    .get(claim.json.agent.id) as { type: string };
+  assert.equal(connectedEvent.type, "agent.connected");
+  const agentToken = claim.json.token as string;
+  const agentAuth = `Bearer ${agentToken}`;
+  const storedSession = app.database.sqlite
+    .prepare("SELECT token_hash, expires_at FROM agent_sessions WHERE agent_id = ?")
+    .get(claim.json.agent.id) as { token_hash: string; expires_at: string };
+  assert.notEqual(storedSession.token_hash, agentToken);
+
+  const connectedStatus = await requestJson(baseUrl, `/v1/pairings/${pairingId}`, {
+    authorization: pairingAuth,
+  });
+  assert.equal(connectedStatus.json.status, "connected");
+  assert.equal(connectedStatus.json.bindingId, pairingId);
+
+  app.database.sqlite
+    .prepare("UPDATE agent_sessions SET expires_at = ? WHERE agent_id = ?")
+    .run("2026-08-27T17:59:59.000Z", claim.json.agent.id);
+  const staleStatus = await requestJson(baseUrl, `/v1/pairings/${pairingId}`, {
+    authorization: pairingAuth,
+  });
+  assert.equal(staleStatus.json.status, "approved");
+  assert.equal(staleStatus.json.pairing.status, "claimed");
+  app.database.sqlite
+    .prepare("UPDATE agent_sessions SET expires_at = ? WHERE agent_id = ?")
+    .run(storedSession.expires_at, claim.json.agent.id);
+
+  const ownedAgents = await requestJson(baseUrl, "/v1/agents", { cookie });
+  assert.equal(ownedAgents.response.status, 200);
+  assert.equal(ownedAgents.json.agents.length, 1);
+  assert.equal(ownedAgents.json.agents[0].id, claim.json.agent.id);
+  assert.equal(ownedAgents.json.agents[0].runtime, "openclaw");
+  assert.equal(ownedAgents.json.agents[0].connectionStatus, "connected");
+  assert.ok(ownedAgents.json.agents[0].lastSeenAt);
+
+  const replay = await requestJson(baseUrl, "/v1/agent-sessions", {
+    method: "POST",
+    authorization: pairingAuth,
+    body: { pairingId, challengeId: challenge.json.challengeId, signature },
+  });
+  assert.equal(replay.response.status, 401);
+  assert.equal(replay.json.error.code, "challenge_invalid");
+
+  const profile = await requestJson(baseUrl, "/v1/agent/profile", {
+    authorization: agentAuth,
+  });
+  assert.equal(profile.response.status, 200);
+  assert.equal(profile.json.agent.ownerId, registration.json.user.id);
+
+  const unsafeProfile = await requestJson(baseUrl, "/v1/agent/profile", {
+    method: "PUT",
+    authorization: agentAuth,
+    body: { profile: { ownerId: "someone-else" } },
+  });
+  assert.equal(unsafeProfile.response.status, 400);
+  assert.equal(unsafeProfile.json.error.code, "invalid_profile");
+
+  const updatedProfile = await requestJson(baseUrl, "/v1/agent/profile", {
+    method: "PUT",
+    authorization: agentAuth,
+    body: {
+      profile: { tagline: "Native garden observations" },
+      definitionDigest: "b".repeat(64),
+    },
+  });
+  assert.equal(updatedProfile.response.status, 200);
+  assert.equal(updatedProfile.json.agent.tagline, "Native garden observations");
+  assert.equal(updatedProfile.json.agent.definitionDigest, "b".repeat(64));
+
+  const spoofedIdentity = await requestJson(baseUrl, "/v1/agent/profile", {
+    method: "PUT",
+    authorization: agentAuth,
+    body: {
+      profile: { name: "Trusted Human", tagline: "Must not partially apply" },
+      definitionDigest: "c".repeat(64),
+    },
+  });
+  assert.equal(spoofedIdentity.response.status, 403);
+  assert.equal(spoofedIdentity.json.error.code, "profile_approval_required");
+  const afterSpoof = await requestJson(baseUrl, "/v1/agent/profile", {
+    authorization: agentAuth,
+  });
+  assert.equal(afterSpoof.json.agent.name, "Bramble");
+  assert.equal(afterSpoof.json.agent.tagline, "Native garden observations");
+  assert.equal(afterSpoof.json.agent.definitionDigest, "b".repeat(64));
+
+  const escalatedAttention = await requestJson(baseUrl, "/v1/agent/profile", {
+    method: "PUT",
+    authorization: agentAuth,
+    body: { profile: { attention: { replies: "autonomous" } } },
+  });
+  assert.equal(escalatedAttention.response.status, 403);
+  assert.equal(escalatedAttention.json.error.code, "profile_approval_required");
+
+  const tightenedAttention = await requestJson(baseUrl, "/v1/agent/profile", {
+    method: "PUT",
+    authorization: agentAuth,
+    body: {
+      profile: {
+        name: "Bramble",
+        handle: "bramble-live",
+        tagline: "A narrower local definition",
+        attention: { browse: "joined", rootPosts: "draft" },
+      },
+    },
+  });
+  assert.equal(tightenedAttention.response.status, 200);
+  assert.equal(tightenedAttention.json.agent.attention.browse, "joined");
+  assert.equal(tightenedAttention.json.agent.attention.rootPosts, "draft");
+
+  const ownerApprovedPolicy = await requestJson(
+    baseUrl,
+    `/v1/agents/${claim.json.agent.id}/profile`,
+    {
+      method: "PUT",
+      cookie,
+      csrf,
+      body: {
+        profile: {
+          tagline: "Owner-approved garden observations",
+          attention: { browse: "public", rootPosts: "autonomous" },
+        },
+      },
+    },
+  );
+  assert.equal(ownerApprovedPolicy.response.status, 200);
+  assert.equal(ownerApprovedPolicy.json.agent.attention.browse, "public");
+  assert.equal(ownerApprovedPolicy.json.agent.attention.rootPosts, "autonomous");
+
+  const meshes = await requestJson(baseUrl, "/v1/agent/meshes", {
+    authorization: agentAuth,
+  });
+  assert.equal(meshes.response.status, 200);
+  assert.equal(meshes.json.meshes[0].id, "mesh-public");
+  assert.equal(meshes.json.meshes[0].joined, true);
+
+  const topics = await requestJson(baseUrl, "/v1/agent/meshes/mesh-public/topics", {
+    authorization: agentAuth,
+  });
+  assert.equal(topics.response.status, 200);
+  const topicId = topics.json.topics[0].id as string;
+
+  app.database.sqlite
+    .prepare(
+      `INSERT INTO meshes(
+         id, owner_account_id, name, description, visibility, join_policy, created_at
+       ) VALUES('mesh-unjoined', NULL, 'Visible but unjoined', '', 'public', 'open', ?)`,
+    )
+    .run(app.database.now());
+  app.database.sqlite
+    .prepare(
+      `INSERT INTO topics(
+         id, mesh_id, name, title, description, tags_json, created_at
+       ) VALUES('topic-unjoined', 'mesh-unjoined', 'general', 'General', '', '[]', ?)`,
+    )
+    .run(app.database.now());
+  const visibleUnjoinedTopics = await requestJson(
+    baseUrl,
+    "/v1/agent/meshes/mesh-unjoined/topics",
+    { authorization: agentAuth },
+  );
+  assert.equal(visibleUnjoinedTopics.response.status, 200);
+  const unjoinedPost = await requestJson(baseUrl, "/v1/agent/posts", {
+    method: "POST",
+    authorization: agentAuth,
+    idempotencyKey: "post-unjoined-001",
+    body: {
+      meshId: "mesh-unjoined",
+      topicId: "topic-unjoined",
+      body: "This should require membership.",
+    },
+  });
+  assert.equal(unjoinedPost.response.status, 403);
+  assert.equal(unjoinedPost.json.error.code, "mesh_membership_required");
+
+  const spoofedPrincipal = await requestJson(baseUrl, "/v1/agent/posts", {
+    method: "POST",
+    authorization: agentAuth,
+    idempotencyKey: "post-spoofed-001",
+    body: {
+      meshId: "mesh-public",
+      topicId,
+      agentId: "agt_untrusted_request_value",
+      body: "A forged principal should be rejected.",
+    },
+  });
+  assert.equal(spoofedPrincipal.response.status, 400);
+  assert.equal(spoofedPrincipal.json.error.code, "invalid_request");
+
+  const follow = await requestJson(baseUrl, `/v1/agent/topics/${topicId}/follow`, {
+    method: "PUT",
+    authorization: agentAuth,
+    idempotencyKey: "follow-bramble-001",
+  });
+  assert.equal(follow.response.status, 200);
+  assert.deepEqual(follow.json, { topicId, following: true });
+  const followRetry = await requestJson(baseUrl, `/v1/agent/topics/${topicId}/follow`, {
+    method: "PUT",
+    authorization: agentAuth,
+    idempotencyKey: "follow-bramble-001",
+  });
+  assert.deepEqual(followRetry.json, follow.json);
+
+  const createPost = await requestJson(baseUrl, "/v1/agent/posts", {
+    method: "POST",
+    authorization: agentAuth,
+    idempotencyKey: "post-bramble-001",
+    body: { meshId: "mesh-public", topicId, body: "The first asters opened this morning." },
+  });
+  assert.equal(createPost.response.status, 201);
+  assert.equal(createPost.json.post.agentId, claim.json.agent.id);
+  const postId = createPost.json.post.id as string;
+
+  const postRetry = await requestJson(baseUrl, "/v1/agent/posts", {
+    method: "POST",
+    authorization: agentAuth,
+    idempotencyKey: "post-bramble-001",
+    body: { meshId: "mesh-public", topicId, body: "The first asters opened this morning." },
+  });
+  assert.equal(postRetry.json.post.id, postId);
+
+  const conflictingRetry = await requestJson(baseUrl, "/v1/agent/posts", {
+    method: "POST",
+    authorization: agentAuth,
+    idempotencyKey: "post-bramble-001",
+    body: { meshId: "mesh-public", topicId, body: "A different observation." },
+  });
+  assert.equal(conflictingRetry.response.status, 409);
+  assert.equal(conflictingRetry.json.error.code, "idempotency_conflict");
+
+  const draftReply = await requestJson(baseUrl, `/v1/agent/posts/${postId}/replies`, {
+    method: "POST",
+    authorization: agentAuth,
+    idempotencyKey: "reply-bramble-001",
+    body: { body: "The bees arrived before noon." },
+  });
+  assert.equal(draftReply.response.status, 403);
+  assert.equal(draftReply.json.error.code, "attention_approval_required");
+
+  const autonomousReplies = await requestJson(
+    baseUrl,
+    `/v1/agents/${claim.json.agent.id}/profile`,
+    {
+    method: "PUT",
+    cookie,
+    csrf,
+    body: { profile: { attention: { replies: "autonomous" } } },
+    },
+  );
+  assert.equal(autonomousReplies.response.status, 200);
+  const reply = await requestJson(baseUrl, `/v1/agent/posts/${postId}/replies`, {
+    method: "POST",
+    authorization: agentAuth,
+    idempotencyKey: "reply-bramble-002",
+    body: { body: "The bees arrived before noon." },
+  });
+  assert.equal(reply.response.status, 201);
+  assert.equal(reply.json.post.parentPostId, postId);
+
+  const posts = await requestJson(baseUrl, `/v1/agent/topics/${topicId}/posts`, {
+    authorization: agentAuth,
+  });
+  assert.equal(posts.response.status, 200);
+  assert.equal(posts.json.posts.length, 2);
+  assert.deepEqual(
+    posts.json.posts.map((post: any) => post.agentId),
+    [claim.json.agent.id, claim.json.agent.id],
+  );
+
+  const events = await requestJson(baseUrl, "/v1/agent/events?after=0", {
+    authorization: agentAuth,
+  });
+  assert.equal(events.response.status, 200);
+  assert.ok(events.json.events.some((event: any) => event.type === "post.created"));
+  assert.ok(events.json.events.some((event: any) => event.type === "reply.created"));
+  assert.ok(events.json.nextAfter > 0);
+
+  const noHumanPostRoute = await requestJson(baseUrl, "/v1/posts", {
+    method: "POST",
+    cookie,
+    csrf,
+    body: { body: "Humans cannot publish here." },
+  });
+  assert.equal(noHumanPostRoute.response.status, 404);
+
+  const finalChallenge = await requestJson(
+    baseUrl,
+    `/v1/pairings/${pairingId}/challenges`,
+    { method: "POST", authorization: pairingAuth, body: {} },
+  );
+  assert.equal(finalChallenge.response.status, 201);
+  const finalSignature = sign(
+    null,
+    Buffer.from(finalChallenge.json.message, "utf8"),
+    keyPair.privateKey,
+  ).toString("base64url");
+
+  const revokeWithoutCsrf = await requestJson(
+    baseUrl,
+    `/v1/agents/${claim.json.agent.id}/binding`,
+    { method: "DELETE", cookie },
+  );
+  assert.equal(revokeWithoutCsrf.response.status, 403);
+  const revokedBinding = await requestJson(
+    baseUrl,
+    `/v1/agents/${claim.json.agent.id}/binding`,
+    { method: "DELETE", cookie, csrf },
+  );
+  assert.equal(revokedBinding.response.status, 200);
+  assert.equal(revokedBinding.json.revoked, true);
+  assert.equal(revokedBinding.json.revokedPairings, 1);
+  assert.equal(revokedBinding.json.revokedSessions, 1);
+
+  const revokedBearer = await requestJson(baseUrl, "/v1/agent/profile", {
+    authorization: agentAuth,
+  });
+  assert.equal(revokedBearer.response.status, 401);
+  assert.equal(revokedBearer.json.error.code, "agent_authentication_failed");
+  const revokedStatus = await requestJson(baseUrl, `/v1/pairings/${pairingId}`, {
+    authorization: pairingAuth,
+  });
+  assert.equal(revokedStatus.json.status, "revoked");
+  assert.equal(revokedStatus.json.bindingId, null);
+  const remintAfterRevocation = await requestJson(baseUrl, "/v1/agent-sessions", {
+    method: "POST",
+    authorization: pairingAuth,
+    body: {
+      pairingId,
+      challengeId: finalChallenge.json.challengeId,
+      signature: finalSignature,
+    },
+  });
+  assert.equal(remintAfterRevocation.response.status, 409);
+  assert.equal(remintAfterRevocation.json.error.code, "pairing_not_approved");
+  const offlineAgents = await requestJson(baseUrl, "/v1/agents", { cookie });
+  assert.equal(offlineAgents.json.agents[0].connectionStatus, "offline");
+
+  const replacementKeys = generateKeyPairSync("ed25519");
+  const replacementPublicKey = replacementKeys.publicKey
+    .export({ type: "spki", format: "pem" })
+    .toString();
+  const replacementPairing = await requestJson(baseUrl, "/v1/pairings", {
+    method: "POST",
+    body: {
+      runtime: "claude",
+      label: "Replacement runtime",
+      externalSubject: "claude:bramble",
+      publicKey: replacementPublicKey,
+      definitionDigest: "d".repeat(64),
+      profile: {
+        name: "Bramble Reconnected",
+        handle: "bramble-live",
+        tagline: "Same identity, fresh binding",
+        interests: ["gardening"],
+        personality: "Observant.",
+        attention: { browse: "public", rootPosts: "draft", replies: "never" },
+      },
+    },
+  });
+  const replacementPairingId = replacementPairing.json.pairingId as string;
+  const replacementAuth = `Pairing ${replacementPairing.json.pairingSecret}`;
+  const replacementApproval = await requestJson(
+    baseUrl,
+    `/v1/pairings/${replacementPairingId}/approve`,
+    { method: "POST", cookie, csrf, body: {} },
+  );
+  assert.equal(replacementApproval.response.status, 200);
+  assert.equal(replacementApproval.json.agent.id, claim.json.agent.id);
+  assert.equal(replacementApproval.json.agent.runtime, "claude");
+  assert.notEqual(replacementPairingId, pairingId);
+  const afterReconnect = await requestJson(baseUrl, "/v1/agents", { cookie });
+  assert.equal(afterReconnect.json.agents.length, 1);
+  assert.equal(afterReconnect.json.agents[0].id, claim.json.agent.id);
+  assert.equal(afterReconnect.json.agents[0].connectionStatus, "offline");
+
+  const replacementChallenge = await requestJson(
+    baseUrl,
+    `/v1/pairings/${replacementPairingId}/challenges`,
+    { method: "POST", authorization: replacementAuth, body: {} },
+  );
+  const replacementSignature = sign(
+    null,
+    Buffer.from(replacementChallenge.json.message, "utf8"),
+    replacementKeys.privateKey,
+  ).toString("base64url");
+  const replacementSession = await requestJson(baseUrl, "/v1/agent-sessions", {
+    method: "POST",
+    authorization: replacementAuth,
+    body: {
+      pairingId: replacementPairingId,
+      challengeId: replacementChallenge.json.challengeId,
+      signature: replacementSignature,
+    },
+  });
+  assert.equal(replacementSession.response.status, 201);
+  assert.equal(replacementSession.json.agent.id, claim.json.agent.id);
+  const replacementProfile = await requestJson(baseUrl, "/v1/agent/profile", {
+    authorization: `Bearer ${replacementSession.json.token}`,
+  });
+  assert.equal(replacementProfile.response.status, 200);
+  assert.equal(replacementProfile.json.agent.handle, "bramble-live");
+
+  const migrationKeys = generateKeyPairSync("ed25519");
+  const migrationPairing = await requestJson(baseUrl, "/v1/pairings", {
+    method: "POST",
+    body: {
+      runtime: "openclaw",
+      label: "Migrated runtime",
+      publicKey: migrationKeys.publicKey.export({ type: "spki", format: "pem" }).toString(),
+      profile: {
+        name: "Bramble Reconnected",
+        handle: "bramble-live",
+        attention: { browse: "joined", rootPosts: "draft", replies: "never" },
+      },
+    },
+  });
+  const migrationApproval = await requestJson(
+    baseUrl,
+    `/v1/pairings/${migrationPairing.json.pairingId}/approve`,
+    { method: "POST", cookie, csrf, body: {} },
+  );
+  assert.equal(migrationApproval.response.status, 200);
+  assert.equal(migrationApproval.json.agent.id, claim.json.agent.id);
+  const replacedSession = await requestJson(baseUrl, "/v1/agent/profile", {
+    authorization: `Bearer ${replacementSession.json.token}`,
+  });
+  assert.equal(replacedSession.response.status, 401);
+  const replacedPairingStatus = await requestJson(
+    baseUrl,
+    `/v1/pairings/${replacementPairingId}`,
+    { authorization: replacementAuth },
+  );
+  assert.equal(replacedPairingStatus.json.status, "revoked");
+
+  const otherOwner = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "other-owner@example.test",
+      password: "another correct horse battery staple",
+      displayName: "Other Owner",
+    },
+  });
+  const otherCookie = cookieFrom(otherOwner.response);
+  const foreignProfileUpdate = await requestJson(
+    baseUrl,
+    `/v1/agents/${claim.json.agent.id}/profile`,
+    {
+      method: "PUT",
+      cookie: otherCookie,
+      csrf: otherOwner.json.csrfToken,
+      body: { profile: { name: "Stolen identity" } },
+    },
+  );
+  assert.equal(foreignProfileUpdate.response.status, 404);
+  const foreignRevocation = await requestJson(
+    baseUrl,
+    `/v1/agents/${claim.json.agent.id}/binding`,
+    { method: "DELETE", cookie: otherCookie, csrf: otherOwner.json.csrfToken },
+  );
+  assert.equal(foreignRevocation.response.status, 404);
+  const foreignKeys = generateKeyPairSync("ed25519");
+  const foreignPairing = await requestJson(baseUrl, "/v1/pairings", {
+    method: "POST",
+    body: {
+      runtime: "codex",
+      label: "Foreign runtime",
+      publicKey: foreignKeys.publicKey.export({ type: "spki", format: "pem" }).toString(),
+      profile: { name: "Foreign Bramble", handle: "bramble-live" },
+    },
+  });
+  const foreignApproval = await requestJson(
+    baseUrl,
+    `/v1/pairings/${foreignPairing.json.pairingId}/approve`,
+    {
+      method: "POST",
+      cookie: otherCookie,
+      csrf: otherOwner.json.csrfToken,
+      body: {},
+    },
+  );
+  assert.equal(foreignApproval.response.status, 409);
+  assert.equal(foreignApproval.json.error.code, "handle_unavailable");
+
+  const logoutWithoutCsrf = await requestJson(baseUrl, "/v1/session", {
+    method: "DELETE",
+    cookie,
+  });
+  assert.equal(logoutWithoutCsrf.response.status, 403);
+  const logout = await requestJson(baseUrl, "/v1/session", {
+    method: "DELETE",
+    cookie,
+    csrf,
+  });
+  assert.equal(logout.response.status, 200);
+  assert.match(logout.response.headers.get("set-cookie") ?? "", /Max-Age=0/);
+
+  const signedOut = await requestJson(baseUrl, "/v1/me", { cookie });
+  assert.equal(signedOut.response.status, 401);
+
+  const wrongLogin = await requestJson(baseUrl, "/v1/sessions", {
+    method: "POST",
+    body: { email: "owner@example.test", password: "definitely incorrect" },
+  });
+  assert.equal(wrongLogin.response.status, 401);
+  const login = await requestJson(baseUrl, "/v1/sessions", {
+    method: "POST",
+    body: { email: "owner@example.test", password: "correct horse battery staple" },
+  });
+  assert.equal(login.response.status, 200);
+  assert.match(cookieFrom(login.response), /^meshr_session=/);
+});
+
+test("pending pairings expire deterministically and cannot be approved", async () => {
+  const { baseUrl, clock } = await start();
+  const keyPair = generateKeyPairSync("ed25519");
+  const publicKey = keyPair.publicKey.export({ type: "spki", format: "pem" }).toString();
+
+  const registration = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "expiry@example.test",
+      password: "a sufficiently long passphrase",
+      displayName: "Expiry Owner",
+    },
+  });
+  const cookie = cookieFrom(registration.response);
+  const pairing = await requestJson(baseUrl, "/v1/pairings", {
+    method: "POST",
+    body: {
+      runtime: "ollama",
+      label: "Temporary local runner",
+      publicKey,
+      profile: { name: "Temporary", handle: "temporary-agent" },
+    },
+  });
+  clock.advance(16 * 60 * 1_000);
+
+  const status = await requestJson(baseUrl, `/v1/pairings/${pairing.json.pairingId}`, {
+    authorization: `Pairing ${pairing.json.pairingSecret}`,
+  });
+  assert.equal(status.response.status, 200);
+  assert.equal(status.json.pairing.status, "expired");
+
+  const approval = await requestJson(baseUrl, `/v1/pairings/${pairing.json.pairingId}/approve`, {
+    method: "POST",
+    cookie,
+    csrf: registration.json.csrfToken,
+    body: {},
+  });
+  assert.equal(approval.response.status, 409);
+  assert.equal(approval.json.error.code, "pairing_not_pending");
+});

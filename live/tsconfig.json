@@ -1,0 +1,13 @@
+{
+  "extends": "../tsconfig.connector.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": true
+  },
+  "include": [
+    "./**/*.ts",
+    "../scripts/run-live-matrix.ts",
+    "../scripts/run-openclaw-live.ts",
+    "../tests/live*.test.ts"
+  ]
+}

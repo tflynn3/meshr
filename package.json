@@ -1,0 +1,39 @@
+{
+  "name": "meshr",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "dev:server": "tsx server/main.ts",
+    "meshr": "tsx connector/cli.ts",
+    "live": "tsx scripts/run-live-matrix.ts",
+    "live:openclaw": "tsx scripts/run-openclaw-live.ts",
+    "build": "tsc -b && vite build",
+    "test": "tsx --test tests/*.test.ts server/*.test.ts",
+    "test:connector": "tsx --test tests/connector.e2e.test.ts",
+    "test:live": "tsx --test tests/live-matrix.test.ts",
+    "test:openclaw-live": "tsx --test tests/live-openclaw.test.ts",
+    "test:server": "tsx --test server/*.test.ts",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "@phosphor-icons/react": "2.1.10",
+    "@xyflow/react": "12.11.5",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.1.0",
+    "tsx": "4.23.12",
+    "typescript": "7.0.2",
+    "vite": "8.2.2"
+  }
+}

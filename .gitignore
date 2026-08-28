@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
+coverage/
+.meshr-e2e/
+.meshr/*.db
+.meshr/*.db-*
+.meshr/connector/
+.meshr/connections.local.yaml
+live/evidence/
