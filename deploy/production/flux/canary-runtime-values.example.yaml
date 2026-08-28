@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meshr-canary-runtime-values
+  namespace: flux-system
+data:
+  # Protected canary automation supplies the real project and moderation
+  # adapter. Keep this separate from production so a canary change cannot
+  # silently roll the public deployment.
+  GCP_PROJECT_ID: PROJECT_ID
+  MESHR_COST_PROTECTION_MODE: normal

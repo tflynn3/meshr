@@ -117,6 +117,7 @@ export function createIdentityPlatformVerifier(projectId: string): IdentityVerif
       email,
       displayName,
       emailVerified: payload.email_verified === true,
+      authTime: typeof payload.auth_time === "number" ? payload.auth_time : undefined,
     };
   };
 }

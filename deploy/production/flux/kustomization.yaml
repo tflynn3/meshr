@@ -21,9 +21,33 @@ spec:
       kind: Deployment
       name: live-gateway
       namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: web
+      namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: ingest
+      namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: topology-materializer
+      namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: moderation-worker
+      namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: audit-worker
+      namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: notification-worker
+      namespace: meshr
   postBuild:
     substituteFrom:
       - kind: ConfigMap
-        name: meshr-image-digests
+        name: meshr-production-image-digests
       - kind: ConfigMap
-        name: meshr-runtime-values
+        name: meshr-production-runtime-values

@@ -34,24 +34,29 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   useSyncExternalStore,
   type FormEvent,
   type ReactNode,
 } from "react";
 import { useAuth } from "./auth/AuthContext";
+import { ProviderLinkDialog } from "./auth/ProviderLinkDialog";
 import {
   disableWebMcpSession,
   enableWebMcpSession,
   createMesh,
+  getActivityPreferences,
   getPublicActivity,
   getMeshGovernance,
   getWebMcpSession,
   listMeshes,
   listOwnedAgents,
+  updateActivityPreference,
   updateMeshGovernance,
   updateMeshRole,
   type HumanUser,
+  type ActivityPreference,
   type MeshSummary,
   type OwnedAgent,
   type PublicActivitySnapshot,
@@ -277,17 +282,46 @@ export function App() {
   const [createMeshOpen, setCreateMeshOpen] = useState(false);
   const [createAgentOpen, setCreateAgentOpen] = useState(false);
   const [governanceOpen, setGovernanceOpen] = useState(false);
+  const [accountSettingsOpen, setAccountSettingsOpen] = useState(false);
   const [toast, setToast] = useState("");
   const [ownedAgents, setOwnedAgents] = useState<OwnedAgent[] | null>(null);
   const [serverMeshes, setServerMeshes] = useState<MeshSummary[] | null>(null);
   const [publicActivity, setPublicActivity] =
     useState<PublicActivitySnapshot | null>(null);
+  const [liveHealthy, setLiveHealthy] = useState(false);
+  const [activityPreferences, setActivityPreferences] = useState<
+    Record<string, ActivityPreference>
+  >({});
   const [webMcpSession, setWebMcpSession] =
     useState<WebMcpSessionStatus | null>(null);
   const [webMcpBusyAgentId, setWebMcpBusyAgentId] = useState<string | null>(null);
   const [webMcpStatus, setWebMcpStatus] = useState<
     WebMcpRegistrationStatus | "disabled" | "registering" | "error"
   >("registering");
+  // A topology shard can fan out many frames while several agents are
+  // posting. Coalesce the resulting snapshot reads so one viewer never turns
+  // every frame into a full activity query (and so polling and WebSocket
+  // recovery share the same in-flight request).
+  const publicActivityRequest = useRef<Promise<void> | null>(null);
+  const publicActivityFetchedAt = useRef(0);
+  const refreshPublicActivity = useCallback((): Promise<void> => {
+    const now = Date.now();
+    if (publicActivityRequest.current) return publicActivityRequest.current;
+    if (now - publicActivityFetchedAt.current < 1_000) return Promise.resolve();
+    const request = getPublicActivity()
+      .then((activity) => {
+        publicActivityFetchedAt.current = Date.now();
+        setPublicActivity(activity);
+      })
+      .catch(() => {
+        // Retain the last good topology during a transient polling failure.
+      })
+      .finally(() => {
+        publicActivityRequest.current = null;
+      });
+    publicActivityRequest.current = request;
+    return request;
+  }, []);
 
   const refreshMeshes = useCallback(async (signal?: AbortSignal) => {
     const next = await listMeshes(signal);
@@ -299,6 +333,38 @@ export function App() {
     setOwnedAgents(next);
     return next;
   }, []);
+  const refreshActivityPreferences = useCallback(async (signal?: AbortSignal) => {
+    const next = await getActivityPreferences(signal);
+    setActivityPreferences(
+      Object.fromEntries(
+        next.map((preference) => [
+          `${preference.kind}:${preference.resourceId}`,
+          preference,
+        ]),
+      ),
+    );
+    return next;
+  }, []);
+  const saveActivityPreference = useCallback(
+    async (
+      kind: ActivityPreference["kind"],
+      resourceId: string,
+      input: { watching?: boolean; muted?: boolean },
+    ) => {
+      const next = await updateActivityPreference(
+        kind,
+        resourceId,
+        input,
+        session!.csrfToken,
+      );
+      setActivityPreferences((current) => ({
+        ...current,
+        [`${next.kind}:${next.resourceId}`]: next,
+      }));
+      return next;
+    },
+    [session],
+  );
 
   const accountId = session!.user.id;
   const owner = state.owners.find((candidate) => candidate.id === accountId) ?? {
@@ -413,24 +479,18 @@ export function App() {
     ) ?? null;
 
   useEffect(() => {
-    const controller = new AbortController();
-    let active = true;
-    const refresh = async () => {
-      try {
-        const activity = await getPublicActivity(controller.signal);
-        if (active) setPublicActivity(activity);
-      } catch {
-        // Retain the last good topology during a transient polling failure.
-      }
-    };
-    void refresh();
-    const interval = window.setInterval(() => void refresh(), 5_000);
+    void refreshPublicActivity();
+    // Live topology frames are the normal update path. Keep a slower HTTP
+    // recovery poll for account-wide/private meshes, and fall back to the
+    // tighter interval only while the gateway is disconnected.
+    const interval = window.setInterval(
+      () => void refreshPublicActivity(),
+      liveHealthy ? 60_000 : 15_000,
+    );
     return () => {
-      active = false;
-      controller.abort();
       window.clearInterval(interval);
     };
-  }, []);
+  }, [liveHealthy, refreshPublicActivity]);
 
   // The topology canvas listens to the same-origin live gateway when a mesh
   // is selected. The existing activity request remains a snapshot fallback
@@ -438,24 +498,48 @@ export function App() {
   // viewers do not have to chase a chronological firehose.
   useEffect(() => {
     const meshId = selectedMesh?.id;
-    if (!meshId || typeof WebSocket === "undefined") return;
+    if (!meshId || typeof WebSocket === "undefined") {
+      setLiveHealthy(false);
+      return;
+    }
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(
       `${protocol}//${window.location.host}/v1/live?meshId=${encodeURIComponent(meshId)}&contractVersion=1`,
     );
     let active = true;
-    socket.onmessage = () => {
-      if (!active) return;
-      void getPublicActivity().then(setPublicActivity).catch(() => {
-        // The next snapshot poll will recover after a transient gateway error.
-      });
+    setLiveHealthy(false);
+    socket.onopen = () => {
+      if (active) setLiveHealthy(true);
     };
-    socket.onerror = () => socket.close();
-    return () => {
-      active = false;
+    socket.onmessage = (event) => {
+      if (!active) return;
+      setLiveHealthy(true);
+      try {
+        const message = JSON.parse(event.data) as {
+          activity?: PublicActivitySnapshot;
+        };
+        if (message.activity && Array.isArray(message.activity.meshes)) {
+          setPublicActivity(message.activity);
+          return;
+        }
+      } catch {
+        // Fall through to the coalesced HTTP snapshot recovery below.
+      }
+      void refreshPublicActivity();
+    };
+    socket.onerror = () => {
+      if (active) setLiveHealthy(false);
       socket.close();
     };
-  }, [selectedMesh?.id]);
+    socket.onclose = () => {
+      if (active) setLiveHealthy(false);
+    };
+    return () => {
+      active = false;
+      setLiveHealthy(false);
+      socket.close();
+    };
+  }, [refreshPublicActivity, selectedMesh?.id]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -470,13 +554,30 @@ export function App() {
       void refreshMeshes().catch(() => {
         // Keep the last durable projection during a transient network failure.
       });
-    }, 10_000);
+    }, 30_000);
     return () => {
       active = false;
       controller.abort();
       window.clearInterval(interval);
     };
   }, [refreshMeshes]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void refreshActivityPreferences(controller.signal).catch(() => {
+      // Preferences are non-critical to topology rendering; retain the last
+      // local view while the durable preference read recovers.
+    });
+    const interval = window.setInterval(() => {
+      void refreshActivityPreferences().catch(() => {
+        // Keep the last good preference snapshot during transient failures.
+      });
+    }, 30_000);
+    return () => {
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [refreshActivityPreferences]);
 
   useEffect(() => {
     let active = true;
@@ -492,7 +593,7 @@ export function App() {
       });
     };
     refresh();
-    const interval = window.setInterval(refresh, 5_000);
+    const interval = window.setInterval(refresh, 15_000);
     return () => {
       active = false;
       window.clearInterval(interval);
@@ -664,6 +765,7 @@ export function App() {
         onLogout={() => {
           void signOut().catch(() => setToast("Could not sign out"));
         }}
+        onAccountSettings={() => setAccountSettingsOpen(true)}
       />
       {view.kind === "agents" ? (
         <AgentPortfolio
@@ -690,6 +792,8 @@ export function App() {
             selectedLink={selectedLink}
             webMcpStatus={webMcpStatus}
             webMcpAgentHandle={webMcpSession?.agent?.handle ?? null}
+            activityPreferences={activityPreferences}
+            onSaveActivityPreference={saveActivityPreference}
             onSelectTopic={(topicId) => {
               setSelectedTopicId(topicId);
               setSelectedLinkId(null);
@@ -727,6 +831,13 @@ export function App() {
           onClose={() => setGovernanceOpen(false)}
         />
       )}
+      {accountSettingsOpen && (
+        <ProviderLinkDialog
+          csrfToken={session!.csrfToken}
+          onClose={() => setAccountSettingsOpen(false)}
+          onSaved={() => setToast("Provider linked")}
+        />
+      )}
       {toast && (
         <div className="toast">
           <Check size={16} weight="bold" />
@@ -746,6 +857,7 @@ function MeshRail({
   onMesh,
   onCreate,
   onLogout,
+  onAccountSettings,
 }: {
   state: ReturnType<typeof meshStore.getSnapshot>;
   owner: Owner;
@@ -755,6 +867,7 @@ function MeshRail({
   onMesh: (id: string) => void;
   onCreate: () => void;
   onLogout: () => void;
+  onAccountSettings: () => void;
 }) {
   const initials = account.displayName
     .split(/\s+/)
@@ -835,6 +948,14 @@ function MeshRail({
           <strong>{account.displayName}</strong>
           <small>{account.email}</small>
         </div>
+        <button
+          className="rail-account-settings"
+          onClick={onAccountSettings}
+          aria-label="Account settings"
+          title="Account settings"
+        >
+          <Gear size={16} />
+        </button>
         <button
           className="rail-logout"
           onClick={onLogout}
@@ -1074,6 +1195,8 @@ function MeshExperience({
   selectedLink,
   webMcpStatus,
   webMcpAgentHandle,
+  activityPreferences,
+  onSaveActivityPreference,
   onSelectTopic,
   onSelectLink,
   onOpenGovernance,
@@ -1088,6 +1211,12 @@ function MeshExperience({
   selectedLink: TrafficLink | null;
   webMcpStatus: WebMcpRegistrationStatus | "disabled" | "registering" | "error";
   webMcpAgentHandle: string | null;
+  activityPreferences: Record<string, ActivityPreference>;
+  onSaveActivityPreference: (
+    kind: ActivityPreference["kind"],
+    resourceId: string,
+    input: { watching?: boolean; muted?: boolean },
+  ) => Promise<ActivityPreference>;
   onSelectTopic: (id: string) => void;
   onSelectLink: (id: string) => void;
   onOpenGovernance: () => void;
@@ -1138,6 +1267,8 @@ function MeshExperience({
           link={selectedLink}
           state={state}
           mesh={mesh}
+          preference={activityPreferences[`link:${selectedLink.id}`]}
+          onSavePreference={onSaveActivityPreference}
           onClose={() => onSelectTopic(topic.id)}
         />
       ) : (
@@ -1146,6 +1277,8 @@ function MeshExperience({
           mesh={mesh}
           state={state}
           ownerId={ownerId}
+          preference={activityPreferences[`topic:${topic.id}`]}
+          onSavePreference={onSaveActivityPreference}
         />
       )}
     </div>
@@ -1242,18 +1375,35 @@ function ConversationInspector({
   mesh,
   state,
   ownerId,
+  preference,
+  onSavePreference,
 }: {
   topic: Topic;
   mesh: Mesh;
   state: ReturnType<typeof meshStore.getSnapshot>;
   ownerId: string;
+  preference?: ActivityPreference;
+  onSavePreference: (
+    kind: ActivityPreference["kind"],
+    resourceId: string,
+    input: { watching?: boolean; muted?: boolean },
+  ) => Promise<ActivityPreference>;
 }) {
-  const [muted, setMuted] = useState(false);
-  const [watching, setWatching] = useState(false);
+  const [muted, setMuted] = useState(preference?.muted ?? false);
+  const [watching, setWatching] = useState(preference?.watching ?? false);
   useEffect(() => {
-    setMuted(false);
-    setWatching(false);
-  }, [topic.id]);
+    setMuted(preference?.muted ?? false);
+    setWatching(preference?.watching ?? false);
+  }, [preference?.muted, preference?.resourceId, preference?.updatedAt, preference?.watching]);
+  const save = (input: { watching?: boolean; muted?: boolean }) => {
+    const previous = { muted, watching };
+    if (input.muted !== undefined) setMuted(input.muted);
+    if (input.watching !== undefined) setWatching(input.watching);
+    void onSavePreference("topic", topic.id, input).catch(() => {
+      setMuted(previous.muted);
+      setWatching(previous.watching);
+    });
+  };
   const participants = topic.participantAgentIds
     .map((id) => state.agents.find((agent) => agent.id === id))
     .filter(Boolean) as Agent[];
@@ -1317,11 +1467,11 @@ function ConversationInspector({
         ))}
       </section>
       <div className="inspector-actions">
-        <button className="primary" onClick={() => setWatching((value) => !value)}>
+        <button className="primary" onClick={() => save({ watching: !watching })}>
           <Eye size={17} />
           {watching ? "Watching activity" : "Watch activity"}
         </button>
-        <button onClick={() => setMuted((value) => !value)}>
+        <button onClick={() => save({ muted: !muted })}>
           <BellSlash size={17} />
           {muted ? "Unmute" : "Mute"}
         </button>
@@ -1342,14 +1492,25 @@ function TrafficInspector({
   link,
   state,
   mesh,
+  preference,
+  onSavePreference,
   onClose,
 }: {
   link: TrafficLink;
   state: ReturnType<typeof meshStore.getSnapshot>;
   mesh: Mesh;
+  preference?: ActivityPreference;
+  onSavePreference: (
+    kind: ActivityPreference["kind"],
+    resourceId: string,
+    input: { watching?: boolean; muted?: boolean },
+  ) => Promise<ActivityPreference>;
   onClose: () => void;
 }) {
-  const [watching, setWatching] = useState(false);
+  const [watching, setWatching] = useState(preference?.watching ?? false);
+  useEffect(() => {
+    setWatching(preference?.watching ?? false);
+  }, [preference?.resourceId, preference?.updatedAt, preference?.watching]);
   const source = state.agents.find((agent) => agent.id === link.sourceAgentId)!;
   const target = state.agents.find((agent) => agent.id === link.targetAgentId)!;
   const conversations = state.topics.filter((topic) =>
@@ -1434,7 +1595,16 @@ function TrafficInspector({
         ))}
       </section>
       <div className="inspector-actions">
-        <button className="primary" onClick={() => setWatching((value) => !value)}>
+        <button
+          className="primary"
+          onClick={() => {
+            const next = !watching;
+            setWatching(next);
+            void onSavePreference("link", link.id, { watching: next }).catch(() => {
+              setWatching(watching);
+            });
+          }}
+        >
           <Eye size={17} />
           {watching ? "Watching this link" : "Watch this link"}
         </button>

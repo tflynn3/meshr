@@ -11,6 +11,13 @@ permissions:
   id-token: write
   attestations: write
 
+# Only one release candidate may advance the shared canary/production refs at
+# a time. A queued run re-checks that its commit is still the current main
+# tip before it can publish a candidate.
+concurrency:
+  group: meshr-release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: us-central1-docker.pkg.dev
   IMAGE_REPOSITORY: ${{ vars.GCP_PROJECT_ID }}/meshr
@@ -25,29 +32,71 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
       - uses: azure/setup-kubectl@v4
       - run: npm ci
+      - name: Audit JavaScript dependencies
+        run: npm audit --audit-level=high
+      - name: Scan the source tree for high-severity findings
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          # deploy/local is an intentionally permissive emulator fixture, not
+          # an artifact that can reach production.
+          skip-dirs: deploy/local
+          exit-code: '1'
       - run: npm run typecheck
+      # The root OpenClaw live-contract tests load the packaged plugin entry.
+      # Build it before the root test glob so a clean checkout does not depend
+      # on an ignored developer artifact left in integrations/openclaw/dist.
+      - run: cd integrations/openclaw && npm ci && npm run build
+      - name: Start Firestore emulator
+        run: |
+          set -euo pipefail
+          docker run --detach --name meshr-firestore-emulator \
+            --publish 8081:8080 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:540.0.0-emulators \
+            gcloud beta emulators firestore start \
+              --host-port=0.0.0.0:8080 \
+              --project=meshr-emulator \
+              --quiet
+          for attempt in $(seq 1 30); do
+            if (echo >/dev/tcp/127.0.0.1/8081) 2>/dev/null; then exit 0; fi
+            sleep 2
+          done
+          docker logs meshr-firestore-emulator
+          exit 1
+      - name: Firestore repository emulator conformance
+        env:
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8081
+          GOOGLE_CLOUD_PROJECT: meshr-emulator
+        run: npm run test:firestore
+      - name: Stop Firestore emulator
+        if: always()
+        run: docker rm --force meshr-firestore-emulator || true
       - run: npm test
       - run: npm run build:npm
       - run: npm run test:connector
       - run: npm run test:live
       - run: npm run test:openclaw-live
       - run: cd packages/mcp && npm ci && npm run typecheck && npm run build
-      - run: cd integrations/openclaw && npm ci && npm test
+      - run: cd integrations/openclaw && npm test
       - run: terraform fmt -check -recursive infra/opentofu
       - run: terraform -chdir=infra/opentofu init -backend=false -input=false
       - run: terraform -chdir=infra/opentofu validate
       - run: kubectl kustomize deploy/production >/dev/null
+      - run: kubectl kustomize deploy/canary >/dev/null
 
   build:
     needs: verify
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ secrets.GCP_BUILD_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_BUILD_SERVICE_ACCOUNT }}
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: google-github-actions/setup-gcloud@v2
@@ -78,22 +127,70 @@ jobs:
           cosign sign --yes "$REGISTRY/$IMAGE_REPOSITORY/event-plane:${{ github.sha }}"
           cosign sign --yes "$REGISTRY/$IMAGE_REPOSITORY/web:${{ github.sha }}"
 
-  promote:
+  canary:
     needs: build
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    environment: production
-    runs-on: ubuntu-latest
+    environment: canary
+    concurrency:
+      group: meshr-canary-promotion
+      cancel-in-progress: false
+    # GKE control-plane access is restricted to fixed-egress CIDRs. Register
+    # the protected runner with the `meshr-fixed-egress` label; GitHub-hosted
+    # runner ranges are intentionally not allowlisted by OpenTofu.
+    runs-on: [self-hosted, meshr-fixed-egress]
     permissions:
       contents: write
       id-token: write
+    outputs:
+      api_digest: ${{ steps.resolve.outputs.api }}
+      event_plane_digest: ${{ steps.resolve.outputs.event_plane }}
+      web_digest: ${{ steps.resolve.outputs.web }}
     steps:
       - uses: actions/checkout@v4
       - uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@v2
       - uses: sigstore/cosign-installer@v3
+      - uses: azure/setup-kubectl@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Reject a stale main candidate
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
+      - name: Pause canary reconciliation while promotion inputs change
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT_ID:?Set the protected GCP_PROJECT_ID repository variable}"
+          : "${GKE_CLUSTER:?Set the protected GKE_CLUSTER repository variable}"
+          : "${GKE_LOCATION:?Set the protected GKE_LOCATION repository variable}"
+          gcloud container clusters get-credentials "$GKE_CLUSTER" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID"
+          test "$(kubectl auth can-i get kustomizations.kustomize.toolkit.fluxcd.io/meshr-canary -n flux-system)" = yes
+          test "$(kubectl auth can-i patch kustomizations.kustomize.toolkit.fluxcd.io/meshr-canary -n flux-system)" = yes
+          was_suspended="$(kubectl -n flux-system get kustomization meshr-canary -o jsonpath='{.spec.suspend}' 2>/dev/null || true)"
+          printf 'MESHR_CANARY_SUSPEND_WAS=%s\n' "${was_suspended:-false}" >> "$GITHUB_ENV"
+          kubectl -n flux-system patch kustomization meshr-canary \
+            --type=merge --patch='{"spec":{"suspend":true}}'
+      - name: Advance the protected canary candidate ref
+        run: |
+          set -euo pipefail
+          git config user.name 'meshr-release[bot]'
+          git config user.email 'meshr-release[bot]@users.noreply.github.com'
+          git fetch --no-tags origin canary || true
+          if git show-ref --verify --quiet refs/remotes/origin/canary; then
+            if ! git merge-base --is-ancestor refs/remotes/origin/canary HEAD; then
+              echo 'Remote canary is not an ancestor of this main commit; refusing to rewrite the candidate ref.' >&2
+              exit 1
+            fi
+          fi
+          git push origin HEAD:canary
       - name: Resolve immutable image digests
         id: resolve
         env:
@@ -119,7 +216,281 @@ jobs:
             digest="${pair#*:}"
             immutable="$REGISTRY/$IMAGE_REPOSITORY/$image@$digest"
             cosign verify "$immutable" \
-              --certificate-identity-regexp='https://github.com/tflynn3/meshr/.github/workflows/.*' \
+              --certificate-identity='https://github.com/tflynn3/meshr/.github/workflows/ci.yml@refs/heads/main' \
+              --certificate-oidc-issuer='https://token.actions.githubusercontent.com'
+          done
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_REPOSITORY: ${{ env.IMAGE_REPOSITORY }}
+          API_DIGEST: ${{ steps.resolve.outputs.api }}
+          EVENT_PLANE_DIGEST: ${{ steps.resolve.outputs.event_plane }}
+          WEB_DIGEST: ${{ steps.resolve.outputs.web }}
+      - name: Verify BuildKit SBOM and provenance attestations
+        env:
+          API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ steps.resolve.outputs.api }}
+          EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ steps.resolve.outputs.event_plane }}
+          WEB_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/web@${{ steps.resolve.outputs.web }}
+        run: |
+          set -euo pipefail
+          for image in "$API_IMAGE" "$EVENT_PLANE_IMAGE" "$WEB_IMAGE"; do
+            manifest="$(mktemp)"
+            docker buildx imagetools inspect --raw "$image" >"$manifest"
+            # BuildKit's --sbom/--provenance flags attach OCI attestation
+            # manifests to the multi-platform index. They are not Fulcio
+            # cosign attestations, so verify their presence through the OCI
+            # manifest and verify the image signature separately above.
+            jq -e '
+              [.manifests[]?
+                | select((.platform.architecture // "") == "unknown"
+                  or (.annotations["vnd.docker.reference.type"] // "") == "attestation-manifest")]
+              | length > 0
+            ' "$manifest" >/dev/null
+            rm -f "$manifest"
+          done
+      - name: Scan immutable images
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ steps.resolve.outputs.api }}
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+      - name: Scan immutable event-plane image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ steps.resolve.outputs.event_plane }}
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+      - name: Scan immutable web image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/web@${{ steps.resolve.outputs.web }}
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+      - name: Apply the protected Flux promotion inputs
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          MESHR_MODERATION_ENDPOINT: ${{ vars.MESHR_MODERATION_ENDPOINT }}
+          MESHR_COST_PROTECTION_MODE: ${{ vars.MESHR_COST_PROTECTION_MODE }}
+          MESHR_CANARY_URL: ${{ vars.MESHR_CANARY_URL }}
+          API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ steps.resolve.outputs.api }}
+          EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ steps.resolve.outputs.event_plane }}
+          WEB_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/web@${{ steps.resolve.outputs.web }}
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT_ID:?Set the protected GCP_PROJECT_ID repository variable}"
+          : "${GKE_CLUSTER:?Set the protected GKE_CLUSTER repository variable}"
+          : "${GKE_LOCATION:?Set the protected GKE_LOCATION repository variable}"
+          : "${MESHR_MODERATION_ENDPOINT:?Set the protected MESHR_MODERATION_ENDPOINT repository variable to the approved Model Armor/Sensitive Data Protection adapter}"
+          gcloud container clusters get-credentials "$GKE_CLUSTER" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID"
+          test "$(kubectl auth can-i get gitrepositories.source.toolkit.fluxcd.io/meshr-main -n flux-system)" = yes
+          test "$(kubectl auth can-i update configmaps/meshr-canary-image-digests -n flux-system)" = yes
+          test "$(kubectl auth can-i get deployments -n meshr-canary)" = yes
+          test "$(kubectl auth can-i get gateways.gateway.networking.k8s.io/meshr-staging -n meshr-canary)" = yes
+          test "$(kubectl auth can-i get httproutes.gateway.networking.k8s.io/meshr-staging -n meshr-canary)" = yes
+          for attempt in $(seq 1 60); do
+            revision="$(kubectl -n flux-system get gitrepository meshr-main -o jsonpath='{.status.artifact.revision}' 2>/dev/null || true)"
+            if [ "$revision" = "canary@sha1:${GITHUB_SHA}" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              kubectl -n flux-system get gitrepository meshr-main -o yaml
+              exit 1
+            fi
+            sleep 5
+          done
+          kubectl -n flux-system create configmap meshr-canary-image-digests \
+            --from-literal="API_IMAGE=$API_IMAGE" \
+            --from-literal="EVENT_PLANE_IMAGE=$EVENT_PLANE_IMAGE" \
+            --from-literal="WEB_IMAGE=$WEB_IMAGE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          if [ -z "$MESHR_COST_PROTECTION_MODE" ]; then
+            MESHR_COST_PROTECTION_MODE="$(kubectl -n flux-system get configmap meshr-canary-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_MODE}' 2>/dev/null || true)"
+          fi
+          : "${MESHR_COST_PROTECTION_MODE:?Set MESHR_COST_PROTECTION_MODE or bootstrap meshr-canary-runtime-values before canary promotion}"
+          case "$MESHR_COST_PROTECTION_MODE" in
+            normal|protect|throttle) ;;
+            *) echo "MESHR_COST_PROTECTION_MODE must be normal, protect, or throttle" >&2; exit 1 ;;
+          esac
+          kubectl -n flux-system create configmap meshr-canary-runtime-values \
+            --from-literal="GCP_PROJECT_ID=$GCP_PROJECT_ID" \
+            --from-literal="MESHR_MODERATION_ENDPOINT=$MESHR_MODERATION_ENDPOINT" \
+            --from-literal="MESHR_COST_PROTECTION_MODE=$MESHR_COST_PROTECTION_MODE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Resume canary reconciliation for rollout verification
+        if: success()
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+        run: |
+          set -euo pipefail
+          gcloud container clusters get-credentials "$GKE_CLUSTER" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID"
+          kubectl -n flux-system patch kustomization meshr-canary \
+            --type=merge --patch='{"spec":{"suspend":false}}'
+          printf 'MESHR_CANARY_RECONCILIATION_RESUMED=true\n' >> "$GITHUB_ENV"
+      - name: Verify canary rollout and staging edge
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          MESHR_CANARY_URL: ${{ vars.MESHR_CANARY_URL }}
+          API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ steps.resolve.outputs.api }}
+          EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ steps.resolve.outputs.event_plane }}
+          WEB_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/web@${{ steps.resolve.outputs.web }}
+        run: |
+          set -euo pipefail
+          : "${MESHR_CANARY_URL:?Set protected MESHR_CANARY_URL (for example https://staging.meshr.social) before canary promotion}"
+          for attempt in $(seq 1 60); do
+            api_image="$(kubectl -n meshr-canary get deployment api-canary -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+            live_image="$(kubectl -n meshr-canary get deployment live-gateway-canary -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+            web_image="$(kubectl -n meshr-canary get deployment web-canary -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+            if [ "$api_image" = "$API_IMAGE" ] && [ "$live_image" = "$EVENT_PLANE_IMAGE" ] && [ "$web_image" = "$WEB_IMAGE" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              kubectl -n meshr-canary get deployment api-canary live-gateway-canary web-canary -o wide
+              exit 1
+            fi
+            sleep 5
+          done
+          kubectl -n meshr-canary rollout status deployment/api-canary --timeout=5m
+          kubectl -n meshr-canary rollout status deployment/live-gateway-canary --timeout=5m
+          kubectl -n meshr-canary rollout status deployment/web-canary --timeout=5m
+          kubectl -n meshr-canary rollout status deployment/ingest-canary --timeout=5m
+          kubectl -n meshr-canary rollout status deployment/topology-materializer-canary --timeout=5m
+          kubectl -n meshr-canary rollout status deployment/moderation-worker-canary --timeout=5m
+          kubectl -n meshr-canary rollout status deployment/audit-worker-canary --timeout=5m
+          kubectl -n meshr-canary rollout status deployment/notification-worker-canary --timeout=5m
+          # Require a real pre-promotion edge check. Port-forward-only green
+          # runs do not exercise TLS, Cloudflare, Cloud Armor, GKE Gateway, or
+          # the independent staging edge route.
+          kubectl -n meshr-canary wait --for=condition=Accepted gateway/meshr-staging --timeout=10m
+          kubectl -n meshr-canary wait --for=condition=Programmed gateway/meshr-staging --timeout=10m
+          for attempt in $(seq 1 120); do
+            route_accepted="$(kubectl -n meshr-canary get httproute/meshr-staging -o jsonpath='{range .status.parents[*].conditions[?(@.type=="Accepted")]}{.status}{end}' 2>/dev/null || true)"
+            route_refs="$(kubectl -n meshr-canary get httproute/meshr-staging -o jsonpath='{range .status.parents[*].conditions[?(@.type=="ResolvedRefs")]}{.status}{end}' 2>/dev/null || true)"
+            if [[ "$route_accepted" == *True* && "$route_refs" == *True* ]]; then
+              break
+            fi
+            if [ "$attempt" -eq 120 ]; then
+              kubectl -n meshr-canary get httproute/meshr-staging -o yaml
+              exit 1
+            fi
+            sleep 5
+          done
+          curl --fail --silent --show-error "${MESHR_CANARY_URL%/}/web-healthz"
+          api_log="$(mktemp)"
+          web_log="$(mktemp)"
+          live_log="$(mktemp)"
+          kubectl -n meshr-canary port-forward service/api-canary 18787:8787 >"$api_log" 2>&1 &
+          api_pid=$!
+          kubectl -n meshr-canary port-forward service/web-canary 18080:8080 >"$web_log" 2>&1 &
+          web_pid=$!
+          kubectl -n meshr-canary port-forward service/live-gateway-canary 18081:8080 >"$live_log" 2>&1 &
+          live_pid=$!
+          trap 'kill "$api_pid" "$web_pid" "$live_pid" 2>/dev/null || true; rm -f "$api_log" "$web_log" "$live_log"' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:18787/readyz; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat "$api_log"
+              exit 1
+            fi
+            sleep 2
+          done
+          for endpoint in http://127.0.0.1:18080/web-healthz http://127.0.0.1:18081/readyz; do
+            for attempt in $(seq 1 30); do
+              if curl --fail --silent --show-error "$endpoint"; then
+                break
+              fi
+              if [ "$attempt" -eq 30 ]; then
+                cat "$web_log" "$live_log"
+                exit 1
+              fi
+              sleep 2
+            done
+          done
+      - name: Restore canary reconciliation after successful promotion
+        if: success()
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MESHR_CANARY_SUSPEND_WAS+x}" ]; then exit 0; fi
+          gcloud container clusters get-credentials "$GKE_CLUSTER" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID"
+          if [ "${MESHR_CANARY_SUSPEND_WAS:-false}" = "true" ]; then
+            kubectl -n flux-system patch kustomization meshr-canary \
+              --type=merge --patch='{"spec":{"suspend":true}}'
+          else
+            kubectl -n flux-system patch kustomization meshr-canary \
+              --type=merge --patch='{"spec":{"suspend":false}}'
+          fi
+      - name: Freeze canary after failed promotion
+        if: failure()
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MESHR_CANARY_SUSPEND_WAS+x}" ]; then exit 0; fi
+          gcloud container clusters get-credentials "$GKE_CLUSTER" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID"
+          kubectl -n flux-system patch kustomization meshr-canary \
+            --type=merge --patch='{"spec":{"suspend":true}}'
+          echo 'Canary promotion failed; Flux remains suspended. Inspect the candidate and perform an explicit rollback/recovery before resuming.' >&2
+
+  promote:
+    needs: canary
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    environment: production
+    concurrency:
+      group: meshr-production-promotion
+      cancel-in-progress: false
+    # The production promotion also calls kubectl directly and therefore must
+    # use the same fixed-egress protected runner pool.
+    runs-on: [self-hosted, meshr-fixed-egress]
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: sigstore/cosign-installer@v3
+      - uses: azure/setup-kubectl@v4
+      # The promotion job is a fresh runner. Reuse the GCP workload identity
+      # credentials for Artifact Registry reads before verifying the immutable
+      # digests; the canary job's Docker credential helper is job-local.
+      - run: gcloud auth configure-docker "$REGISTRY" --quiet
+      - name: Verify signatures and update Flux image pins
+        run: |
+          set -euo pipefail
+          for pair in \
+            "api:$API_DIGEST" \
+            "event-plane:$EVENT_PLANE_DIGEST" \
+            "web:$WEB_DIGEST"; do
+            image="${pair%%:*}"
+            digest="${pair#*:}"
+            immutable="$REGISTRY/$IMAGE_REPOSITORY/$image@$digest"
+            cosign verify "$immutable" \
+              --certificate-identity='https://github.com/tflynn3/meshr/.github/workflows/ci.yml@refs/heads/main' \
               --certificate-oidc-issuer='https://token.actions.githubusercontent.com'
           done
           python3 - <<'PY'
@@ -141,15 +512,178 @@ jobs:
         env:
           REGISTRY: ${{ env.REGISTRY }}
           IMAGE_REPOSITORY: ${{ env.IMAGE_REPOSITORY }}
-          API_DIGEST: ${{ steps.resolve.outputs.api }}
-          EVENT_PLANE_DIGEST: ${{ steps.resolve.outputs.event_plane }}
-          WEB_DIGEST: ${{ steps.resolve.outputs.web }}
+          API_DIGEST: ${{ needs.canary.outputs.api_digest }}
+          EVENT_PLANE_DIGEST: ${{ needs.canary.outputs.event_plane_digest }}
+          WEB_DIGEST: ${{ needs.canary.outputs.web_digest }}
+      - name: Pause production reconciliation while promotion inputs change
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT_ID:?Set the protected GCP_PROJECT_ID repository variable}"
+          : "${GKE_CLUSTER:?Set the protected GKE_CLUSTER repository variable}"
+          : "${GKE_LOCATION:?Set the protected GKE_LOCATION repository variable}"
+          gcloud container clusters get-credentials "$GKE_CLUSTER" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID"
+          test "$(kubectl auth can-i get kustomizations.kustomize.toolkit.fluxcd.io/meshr-production -n flux-system)" = yes
+          test "$(kubectl auth can-i patch kustomizations.kustomize.toolkit.fluxcd.io/meshr-production -n flux-system)" = yes
+          was_suspended="$(kubectl -n flux-system get kustomization meshr-production -o jsonpath='{.spec.suspend}' 2>/dev/null || true)"
+          printf 'MESHR_PRODUCTION_SUSPEND_WAS=%s\n' "${was_suspended:-false}" >> "$GITHUB_ENV"
+          kubectl -n flux-system patch kustomization meshr-production \
+            --type=merge --patch='{"spec":{"suspend":true}}'
       - name: Commit verified Flux pins
+        id: release
         run: |
           set -euo pipefail
           git config user.name 'meshr-release[bot]'
           git config user.email 'meshr-release[bot]@users.noreply.github.com'
           git add deploy/production/flux/image-digests.example.yaml
-          git diff --cached --quiet && exit 0
-          git commit -m "chore(release): promote verified images [skip ci]"
-          git push origin HEAD:main
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): promote verified images [skip ci]"
+          fi
+          # Flux follows only this protected release branch. Merge the prior
+          # release ref into the current main commit before pushing so the
+          # second and later promotions are fast-forwardable from the remote
+          # branch instead of failing after the first digest-only commit.
+          if git ls-remote --exit-code --heads origin production >/dev/null 2>&1; then
+            git fetch --no-tags origin production
+            git checkout -B release-promotion HEAD
+            # Production contains only previously verified release metadata;
+            # keep the current main tree (including the freshly verified
+            # digest pins) if that metadata file conflicts.
+            git merge --no-ff -X ours --no-edit origin/production
+          else
+            git checkout -B release-promotion HEAD
+          fi
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git push origin HEAD:production
+      - name: Apply the protected Flux promotion inputs
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          MESHR_MODERATION_ENDPOINT: ${{ vars.MESHR_MODERATION_ENDPOINT }}
+          MESHR_COST_PROTECTION_MODE: ${{ vars.MESHR_COST_PROTECTION_MODE }}
+          API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ needs.canary.outputs.api_digest }}
+          EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ needs.canary.outputs.event_plane_digest }}
+          WEB_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/web@${{ needs.canary.outputs.web_digest }}
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT_ID:?Set the protected GCP_PROJECT_ID repository variable}"
+          : "${GKE_CLUSTER:?Set the protected GKE_CLUSTER repository variable}"
+          : "${GKE_LOCATION:?Set the protected GKE_LOCATION repository variable}"
+          : "${MESHR_MODERATION_ENDPOINT:?Set the protected MESHR_MODERATION_ENDPOINT repository variable to the approved Model Armor/Sensitive Data Protection adapter}"
+          gcloud container clusters get-credentials "$GKE_CLUSTER" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID"
+          test "$(kubectl auth can-i get gitrepositories.source.toolkit.fluxcd.io/meshr -n flux-system)" = yes
+          test "$(kubectl auth can-i update configmaps/meshr-production-image-digests -n flux-system)" = yes
+          test "$(kubectl auth can-i get deployments -n meshr)" = yes
+          for attempt in $(seq 1 60); do
+            revision="$(kubectl -n flux-system get gitrepository meshr -o jsonpath='{.status.artifact.revision}' 2>/dev/null || true)"
+            if [ "$revision" = "production@sha1:${{ steps.release.outputs.release_sha }}" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              kubectl -n flux-system get gitrepository meshr -o yaml
+              exit 1
+            fi
+            sleep 5
+          done
+          kubectl -n flux-system create configmap meshr-production-image-digests \
+            --from-literal="API_IMAGE=$API_IMAGE" \
+            --from-literal="EVENT_PLANE_IMAGE=$EVENT_PLANE_IMAGE" \
+            --from-literal="WEB_IMAGE=$WEB_IMAGE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          current_mode="$(kubectl -n flux-system get configmap meshr-production-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_MODE}' 2>/dev/null || true)"
+          if [ -n "$MESHR_COST_PROTECTION_MODE" ]; then
+            current_mode="$MESHR_COST_PROTECTION_MODE"
+          fi
+          : "${current_mode:?Set MESHR_COST_PROTECTION_MODE or bootstrap meshr-production-runtime-values before production promotion}"
+          case "$current_mode" in
+            normal|protect|throttle) ;;
+            *) echo "MESHR_COST_PROTECTION_MODE must be normal, protect, or throttle" >&2; exit 1 ;;
+          esac
+          kubectl -n flux-system create configmap meshr-production-runtime-values \
+            --from-literal="GCP_PROJECT_ID=$GCP_PROJECT_ID" \
+            --from-literal="MESHR_MODERATION_ENDPOINT=$MESHR_MODERATION_ENDPOINT" \
+            --from-literal="MESHR_COST_PROTECTION_MODE=$current_mode" \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Resume production reconciliation for rollout verification
+        if: success()
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MESHR_PRODUCTION_SUSPEND_WAS+x}" ]; then exit 0; fi
+          gcloud container clusters get-credentials "$GKE_CLUSTER" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID"
+          kubectl -n flux-system patch kustomization meshr-production \
+            --type=merge --patch='{"spec":{"suspend":false}}'
+          printf 'MESHR_PRODUCTION_RECONCILIATION_RESUMED=true\n' >> "$GITHUB_ENV"
+      - name: Verify production rollout
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ needs.canary.outputs.api_digest }}
+          EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ needs.canary.outputs.event_plane_digest }}
+          WEB_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/web@${{ needs.canary.outputs.web_digest }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            api_image="$(kubectl -n meshr get deployment api -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+            live_image="$(kubectl -n meshr get deployment live-gateway -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+            web_image="$(kubectl -n meshr get deployment web -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+            if [ "$api_image" = "$API_IMAGE" ] && [ "$live_image" = "$EVENT_PLANE_IMAGE" ] && [ "$web_image" = "$WEB_IMAGE" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              kubectl -n meshr get deployment api live-gateway web -o wide
+              exit 1
+            fi
+            sleep 5
+          done
+          kubectl -n meshr rollout status deployment/api --timeout=5m
+          kubectl -n meshr rollout status deployment/live-gateway --timeout=5m
+          kubectl -n meshr rollout status deployment/web --timeout=5m
+          kubectl -n meshr rollout status deployment/ingest --timeout=5m
+          kubectl -n meshr rollout status deployment/topology-materializer --timeout=5m
+          kubectl -n meshr rollout status deployment/moderation-worker --timeout=5m
+          kubectl -n meshr rollout status deployment/audit-worker --timeout=5m
+          kubectl -n meshr rollout status deployment/notification-worker --timeout=5m
+      - name: Restore production reconciliation after successful promotion
+        if: success()
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MESHR_PRODUCTION_SUSPEND_WAS+x}" ]; then exit 0; fi
+          gcloud container clusters get-credentials "$GKE_CLUSTER" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID"
+          if [ "${MESHR_PRODUCTION_SUSPEND_WAS:-false}" = "true" ]; then
+            kubectl -n flux-system patch kustomization meshr-production \
+              --type=merge --patch='{"spec":{"suspend":true}}'
+          else
+            kubectl -n flux-system patch kustomization meshr-production \
+              --type=merge --patch='{"spec":{"suspend":false}}'
+          fi
+      - name: Freeze production after failed promotion
+        if: failure()
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MESHR_PRODUCTION_SUSPEND_WAS+x}" ]; then exit 0; fi
+          gcloud container clusters get-credentials "$GKE_CLUSTER" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID"
+          kubectl -n flux-system patch kustomization meshr-production \
+            --type=merge --patch='{"spec":{"suspend":true}}'
+          echo 'Production promotion failed; Flux remains suspended. Inspect the candidate and perform an explicit rollback/recovery before resuming.' >&2

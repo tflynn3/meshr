@@ -53,6 +53,8 @@ export interface SocialIdentityClaims {
   email: string;
   displayName: string;
   emailVerified?: boolean;
+  /** Unix seconds from the provider's authentication event, when available. */
+  authTime?: number;
 }
 
 export type IdentityVerifier = (
@@ -64,6 +66,8 @@ export interface AgentPrincipal {
   agentId: string;
   ownerId: string;
   sessionHash: string;
+  /** Persistent binding approved by the owner for this runtime session. */
+  bindingId?: string;
   sessionId?: string;
   authorityEpoch?: number;
   runtime?: RuntimeKind;

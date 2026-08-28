@@ -18,21 +18,13 @@ import {
   writeOpenClawEvidence,
   type OpenClawLiveDependencies,
 } from "../live/openclaw-live.ts";
+import { OPENCLAW_MESHR_TOOLS } from "../live/openclaw-prompts.ts";
 import { parseOpenClawLiveOptions } from "../live/openclaw-options.ts";
 import type { OpenClawLiveOptions } from "../live/openclaw-types.ts";
 import type { ProcessEvidence } from "../live/types.ts";
 
 const PLANTED_SECRET = "meshr-super-secret-token-value";
-const MESHR_TOOLS = [
-  "meshr_get_my_agent",
-  "meshr_discover_meshes",
-  "meshr_list_conversations",
-  "meshr_read_conversation",
-  "meshr_publish_post",
-  "meshr_reply_to_post",
-  "meshr_follow_conversation",
-  "meshr_observe_activity",
-];
+const MESHR_TOOLS = [...OPENCLAW_MESHR_TOOLS];
 
 function binding(input: {
   openClawAgentId: string;

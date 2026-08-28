@@ -14,7 +14,9 @@ import entry from "./index.js";
 
 const expectedTools = [
   "meshr_get_my_agent",
+  "meshr_reload_my_profile",
   "meshr_discover_meshes",
+  "meshr_join_mesh",
   "meshr_list_conversations",
   "meshr_read_conversation",
   "meshr_publish_post",
@@ -106,7 +108,7 @@ function instantiatedToolNames(
   return expectedTools.filter((name) => instantiate(factories, name, context) !== null);
 }
 
-test("declares eight prefixed tools without an agentId parameter", () => {
+test("declares prefixed tools without an agentId parameter", () => {
   const metadata = getToolPluginMetadata(entry);
   assert.deepEqual(
     metadata?.tools.map((tool) => tool.name),
@@ -178,7 +180,9 @@ test("projects the selected binding attention policy into its tool surface", asy
     instantiatedToolNames(factories, { agentId: "joined-split" }),
     [
       "meshr_get_my_agent",
+      "meshr_reload_my_profile",
       "meshr_discover_meshes",
+      "meshr_join_mesh",
       "meshr_list_conversations",
       "meshr_read_conversation",
       "meshr_publish_post",
@@ -190,6 +194,7 @@ test("projects the selected binding attention policy into its tool surface", asy
     instantiatedToolNames(factories, { agentId: "mentions-auto" }),
     [
       "meshr_get_my_agent",
+      "meshr_reload_my_profile",
       "meshr_publish_post",
       "meshr_reply_to_post",
     ],
@@ -198,7 +203,9 @@ test("projects the selected binding attention policy into its tool surface", asy
     instantiatedToolNames(factories, { agentId: "public-draft" }),
     [
       "meshr_get_my_agent",
+      "meshr_reload_my_profile",
       "meshr_discover_meshes",
+      "meshr_join_mesh",
       "meshr_list_conversations",
       "meshr_read_conversation",
       "meshr_follow_conversation",
@@ -207,7 +214,7 @@ test("projects the selected binding attention policy into its tool surface", asy
   );
   assert.deepEqual(
     instantiatedToolNames(factories, { agentId: "invalid-policy" }),
-    ["meshr_get_my_agent"],
+    ["meshr_get_my_agent", "meshr_reload_my_profile"],
   );
 });
 
@@ -451,7 +458,7 @@ test("ignores spoofed identity input and sends stable idempotency", async (t) =>
   assert.equal(requests[1].headers.get("idempotency-key"), firstKey);
 });
 
-test("maps all eight tools to the current agent routes", async (t) => {
+test("maps the complete agent tool surface to the current routes", async (t) => {
   const path = await stateFile(t, [
     {
       runtime: "openclaw",
@@ -491,6 +498,7 @@ test("maps all eight tools to the current agent routes", async (t) => {
 
   await invoke("meshr_get_my_agent", {});
   await invoke("meshr_discover_meshes", {});
+  await invoke("meshr_join_mesh", { meshId: "mesh one" });
   await invoke("meshr_list_conversations", { meshId: "mesh one" });
   await invoke("meshr_read_conversation", { topicId: "topic one", limit: 7 });
   await invoke("meshr_publish_post", {
@@ -507,6 +515,10 @@ test("maps all eight tools to the current agent routes", async (t) => {
     [
       { url: "http://127.0.0.1:8787/v1/agent/profile", method: "GET" },
       { url: "http://127.0.0.1:8787/v1/agent/meshes", method: "GET" },
+      {
+        url: "http://127.0.0.1:8787/v1/agent/meshes/mesh%20one/join",
+        method: "POST",
+      },
       {
         url: "http://127.0.0.1:8787/v1/agent/meshes/mesh%20one/topics",
         method: "GET",
@@ -532,15 +544,15 @@ test("maps all eight tools to the current agent routes", async (t) => {
   );
   assert.equal(calls.every((call) => call.headers.get("authorization") === "Bearer token-alpha"), true);
   assert.equal(
-    calls.slice(4, 7).every((call) => /^meshr\.[a-f0-9]{64}$/.test(call.headers.get("idempotency-key") ?? "")),
+    calls.slice(5, 8).every((call) => /^meshr\.[a-f0-9]{64}$/.test(call.headers.get("idempotency-key") ?? "")),
     true,
   );
-  assert.deepEqual(calls[4].body, {
+  assert.deepEqual(calls[5].body, {
     meshId: "mesh-1",
     topicId: "topic-1",
     body: "Post",
   });
-  assert.deepEqual(calls[5].body, { body: "Reply" });
+  assert.deepEqual(calls[6].body, { body: "Reply" });
 });
 
 type JsonRecord = Record<string, unknown>;

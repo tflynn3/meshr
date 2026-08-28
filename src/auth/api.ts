@@ -12,6 +12,12 @@ export interface HumanSession {
   csrfToken: string;
 }
 
+export interface LinkedProvider {
+  provider: "google" | "github";
+  email: string;
+  linkedAt: string;
+}
+
 export interface OwnedAgent {
   id: string;
   ownerId: string;
@@ -78,7 +84,7 @@ export interface PublicActivityMesh {
   id: string;
   name: string;
   description: string;
-  visibility: "public";
+  visibility: "public" | "unlisted" | "private";
   joinPolicy: "open" | "approval" | "invite_only";
   memberAgentIds: string[];
   postCount: number;
@@ -121,6 +127,14 @@ export interface PublicActivitySnapshot {
   meshes: PublicActivityMesh[];
   agents: PublicActivityAgent[];
   links: PublicActivityLink[];
+}
+
+export interface ActivityPreference {
+  kind: "topic" | "link";
+  resourceId: string;
+  watching: boolean;
+  muted: boolean;
+  updatedAt: string;
 }
 
 export interface MeshTopicSummary {
@@ -327,6 +341,32 @@ export function getCurrentSession(): Promise<HumanSession> {
   return request<HumanSession>("/v1/me");
 }
 
+export function getLinkedProviders(): Promise<{ providers: LinkedProvider[] }> {
+  return request<{ providers: LinkedProvider[] }>("/v1/account/providers");
+}
+
+export function linkSocialProvider(input: {
+  provider: "google" | "github";
+  idToken: string;
+  currentProvider?: "google" | "github";
+  currentIdToken?: string;
+  csrfToken: string;
+}): Promise<{ identity: LinkedProvider }> {
+  return request<{ identity: LinkedProvider }>("/v1/account/providers/link", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Meshr-CSRF": input.csrfToken,
+    },
+    body: JSON.stringify({
+      provider: input.provider,
+      idToken: input.idToken,
+      ...(input.currentProvider ? { currentProvider: input.currentProvider } : {}),
+      ...(input.currentIdToken ? { currentIdToken: input.currentIdToken } : {}),
+    }),
+  });
+}
+
 export async function listOwnedAgents(): Promise<OwnedAgent[]> {
   const response = await request<{ agents: OwnedAgent[] }>("/v1/agents");
   return response.agents;
@@ -418,7 +458,35 @@ export async function removeMeshRole(
 }
 
 export function getPublicActivity(signal?: AbortSignal): Promise<PublicActivitySnapshot> {
-  return request<PublicActivitySnapshot>("/v1/activity/public", { signal });
+  return request<PublicActivitySnapshot>("/v1/activity/public?includeAuthorized=1", { signal });
+}
+
+export async function getActivityPreferences(signal?: AbortSignal): Promise<ActivityPreference[]> {
+  const response = await request<{ preferences: ActivityPreference[] }>(
+    "/v1/activity/preferences",
+    { signal },
+  );
+  return response.preferences;
+}
+
+export async function updateActivityPreference(
+  kind: ActivityPreference["kind"],
+  resourceId: string,
+  input: { watching?: boolean; muted?: boolean },
+  csrfToken: string,
+): Promise<ActivityPreference> {
+  const response = await request<{ preference: ActivityPreference }>(
+    `/v1/activity/preferences/${kind}/${encodeURIComponent(resourceId)}`,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Meshr-CSRF": csrfToken,
+      },
+      body: JSON.stringify(input),
+    },
+  );
+  return response.preference;
 }
 
 export function getWebMcpSession(signal?: AbortSignal): Promise<WebMcpSessionStatus> {

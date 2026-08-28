@@ -330,6 +330,73 @@ const MIGRATION_6 = `
     ON human_sessions(last_seen_at, expires_at, absolute_expires_at);
 `;
 
+// Human observation preferences are durable account state, not a browser
+// component flag. Links are intentionally free-form resources so a viewer can
+// watch a path before its next reply is materialized.
+const MIGRATION_7 = `
+  CREATE TABLE IF NOT EXISTS human_activity_preferences (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK(kind IN ('topic', 'link')),
+    resource_id TEXT NOT NULL,
+    watching INTEGER NOT NULL DEFAULT 0 CHECK(watching IN (0, 1)),
+    muted INTEGER NOT NULL DEFAULT 0 CHECK(muted IN (0, 1)),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(account_id, kind, resource_id)
+  ) WITHOUT ROWID, STRICT;
+  CREATE INDEX IF NOT EXISTS human_activity_preferences_account_idx
+    ON human_activity_preferences(account_id, updated_at);
+`;
+
+// Profile reloads can safely apply presentation and tighter policy edits from
+// the host's local definition. Identity changes and policy relaxation remain
+// durable owner-review proposals rather than being silently accepted.
+const MIGRATION_8 = `
+  CREATE TABLE IF NOT EXISTS profile_review_proposals (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    source_digest TEXT NOT NULL,
+    requested_json TEXT NOT NULL,
+    pending_fields_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'denied')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS profile_review_proposals_agent_idx
+    ON profile_review_proposals(agent_id, status, updated_at);
+`;
+
+const MIGRATION_9 = `
+  ALTER TABLE profile_review_proposals ADD COLUMN owner_account_id TEXT NOT NULL DEFAULT '';
+  ALTER TABLE profile_review_proposals ADD COLUMN resolved_at TEXT;
+  ALTER TABLE profile_review_proposals ADD COLUMN resolution TEXT CHECK(resolution IN ('approved', 'denied'));
+  UPDATE profile_review_proposals
+     SET owner_account_id = COALESCE((SELECT owner_account_id FROM agents WHERE agents.id = profile_review_proposals.agent_id), '')
+   WHERE owner_account_id = '';
+  CREATE INDEX IF NOT EXISTS profile_review_proposals_owner_idx
+    ON profile_review_proposals(owner_account_id, status, updated_at);
+`;
+
+// A human session has one page-control fence. Every page WebMCP transfer,
+// revoke, and write participates in this row so two browser tabs cannot keep
+// independent grants alive at the same time. The fence is deliberately
+// separate from per-agent authority: a human can switch between agents while
+// only the newest grant remains writable.
+const MIGRATION_10 = `
+  CREATE TABLE IF NOT EXISTS webmcp_authority (
+    human_session_hash TEXT PRIMARY KEY REFERENCES human_sessions(token_hash) ON DELETE CASCADE,
+    epoch INTEGER NOT NULL,
+    grant_id TEXT,
+    agent_id TEXT,
+    session_id TEXT,
+    updated_at TEXT NOT NULL,
+    revoked_at TEXT
+  ) WITHOUT ROWID, STRICT;
+  CREATE INDEX IF NOT EXISTS webmcp_authority_grant_idx
+    ON webmcp_authority(grant_id, epoch, revoked_at);
+`;
+
+export const CURRENT_SCHEMA_VERSION = 10;
+
 export interface MeshrDatabaseOptions {
   path: string;
   clock?: Clock;
@@ -458,6 +525,54 @@ export class MeshrDatabase {
         this.sqlite.exec(MIGRATION_6);
         this.sqlite
           .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(6, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration7 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 7")
+      .get() as { applied: number } | undefined;
+    if (!migration7) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_7);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(7, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration8 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 8")
+      .get() as { applied: number } | undefined;
+    if (!migration8) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_8);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(8, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration9 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 9")
+      .get() as { applied: number } | undefined;
+    if (!migration9) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_9);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(9, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration10 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 10")
+      .get() as { applied: number } | undefined;
+    if (!migration10) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_10);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(10, ?)")
           .run(this.now());
       });
     }

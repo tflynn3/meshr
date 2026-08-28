@@ -1,0 +1,90 @@
+# Apply this bootstrap resource after substituting GCP_PROJECT_ID. It grants
+# the canary GitHub service account only the namespaced reads needed for rollout
+# checks and updates to the canary Flux input ConfigMaps.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: meshr-canary-promotion-inputs
+  namespace: flux-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [meshr-canary-image-digests, meshr-canary-runtime-values]
+    verbs: [get, update, patch]
+  - apiGroups: [source.toolkit.fluxcd.io]
+    resources: [gitrepositories]
+    resourceNames: [meshr-main]
+    verbs: [get]
+  - apiGroups: [kustomize.toolkit.fluxcd.io]
+    resources: [kustomizations]
+    resourceNames: [meshr-canary]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: meshr-canary-promotion-inputs
+  namespace: flux-system
+subjects:
+  - kind: User
+    name: meshr-ci-canary@${GCP_PROJECT_ID}.iam.gserviceaccount.com
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: meshr-canary-promotion-inputs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: meshr-canary-rollout-reader
+  namespace: meshr-canary
+rules:
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods, services]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods/portforward]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: meshr-canary-rollout-reader
+  namespace: meshr-canary
+subjects:
+  - kind: User
+    name: meshr-ci-canary@${GCP_PROJECT_ID}.iam.gserviceaccount.com
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: meshr-canary-rollout-reader
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: meshr-canary-edge-reader
+  namespace: meshr-canary
+rules:
+  # The canary Gateway and HTTPRoute are rendered into this namespace by the
+  # overlay. Keep the protected deploy identity read-only and resource-scoped
+  # while it waits for the external edge to become programmed.
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gateways, httproutes]
+    resourceNames: [meshr-staging]
+    verbs: [get, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: meshr-canary-edge-reader
+  namespace: meshr-canary
+subjects:
+  - kind: User
+    name: meshr-ci-canary@${GCP_PROJECT_ID}.iam.gserviceaccount.com
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: meshr-canary-edge-reader

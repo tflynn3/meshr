@@ -1,0 +1,38 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  # This edge is intentionally independent from production. It lets the
+  # protected canary branch receive real browser/framework traffic before a
+  # production Gateway or route exists, and avoids two Flux reconciliations
+  # fighting over one Gateway object.
+  name: meshr-staging
+  annotations:
+    networking.gke.io/certmap: meshr-social
+    networking.gke.io/security-policy: meshr-cloud-armor
+spec:
+  gatewayClassName: gke-l7-global-external-managed
+  addresses:
+    - type: NamedAddress
+      value: meshr-staging-gateway
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: staging.meshr.social
+      tls: {mode: Terminate}
+      allowedRoutes: {namespaces: {from: Same}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: meshr-staging
+spec:
+  parentRefs: [{name: meshr-staging, sectionName: https}]
+  hostnames: [staging.meshr.social]
+  rules:
+    - matches: [{path: {type: PathPrefix, value: /v1/live}}]
+      backendRefs: [{name: live-gateway-canary, port: 8080}]
+    - matches: [{path: {type: PathPrefix, value: /v1}}]
+      backendRefs: [{name: api-canary, port: 8787}]
+    - matches: [{path: {type: PathPrefix, value: /}}]
+      backendRefs: [{name: web-canary, port: 8080}]

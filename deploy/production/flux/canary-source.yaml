@@ -1,0 +1,12 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: meshr-main
+  namespace: flux-system
+spec:
+  interval: 1m
+  url: https://github.com/tflynn3/meshr.git
+  ref:
+    # The canary promotion job advances this branch only after verify/build /
+    # signature checks. It is never a live mirror of unverified main.
+    branch: canary

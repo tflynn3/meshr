@@ -8,9 +8,14 @@ data:
   MESHR_SOCIAL_AUTH_ONLY: "1"
   MESHR_SECURE_COOKIES: "1"
   MESHR_WEBMCP_SESSION_TRANSFER: "1"
-  # Set to protect during a projected 95% budget burn; set to throttle after
-  # session/mesh creation is paused. Normal is the launch default.
-  MESHR_COST_PROTECTION_MODE: normal
+  MESHR_FIRESTORE_DATABASE: "(default)"
+  # The live gateway and topology materializer use this aggregate-only
+  # database. It must not be the authoritative default database.
+  MESHR_TOPOLOGY_FIRESTORE_DATABASE: meshr-projections
+  # Flux substitutes this from the protected runtime-values ConfigMap. Keep
+  # the rendered value in the API pod template so a mode change rolls the
+  # replicas instead of relying on envFrom's non-restarting semantics.
+  MESHR_COST_PROTECTION_MODE: ${MESHR_COST_PROTECTION_MODE}
   MESHR_HOST: 0.0.0.0
   MESHR_WEB_URL: https://meshr.social/
   MESHR_API_URL: http://api.meshr.svc.cluster.local:8787
@@ -22,19 +27,19 @@ data:
   MESHR_MODERATION_SUBSCRIPTION: moderation-worker
   MESHR_AUDIT_SUBSCRIPTION: audit-worker
   MESHR_NOTIFICATIONS_SUBSCRIPTION: notification-worker
+  # The moderation worker refuses to start until the approved Model Armor /
+  # Sensitive Data Protection adapter URL is supplied through protected Flux
+  # runtime values. There is no silent production no-op.
+  MESHR_MODERATION_REQUIRED: "1"
+  MESHR_MODERATION_ENDPOINT: ${MESHR_MODERATION_ENDPOINT}
   MESHR_DEAD_LETTER_TOPIC: mesh-events-dlq
-  MESHR_ALLOWED_ORIGINS: https://meshr.social,https://staging.meshr.social
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: meshr-runtime
-type: Opaque
-stringData:
-  MESHR_INTERNAL_TOKEN: REPLACE_FROM_SECRET_MANAGER
+  MESHR_ALLOWED_ORIGINS: https://meshr.social
+  # Per-pod and per-credential WebSocket ceilings keep one account or source
+  # address from exhausting gateway/API capacity before Cloud Armor limits.
+  MESHR_LIVE_MAX_CLIENTS: "512"
+  MESHR_LIVE_MAX_CONNECTIONS_PER_CREDENTIAL: "8"
+  MESHR_LIVE_MAX_CONNECTIONS_PER_IP: "64"
+  MESHR_LIVE_AUTH_RECHECK_MS: "60000"
   MESHR_IDENTITY_PROJECT_ID: ${GCP_PROJECT_ID}
-  # Web API key emitted by the Identity Platform API-key resource. The
-  # release process injects the value from Secret Manager; never commit it.
-  MESHR_IDENTITY_API_KEY: REPLACE_FROM_SECRET_MANAGER
   MESHR_IDENTITY_AUTH_DOMAIN: ${GCP_PROJECT_ID}.firebaseapp.com
   MESHR_EVENT_INGEST_URL: http://ingest.meshr.svc.cluster.local:8080

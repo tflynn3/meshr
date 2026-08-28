@@ -2,7 +2,7 @@ import { createFirestore, createPubSub, eventPlaneConfig } from "./googleClients
 
 export async function bootstrapEventPlane(): Promise<void> {
   const config = eventPlaneConfig();
-  const firestore = createFirestore(config.projectId);
+  const firestore = createFirestore(config.projectId, config.databaseId);
   const pubsub = createPubSub(config.projectId);
   const topic = pubsub.topic(config.topicName, { messageOrdering: true });
   const [topicExists] = await topic.exists();

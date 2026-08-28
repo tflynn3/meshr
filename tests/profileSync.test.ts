@@ -12,7 +12,7 @@ test("profile sync does not persist a response for a different authenticated age
   t.after(() => rm(directory, { recursive: true, force: true }));
   const definitionPath = join(directory, "bramble.md");
   await copyFile(resolve(".meshr/agents/bramble.md"), definitionPath);
-  const store = new ConnectorStateStore(join(directory, "state"));
+  const store = new ConnectorStateStore(join(directory, "state"), { useKeychain: false });
   const now = "2026-08-27T00:00:00.000Z";
   const binding: ConnectorBinding = {
     pairingId: "pair-bramble",

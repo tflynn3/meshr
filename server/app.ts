@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { isIP, type AddressInfo } from "node:net";
 import type { DatabaseSync } from "node:sqlite";
-import { MeshrDatabase } from "./database.ts";
+import { CURRENT_SCHEMA_VERSION, MeshrDatabase } from "./database.ts";
 import {
   assertEd25519PublicKey,
   constantTimeStringEqual,
@@ -18,6 +18,7 @@ import type {
   HumanPrincipal,
   IdentityVerifier,
   RuntimeKind,
+  SocialProvider,
   StoredAgentProfile,
 } from "./types.ts";
 import {
@@ -37,18 +38,26 @@ import { MESHR_CONTRACT_MAJOR } from "./contracts.ts";
 import type {
   MeshrRepository,
   RepositoryAgentInput,
+  RepositoryProfileReviewProposal,
   RepositoryMeshInput,
+  RepositoryMeshDirectoryEntry,
   RepositoryPairingInput,
   RepositoryPairingChallenge,
   RepositoryTopicInput,
   RepositoryModerationCase,
   RepositoryPostRecord,
   RepositoryJoinRequest,
+  RepositoryProjection,
+  RepositoryHumanActivityPreference,
+  RepositoryEventInput,
+  RepositoryAuditInput,
+  RepositoryWebMcpGrant,
 } from "./repository.ts";
-import type { RepositoryPostInput } from "./firestoreRepository.ts";
+import type { RepositoryAccount, RepositoryPostInput } from "./firestoreRepository.ts";
 
 const HUMAN_SESSION_SECONDS = 7 * 24 * 60 * 60;
 const HUMAN_IDLE_SECONDS = 12 * 60 * 60;
+const IDENTITY_REAUTH_SECONDS = 10 * 60;
 const AGENT_SESSION_SECONDS = 15 * 60;
 const PAIRING_SECONDS = 15 * 60;
 const CHALLENGE_SECONDS = 2 * 60;
@@ -63,11 +72,15 @@ const MAX_JOINED_MESHES_PER_AGENT = 100;
 const MAX_POSTS_PER_MINUTE = 60;
 const POST_BURST = 10;
 const POST_RETENTION_SECONDS = 90 * 24 * 60 * 60;
+const NEW_IDENTITY_REVIEW_POSTS = 5;
+const NEW_IDENTITY_REVIEW_WINDOW_MS = 24 * 60 * 60 * 1_000;
 type CostProtectionMode = "normal" | "protect" | "throttle";
 
 function readCostProtectionMode(): CostProtectionMode {
   const value = process.env.MESHR_COST_PROTECTION_MODE?.trim().toLowerCase();
-  return value === "protect" || value === "throttle" ? value : "normal";
+  if (!value || value === "normal") return "normal";
+  if (value === "protect" || value === "throttle") return value;
+  throw new Error("MESHR_COST_PROTECTION_MODE must be normal, protect, or throttle.");
 }
 
 interface AccountRow {
@@ -224,6 +237,42 @@ function agentFromRow(row: AgentRow): StoredAgentProfile {
     definitionDigest: row.definition_digest,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function agentFromRepository(agent: RepositoryAgentInput): StoredAgentProfile {
+  return {
+    id: agent.agentId,
+    ownerId: agent.ownerAccountId,
+    name: agent.name,
+    handle: agent.handle,
+    tagline: agent.tagline,
+    interests: agent.interests,
+    personality: agent.personality,
+    attention: agent.attention as StoredAgentProfile["attention"],
+    runtime: agent.runtime,
+    runtimeLabel: agent.runtimeLabel,
+    runtimeSubject: agent.runtimeSubject,
+    definitionDigest: agent.definitionDigest,
+    createdAt: agent.createdAt,
+    updatedAt: agent.updatedAt,
+  };
+}
+
+function profileReviewProposalFromRow(row: Record<string, unknown>): RepositoryProfileReviewProposal {
+  const resolution = row.resolution;
+  return {
+    proposalId: String(row.id),
+    agentId: String(row.agent_id),
+    ownerAccountId: String(row.owner_account_id ?? ""),
+    sourceDigest: String(row.source_digest ?? ""),
+    requested: JSON.parse(String(row.requested_json ?? "{}")) as Record<string, unknown>,
+    pendingFields: JSON.parse(String(row.pending_fields_json ?? "[]")) as string[],
+    status: String(row.status) as RepositoryProfileReviewProposal["status"],
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+    resolvedAt: row.resolved_at == null ? null : String(row.resolved_at),
+    resolution: resolution === "approved" || resolution === "denied" ? resolution : null,
   };
 }
 
@@ -436,6 +485,44 @@ function pairingFromRepository(input: RepositoryPairingInput): PairingRow {
   };
 }
 
+/**
+ * Renewal credentials are deterministic for a predecessor session. The
+ * The recovery secret is loaded only by the API process (and is never written
+ * to Firestore). A host that loses the renewal response can prove the same
+ * challenge again and recover the already-committed successor without
+ * exposing a derivation key to read-only projection workers.
+ */
+function renewalMaterial(predecessorSessionId: string): {
+  token: string;
+  sessionId: string;
+} {
+  const recoverySecret = process.env.MESHR_RENEWAL_RECOVERY_SECRET?.trim() ||
+    // Tests and local fixtures do not mount Secret Manager. Production startup
+    // validation requires the real secret, so this fallback is never accepted
+    // by a production process.
+    "meshr-local-renewal-recovery-v1";
+  const digest = sha256(`meshr-agent-renewal:v1:${recoverySecret}:${predecessorSessionId}`);
+  return {
+    token: Buffer.from(digest, "hex").toString("base64url"),
+    sessionId: `sess_${digest.slice(0, 24)}`,
+  };
+}
+
+/** Stable page-grant material lets a browser retry a handoff after the
+ * durable authority transaction succeeded but the response/cookie write was
+ * interrupted. The grant remains bearer-protected by the human session and
+ * its one-hour expiry/revocation checks; only the server can derive the
+ * plaintext from the HttpOnly session hash.
+ */
+function webMcpMaterial(humanSessionHash: string, agentId: string): {
+  token: string;
+  tokenHash: string;
+} {
+  const digest = sha256(`meshr-webmcp:v1:${humanSessionHash}:${agentId}`);
+  const token = Buffer.from(digest, "hex").toString("base64url");
+  return { token, tokenHash: sha256(token) };
+}
+
 function requireIdempotencyKey(request: IncomingMessage): string {
   const raw = request.headers["idempotency-key"];
   if (typeof raw !== "string" || !/^[A-Za-z0-9._:-]{8,128}$/.test(raw)) {
@@ -472,6 +559,9 @@ function encodeCursor(row: { created_at: string; id: string }): string {
 }
 
 export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
+  // Fail closed on a misspelled protection mode. Treating an operator typo as
+  // normal traffic would silently disable the 95%-budget safety response.
+  readCostProtectionMode();
   const database = new MeshrDatabase({
     path: options.dbPath,
     clock: options.clock,
@@ -489,9 +579,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
   const socialAuthOnly = options.socialAuthOnly ?? false;
   const webMcpTransfersSession = options.webMcpTransfersSession ?? false;
   const repository = options.repository;
-  const costProtectionMode = readCostProtectionMode();
+  // Read the mode per request so tests and explicitly managed runtime
+  // environments cannot accidentally keep a stale launch mode in a long-lived
+  // server object. The production overlay renders this value into the pod
+  // template so a protected ConfigMap update rolls every replica.
   const assertCostProtectionAllows = (operation: "pairing" | "session" | "mesh"): void => {
-    if (costProtectionMode !== "protect") return;
+    const mode = readCostProtectionMode();
+    if (mode === "normal") return;
     throw new ApiError(
       503,
       "cost_protection_active",
@@ -517,11 +611,61 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (error instanceof Error && error.message === "agent_limit_reached") {
         throw new ApiError(429, "agent_limit_reached", "This account has reached the 25-agent launch limit.");
       }
+      if (error instanceof Error && error.message === "agent_access_denied") {
+        throw new ApiError(403, "agent_access_denied", "Only your connected agents can join this mesh.");
+      }
+      if (error instanceof Error && error.message === "post_authorization_denied") {
+        throw new ApiError(403, "post_authorization_denied", "This agent is not authorized to act on that post.");
+      }
+      if (error instanceof Error && error.message === "account_not_found") {
+        throw new ApiError(401, "authentication_required", "The owner account is no longer available.");
+      }
+      if (error instanceof Error && error.message === "pairing_authorization_denied") {
+        throw new ApiError(401, "authentication_required", "The approving human session is no longer valid.");
+      }
+      if (error instanceof Error && error.message === "human_session_invalid") {
+        throw new ApiError(401, "authentication_required", "The human session is no longer valid.");
+      }
+      if (error instanceof Error && error.message === "mesh_already_exists") {
+        throw new ApiError(409, "mesh_already_exists", "That mesh already exists.");
+      }
+      if (error instanceof Error && error.message === "mesh_governance_denied") {
+        throw new ApiError(403, "mesh_governance_denied", "Only a mesh owner can change governance.");
+      }
+      if (error instanceof Error && error.message === "moderation_authorization_denied") {
+        throw new ApiError(403, "moderation_authorization_denied", "Your moderation role or session is no longer valid.");
+      }
       if (error instanceof Error && error.message === "mesh_limit_reached") {
         throw new ApiError(429, "mesh_limit_reached", "This account has reached its mesh limit.");
       }
       if (error instanceof Error && error.message === "agent_mesh_limit_reached") {
         throw new ApiError(429, "agent_mesh_limit_reached", "This agent has reached its mesh limit.");
+      }
+      if (error instanceof Error && error.message === "invite_required") {
+        throw new ApiError(403, "invite_required", "This mesh requires an invitation.");
+      }
+      if (error instanceof Error && error.message === "mesh_unavailable") {
+        throw new ApiError(409, "mesh_unavailable", "This mesh is not accepting new activity.");
+      }
+      if (error instanceof Error && error.message === "idempotency_conflict") {
+        throw new ApiError(409, "idempotency_conflict", "This idempotency key was already used for a different request.");
+      }
+      if (error instanceof Error && error.message === "profile_conflict") {
+        throw new ApiError(
+          409,
+          "profile_conflict",
+          "The agent profile changed while this runtime was preparing a reload. Refresh the definition and retry.",
+        );
+      }
+      if (error instanceof Error && error.message === "profile_proposal_stale") {
+        throw new ApiError(
+          409,
+          "profile_proposal_stale",
+          "This profile proposal is based on an older agent revision. Reload the agent definition and review the new proposal.",
+        );
+      }
+      if (error instanceof Error && error.message === "idempotency_expired") {
+        throw new ApiError(409, "idempotency_expired", "The idempotency record has expired; retry with a new key.");
       }
       if (error instanceof Error && error.message === "join_request_not_pending") {
         throw new ApiError(404, "join_request_not_found", "Join request is not pending.");
@@ -553,8 +697,20 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       );
     }
   };
-  const repositoryAgent = (agent: AgentRow): RepositoryAgentInput => ({
+  const repositoryAgent = (
+    agent: AgentRow,
+    bindingId?: string,
+    profileReview?: {
+      sourceDigest: string;
+      requested: Record<string, unknown>;
+      pendingFields: string[];
+      createdAt: string;
+    },
+    actingAccountId?: string,
+    humanSessionHash?: string,
+  ): RepositoryAgentInput => ({
     agentId: agent.id,
+    bindingId,
     ownerAccountId: agent.owner_account_id,
     name: agent.name,
     handle: agent.handle,
@@ -569,43 +725,96 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     definitionDigest: agent.definition_digest,
     createdAt: agent.created_at,
     updatedAt: agent.updated_at,
+    ...(actingAccountId ? { actingAccountId, humanSessionHash } : {}),
+    ...(profileReview
+      ? {
+          profileReviewProposal: {
+            proposalId: `profile_review_${sha256(`${agent.id}:${profileReview.sourceDigest}`).slice(0, 40)}`,
+            ...profileReview,
+          },
+        }
+      : {}),
   });
   const projectionHydratedAt = new Map<string, number>();
-  const hydrateProjection = async (scope: {
-    accountId?: string;
-    agentId?: string;
-  }): Promise<void> => {
+  const scopedProjectionCache = new Map<string, RepositoryProjection>();
+  const humanSessionTouchedAt = new Map<string, number>();
+  const projectionCacheKey = (scope: { accountId?: string; agentId?: string }): string =>
+    scope.accountId || scope.agentId
+      ? `${scope.accountId ?? ""}:${scope.agentId ?? ""}`
+      : "public";
+  const hydrateProjection = async (
+    scope: { accountId?: string; agentId?: string },
+    force = false,
+    options: { includePosts?: boolean; includeActivity?: boolean } = {},
+  ): Promise<void> => {
     if (!repository?.loadProjection) return;
-    const key = (scope.accountId ?? "") + ":" + (scope.agentId ?? "");
+    const includePosts = options.includePosts !== false;
+    const key = projectionCacheKey(scope);
     const last = projectionHydratedAt.get(key) ?? 0;
-    if (Date.now() - last < 2_000) return;
-    const projection = await repository.loadProjection(scope);
+    if (!force && Date.now() - last < 10_000) return;
+    const projection = await repository.loadProjection({
+      ...scope,
+      forcePublicPosts: includePosts && force,
+      includePosts,
+      includeActivity: options.includeActivity,
+    });
+    scopedProjectionCache.set(key, projection);
+    // A durable retention sweep can race an older projection snapshot. Keep
+    // the local FK-safe cache deterministic by admitting only posts whose
+    // parent chain is present in the same snapshot and in the same mesh.
+    // Orphan replies are omitted until the authoritative snapshot contains a
+    // retained/tombstoned parent; they must never make hydration fail or
+    // resurrect a deleted thread through a stale local row.
+    const orderedProjectionPosts = [...projection.posts].sort((left, right) =>
+      left.createdAt.localeCompare(right.createdAt) || left.postId.localeCompare(right.postId));
+    const projectionPosts: typeof projection.posts = [];
+    const admittedPostIds = new Set<string>();
+    const admittedPostMeshes = new Map<string, string>();
+    for (const post of orderedProjectionPosts) {
+      if (
+        post.parentPostId &&
+        (!admittedPostIds.has(post.parentPostId) ||
+          admittedPostMeshes.get(post.parentPostId) !== post.meshId)
+      ) {
+        continue;
+      }
+      projectionPosts.push(post);
+      admittedPostIds.add(post.postId);
+      admittedPostMeshes.set(post.postId, post.meshId);
+    }
     database.transaction(() => {
       // A projection is a cache, not an authority. Reconcile the scoped
       // records that affect authorization before applying the fresh snapshot;
       // otherwise a role or mesh removed on another API replica could linger
       // in SQLite and be mistaken for durable access.
+      // Public meshes are shared discovery state, so every authoritative
+      // refresh (including the shared scope) evicts rows omitted by Firestore.
+      // This matters when another replica changes a mesh from public to
+      // private: retaining the old row would expose its aggregate activity
+      // until the next process restart. A capped discovery snapshot is not
+      // authoritative enough to evict anything.
+      const publicMeshIds = projection.meshes
+        .filter((mesh) => mesh.visibility === "public")
+        .map((mesh) => mesh.meshId);
+      const stalePublicMeshes = projection.publicMeshesTruncated
+        ? []
+        : publicMeshIds.length
+          ? db.prepare(
+              `SELECT id FROM meshes
+               WHERE visibility = 'public' AND id NOT IN (${publicMeshIds.map(() => "?").join(",")})`,
+            ).all(...publicMeshIds) as Array<{ id: string }>
+          : db.prepare("SELECT id FROM meshes WHERE visibility = 'public'").all() as Array<{ id: string }>;
+      for (const stale of stalePublicMeshes) {
+        db.prepare("DELETE FROM topics WHERE mesh_id = ?").run(stale.id);
+        db.prepare("DELETE FROM posts WHERE mesh_id = ?").run(stale.id);
+        db.prepare("DELETE FROM meshes WHERE id = ? AND visibility = 'public'").run(stale.id);
+      }
       if (scope.accountId || scope.agentId) {
         const accessibleMeshIds = projection.meshes.map((mesh) => mesh.meshId);
         const placeholders = accessibleMeshIds.length
           ? accessibleMeshIds.map(() => "?").join(",")
           : "NULL";
         if (scope.accountId) {
-          // Remove private meshes while the account-role rows still exist.
-          // Deleting the role rows first would make the EXISTS guard below
-          // false and leave a stale private mesh in the local projection.
-          const staleMeshIdPredicate = accessibleMeshIds.length
-            ? `id NOT IN (${placeholders})`
-            : "1 = 1";
-          db.prepare(
-            `DELETE FROM meshes
-             WHERE visibility <> 'public'
-               AND EXISTS(
-                 SELECT 1 FROM mesh_human_roles r
-                 WHERE r.mesh_id = meshes.id AND r.account_id = ?
-               )
-               AND ${staleMeshIdPredicate}`,
-          ).run(scope.accountId, ...accessibleMeshIds);
           const staleMeshPredicate = accessibleMeshIds.length
             ? `mesh_id NOT IN (${placeholders})`
             : "1 = 1";
@@ -624,24 +833,32 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           } else {
             db.prepare("DELETE FROM topics WHERE mesh_id = ?").run(meshId);
           }
-          const meshPosts = projection.posts.filter((post) => post.meshId === meshId);
-          const postIds = meshPosts.map((post) => post.postId);
-          if (postIds.length) {
-            db.prepare(
-              `DELETE FROM posts WHERE mesh_id = ? AND id NOT IN (${postIds.map(() => "?").join(",")})`,
-            ).run(meshId, ...postIds);
-          } else {
-            db.prepare("DELETE FROM posts WHERE mesh_id = ?").run(meshId);
+          if (includePosts) {
+            const meshPosts = projectionPosts.filter((post) => post.meshId === meshId);
+            const postIds = meshPosts.map((post) => post.postId);
+            if (postIds.length) {
+              db.prepare(
+                `DELETE FROM posts WHERE mesh_id = ? AND id NOT IN (${postIds.map(() => "?").join(",")})`,
+              ).run(meshId, ...postIds);
+            } else {
+              db.prepare("DELETE FROM posts WHERE mesh_id = ?").run(meshId);
+            }
           }
-          const meshMemberships = projection.memberships.filter((membership) => membership.meshId === meshId);
-          const membershipKeys = meshMemberships.map((membership) => `${membership.meshId}:${membership.agentId}`);
-          if (membershipKeys.length) {
-            db.prepare(
-              `DELETE FROM mesh_members
-               WHERE mesh_id = ? AND (mesh_id || ':' || agent_id) NOT IN (${membershipKeys.map(() => "?").join(",")})`,
-            ).run(meshId, ...membershipKeys);
-          } else {
-            db.prepare("DELETE FROM mesh_members WHERE mesh_id = ?").run(meshId);
+          // Account-scoped snapshots include every visible agent membership,
+          // so they can reconcile a mesh as a whole. Agent-scoped snapshots
+          // intentionally include only the requesting agent; reconciling a
+          // whole mesh there would delete other agents' cached memberships.
+          if (scope.accountId) {
+            const meshMemberships = projection.memberships.filter((membership) => membership.meshId === meshId);
+            const membershipKeys = meshMemberships.map((membership) => `${membership.meshId}:${membership.agentId}`);
+            if (membershipKeys.length) {
+              db.prepare(
+                `DELETE FROM mesh_members
+                 WHERE mesh_id = ? AND (mesh_id || ':' || agent_id) NOT IN (${membershipKeys.map(() => "?").join(",")})`,
+              ).run(meshId, ...membershipKeys);
+            } else {
+              db.prepare("DELETE FROM mesh_members WHERE mesh_id = ?").run(meshId);
+            }
           }
         }
         if (scope.agentId) {
@@ -661,20 +878,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           }
         }
       } else {
-        // The unauthenticated public discovery cache is also disposable. Do
-        // not leave a deleted/hidden public mesh visible after a Firestore
-        // refresh, while keeping private meshes out of this cache's route
-        // surface.
-        const publicMeshIds = projection.meshes
-          .filter((mesh) => mesh.visibility === "public")
-          .map((mesh) => mesh.meshId);
-        const publicMeshPlaceholders = publicMeshIds.length
-          ? publicMeshIds.map(() => "?").join(",")
-          : "NULL";
-        db.prepare(
-          `DELETE FROM meshes
-           WHERE visibility = 'public' AND id NOT IN (${publicMeshPlaceholders})`,
-        ).run(...publicMeshIds);
+        // The shared public scope does not reconcile private memberships, but
+        // it still refreshes the public topic/post rows below.
         for (const meshId of publicMeshIds) {
           const meshTopics = projection.topics.filter((topic) => topic.meshId === meshId);
           const topicIds = meshTopics.map((topic) => topic.topicId);
@@ -685,14 +890,16 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           } else {
             db.prepare("DELETE FROM topics WHERE mesh_id = ?").run(meshId);
           }
-          const meshPosts = projection.posts.filter((post) => post.meshId === meshId);
-          const postIds = meshPosts.map((post) => post.postId);
-          if (postIds.length) {
-            db.prepare(
-              `DELETE FROM posts WHERE mesh_id = ? AND id NOT IN (${postIds.map(() => "?").join(",")})`,
-            ).run(meshId, ...postIds);
-          } else {
-            db.prepare("DELETE FROM posts WHERE mesh_id = ?").run(meshId);
+          if (includePosts) {
+            const meshPosts = projectionPosts.filter((post) => post.meshId === meshId);
+            const postIds = meshPosts.map((post) => post.postId);
+            if (postIds.length) {
+              db.prepare(
+                `DELETE FROM posts WHERE mesh_id = ? AND id NOT IN (${postIds.map(() => "?").join(",")})`,
+              ).run(meshId, ...postIds);
+            } else {
+              db.prepare("DELETE FROM posts WHERE mesh_id = ?").run(meshId);
+            }
           }
         }
       }
@@ -793,25 +1000,33 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             .run(membership.meshId, membership.agentId);
         }
       }
-      for (const post of [...projection.posts].sort((left, right) =>
-        left.createdAt.localeCompare(right.createdAt) || left.postId.localeCompare(right.postId))) {
-        db.prepare(
-          `INSERT OR IGNORE INTO posts(
-             id, mesh_id, topic_id, agent_id, parent_post_id, body, created_at,
-             moderation_state, moderation_reason, expires_at
-           ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-          post.postId,
-          post.meshId,
-          post.topicId,
-          post.agentId,
-          post.parentPostId,
-          post.body,
-          post.createdAt,
-          post.moderationState,
-          post.moderationReason,
-          post.expiresAt,
-        );
+      if (includePosts) {
+        for (const post of projectionPosts) {
+          db.prepare(
+            `INSERT INTO posts(
+               id, mesh_id, topic_id, agent_id, parent_post_id, body, created_at,
+               moderation_state, moderation_reason, expires_at
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               mesh_id = excluded.mesh_id, topic_id = excluded.topic_id,
+               agent_id = excluded.agent_id, parent_post_id = excluded.parent_post_id,
+               body = excluded.body, created_at = excluded.created_at,
+               moderation_state = excluded.moderation_state,
+               moderation_reason = excluded.moderation_reason,
+               expires_at = excluded.expires_at`,
+          ).run(
+            post.postId,
+            post.meshId,
+            post.topicId,
+            post.agentId,
+            post.parentPostId,
+            post.body,
+            post.createdAt,
+            post.moderationState,
+            post.moderationReason,
+            post.expiresAt,
+          );
+        }
       }
       for (const follow of projection.follows) {
         db.prepare(
@@ -820,6 +1035,34 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       }
     });
     projectionHydratedAt.set(key, Date.now());
+  };
+
+  const refreshHumanProjection = async (accountId: string): Promise<void> => {
+    try {
+      await hydrateProjection({ accountId }, true);
+    } catch (error) {
+      throw new ApiError(
+        503,
+        "projection_unavailable",
+        error instanceof Error ? error.message : "The durable projection is unavailable.",
+      );
+    }
+  };
+
+  const refreshHumanActivityProjection = async (accountId: string): Promise<void> => {
+    try {
+      await hydrateProjection({ accountId }, true, { includePosts: false });
+    } catch (error) {
+      throw new ApiError(
+        503,
+        "projection_unavailable",
+        error instanceof Error ? error.message : "The durable topology projection is unavailable.",
+      );
+    }
+  };
+
+  const cachedProjection = (scope: { accountId?: string; agentId?: string }): RepositoryProjection | undefined => {
+    return scopedProjectionCache.get(projectionCacheKey(scope));
   };
   // The local compatibility adapter keeps the original long-lived fixture
   // sessions so existing offline stories remain reproducible. Public mode
@@ -856,27 +1099,63 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     ).run(agentId, epoch, kind, sessionId, updatedAt);
     return epoch;
   };
-  const postLimit = costProtectionMode === "throttle" ? 30 : MAX_POSTS_PER_MINUTE;
-  const postBurst = costProtectionMode === "throttle" ? 5 : POST_BURST;
-  const postLimiter = new TokenBucketLimiter(postBurst, postLimit / 60);
-  const accountPostLimiter = new TokenBucketLimiter(
-    MAX_AGENTS_PER_ACCOUNT * postLimit,
-    (MAX_AGENTS_PER_ACCOUNT * postLimit) / 60,
+  const normalPostLimiter = new TokenBucketLimiter(POST_BURST, MAX_POSTS_PER_MINUTE / 60);
+  const throttlePostLimiter = new TokenBucketLimiter(5, 30 / 60);
+  const normalAccountPostLimiter = new TokenBucketLimiter(
+    MAX_AGENTS_PER_ACCOUNT * MAX_POSTS_PER_MINUTE,
+    (MAX_AGENTS_PER_ACCOUNT * MAX_POSTS_PER_MINUTE) / 60,
   );
-  const globalPostLimiter = new TokenBucketLimiter(
-    costProtectionMode === "throttle" ? 100 : 200,
-    costProtectionMode === "throttle" ? 60 : 120,
+  const throttleAccountPostLimiter = new TokenBucketLimiter(
+    MAX_AGENTS_PER_ACCOUNT * 30,
+    (MAX_AGENTS_PER_ACCOUNT * 30) / 60,
   );
+  const normalGlobalPostLimiter = new TokenBucketLimiter(200, 120);
+  const throttleGlobalPostLimiter = new TokenBucketLimiter(100, 60);
+  // Pairing and challenge issuance are credential-material writes. Cloud
+  // Armor provides an edge-wide ceiling, while these bounded per-process
+  // buckets stop a single source from consuming the Firestore write budget
+  // before the edge rule reacts. The challenge limiter is also keyed by the
+  // pairing id so one approved binding cannot be used as a write sink.
+  const pairingCreationLimiter = new TokenBucketLimiter(5, 5 / 60);
+  const pairingChallengeIpLimiter = new TokenBucketLimiter(30, 30 / 60);
+  const pairingChallengePairLimiter = new TokenBucketLimiter(10, 10 / 60);
+  const agentSessionIpLimiter = new TokenBucketLimiter(30, 30 / 60);
+
+  const requestClientKey = (request: IncomingMessage): string => {
+    const forwarded = request.headers["cf-connecting-ip"];
+    const candidate = typeof forwarded === "string" ? forwarded.trim() : "";
+    if (candidate && isIP(candidate) !== 0) return `ip:${candidate}`;
+    const remote = request.socket?.remoteAddress?.trim() ?? "unknown";
+    return `ip:${remote && isIP(remote) !== 0 ? remote : "unknown"}`;
+  };
+
+  const enforceEndpointRate = (
+    limiter: TokenBucketLimiter,
+    key: string,
+    code: string,
+    message: string,
+  ): void => {
+    const result = limiter.consume(key);
+    if (!result.allowed) {
+      throw new ApiError(429, code, message, result.retryAfterSeconds);
+    }
+  };
   const pageAuthorityJoin = webMcpTransfersSession
     ? `JOIN agent_authority aa
            ON aa.agent_id = wg.agent_id
           AND aa.authority_kind = 'page'
           AND aa.session_id = wg.session_id
-          AND aa.epoch = wg.authority_epoch`
+          AND aa.epoch = wg.authority_epoch
+       JOIN webmcp_authority wa
+           ON wa.human_session_hash = wg.human_session_hash
+          AND wa.grant_id = wg.token_hash
+          AND wa.epoch = wg.authority_epoch
+          AND wa.revoked_at IS NULL`
     : "";
 
   const enforcePostCapacity = (agent: AgentRow): void => {
-    const globalResult = globalPostLimiter.consume("global");
+    const throttled = readCostProtectionMode() === "throttle";
+    const globalResult = (throttled ? throttleGlobalPostLimiter : normalGlobalPostLimiter).consume("global");
     if (!globalResult.allowed) {
       throw new ApiError(
         429,
@@ -885,7 +1164,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         globalResult.retryAfterSeconds,
       );
     }
-    const agentResult = postLimiter.consume(`agent:${agent.id}`);
+    const agentResult = (throttled ? throttlePostLimiter : normalPostLimiter).consume(`agent:${agent.id}`);
     if (!agentResult.allowed) {
       throw new ApiError(
         429,
@@ -894,7 +1173,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         agentResult.retryAfterSeconds,
       );
     }
-    const accountResult = accountPostLimiter.consume(`account:${agent.owner_account_id}`);
+    const accountResult = (throttled ? throttleAccountPostLimiter : normalAccountPostLimiter)
+      .consume(`account:${agent.owner_account_id}`);
     if (!accountResult.allowed) {
       throw new ApiError(
         429,
@@ -930,7 +1210,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     return pairing;
   };
 
-  const requireHuman = async (request: IncomingMessage): Promise<HumanPrincipal> => {
+  const requireHuman = async (
+    request: IncomingMessage,
+    refreshProjection: boolean | "cached" = false,
+    options: { touchSession?: boolean } = {},
+  ): Promise<HumanPrincipal> => {
+    const touchSession = options.touchSession !== false;
     const token = parseCookies(request.headers.cookie).meshr_session;
     if (!token) throw new ApiError(401, "authentication_required", "Sign in is required.");
     const tokenHash = sha256(token);
@@ -1047,10 +1332,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     } else {
       throw new ApiError(401, "authentication_required", "Sign in is required.");
     }
-    db.prepare("UPDATE human_sessions SET last_seen_at = ? WHERE token_hash = ?").run(now, tokenHash);
-    if (repository) {
+    if (touchSession) {
+      db.prepare("UPDATE human_sessions SET last_seen_at = ? WHERE token_hash = ?").run(now, tokenHash);
+    }
+    if (repository && touchSession) {
+      const lastDurableTouch = humanSessionTouchedAt.get(tokenHash) ?? 0;
+      const shouldTouchDurableSession = Date.parse(now) - lastDurableTouch >= 60_000;
       try {
-        await repository.touchHumanSession(tokenHash, now);
+        if (shouldTouchDurableSession) await repository.touchHumanSession(tokenHash, now);
       } catch (error) {
         throw new ApiError(
           503,
@@ -1058,14 +1347,18 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           error instanceof Error ? error.message : "The session store is unavailable.",
         );
       }
-      try {
-        await hydrateProjection({ accountId });
-      } catch (error) {
-        throw new ApiError(
-          503,
-          "projection_unavailable",
-          error instanceof Error ? error.message : "The durable projection is unavailable.",
-        );
+      if (shouldTouchDurableSession) humanSessionTouchedAt.set(tokenHash, Date.parse(now));
+      if (refreshProjection === true) await refreshHumanProjection(accountId);
+      else if (refreshProjection === "cached") {
+        try {
+          await hydrateProjection({ accountId });
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "projection_unavailable",
+            error instanceof Error ? error.message : "The durable projection is unavailable.",
+          );
+        }
       }
     }
     return {
@@ -1439,9 +1732,66 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     return true;
   };
 
+  // An approved pairing can be replayed on a replica that never handled the
+  // approval request. Hydrate the canonical agent before returning that
+  // idempotent response instead of dereferencing a missing local row.
+  const hydrateDurableAgent = async (agentId: string): Promise<AgentRow | undefined> => {
+    if (!repository?.findAgentById) return db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
+    let durableAgent: RepositoryAgentInput | null;
+    try {
+      durableAgent = await repository.findAgentById(agentId);
+    } catch (error) {
+      throw new ApiError(
+        503,
+        "agent_store_unavailable",
+        error instanceof Error ? error.message : "The agent store is unavailable.",
+      );
+    }
+    if (!durableAgent) return undefined;
+    database.transaction(() => {
+      db.prepare(
+        `INSERT INTO agents(
+           id, owner_account_id, name, handle, tagline, interests_json,
+           personality, attention_json, runtime, runtime_label, runtime_subject,
+           public_key_pem, definition_digest, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           owner_account_id = excluded.owner_account_id, name = excluded.name,
+           handle = excluded.handle, tagline = excluded.tagline,
+           interests_json = excluded.interests_json, personality = excluded.personality,
+           attention_json = excluded.attention_json, runtime = excluded.runtime,
+           runtime_label = excluded.runtime_label, runtime_subject = excluded.runtime_subject,
+           public_key_pem = excluded.public_key_pem, definition_digest = excluded.definition_digest,
+           updated_at = excluded.updated_at`,
+      ).run(
+        durableAgent.agentId,
+        durableAgent.ownerAccountId,
+        durableAgent.name,
+        durableAgent.handle,
+        durableAgent.tagline,
+        JSON.stringify(durableAgent.interests),
+        durableAgent.personality,
+        JSON.stringify(durableAgent.attention),
+        durableAgent.runtime,
+        durableAgent.runtimeLabel,
+        durableAgent.runtimeSubject,
+        durableAgent.publicKeyPem,
+        durableAgent.definitionDigest,
+        durableAgent.createdAt,
+        durableAgent.updatedAt,
+      );
+    });
+    return db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
+  };
+
   const requireAgent = async (
     request: IncomingMessage,
-    options: { allowStaleHeartbeat?: boolean } = {},
+    options: {
+      allowStaleHeartbeat?: boolean;
+      refreshProjection?: boolean;
+      /** Refresh the canonical profile before applying attention policy. */
+      refreshAgent?: boolean;
+    } = {},
   ): Promise<AgentPrincipal> => {
     const authorization = request.headers.authorization;
     if (!authorization?.startsWith("Bearer ")) {
@@ -1452,7 +1802,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     const onlineAfter = addSeconds(database.clock.now(), -runtimeOfflineSeconds);
     let row = db
       .prepare(
-        `SELECT s.agent_id, a.owner_account_id, s.session_id, s.runtime_kind,
+        `SELECT s.agent_id, s.pairing_id, a.owner_account_id, s.session_id, s.runtime_kind,
                 s.authority_epoch
          FROM agent_sessions s
          JOIN agents a ON a.id = s.agent_id
@@ -1467,6 +1817,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       .get(tokenHash, now, options.allowStaleHeartbeat ? 1 : 0, onlineAfter) as
       | {
           agent_id: string;
+          pairing_id: string;
           owner_account_id: string;
           session_id: string;
           runtime_kind: RuntimeKind;
@@ -1483,6 +1834,16 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           "session_store_unavailable",
           error instanceof Error ? error.message : "The session store is unavailable.",
         );
+      }
+      if (durableSession?.status === "superseded") {
+        throw new ApiError(
+          401,
+          "session_superseded",
+          "This runtime session has been superseded by a newer session.",
+        );
+      }
+      if (durableSession?.status === "revoked") {
+        throw new ApiError(401, "session_invalid", "This runtime session has been revoked.");
       }
       if (
         !durableSession ||
@@ -1510,7 +1871,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         }
         row = db
           .prepare(
-            `SELECT s.agent_id, a.owner_account_id, s.session_id, s.runtime_kind,
+            `SELECT s.agent_id, s.pairing_id, a.owner_account_id, s.session_id, s.runtime_kind,
                     s.authority_epoch
              FROM agent_sessions s
              JOIN agents a ON a.id = s.agent_id
@@ -1528,8 +1889,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         await hydrateDurableAgentSession(tokenHash, now);
         row = db
           .prepare(
-            `SELECT s.agent_id, a.owner_account_id, s.session_id, s.runtime_kind,
-                    s.authority_epoch
+                    `SELECT s.agent_id, s.pairing_id, a.owner_account_id, s.session_id, s.runtime_kind,
+                            s.authority_epoch
              FROM agent_sessions s
              JOIN agents a ON a.id = s.agent_id
              JOIN agent_authority aa
@@ -1547,10 +1908,31 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         );
       }
     }
+    if (!row && !repository) {
+      const superseded = db
+        .prepare("SELECT status FROM agent_sessions WHERE token_hash = ? LIMIT 1")
+        .get(tokenHash) as { status: string } | undefined;
+      if (superseded?.status === "superseded") {
+        throw new ApiError(
+          401,
+          "session_superseded",
+          "This runtime session has been superseded by a newer session.",
+        );
+      }
+    }
     if (!row) throw new ApiError(401, "agent_authentication_failed", "Agent token is invalid.");
-    if (repository) {
+    if (repository && options.refreshAgent) {
+      // Attention is an authorization boundary, not a disposable read-model
+      // hint. A profile reload on another API replica must take effect before
+      // this request decides whether the agent may browse or publish.
+      const durableAgent = await hydrateDurableAgent(row.agent_id);
+      if (!durableAgent) {
+        throw new ApiError(401, "agent_authentication_failed", "Agent identity is no longer available.");
+      }
+    }
+    if (repository && options.refreshProjection === true) {
       try {
-        await hydrateProjection({ agentId: row.agent_id });
+        await hydrateProjection({ agentId: row.agent_id }, true);
       } catch (error) {
         throw new ApiError(
           503,
@@ -1570,6 +1952,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       agentId: row.agent_id,
       ownerId: row.owner_account_id,
       sessionHash: tokenHash,
+      bindingId: row.pairing_id,
       sessionId: row.session_id,
       authorityEpoch: row.authority_epoch,
       runtime: row.runtime_kind,
@@ -1609,10 +1992,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           if (!durableAgent || durableAgent.ownerAccountId !== human.accountId) {
             grant = undefined;
           } else {
-            // The human may not itself be a member of a private mesh. Hydrate
-            // the agent-scoped membership projection before page tools apply
-            // the agent's attention and mesh-access policy.
-            await hydrateProjection({ agentId: durableGrant.agentId });
+            // The human may not itself be a member of a private mesh. Page
+            // tools re-check membership and attention in the authoritative
+            // repository; only hydrate the canonical profile here. This
+            // status/read path must never scan retained post bodies.
+            await hydrateDurableAgent(durableGrant.agentId);
             database.transaction(() => {
               db.prepare(
                 `INSERT INTO agents(
@@ -1705,6 +2089,125 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       | undefined;
     if (!agent || agent.owner_account_id !== human.accountId) return null;
     return { grant, agent };
+  };
+
+  // Reconcile a durable page grant into the disposable local projection. This
+  // is also the recovery path for a transfer whose HTTP response/cookie was
+  // lost after Firestore committed the authority transaction: the stable
+  // grant material can be reissued without superseding the agent a second
+  // time.
+  const reconcileDurableWebMcpGrant = async (
+    durableGrant: RepositoryWebMcpGrant,
+    human: HumanPrincipal,
+  ): Promise<{ grant: WebMcpGrantRow; agent: AgentRow } | null> => {
+    if (
+      durableGrant.revokedAt ||
+      Date.parse(durableGrant.expiresAt) <= Date.parse(database.now()) ||
+      !repository?.findAgentById
+    ) {
+      return null;
+    }
+    const durableAgent = await repository.findAgentById(durableGrant.agentId);
+    if (!durableAgent || durableAgent.ownerAccountId !== human.accountId) return null;
+    await hydrateProjection({ agentId: durableGrant.agentId }, true);
+    database.transaction(() => {
+      db.prepare(
+        `INSERT INTO agents(
+           id, owner_account_id, name, handle, tagline, interests_json,
+           personality, attention_json, runtime, runtime_label, runtime_subject,
+           public_key_pem, definition_digest, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           owner_account_id = excluded.owner_account_id, name = excluded.name,
+           handle = excluded.handle, tagline = excluded.tagline,
+           interests_json = excluded.interests_json, personality = excluded.personality,
+           attention_json = excluded.attention_json, runtime = excluded.runtime,
+           runtime_label = excluded.runtime_label, runtime_subject = excluded.runtime_subject,
+           public_key_pem = excluded.public_key_pem,
+           definition_digest = excluded.definition_digest, updated_at = excluded.updated_at`,
+      ).run(
+        durableAgent.agentId,
+        durableAgent.ownerAccountId,
+        durableAgent.name,
+        durableAgent.handle,
+        durableAgent.tagline,
+        JSON.stringify(durableAgent.interests),
+        durableAgent.personality,
+        JSON.stringify(durableAgent.attention),
+        durableAgent.runtime,
+        durableAgent.runtimeLabel,
+        durableAgent.runtimeSubject,
+        durableAgent.publicKeyPem,
+        durableAgent.definitionDigest,
+        durableAgent.createdAt,
+        durableAgent.updatedAt,
+      );
+      db.prepare(
+        `INSERT INTO webmcp_grants(
+           token_hash, human_session_hash, agent_id, created_at, expires_at,
+           last_used_at, revoked_at, session_id, authority_epoch
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(token_hash) DO UPDATE SET
+           human_session_hash = excluded.human_session_hash,
+           agent_id = excluded.agent_id, expires_at = excluded.expires_at,
+           last_used_at = excluded.last_used_at, revoked_at = excluded.revoked_at,
+           session_id = excluded.session_id, authority_epoch = excluded.authority_epoch`,
+      ).run(
+        durableGrant.tokenHash,
+        durableGrant.humanSessionHash,
+        durableGrant.agentId,
+        durableGrant.createdAt,
+        durableGrant.expiresAt,
+        durableGrant.lastUsedAt,
+        durableGrant.revokedAt,
+        durableGrant.sessionId,
+        durableGrant.authorityEpoch,
+      );
+      db.prepare(
+        `INSERT INTO agent_authority(agent_id, epoch, authority_kind, session_id, updated_at)
+         VALUES(?, ?, 'page', ?, ?)
+         ON CONFLICT(agent_id) DO UPDATE SET
+           epoch = excluded.epoch, authority_kind = excluded.authority_kind,
+           session_id = excluded.session_id, updated_at = excluded.updated_at`,
+      ).run(
+        durableGrant.agentId,
+        durableGrant.authorityEpoch,
+        durableGrant.sessionId,
+        durableGrant.lastUsedAt,
+      );
+      if (webMcpTransfersSession) {
+        db.prepare(
+          `INSERT INTO webmcp_authority(
+             human_session_hash, epoch, grant_id, agent_id, session_id, updated_at, revoked_at
+           ) VALUES(?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(human_session_hash) DO UPDATE SET
+             epoch = excluded.epoch, grant_id = excluded.grant_id,
+             agent_id = excluded.agent_id, session_id = excluded.session_id,
+             updated_at = excluded.updated_at, revoked_at = excluded.revoked_at`,
+        ).run(
+          durableGrant.humanSessionHash,
+          durableGrant.authorityEpoch,
+          durableGrant.tokenHash,
+          durableGrant.agentId,
+          durableGrant.sessionId,
+          durableGrant.lastUsedAt,
+          durableGrant.revokedAt,
+        );
+      }
+    });
+    const grant = db
+      .prepare(
+        `SELECT token_hash, human_session_hash, agent_id, created_at,
+                expires_at, last_used_at, revoked_at, session_id, authority_epoch
+         FROM webmcp_grants wg
+         ${pageAuthorityJoin}
+         WHERE wg.token_hash = ? AND wg.human_session_hash = ?
+           AND wg.revoked_at IS NULL AND wg.expires_at > ?`,
+      )
+      .get(durableGrant.tokenHash, human.sessionHash, database.now()) as WebMcpGrantRow | undefined;
+    if (!grant) return null;
+    const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(grant.agent_id) as AgentRow | undefined;
+    return agent && agent.owner_account_id === human.accountId ? { grant, agent } : null;
   };
 
   const requireWebMcp = async (request: IncomingMessage): Promise<WebMcpPrincipal> => {
@@ -2286,6 +2789,41 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     };
   };
 
+  const meshSummaryFromDirectory = (entry: RepositoryMeshDirectoryEntry) => {
+    const { mesh } = entry;
+    const visibleRoles = entry.roles.map((role) => {
+      if (entry.role === "owner" || entry.role === "steward") return role;
+      const { email: _email, ...withoutEmail } = role;
+      return withoutEmail;
+    });
+    return {
+      id: mesh.meshId,
+      ownerId: mesh.ownerAccountId ?? "system",
+      name: mesh.name,
+      description: mesh.description,
+      visibility: mesh.visibility,
+      joinPolicy: mesh.admission,
+      role: entry.role,
+      memberAgentIds: entry.memberAgentIds,
+      agentCount: entry.memberAgentIds.length,
+      topics: entry.topics.map(({ topic, activityCount, recentActivityCount, participantAgentIds, lastActivityAt }) => ({
+        id: topic.topicId,
+        meshId: topic.meshId,
+        name: topic.name,
+        title: topic.title,
+        description: topic.description,
+        tags: topic.tags,
+        activityCount,
+        recentActivityCount,
+        participantAgentIds,
+        lastActivityAt,
+        createdAt: topic.createdAt,
+      })),
+      roles: visibleRoles,
+      createdAt: mesh.createdAt,
+    };
+  };
+
   const ensureAttentionMeshAccess = (
     agent: AgentRow,
     agentId: string,
@@ -2327,6 +2865,31 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     return topic;
   };
 
+  const webMcpTopicForAccess = async (principal: WebMcpPrincipal, topicId: string) => {
+    if (repository?.findTopicById) {
+      let topic: RepositoryTopicInput | null;
+      try {
+        topic = await repository.findTopicById(topicId);
+      } catch (error) {
+        throw new ApiError(
+          503,
+          "authorization_store_unavailable",
+          error instanceof Error ? error.message : "The topic store is unavailable.",
+        );
+      }
+      if (!topic) throw new ApiError(404, "topic_not_found", "Topic not found.");
+      return {
+        id: topic.topicId,
+        mesh_id: topic.meshId,
+        name: topic.name,
+        title: topic.title,
+        description: topic.description,
+        tags_json: JSON.stringify(topic.tags),
+      };
+    }
+    return webMcpTopicWithAccess(principal, topicId);
+  };
+
   const topicWithAccess = (agentId: string, topicId: string) => {
     const topic = db
       .prepare("SELECT id, mesh_id, name, title, description, tags_json FROM topics WHERE id = ?")
@@ -2345,13 +2908,192 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     return topic;
   };
 
+  const topicForAgentRoute = async (agentId: string, topicId: string) => {
+    if (repository?.findTopicById) {
+      let topic: RepositoryTopicInput | null;
+      try {
+        topic = await repository.findTopicById(topicId);
+      } catch (error) {
+        throw new ApiError(
+          503,
+          "authorization_store_unavailable",
+          error instanceof Error ? error.message : "The topic store is unavailable.",
+        );
+      }
+      if (!topic) throw new ApiError(404, "topic_not_found", "Topic not found.");
+      return {
+        id: topic.topicId,
+        mesh_id: topic.meshId,
+        name: topic.name,
+        title: topic.title,
+        description: topic.description,
+        tags_json: JSON.stringify(topic.tags),
+      };
+    }
+    return topicWithAccess(agentId, topicId);
+  };
+
+  /**
+   * A topic post query is intentionally identity-blind so Firestore can use
+   * its topic/time indexes. Re-read the topic, canonical profile, and mesh
+   * admission after the query completes before returning any body. This is
+   * the terminal authorization boundary for a request that may have raced a
+   * visibility, membership, or attention-policy change on another replica.
+   */
+  const revalidateTopicAccessAuthoritatively = async (input: {
+    agent: AgentRow;
+    agentId: string;
+    topicId: string;
+    expectedMeshId: string;
+  }): Promise<AgentRow> => {
+    if (repository?.findTopicById) {
+      let topic: RepositoryTopicInput | null;
+      try {
+        topic = await repository.findTopicById(input.topicId);
+      } catch (error) {
+        throw new ApiError(
+          503,
+          "authorization_store_unavailable",
+          error instanceof Error ? error.message : "The topic store is unavailable.",
+        );
+      }
+      if (!topic || topic.meshId !== input.expectedMeshId) {
+        throw new ApiError(404, "topic_not_found", "Topic not found.");
+      }
+    }
+    const currentAgent = repository?.findAgentById
+      ? await hydrateDurableAgent(input.agentId)
+      : input.agent;
+    if (!currentAgent) {
+      throw new ApiError(401, "agent_authentication_failed", "Agent identity is no longer available.");
+    }
+    await ensureAttentionMeshAccessAuthoritatively(
+      currentAgent,
+      input.agentId,
+      input.expectedMeshId,
+    );
+    return currentAgent;
+  };
+
+  /**
+   * A body-bearing topic read must revalidate the authority that authorized
+   * the request after the Firestore query completes. Mesh visibility alone is
+   * insufficient: a native session or page grant may have been superseded
+   * while the post query was in flight.
+   */
+  const revalidatePostReadAuthority = async (principal: AgentPrincipal): Promise<void> => {
+    const now = database.now();
+    const offlineAfter = addSeconds(database.clock.now(), -runtimeOfflineSeconds);
+    const humanIdleAfter = addSeconds(database.clock.now(), -HUMAN_IDLE_SECONDS);
+    if (isWebMcpPrincipal(principal)) {
+      if (repository?.findWebMcpGrant) {
+        let grant: RepositoryWebMcpGrant | null;
+        let humanSession: Awaited<ReturnType<MeshrRepository["findHumanSession"]>>;
+        try {
+          [grant, humanSession] = await Promise.all([
+            repository.findWebMcpGrant(principal.sessionHash, principal.human.sessionHash),
+            repository.findHumanSession(principal.human.sessionHash),
+          ]);
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "authorization_store_unavailable",
+            error instanceof Error ? error.message : "The authorization store is unavailable.",
+          );
+        }
+        if (
+          !grant ||
+          grant.agentId !== principal.agentId ||
+          grant.sessionId !== principal.sessionId ||
+          grant.authorityEpoch !== principal.authorityEpoch ||
+          Date.parse(grant.expiresAt) <= Date.parse(now) ||
+          !humanSession ||
+          humanSession.accountId !== principal.ownerId ||
+          Date.parse(humanSession.expiresAt) <= Date.parse(now) ||
+          Date.parse(humanSession.absoluteExpiresAt) <= Date.parse(now) ||
+          Date.parse(humanSession.lastSeenAt) < Date.parse(humanIdleAfter)
+        ) {
+          throw new ApiError(
+            401,
+            "webmcp_grant_required",
+            "The WebMCP grant or human session was revoked while reading this topic.",
+          );
+        }
+      } else {
+        assertCurrentWebMcpGrant(principal);
+      }
+      return;
+    }
+    if (repository?.findRuntimeSessionById) {
+      if (!principal.sessionId) {
+        throw new ApiError(401, "agent_authentication_failed", "The runtime session is unavailable.");
+      }
+      let session: Awaited<ReturnType<NonNullable<MeshrRepository["findRuntimeSessionById"]>>>;
+      try {
+        session = await repository.findRuntimeSessionById(principal.sessionId);
+      } catch (error) {
+        throw new ApiError(
+          503,
+          "authorization_store_unavailable",
+          error instanceof Error ? error.message : "The authorization store is unavailable.",
+        );
+      }
+      if (
+        !session ||
+        session.agentId !== principal.agentId ||
+        session.sessionId !== principal.sessionId ||
+        session.bindingId !== principal.bindingId ||
+        session.authorityEpoch !== principal.authorityEpoch ||
+        session.status !== "active" ||
+        Date.parse(session.expiresAt) <= Date.parse(now) ||
+        Date.parse(session.lastSeenAt) < Date.parse(offlineAfter)
+      ) {
+        throw new ApiError(
+          401,
+          "agent_authentication_failed",
+          "The runtime session was superseded or revoked while reading this topic.",
+        );
+      }
+    } else {
+      assertCurrentAgentSession(principal);
+    }
+  };
+
+  const formatAuthoritativeTopicPosts = (
+    page: import("./repository.ts").RepositoryTopicPostsPage,
+  ) => {
+    const agents = new Map(page.agents.map((agent) => [agent.agentId, agent]));
+    return page.posts.map((post) => {
+      const agent = agents.get(post.agentId);
+      return {
+        id: post.postId,
+        meshId: post.meshId,
+        topicId: post.topicId,
+        agentId: post.agentId,
+        parentPostId: post.parentPostId,
+        body: post.body,
+        createdAt: post.createdAt,
+        agent: agent
+          ? { id: agent.agentId, name: agent.name, handle: agent.handle }
+          : { id: post.agentId, name: "", handle: "" },
+      };
+    });
+  };
+
   const emitEvent = (
     type: string,
     agentId: string | null,
     meshId: string | null,
     topicId: string | null,
     data: unknown,
-    context: { sessionId?: string | null; runtimeKind?: RuntimeKind | null } = {},
+    context: {
+      sessionId?: string | null;
+      runtimeKind?: RuntimeKind | null;
+      eventId?: string;
+      occurredAt?: string;
+      /** The durable repository already committed this event atomically. */
+      durable?: boolean;
+    } = {},
   ) => {
     const activeSession = agentId
       ? (db
@@ -2363,8 +3105,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       : undefined;
     const sessionId = context.sessionId ?? activeSession?.session_id ?? null;
     const runtimeKind = context.runtimeKind ?? activeSession?.runtime_kind ?? null;
-    const eventId = database.id("evt");
-    const createdAt = database.now();
+    const eventId = context.eventId ?? database.id("evt");
+    const createdAt = context.occurredAt ?? database.now();
     const result = db
       .prepare(
         `INSERT INTO events(type, mesh_id, topic_id, agent_id, data_json, created_at)
@@ -2387,7 +3129,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       JSON.stringify(data),
       createdAt,
     );
-    if (repository?.appendEvent) {
+    if (repository?.appendEvent && !context.durable) {
       void repository.appendEvent({
         eventId,
         type,
@@ -2418,9 +3160,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     resourceType: string;
     resourceId: string;
     data?: unknown;
+    auditId?: string;
+    createdAt?: string;
+    /** The durable repository already committed this audit record atomically. */
+    durable?: boolean;
   }): void => {
-    const auditId = database.id("audit");
-    const createdAt = database.now();
+    const auditId = input.auditId ?? database.id("audit");
+    const createdAt = input.createdAt ?? database.now();
     db.prepare(
       `INSERT INTO audit_events(
          id, actor_type, actor_id, session_id, action, resource_type, resource_id,
@@ -2437,7 +3183,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       JSON.stringify(input.data ?? {}),
       createdAt,
     );
-    if (repository?.appendAuditEvent) {
+    if (repository?.appendAuditEvent && !input.durable) {
       void repository.appendAuditEvent({
         auditId,
         actorType: input.actorType,
@@ -2685,6 +3431,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     meshId: string;
     decision: "approved" | "denied";
     resolvedAt: string;
+    actingAccountId: string;
+    humanSessionHash: string;
+    event?: RepositoryEventInput;
+    audit?: RepositoryAuditInput;
   }): Promise<{ agentId: string; status: "approved" | "denied" } | null> => {
     if (!repository?.resolveJoinRequest) return null;
     try {
@@ -2700,6 +3450,51 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         503,
         "governance_store_unavailable",
         error instanceof Error ? error.message : "The governance store is unavailable.",
+      );
+    }
+  };
+
+  const joinMeshForAgentAuthoritatively = async (input: {
+    meshId: string;
+    agentId: string;
+    ownerAccountId: string;
+    sessionId: string;
+    authorityEpoch: number;
+    runtimeKind: RuntimeKind;
+    idempotencyKey: string;
+    requestId: string;
+    requestedAt: string;
+    attentionPolicy: Record<string, unknown>;
+  }): Promise<{ status: "joined" | "pending"; requestId?: string; duplicate: boolean } | null> => {
+    if (!repository?.joinMeshForAgent) return null;
+    try {
+      return await repository.joinMeshForAgent(input);
+    } catch (error) {
+      if (error instanceof Error && error.message === "invite_required") {
+        throw new ApiError(403, "invite_required", "This mesh requires an invitation.");
+      }
+      if (error instanceof Error && error.message === "mesh_unavailable") {
+        throw new ApiError(409, "mesh_unavailable", "This mesh is not accepting new activity.");
+      }
+      if (error instanceof Error && error.message === "idempotency_conflict") {
+        throw new ApiError(409, "idempotency_conflict", "This idempotency key was already used for a different request.");
+      }
+      if (error instanceof Error && error.message === "idempotency_expired") {
+        throw new ApiError(409, "idempotency_expired", "The idempotency record has expired; retry with a new key.");
+      }
+      if (error instanceof Error && error.message === "invalid_request_timestamp") {
+        throw new ApiError(400, "invalid_request", "The request timestamp is invalid.");
+      }
+      if (error instanceof Error && error.message === "session_superseded") {
+        throw new ApiError(401, "session_superseded", "This runtime session has been superseded by a newer session.");
+      }
+      if (error instanceof Error && error.message === "session_invalid") {
+        throw new ApiError(401, "agent_authentication_failed", "This runtime session is expired or offline.");
+      }
+      throw new ApiError(
+        503,
+        "authorization_store_unavailable",
+        error instanceof Error ? error.message : "The mesh authorization store is unavailable.",
       );
     }
   };
@@ -2748,6 +3543,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     const postId = database.id("post");
     const createdAt = database.now();
     const moderation = moderatePost(input.body, postId);
+    const priorPostCount = Number(
+      (db.prepare("SELECT COUNT(*) AS count FROM posts WHERE agent_id = ?").get(input.principal.agentId) as { count: number }).count ?? 0,
+    );
+    const newIdentityReview = priorPostCount < NEW_IDENTITY_REVIEW_POSTS ||
+      Date.parse(agent.created_at) >= Date.parse(createdAt) - NEW_IDENTITY_REVIEW_WINDOW_MS;
+    const reviewQueued = moderation.asyncReview || newIdentityReview;
     const expiresAt = addSeconds(new Date(createdAt), POST_RETENTION_SECONDS);
     const post = {
       id: postId,
@@ -2778,7 +3579,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       post.moderationReason,
       post.expiresAt,
     );
-    if (moderation.asyncReview) {
+    if (reviewQueued) {
       db.prepare(
         `INSERT INTO moderation_cases(
            id, post_id, mesh_id, reason, state, severity, created_at, updated_at
@@ -2787,7 +3588,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         database.id("case"),
         post.id,
         post.meshId,
-        moderation.reason ?? "sampled_review",
+        newIdentityReview ? "new_identity" : moderation.reason ?? "sampled_review",
         moderation.severity,
         createdAt,
         createdAt,
@@ -2795,14 +3596,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }
     emitEvent(input.eventType, input.principal.agentId, post.meshId, post.topicId, {
       post,
-      reviewQueued: moderation.asyncReview,
+      reviewQueued,
     }, {
       sessionId: input.principal.sessionId,
       runtimeKind: input.principal.runtime,
     });
     return {
       post,
-      moderation: { state: moderation.state, reviewQueued: moderation.asyncReview },
+      moderation: { state: moderation.state, reviewQueued },
     };
   };
 
@@ -2849,11 +3650,20 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     if (!repository) {
       return persistPost(input);
     }
+    // Firestore owns the quota transaction in production. Do not consume a
+    // process-local token bucket before the idempotency record is checked: an
+    // exact retry must replay its original response even when it lands on a
+    // different API replica or arrives in a retry storm.
     const agent = currentAgentForCommit(input.principal.agentId);
-    enforcePostCapacity(agent);
     const postId = database.id("post");
     const createdAt = database.now();
     const moderation = moderatePost(input.body, postId);
+    const priorPostCount = Number(
+      (db.prepare("SELECT COUNT(*) AS count FROM posts WHERE agent_id = ?").get(input.principal.agentId) as { count: number }).count ?? 0,
+    );
+    const newIdentityReview = priorPostCount < NEW_IDENTITY_REVIEW_POSTS ||
+      Date.parse(agent.created_at) >= Date.parse(createdAt) - NEW_IDENTITY_REVIEW_WINDOW_MS;
+    const reviewQueued = moderation.asyncReview || newIdentityReview;
     const expiresAt = addSeconds(new Date(createdAt), POST_RETENTION_SECONDS);
     const pagePrincipal = isWebMcpPrincipal(input.principal) ? input.principal : undefined;
     const repositoryInput: RepositoryPostInput = {
@@ -2871,7 +3681,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       eventType: input.eventType,
       idempotencyKey: input.idempotencyKey,
       requestHash: input.requestHash,
-      reviewQueued: moderation.asyncReview,
+      reviewQueued,
       authorityKind: pagePrincipal ? "page" : "native",
       authorityEpoch: input.principal.authorityEpoch,
       ownerAccountId: agent.owner_account_id,
@@ -2920,7 +3730,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         // recomputing it for a duplicate request could otherwise return a
         // different HTTP status than the original write.
         state: post.moderationState,
-        reviewQueued: post.moderationState === "quarantined" || Boolean(post.moderationReason),
+        reviewQueued: committed.reviewQueued ?? reviewQueued,
       },
       duplicate: committed.duplicate,
     };
@@ -2930,15 +3740,23 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     agentId: string,
     input: Record<string, unknown>,
     authority: "agent-sync" | "owner-approval",
+    review?: {
+      appliedFields: string[];
+      pendingFields: string[];
+      requested: Record<string, unknown>;
+      sourceDigest: string | null;
+    },
+    options: { persist?: boolean } = {},
   ): AgentRow => {
+    const persist = options.persist ?? true;
     if (input.profile !== undefined) {
       for (const key of Object.keys(input)) {
-        if (key !== "profile" && key !== "definitionDigest") {
+        if (key !== "profile" && key !== "definitionDigest" && key !== "reload") {
           throw new ApiError(400, "invalid_profile", `${key} is not allowed.`);
         }
       }
     }
-    const { definitionDigest: _definitionDigest, ...inlineProfile } = input;
+    const { definitionDigest: _definitionDigest, reload: _reload, ...inlineProfile } = input;
     const profileInput = input.profile ?? inlineProfile;
     const profile = parseAgentProfile(profileInput, { partial: true });
     const definitionDigest = optionalString(input, "definitionDigest", 64)?.toLowerCase();
@@ -2952,11 +3770,17 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     if (Object.keys(profile).length === 0 && definitionDigest === undefined) {
       throw new ApiError(400, "invalid_profile", "At least one profile field is required.");
     }
-
     const currentRow = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as
       | AgentRow
       | undefined;
     if (!currentRow) throw new ApiError(404, "agent_not_found", "Agent not found.");
+    if (review && definitionDigest === undefined) {
+      throw new ApiError(
+        400,
+        "invalid_definition_digest",
+        "A profile reload must include the SHA-256 digest of its local definition.",
+      );
+    }
     const current = agentFromRow(currentRow);
     const merged = completeProfile({
       name: profile.name ?? current.name,
@@ -2967,15 +3791,26 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       attention: { ...current.attention, ...(profile.attention ?? {}) },
     });
 
+    const requestedRestricted: Record<string, unknown> = {};
     if (authority === "agent-sync") {
       const approvalRequired: string[] = [];
-      if (merged.name !== current.name) approvalRequired.push("name");
-      if (merged.handle !== current.handle) approvalRequired.push("handle");
+      if (merged.name !== current.name) {
+        approvalRequired.push("name");
+        requestedRestricted.name = merged.name;
+      }
+      if (merged.handle !== current.handle) {
+        approvalRequired.push("handle");
+        requestedRestricted.handle = merged.handle;
+      }
       if (
         browseRestriction[merged.attention.browse] <
         browseRestriction[current.attention.browse]
       ) {
         approvalRequired.push("attention.browse");
+        requestedRestricted.attention = {
+          ...(requestedRestricted.attention as Record<string, unknown> | undefined),
+          browse: merged.attention.browse,
+        };
       }
       for (const field of ["rootPosts", "replies"] as const) {
         if (
@@ -2983,18 +3818,84 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           participationRestriction[current.attention[field]]
         ) {
           approvalRequired.push(`attention.${field}`);
+          requestedRestricted.attention = {
+            ...(requestedRestricted.attention as Record<string, unknown> | undefined),
+            [field]: merged.attention[field],
+          };
         }
       }
       if (approvalRequired.length > 0) {
-        throw new ApiError(
-          403,
-          "profile_approval_required",
-          `Owner approval is required to change ${approvalRequired.join(", ")}.`,
-        );
+        if (!review) {
+          throw new ApiError(
+            403,
+            "profile_approval_required",
+            `Owner approval is required to change ${approvalRequired.join(", ")}.`,
+          );
+        }
+        review.pendingFields.push(...approvalRequired);
+        Object.assign(review.requested, requestedRestricted);
+        // A reload is intentionally partial: safe presentation edits apply
+        // now, while identity and policy relaxation remain proposals for the
+        // owner. Never persist the restricted values in the agent record.
+        if (approvalRequired.includes("name")) merged.name = current.name;
+        if (approvalRequired.includes("handle")) merged.handle = current.handle;
+        const pendingAttention = new Set(approvalRequired);
+        if (pendingAttention.has("attention.browse")) merged.attention.browse = current.attention.browse;
+        if (pendingAttention.has("attention.rootPosts")) merged.attention.rootPosts = current.attention.rootPosts;
+        if (pendingAttention.has("attention.replies")) merged.attention.replies = current.attention.replies;
       }
     }
 
+    if (review) {
+      const candidateFields: Array<[string, unknown, unknown]> = [
+        ["name", current.name, merged.name],
+        ["handle", current.handle, merged.handle],
+        ["tagline", current.tagline, merged.tagline],
+        ["interests", current.interests, merged.interests],
+        ["personality", current.personality, merged.personality],
+        ["attention.browse", current.attention.browse, merged.attention.browse],
+        ["attention.rootPosts", current.attention.rootPosts, merged.attention.rootPosts],
+        ["attention.replies", current.attention.replies, merged.attention.replies],
+        ["attention.notes", current.attention.notes, merged.attention.notes],
+      ];
+      review.appliedFields.push(
+        ...candidateFields
+          .filter(([, before, after]) => JSON.stringify(before) !== JSON.stringify(after))
+          .map(([field]) => field),
+      );
+      // A reload is a statement about the exact local source. Never reuse an
+      // older digest: doing so would make owner-review provenance point at a
+      // different definition than the one the runtime just submitted.
+      review.sourceDigest = definitionDigest!;
+    }
+
     const now = database.now();
+    const candidate: AgentRow = {
+      ...currentRow,
+      name: merged.name,
+      handle: merged.handle,
+      tagline: merged.tagline,
+      interests_json: JSON.stringify(merged.interests),
+      personality: merged.personality,
+      attention_json: JSON.stringify(merged.attention),
+      definition_digest: definitionDigest ?? currentRow.definition_digest,
+      updated_at: now,
+    };
+    if (!persist) {
+      // Repository-backed routes use this pure candidate to validate and
+      // commit the authoritative Firestore transaction before touching the
+      // local SQLite projection. A failed durable write must leave this
+      // replica exactly as it was.
+      if (candidate.handle.trim().toLowerCase() !== currentRow.handle.trim().toLowerCase()) {
+        const handleOwner = db
+          .prepare("SELECT id FROM agents WHERE handle = ? COLLATE NOCASE AND id <> ?")
+          .get(candidate.handle, agentId) as { id: string } | undefined;
+        if (handleOwner) {
+          throw new ApiError(409, "handle_unavailable", "That agent handle is already in use.");
+        }
+      }
+      return candidate;
+    }
     try {
       db.prepare(
         `UPDATE agents SET
@@ -3196,11 +4097,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     if (method === "GET" && path === "/healthz") {
       const migration = db
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
-        .get() as { version: number };
+        .get() as { version: number | null };
       return {
-        // Keep the health response contract stable while migrations remain
-        // additive and observable through the database migration table.
-        body: { status: "ok", database: "ok", schemaVersion: 2 },
+        // Report the schema actually serving this process.  Readiness still
+        // enforces the current migration, while health remains useful during
+        // a rolling upgrade where an older projection pod may be draining.
+        body: { status: "ok", database: "ok", schemaVersion: migration.version ?? 0 },
       };
     }
 
@@ -3208,7 +4110,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       try {
         if (repository?.checkReady) await repository.checkReady();
         else {
-          db.prepare("SELECT 1 FROM schema_migrations WHERE version = 6").get();
+          const current = db
+            .prepare("SELECT 1 AS ready FROM schema_migrations WHERE version = ?")
+            .get(CURRENT_SCHEMA_VERSION) as { ready: number } | undefined;
+          if (!current) throw new Error("SQLite schema is not initialized");
         }
         return { body: { status: "ready", database: repository ? "firestore" : "sqlite" } };
       } catch (error) {
@@ -3411,19 +4316,127 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       return { body: { user: publicUser(account), csrfToken: principal.csrfToken } };
     }
 
+    if (method === "GET" && path === "/v1/account/providers") {
+      const principal = await requireHuman(request);
+      let identities: Array<{ provider: SocialProvider; email: string; linkedAt: string }>;
+      if (repository?.listProviderIdentities) {
+        try {
+          identities = await repository.listProviderIdentities(principal.accountId);
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "identity_store_unavailable",
+            error instanceof Error ? error.message : "The identity store is unavailable.",
+          );
+        }
+      } else {
+        identities = (db.prepare(
+          `SELECT provider, email, created_at AS linked_at
+           FROM provider_identities WHERE account_id = ? ORDER BY provider ASC`,
+        ).all(principal.accountId) as Array<{
+          provider: SocialProvider;
+          email: string;
+          linked_at: string;
+        }>).map((identity) => ({
+          provider: identity.provider,
+          email: identity.email,
+          linkedAt: identity.linked_at,
+        }));
+      }
+      return { body: { providers: identities } };
+    }
+
     if (method === "POST" && path === "/v1/account/providers/link") {
       const principal = await requireHuman(request);
       requireCsrf(request, principal);
       const input = asObject(await readJson(request));
       for (const key of Object.keys(input)) {
-        if (key !== "provider" && key !== "idToken") {
+        if (key !== "provider" && key !== "idToken" && key !== "currentProvider" && key !== "currentIdToken") {
           throw new ApiError(400, "invalid_request", `${key} is not allowed.`);
         }
       }
       const provider = parseSocialProvider(input.provider);
       const idToken = requiredString(input, "idToken", { max: 16_384 });
+      const currentProvider = input.currentProvider === undefined
+        ? undefined
+        : parseSocialProvider(input.currentProvider);
+      const currentIdToken = input.currentIdToken === undefined
+        ? undefined
+        : requiredString(input, "currentIdToken", { max: 16_384 });
+      if ((currentProvider === undefined) !== (currentIdToken === undefined)) {
+        throw new ApiError(
+          400,
+          "identity_reauthentication_required",
+          "Authenticate with the existing provider before linking a new one.",
+        );
+      }
+      if (currentProvider === provider) {
+        throw new ApiError(
+          400,
+          "identity_provider_already_selected",
+          "Choose a different provider to link to this account.",
+        );
+      }
       if (!identityVerifier) {
         throw new ApiError(503, "social_auth_unconfigured", "Social login is not configured.");
+      }
+      let reauthSubject: string | undefined;
+      if (currentProvider && currentIdToken) {
+        let currentClaims;
+        try {
+          currentClaims = await identityVerifier(currentProvider, currentIdToken);
+        } catch {
+          throw new ApiError(401, "invalid_identity_token", "The existing social identity token is invalid.");
+        }
+        if (currentClaims.provider !== currentProvider || currentClaims.emailVerified !== true) {
+          throw new ApiError(401, "invalid_identity_token", "The existing social identity token is invalid.");
+        }
+        const authTime = currentClaims.authTime;
+        const nowSeconds = Math.floor(database.clock.now().getTime() / 1_000);
+        if (
+          socialAuthOnly &&
+          (typeof authTime !== "number" || !Number.isFinite(authTime) ||
+            authTime > nowSeconds + 60 || nowSeconds - authTime > IDENTITY_REAUTH_SECONDS)
+        ) {
+          throw new ApiError(
+            401,
+            "identity_reauthentication_required",
+            "Authenticate again with the existing provider before linking a new one.",
+          );
+        }
+        let currentIdentity: RepositoryAccount | null = null;
+        try {
+          currentIdentity = repository
+            ? await repository.findAccountByProvider(currentProvider, currentClaims.subject)
+            : (() => {
+                const row = db.prepare(
+                  "SELECT account_id FROM provider_identities WHERE provider = ? AND subject = ?",
+                ).get(currentProvider, currentClaims.subject) as { account_id: string } | undefined;
+                return row && row.account_id === principal.accountId
+                  ? { accountId: row.account_id, email: principal.email, displayName: principal.displayName, createdAt: database.now() }
+                  : null;
+              })();
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "identity_store_unavailable",
+            error instanceof Error ? error.message : "The identity store is unavailable.",
+          );
+        }
+        if (!currentIdentity || currentIdentity.accountId !== principal.accountId) {
+          throw new ApiError(
+            403,
+            "identity_reauthentication_required",
+            "Authenticate with an identity already linked to this account.",
+          );
+        }
+        reauthSubject = currentClaims.subject;
+      } else if (socialAuthOnly) {
+        throw new ApiError(
+          401,
+          "identity_reauthentication_required",
+          "Authenticate with the existing provider before linking a new one.",
+        );
       }
       let claims;
       try {
@@ -3433,6 +4446,19 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       }
       if (claims.provider !== provider) {
         throw new ApiError(401, "invalid_identity_token", "The social identity provider does not match the selected login.");
+      }
+      if (
+        socialAuthOnly &&
+        (typeof claims.authTime !== "number" ||
+          !Number.isFinite(claims.authTime) ||
+          claims.authTime > Math.floor(database.clock.now().getTime() / 1_000) + 60 ||
+          Math.floor(database.clock.now().getTime() / 1_000) - claims.authTime > IDENTITY_REAUTH_SECONDS)
+      ) {
+        throw new ApiError(
+          401,
+          "identity_reauthentication_required",
+          "Authenticate with the target provider again before linking it.",
+        );
       }
       const account = db.prepare("SELECT * FROM accounts WHERE id = ?").get(principal.accountId) as
         | AccountRow
@@ -3453,6 +4479,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             provider,
             subject: claims.subject,
             email: normalizeEmail(claims.email),
+            humanSessionHash: principal.sessionHash,
+            reauthProvider: currentProvider,
+            reauthSubject,
+            linkedAt: now,
           });
         } catch (error) {
           if (error instanceof Error && error.message === "identity_already_linked") {
@@ -3460,6 +4490,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           }
           if (error instanceof Error && error.message === "account_not_found") {
             throw new ApiError(401, "authentication_required", "Sign in is required.");
+          }
+          if (error instanceof Error && error.message === "identity_reauthentication_required") {
+            throw new ApiError(
+              401,
+              "identity_reauthentication_required",
+              "Authenticate with the existing provider before linking a new one.",
+            );
           }
           throw new ApiError(
             503,
@@ -3480,13 +4517,95 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
            VALUES(?, ?, ?, ?, ?, ?)
            ON CONFLICT(provider, subject) DO UPDATE SET email = excluded.email, last_seen_at = excluded.last_seen_at`,
         ).run(provider, claims.subject, principal.accountId, normalizeEmail(claims.email), now, now);
-        return { provider, subject: claims.subject, linkedAt: now };
+        return { provider, email: normalizeEmail(claims.email), linkedAt: now };
       });
       return { status: 201, body: { identity: linked } };
     }
 
     if (method === "GET" && path === "/v1/agents") {
-      const principal = await requireHuman(request);
+      const principal = await requireHuman(request, false, { touchSession: false });
+      if (repository?.listAgentsForAccount && repository.listRuntimeSessionsForAgents) {
+        try {
+          const agents = await repository.listAgentsForAccount(principal.accountId);
+          const sessions = await repository.listRuntimeSessionsForAgents(
+            agents.map((agent) => agent.agentId),
+            database.now(),
+            addSeconds(database.clock.now(), -runtimeOfflineSeconds),
+          );
+          const nowMs = Date.parse(database.now());
+          const presenceByAgent = new Map<string, { lastSeenAt: string; connected: boolean }>();
+          for (const session of sessions) {
+            const connected =
+              session.status === "active" &&
+              Date.parse(session.expiresAt) > nowMs &&
+              Date.parse(session.lastSeenAt) >= nowMs - runtimeOfflineSeconds * 1_000;
+            const previous = presenceByAgent.get(session.agentId);
+            if (!previous || session.lastSeenAt > previous.lastSeenAt) {
+              presenceByAgent.set(session.agentId, { lastSeenAt: session.lastSeenAt, connected });
+            }
+          }
+          return {
+            body: {
+              agents: agents.map((agent) => ({
+                ...agentFromRepository(agent),
+                connectionStatus: presenceByAgent.get(agent.agentId)?.connected ? "connected" : "offline",
+                lastSeenAt: presenceByAgent.get(agent.agentId)?.lastSeenAt ?? null,
+              })),
+            },
+          };
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "agent_store_unavailable",
+            error instanceof Error ? error.message : "The agent store is unavailable.",
+          );
+        }
+      }
+      if (repository?.loadProjection) {
+        try {
+          await hydrateProjection({ accountId: principal.accountId }, true, {
+            includePosts: false,
+            includeActivity: false,
+          });
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "projection_unavailable",
+            error instanceof Error ? error.message : "The durable projection is unavailable.",
+          );
+        }
+      }
+      const projection = repository?.loadProjection
+        ? cachedProjection({ accountId: principal.accountId })
+        : undefined;
+      if (projection) {
+        const nowMs = Date.parse(database.now());
+        const presenceByAgent = new Map<string, { lastSeenAt: string; connected: boolean }>();
+        for (const session of projection.runtimeSessions) {
+          const lastSeenAt = session.lastSeenAt;
+          const connected =
+            session.status === "active" &&
+            Date.parse(session.expiresAt) > nowMs &&
+            Date.parse(lastSeenAt) >= nowMs - runtimeOfflineSeconds * 1_000;
+          const previous = presenceByAgent.get(session.agentId);
+          if (!previous || lastSeenAt > previous.lastSeenAt) {
+            presenceByAgent.set(session.agentId, { lastSeenAt, connected });
+          }
+        }
+        return {
+          body: {
+            agents: projection.agents
+              .filter((agent) => agent.ownerAccountId === principal.accountId)
+              .map((agent) => ({
+                ...agentFromRepository(agent),
+                connectionStatus: presenceByAgent.get(agent.agentId)?.connected
+                  ? "connected"
+                  : "offline",
+                lastSeenAt: presenceByAgent.get(agent.agentId)?.lastSeenAt ?? null,
+              })),
+          },
+        };
+      }
       const onlineAfter = addSeconds(database.clock.now(), -runtimeOfflineSeconds);
       const rows = db
         .prepare(
@@ -3518,7 +4637,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
 
     const ownerProfileMatch = matchingPath(path, /^\/v1\/agents\/([^/]+)\/profile$/);
     if (method === "PUT" && ownerProfileMatch) {
-      const principal = await requireHuman(request);
+      const principal = await requireHuman(request, true);
       requireCsrf(request, principal);
       const agentId = decodeURIComponent(ownerProfileMatch[1]);
       const owned = db
@@ -3526,18 +4645,272 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         .get(agentId, principal.accountId);
       if (!owned) throw new ApiError(404, "agent_not_found", "Owned agent not found.");
       const profileInput = asObject(await readJson(request));
+      if (repository?.upsertAgent) {
+        const before = db.prepare("SELECT updated_at FROM agents WHERE id = ?").get(agentId) as
+          | { updated_at: string }
+          | undefined;
+        if (!before) throw new ApiError(404, "agent_not_found", "Owned agent not found.");
+        const candidate = updateAgentProfile(
+          agentId,
+          profileInput,
+          "owner-approval",
+          undefined,
+          { persist: false },
+        );
+        await durableWrite("agent profile update", async () => {
+          await repository.upsertAgent?.({
+            ...repositoryAgent(
+              candidate,
+              undefined,
+              undefined,
+              principal.accountId,
+              principal.sessionHash,
+            ),
+            expectedUpdatedAt: before.updated_at,
+          });
+        });
+        // SQLite is a read projection in production. Reconcile it only after
+        // Firestore accepts the owner edit so a rejected transaction cannot
+        // leave this replica ahead of the authoritative profile.
+        database.transaction(() => {
+          db.prepare(
+            `UPDATE agents SET name = ?, handle = ?, tagline = ?, interests_json = ?,
+               personality = ?, attention_json = ?, definition_digest = ?, updated_at = ?
+             WHERE id = ?`,
+          ).run(
+            candidate.name,
+            candidate.handle,
+            candidate.tagline,
+            candidate.interests_json,
+            candidate.personality,
+            candidate.attention_json,
+            candidate.definition_digest,
+            candidate.updated_at,
+            candidate.id,
+          );
+        });
+        return { body: { agent: agentFromRow(candidate) } };
+      }
       const updated = database.transaction(() =>
         updateAgentProfile(agentId, profileInput, "owner-approval"),
       );
-      await durableWrite("agent profile update", async () => {
-        await repository?.upsertAgent?.(repositoryAgent(updated));
-      });
       return { body: { agent: agentFromRow(updated) } };
+    }
+
+    const profileProposalListMatch = matchingPath(path, /^\/v1\/agents\/([^/]+)\/profile\/proposals$/);
+    if (method === "GET" && profileProposalListMatch) {
+      const principal = await requireHuman(request, true);
+      const agentId = decodeURIComponent(profileProposalListMatch[1]);
+      const owned = db
+        .prepare("SELECT 1 AS owned FROM agents WHERE id = ? AND owner_account_id = ?")
+        .get(agentId, principal.accountId);
+      if (!owned) throw new ApiError(404, "agent_not_found", "Owned agent not found.");
+      if (repository?.listProfileReviewProposals) {
+        try {
+          const proposals = await repository.listProfileReviewProposals({
+            agentId,
+            ownerAccountId: principal.accountId,
+            humanSessionHash: principal.sessionHash,
+          });
+          return { body: { proposals } };
+        } catch (error) {
+          if (error instanceof Error && error.message === "mesh_governance_denied") {
+            throw new ApiError(401, "authentication_required", "The human session is no longer valid.");
+          }
+          throw new ApiError(
+            503,
+            "profile_store_unavailable",
+            error instanceof Error ? error.message : "The profile review store is unavailable.",
+          );
+        }
+      }
+      const rows = db.prepare(
+        `SELECT id, agent_id, owner_account_id, source_digest, requested_json,
+                pending_fields_json, status, created_at, updated_at, resolved_at, resolution
+         FROM profile_review_proposals
+         WHERE agent_id = ? AND owner_account_id = ?
+         ORDER BY updated_at DESC, id ASC LIMIT 100`,
+      ).all(agentId, principal.accountId) as Array<Record<string, unknown>>;
+      return { body: { proposals: rows.map(profileReviewProposalFromRow) } };
+    }
+
+    const profileProposalResolveMatch = matchingPath(
+      path,
+      /^\/v1\/agents\/([^/]+)\/profile\/proposals\/([^/]+)$/,
+    );
+    if (method === "POST" && profileProposalResolveMatch) {
+      const principal = await requireHuman(request, true);
+      requireCsrf(request, principal);
+      const agentId = decodeURIComponent(profileProposalResolveMatch[1]);
+      const proposalId = decodeURIComponent(profileProposalResolveMatch[2]);
+      const input = asObject(await readJson(request));
+      for (const field of Object.keys(input)) {
+        if (field !== "decision") throw new ApiError(400, "invalid_request", `${field} is not allowed.`);
+      }
+      const decision = input.decision;
+      if (decision !== "approved" && decision !== "denied") {
+        throw new ApiError(400, "invalid_request", "decision must be approved or denied.");
+      }
+      const owned = db
+        .prepare("SELECT 1 AS owned FROM agents WHERE id = ? AND owner_account_id = ?")
+        .get(agentId, principal.accountId);
+      if (!owned) throw new ApiError(404, "agent_not_found", "Owned agent not found.");
+      const resolvedAt = database.now();
+      const eventId = `evt_${sha256(`profile-review:${proposalId}:${decision}`).slice(0, 40)}`;
+      const auditId = `audit_${sha256(`profile-review:${proposalId}:${decision}`).slice(0, 40)}`;
+      const event: RepositoryEventInput = {
+        eventId,
+        type: `agent.profile.review.${decision}`,
+        meshId: null,
+        topicId: null,
+        agentId,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload: { proposalId, agentId, decision },
+        occurredAt: resolvedAt,
+      };
+      const audit: RepositoryAuditInput = {
+        auditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: `agent.profile.review.${decision}`,
+        resourceType: "profile_review_proposal",
+        resourceId: proposalId,
+        data: { agentId, decision },
+        createdAt: resolvedAt,
+      };
+      if (repository?.resolveProfileReviewProposal) {
+        let resolved: Awaited<ReturnType<NonNullable<MeshrRepository["resolveProfileReviewProposal"]>>> | undefined;
+        try {
+          resolved = await repository.resolveProfileReviewProposal({
+            proposalId,
+            agentId,
+            ownerAccountId: principal.accountId,
+            humanSessionHash: principal.sessionHash,
+            decision,
+            resolvedAt,
+            event,
+            audit,
+          });
+        } catch (error) {
+          if (error instanceof Error && error.message === "profile_proposal_not_found") {
+            throw new ApiError(404, "profile_proposal_not_found", "Profile review proposal not found.");
+          }
+          if (error instanceof Error && error.message === "profile_proposal_not_pending") {
+            throw new ApiError(409, "profile_proposal_not_pending", "This profile review proposal is already resolved.");
+          }
+          if (error instanceof Error && error.message === "handle_unavailable") {
+            throw new ApiError(409, "handle_unavailable", "That agent handle is already in use.");
+          }
+          if (error instanceof Error && error.message === "profile_proposal_invalid") {
+            throw new ApiError(409, "profile_proposal_invalid", "The proposed profile is no longer valid.");
+          }
+          if (error instanceof Error && error.message === "profile_proposal_stale") {
+            throw new ApiError(
+              409,
+              "profile_proposal_stale",
+              "This profile proposal is based on an older agent revision. Reload the agent definition and review the new proposal.",
+            );
+          }
+          if (error instanceof Error && error.message === "mesh_governance_denied") {
+            throw new ApiError(401, "authentication_required", "The human session is no longer valid.");
+          }
+          throw new ApiError(
+            503,
+            "profile_store_unavailable",
+            error instanceof Error ? error.message : "The profile review store is unavailable.",
+          );
+        }
+        if (!resolved) throw new ApiError(503, "profile_store_unavailable", "The profile review store is unavailable.");
+        const canonical = resolved.agent;
+        database.transaction(() => {
+          db.prepare(
+            `UPDATE agents SET name = ?, handle = ?, attention_json = ?, definition_digest = ?, updated_at = ? WHERE id = ?`,
+          ).run(
+            canonical.name,
+            canonical.handle,
+            JSON.stringify(canonical.attention),
+            canonical.definitionDigest,
+            canonical.updatedAt,
+            canonical.agentId,
+          );
+          db.prepare(
+            `UPDATE profile_review_proposals SET status = ?, resolution = ?, resolved_at = ?, updated_at = ? WHERE id = ?`,
+          ).run(
+            decision,
+            decision,
+            resolved.proposal.resolvedAt ?? resolved.proposal.updatedAt,
+            resolved.proposal.updatedAt,
+            proposalId,
+          );
+        });
+        return { body: { proposal: resolved.proposal, agent: agentFromRepository(canonical) } };
+      }
+      const resolved = database.transaction(() => {
+        const row = db.prepare(
+          `SELECT id, agent_id, owner_account_id, source_digest, requested_json,
+                  pending_fields_json, status, created_at, updated_at, resolved_at, resolution
+           FROM profile_review_proposals WHERE id = ?`,
+        ).get(proposalId) as Record<string, unknown> | undefined;
+        if (!row || String(row.agent_id) !== agentId || String(row.owner_account_id ?? "") !== principal.accountId) {
+          throw new ApiError(404, "profile_proposal_not_found", "Profile review proposal not found.");
+        }
+        if (row.status !== "pending") throw new ApiError(409, "profile_proposal_not_pending", "This profile review proposal is already resolved.");
+        const agentRow = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
+        if (!agentRow) throw new ApiError(404, "agent_not_found", "Owned agent not found.");
+        if (String(row.updated_at) !== String(agentRow.updated_at)) {
+          throw new ApiError(
+            409,
+            "profile_proposal_stale",
+            "This profile proposal is based on an older agent revision. Reload the agent definition and review the new proposal.",
+          );
+        }
+        const requested = JSON.parse(String(row.requested_json)) as Record<string, unknown>;
+        let next = agentFromRow(agentRow);
+        if (decision === "approved") {
+          const nextName = requested.name === undefined ? next.name : String(requested.name);
+          const nextHandle = requested.handle === undefined ? next.handle : String(requested.handle);
+          const handleOwner = db.prepare("SELECT id FROM agents WHERE handle = ? COLLATE NOCASE AND id <> ?").get(nextHandle, agentId);
+          if (handleOwner) throw new ApiError(409, "handle_unavailable", "That agent handle is already in use.");
+          const attention = { ...next.attention };
+          if (requested.attention && typeof requested.attention === "object" && !Array.isArray(requested.attention)) {
+            for (const field of ["browse", "rootPosts", "replies"] as const) {
+              const value = (requested.attention as Record<string, unknown>)[field];
+              if (value !== undefined) attention[field] = value as never;
+            }
+          }
+          db.prepare("UPDATE agents SET name = ?, handle = ?, attention_json = ?, definition_digest = ?, updated_at = ? WHERE id = ?")
+            .run(nextName, nextHandle, JSON.stringify(attention), String(row.source_digest) || next.definitionDigest, resolvedAt, agentId);
+          next = { ...next, name: nextName, handle: nextHandle, attention, definitionDigest: String(row.source_digest) || next.definitionDigest, updatedAt: resolvedAt };
+        }
+        db.prepare("UPDATE profile_review_proposals SET status = ?, resolution = ?, resolved_at = ?, updated_at = ? WHERE id = ?")
+          .run(decision, decision, resolvedAt, resolvedAt, proposalId);
+        db.prepare(
+          `INSERT OR IGNORE INTO outbox_events(event_id, schema_version, type, mesh_id, topic_id, agent_id, session_id, runtime_kind, payload_json, status, attempts, created_at)
+           VALUES(?, 1, ?, NULL, NULL, ?, ?, NULL, ?, 'pending', 0, ?)`,
+        ).run(eventId, event.type, agentId, principal.sessionHash, JSON.stringify(event.payload), resolvedAt);
+        db.prepare(
+          `INSERT OR IGNORE INTO audit_events(id, actor_type, actor_id, session_id, action, resource_type, resource_id, data_json, created_at)
+           VALUES(?, 'human', ?, ?, ?, 'profile_review_proposal', ?, ?, ?)`,
+        ).run(auditId, principal.accountId, principal.sessionHash, audit.action, proposalId, JSON.stringify(audit.data), resolvedAt);
+        return {
+          proposal: {
+            ...profileReviewProposalFromRow(row),
+            status: decision,
+            resolution: decision,
+            resolvedAt,
+            updatedAt: resolvedAt,
+          },
+          agent: next,
+        };
+      });
+      return { body: { proposal: resolved.proposal, agent: agentFromRow(db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as unknown as AgentRow) } };
     }
 
     const bindingMatch = matchingPath(path, /^\/v1\/agents\/([^/]+)\/binding$/);
     if (method === "DELETE" && bindingMatch) {
-      const principal = await requireHuman(request);
+      const principal = await requireHuman(request, true);
       requireCsrf(request, principal);
       const agentId = decodeURIComponent(bindingMatch[1]);
       const owned = db
@@ -3545,8 +4918,39 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         .get(agentId, principal.accountId);
       if (!owned) throw new ApiError(404, "agent_not_found", "Owned agent not found.");
       const now = database.now();
+      const revokeEventId = database.id("evt");
+      const revokeAuditId = database.id("audit");
+      const revokeEvent: RepositoryEventInput = {
+        eventId: revokeEventId,
+        type: "agent.disconnected",
+        meshId: null,
+        topicId: null,
+        agentId,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload: { agentId, reason: "owner_revoked" },
+        occurredAt: now,
+      };
+      const revokeAudit: RepositoryAuditInput = {
+        auditId: revokeAuditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: "agent.binding.revoked",
+        resourceType: "agent",
+        resourceId: agentId,
+        data: { agentId, reason: "owner_revoked" },
+        createdAt: now,
+      };
       await durableWrite("agent binding revoke", async () => {
-        await repository?.revokeAgent?.(agentId, now);
+        await repository?.revokeAgent?.(
+          agentId,
+          now,
+          revokeEvent,
+          revokeAudit,
+          principal.accountId,
+          principal.sessionHash,
+        );
       });
       const revoked = database.transaction(() => {
         const pairings = db
@@ -3564,7 +4968,23 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           )
           .run(now, agentId);
         if (pairings.changes > 0 || sessions.changes > 0 || pageGrants.changes > 0) {
-          emitEvent("agent.disconnected", agentId, null, null, { agentId });
+          emitEvent("agent.disconnected", agentId, null, null, { agentId, reason: "owner_revoked" }, {
+            eventId: revokeEventId,
+            occurredAt: now,
+            durable: Boolean(repository?.revokeAgent),
+          });
+          emitAudit({
+            auditId: revokeAuditId,
+            createdAt: now,
+            actorType: "human",
+            actorId: principal.accountId,
+            sessionId: principal.sessionHash,
+            action: "agent.binding.revoked",
+            resourceType: "agent",
+            resourceId: agentId,
+            data: { agentId, reason: "owner_revoked" },
+            durable: Boolean(repository?.revokeAgent),
+          });
         }
         return {
           pairings: Number(pairings.changes),
@@ -3584,7 +5004,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }
 
     if (method === "GET" && path === "/v1/webmcp/session") {
-      const human = await requireHuman(request);
+      const human = await requireHuman(request, false, { touchSession: false });
       const active = await readWebMcpGrant(request, human);
       if (!active) {
         return {
@@ -3603,9 +5023,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }
 
     if (method === "POST" && path === "/v1/webmcp/session") {
-      const human = await requireHuman(request);
+      const human = await requireHuman(request, true);
       requireCsrf(request, human);
-      assertCostProtectionAllows("session");
       const input = asObject(await readJson(request));
       for (const field of Object.keys(input)) {
         if (field !== "agentId") {
@@ -3619,6 +5038,45 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (!agent) {
         throw new ApiError(404, "agent_not_found", "Owned agent not found.");
       }
+      const pageMaterial = webMcpMaterial(human.sessionHash, agent.id);
+      // The durable handoff can commit before the browser receives its
+      // response (or before the Set-Cookie reaches storage). Reissue the same
+      // deterministic grant on retry before checking native connectivity;
+      // the native session was intentionally superseded by that handoff.
+      if (repository?.findWebMcpGrant && webMcpTransfersSession) {
+        try {
+          const durableGrant = await repository.findWebMcpGrant(
+            pageMaterial.tokenHash,
+            human.sessionHash,
+          );
+          if (durableGrant) {
+            const recovered = await reconcileDurableWebMcpGrant(durableGrant, human);
+            if (recovered) {
+              return {
+                status: 200,
+                headers: { "Set-Cookie": webMcpCookie(pageMaterial.token, secureCookies) },
+                body: {
+                  enabled: true,
+                  agent: agentFromRow(recovered.agent),
+                  createdAt: recovered.grant.created_at,
+                  expiresAt: recovered.grant.expires_at,
+                },
+              };
+            }
+          }
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "session_store_unavailable",
+            error instanceof Error ? error.message : "The session store is unavailable.",
+          );
+        }
+      }
+      // A committed handoff may have lost its HTTP response. Reissuing that
+      // deterministic grant is recovery, not a new session start, and must
+      // remain available while cost protection is active. New transfers are
+      // blocked below after the recovery path has been exhausted.
+      assertCostProtectionAllows("session");
       let connected = db
         .prepare(
           `SELECT 1 AS connected FROM agent_sessions
@@ -3652,13 +5110,64 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           "Only a connected agent can be enabled for page WebMCP.",
         );
       }
-      const token = randomToken();
-      const tokenHash = sha256(token);
+      const token = pageMaterial.token;
+      const tokenHash = pageMaterial.tokenHash;
       const nowDate = database.clock.now();
       const now = nowDate.toISOString();
       const expiresAt = addSeconds(nowDate, WEBMCP_GRANT_SECONDS);
       let transferSessionId = database.id("page");
       let authoritativeEpoch: number | undefined;
+      const transferMeshIds = new Set<string>(
+        (db
+          .prepare("SELECT mesh_id FROM mesh_members WHERE agent_id = ?")
+          .all(agent.id) as Array<{ mesh_id: string }>).map((row) => row.mesh_id),
+      );
+      if (repository?.listMeshesForAgent) {
+        try {
+          const durableMeshes = await repository.listMeshesForAgent(agent.id);
+          transferMeshIds.clear();
+          for (const entry of durableMeshes) {
+            if (entry.joined) transferMeshIds.add(entry.mesh.meshId);
+          }
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "mesh_store_unavailable",
+            error instanceof Error ? error.message : "The mesh store is unavailable.",
+          );
+        }
+      }
+      const transferEventId = database.id("evt");
+      const transferAuditId = database.id("audit");
+      const transferEvent: RepositoryEventInput = {
+        eventId: transferEventId,
+        type: "agent.session.transferred",
+        meshId: null,
+        topicId: null,
+        agentId: agent.id,
+        sessionId: transferSessionId,
+        runtimeKind: agent.runtime,
+        payload: {
+          agentId: agent.id,
+          transferSessionId,
+          authority: "page_webmcp",
+          // The transfer is system-scoped, but topology still needs a bounded
+          // per-mesh projection so observers can see the authority change.
+          meshIds: [...transferMeshIds].slice(0, MAX_JOINED_MESHES_PER_AGENT),
+        },
+        occurredAt: now,
+      };
+      const transferAudit: RepositoryAuditInput = {
+        auditId: transferAuditId,
+        actorType: "human",
+        actorId: human.accountId,
+        sessionId: human.sessionHash,
+        action: "webmcp.session.transferred",
+        resourceType: "agent",
+        resourceId: agent.id,
+        data: { transferSessionId, authority: "page_webmcp" },
+        createdAt: now,
+      };
       if (repository && webMcpTransfersSession) {
         try {
           const committed = await repository.transferPageAuthority({
@@ -3666,6 +5175,9 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             grantId: tokenHash,
             humanSessionHash: human.sessionHash,
             expiresAt,
+            sessionId: transferSessionId,
+            event: transferEvent,
+            audit: transferAudit,
           });
           transferSessionId = committed.sessionId;
           authoritativeEpoch = committed.authorityEpoch;
@@ -3687,9 +5199,9 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       database.transaction(() => {
         db.prepare(
           `UPDATE webmcp_grants SET revoked_at = ?
-           WHERE ${webMcpTransfersSession ? "agent_id = ?" : "human_session_hash = ?"}
+           WHERE human_session_hash = ?
              AND revoked_at IS NULL`,
-        ).run(now, webMcpTransfersSession ? agent.id : human.sessionHash);
+        ).run(now, human.sessionHash);
         let authorityEpoch = readAuthority(agent.id)?.epoch ?? 0;
         if (webMcpTransfersSession) {
           const superseded = db
@@ -3713,6 +5225,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           }
           if (superseded.changes > 0) {
             emitAudit({
+              auditId: transferAuditId,
+              createdAt: now,
               actorType: "human",
               actorId: human.accountId,
               sessionId: human.sessionHash,
@@ -3720,19 +5234,51 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
               resourceType: "agent",
               resourceId: agent.id,
               data: { transferSessionId, authorityEpoch },
+              durable: Boolean(repository && webMcpTransfersSession),
             });
             emitEvent("agent.session.transferred", agent.id, null, null, {
               agentId: agent.id,
               transferSessionId,
               authority: "page_webmcp",
-            }, { sessionId: transferSessionId, runtimeKind: agent.runtime });
+            }, {
+              sessionId: transferSessionId,
+              runtimeKind: agent.runtime,
+              eventId: transferEventId,
+              occurredAt: now,
+              durable: Boolean(repository && webMcpTransfersSession),
+            });
           }
+          db.prepare(
+            `INSERT INTO webmcp_authority(
+               human_session_hash, epoch, grant_id, agent_id, session_id, updated_at, revoked_at
+             ) VALUES(?, ?, ?, ?, ?, ?, NULL)
+             ON CONFLICT(human_session_hash) DO UPDATE SET
+               epoch = excluded.epoch, grant_id = excluded.grant_id,
+               agent_id = excluded.agent_id, session_id = excluded.session_id,
+               updated_at = excluded.updated_at, revoked_at = NULL`,
+          ).run(
+            human.sessionHash,
+            authorityEpoch,
+            tokenHash,
+            agent.id,
+            transferSessionId,
+            now,
+          );
         }
         db.prepare(
           `INSERT INTO webmcp_grants(
              token_hash, human_session_hash, agent_id, created_at,
              expires_at, last_used_at, revoked_at, session_id, authority_epoch
-           ) VALUES(?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+           ) VALUES(?, ?, ?, ?, ?, ?, NULL, ?, ?)
+           ON CONFLICT(token_hash) DO UPDATE SET
+             human_session_hash = excluded.human_session_hash,
+             agent_id = excluded.agent_id,
+             created_at = excluded.created_at,
+             expires_at = excluded.expires_at,
+             last_used_at = excluded.last_used_at,
+             revoked_at = NULL,
+             session_id = excluded.session_id,
+             authority_epoch = excluded.authority_epoch`,
         ).run(
           tokenHash,
           human.sessionHash,
@@ -3757,16 +5303,31 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }
 
     if (method === "DELETE" && path === "/v1/webmcp/session") {
-      const human = await requireHuman(request);
+      const human = await requireHuman(request, true);
       requireCsrf(request, human);
       const now = database.now();
       await durableWrite("WebMCP grant revoke", async () => {
         await repository?.revokeWebMcpGrants?.(human.sessionHash, now);
       });
-      db.prepare(
-        `UPDATE webmcp_grants SET revoked_at = ?
-         WHERE human_session_hash = ? AND revoked_at IS NULL`,
-      ).run(now, human.sessionHash);
+      database.transaction(() => {
+        db.prepare(
+          `UPDATE webmcp_grants SET revoked_at = ?
+           WHERE human_session_hash = ? AND revoked_at IS NULL`,
+        ).run(now, human.sessionHash);
+        if (webMcpTransfersSession) {
+          const fence = db
+            .prepare("SELECT epoch FROM webmcp_authority WHERE human_session_hash = ?")
+            .get(human.sessionHash) as { epoch: number } | undefined;
+          db.prepare(
+            `INSERT INTO webmcp_authority(
+               human_session_hash, epoch, grant_id, agent_id, session_id, updated_at, revoked_at
+             ) VALUES(?, ?, NULL, NULL, NULL, ?, ?)
+             ON CONFLICT(human_session_hash) DO UPDATE SET
+               epoch = excluded.epoch, grant_id = NULL, agent_id = NULL, session_id = NULL,
+               updated_at = excluded.updated_at, revoked_at = excluded.revoked_at`,
+          ).run(human.sessionHash, (fence?.epoch ?? 0) + 1, now, now);
+        }
+      });
       return {
         body: { enabled: false, agent: null, createdAt: null, expiresAt: null },
         headers: { "Set-Cookie": clearWebMcpCookie(secureCookies) },
@@ -3774,10 +5335,224 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }
 
     if (method === "GET" && path === "/v1/activity/public") {
-      const principal = await requireHuman(request);
+      const includeAuthorized = url.searchParams.get("includeAuthorized") === "1";
+      const sharedSnapshot = url.searchParams.get("shared") === "1";
+      const requestedMeshId = url.searchParams.get("meshId") ?? undefined;
+      if (requestedMeshId !== undefined &&
+          !/^[A-Za-z0-9._:-]{1,128}$/.test(requestedMeshId)) {
+        throw new ApiError(400, "invalid_mesh", "The requested mesh is invalid.");
+      }
+      // Public viewers use the bounded shared projection cache. Private or
+      // unlisted activity is deliberately refreshed authoritatively because a
+      // role/admission change must not leave a stale private mesh in a browser
+      // response. The live gateway calls this route without includeAuthorized,
+      // so a topology burst cannot turn into a full account projection read.
+      // Shared gateway polling must not extend a human's idle session. Only
+      // account-scoped browser reads refresh the rolling 12-hour idle window;
+      // the gateway authenticates once and uses its own short-lived grant.
+      const principal = await requireHuman(
+        request,
+        false,
+        { touchSession: false },
+      );
+      if (repository?.loadProjection) {
+        try {
+          if (includeAuthorized) {
+            // Topology is an aggregate-only read model. Do not hydrate
+            // expiring post bodies for the browser's 15-second activity poll.
+            await refreshHumanActivityProjection(principal.accountId);
+          } else {
+            // The live gateway opts into the short shared cache after it has
+            // authenticated the browser/agent subscription. Direct browser
+            // reads stay authoritative so a governance change is visible on
+            // the next refresh and local fixtures do not hide convergence.
+            // Mesh-scoped live frames must converge with the topology worker
+            // within the two-second launch target. Keep the shared route
+            // inexpensive through a short public projection cache, while
+            // direct browser reads remain authoritative.
+            const publicProjectionAge = Date.now() - (projectionHydratedAt.get("public") ?? 0);
+            const refreshSharedMesh = Boolean(requestedMeshId) && publicProjectionAge >= 1_000;
+            await hydrateProjection({}, !sharedSnapshot || refreshSharedMesh, { includePosts: false });
+          }
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "projection_unavailable",
+            error instanceof Error ? error.message : "The public projection is unavailable.",
+          );
+        }
+      }
+      const projection = repository?.loadProjection
+        ? cachedProjection(includeAuthorized ? { accountId: principal.accountId } : {})
+        : undefined;
+      const authorizedMeshIds = includeAuthorized
+        ? projection
+          ? new Set(projection.meshes.map((mesh) => mesh.meshId))
+          : new Set<string>([
+              ...(db
+                .prepare("SELECT id FROM meshes WHERE visibility = 'public'")
+                .all() as Array<{ id: string }>).map((mesh) => mesh.id),
+              ...(db
+                .prepare("SELECT mesh_id AS id FROM mesh_human_roles WHERE account_id = ?")
+                .all(principal.accountId) as Array<{ id: string }>).map((mesh) => mesh.id),
+            ])
+        : undefined;
+      const generatedAt = database.now();
+      const nowMs = Date.parse(generatedAt);
+      const durablePresence = projection
+        ? new Map(
+            projection.runtimeSessions.map((session) => [session.agentId, {
+              lastSeenAt: session.lastSeenAt,
+              connected:
+                session.status === "active" &&
+                Date.parse(session.expiresAt) > nowMs &&
+                Date.parse(session.lastSeenAt) >= nowMs - runtimeOfflineSeconds * 1_000,
+            }]),
+          )
+        : undefined;
       return {
-        body: readPublicActivity(db, principal.accountId, database.now()),
+        body: readPublicActivity(
+          db,
+          principal.accountId,
+          generatedAt,
+          authorizedMeshIds,
+          durablePresence,
+          requestedMeshId,
+          projection?.activity,
+        ),
       };
+    }
+
+    if (method === "GET" && path === "/v1/activity/preferences") {
+      const principal = await requireHuman(request, false, { touchSession: false });
+      let preferences: RepositoryHumanActivityPreference[];
+      if (repository?.listHumanActivityPreferences) {
+        try {
+          preferences = await repository.listHumanActivityPreferences(principal.accountId);
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "preference_store_unavailable",
+            error instanceof Error ? error.message : "The activity preference store is unavailable.",
+          );
+        }
+      } else {
+        const rows = db.prepare(
+          `SELECT account_id, kind, resource_id, watching, muted, updated_at
+           FROM human_activity_preferences
+           WHERE account_id = ?
+           ORDER BY updated_at DESC, kind ASC, resource_id ASC`,
+        ).all(principal.accountId) as Array<{
+          account_id: string;
+          kind: RepositoryHumanActivityPreference["kind"];
+          resource_id: string;
+          watching: number;
+          muted: number;
+          updated_at: string;
+        }>;
+        preferences = rows.map((row) => ({
+          accountId: row.account_id,
+          kind: row.kind,
+          resourceId: row.resource_id,
+          watching: row.watching === 1,
+          muted: row.muted === 1,
+          updatedAt: row.updated_at,
+        }));
+      }
+      return { body: { preferences } };
+    }
+
+    const activityPreferenceMatch = matchingPath(
+      path,
+      /^\/v1\/activity\/preferences\/(topic|link)\/([^/]+)$/,
+    );
+    if (method === "PUT" && activityPreferenceMatch) {
+      const principal = await requireHuman(request, true);
+      requireCsrf(request, principal);
+      const kind = activityPreferenceMatch[1] as RepositoryHumanActivityPreference["kind"];
+      const resourceId = decodeURIComponent(activityPreferenceMatch[2]);
+      if (resourceId.length < 1 || resourceId.length > 256) {
+        throw new ApiError(400, "invalid_preference", "The activity resource is invalid.");
+      }
+      const input = asObject(await readJson(request));
+      const requestedWatching = input.watching as unknown;
+      const requestedMuted = input.muted as unknown;
+      for (const key of Object.keys(input)) {
+        if (key !== "watching" && key !== "muted") {
+          throw new ApiError(400, "invalid_request", `${key} is not allowed.`);
+        }
+        if (typeof input[key] !== "boolean") {
+          throw new ApiError(400, "invalid_preference", `${key} must be a boolean.`);
+        }
+      }
+      if (requestedWatching === undefined && requestedMuted === undefined) {
+        throw new ApiError(400, "invalid_preference", "Set watching or muted.");
+      }
+
+      let meshId: string;
+      if (kind === "topic") {
+        const topic = db.prepare("SELECT mesh_id FROM topics WHERE id = ?").get(resourceId) as
+          | { mesh_id: string }
+          | undefined;
+        if (!topic) throw new ApiError(404, "topic_not_found", "Conversation not found.");
+        meshId = topic.mesh_id;
+      } else {
+        const parts = resourceId.split(":");
+        if (parts.length !== 4 || parts[0] !== "traffic" || parts.slice(1).some((part) => !part)) {
+          throw new ApiError(400, "invalid_preference", "The traffic link is invalid.");
+        }
+        meshId = parts[1]!;
+      }
+      const mesh = readMesh(meshId);
+      if (mesh.visibility !== "public") {
+        const role = await meshRoleForAuthoritatively(principal.accountId, meshId);
+        if (!role) throw new ApiError(403, "mesh_access_denied", "You do not have access to this mesh.");
+      }
+      const current = db.prepare(
+        `SELECT watching, muted FROM human_activity_preferences
+         WHERE account_id = ? AND kind = ? AND resource_id = ?`,
+      ).get(principal.accountId, kind, resourceId) as
+        | { watching: number; muted: number }
+        | undefined;
+      const preference: RepositoryHumanActivityPreference = {
+        accountId: principal.accountId,
+        kind,
+        resourceId,
+        watching: requestedWatching === undefined ? current?.watching === 1 : requestedWatching as boolean,
+        muted: requestedMuted === undefined ? current?.muted === 1 : requestedMuted as boolean,
+        updatedAt: database.now(),
+      };
+      if (repository) {
+        if (!repository.upsertHumanActivityPreference) {
+          throw new ApiError(503, "preference_store_unavailable", "The activity preference store is unavailable.");
+        }
+        try {
+          await repository.upsertHumanActivityPreference(preference);
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "preference_store_unavailable",
+            error instanceof Error ? error.message : "The activity preference store is unavailable.",
+          );
+        }
+      }
+      db.prepare(
+        `INSERT INTO human_activity_preferences(
+           account_id, kind, resource_id, watching, muted, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?)
+         ON CONFLICT(account_id, kind, resource_id) DO UPDATE SET
+           watching = excluded.watching,
+           muted = excluded.muted,
+           updated_at = excluded.updated_at`,
+      ).run(
+        preference.accountId,
+        preference.kind,
+        preference.resourceId,
+        preference.watching ? 1 : 0,
+        preference.muted ? 1 : 0,
+        preference.updatedAt,
+      );
+      return { body: { preference } };
     }
 
     // The live gateway is a separate process, but it must never make its own
@@ -3792,16 +5567,18 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       );
       const authorization = request.headers.authorization ?? "";
       if (authorization.startsWith("Bearer ")) {
-        const principal = await requireAgent(request);
+        const principal = await requireAgent(request, { refreshAgent: true });
         const agent = db
           .prepare("SELECT * FROM agents WHERE id = ?")
           .get(principal.agentId) as unknown as AgentRow;
-        await ensureAttentionMeshAccessAuthoritatively(agent, principal.agentId, meshId);
+        const meshAccess = await ensureAttentionMeshAccessAuthoritatively(agent, principal.agentId, meshId);
         return {
           body: {
             allowed: true,
             principal: "agent",
+            agentId: principal.agentId,
             meshId,
+            meshVisibility: meshAccess.visibility,
             cursor: Number(
               (db.prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events WHERE mesh_id = ?")
                 .get(meshId) as { sequence: number }).sequence ?? 0,
@@ -3809,12 +5586,28 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           },
         };
       }
-      const principal = await requireHuman(request);
-      const mesh = readMesh(meshId);
-      const role = await meshRoleForAuthoritatively(principal.accountId, meshId);
-      const allowed =
-        mesh.visibility !== "private" ||
-        role !== null;
+      // This endpoint is called by the live gateway on access-epoch changes;
+      // it only needs the durable session plus the mesh/role lookup below.
+      // Avoid hydrating the full browser projection on the hot authorization
+      // path.
+      // Gateway heartbeats/reauthorizations must not keep an unattended
+      // browser session alive. Only direct user activity advances idle time.
+      const principal = await requireHuman(request, false, { touchSession: false });
+      let mesh: { visibility: "public" | "unlisted" | "private" };
+      let role: MeshRole | null;
+      if (repository?.findMeshById && repository.findMeshHumanRole) {
+        const [authoritativeMesh, authoritativeRole] = await Promise.all([
+          repository.findMeshById(meshId),
+          repository.findMeshHumanRole(meshId, principal.accountId),
+        ]);
+        if (!authoritativeMesh) throw new ApiError(404, "mesh_not_found", "Mesh not found.");
+        mesh = authoritativeMesh;
+        role = authoritativeRole;
+      } else {
+        mesh = readMesh(meshId);
+        role = await meshRoleForAuthoritatively(principal.accountId, meshId);
+      }
+      const allowed = mesh.visibility !== "private" || role !== null;
       if (!allowed) {
         throw new ApiError(403, "mesh_access_denied", "You do not have access to this mesh.");
       }
@@ -3823,6 +5616,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           allowed: true,
           principal: "human",
           meshId,
+          meshVisibility: mesh.visibility,
           cursor: Number(
             (db.prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events WHERE mesh_id = ?")
               .get(meshId) as { sequence: number }).sequence ?? 0,
@@ -3832,7 +5626,36 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }
 
     if (method === "GET" && path === "/v1/meshes") {
-      const principal = await requireHuman(request);
+      const principal = await requireHuman(request, false, { touchSession: false });
+      if (repository?.listMeshDirectoryForAccount) {
+        try {
+          const directory = await repository.listMeshDirectoryForAccount(principal.accountId);
+          return { body: { meshes: directory.map(meshSummaryFromDirectory) } };
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "mesh_store_unavailable",
+            error instanceof Error ? error.message : "The mesh directory is unavailable.",
+          );
+        }
+      }
+      if (repository?.loadProjection) {
+        try {
+          await hydrateProjection({ accountId: principal.accountId }, true, {
+            includePosts: false,
+            includeActivity: true,
+          });
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "projection_unavailable",
+            error instanceof Error ? error.message : "The durable projection is unavailable.",
+          );
+        }
+      }
+      const authorizedMeshIds = repository?.loadProjection
+        ? new Set(cachedProjection({ accountId: principal.accountId })?.meshes.map((mesh) => mesh.meshId) ?? [])
+        : undefined;
       const meshes = db
         .prepare(
           `SELECT m.id, m.owner_account_id, m.name, m.description, m.visibility,
@@ -3847,12 +5670,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
            ORDER BY m.created_at ASC, m.id ASC`,
         )
         .all(principal.accountId)
+        .filter((raw) => !authorizedMeshIds || authorizedMeshIds.has(String((raw as { id: string }).id)))
         .map((raw) => meshSummary(readMesh(String((raw as { id: string }).id)), principal.accountId));
       return { body: { meshes } };
     }
 
     if (method === "POST" && path === "/v1/meshes") {
-      const principal = await requireHuman(request);
+      const principal = await requireHuman(request, true);
       requireCsrf(request, principal);
       assertCostProtectionAllows("mesh");
       const input = asObject(await readJson(request));
@@ -3903,6 +5727,30 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       const now = database.now();
       const meshId = database.id("mesh");
       const topicId = database.id("topic");
+      const meshEventId = database.id("evt");
+      const meshAuditId = database.id("audit");
+      const meshEvent: RepositoryEventInput = {
+        eventId: meshEventId,
+        type: "mesh.created",
+        meshId,
+        topicId,
+        agentId: null,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload: { meshId, ownerAccountId: principal.accountId, visibility, joinPolicy },
+        occurredAt: now,
+      };
+      const meshAudit: RepositoryAuditInput = {
+        auditId: meshAuditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: "mesh.created",
+        resourceType: "mesh",
+        resourceId: meshId,
+        data: { visibility, joinPolicy },
+        createdAt: now,
+      };
       await durableWrite("mesh create", async () => {
         const meshInput: RepositoryMeshInput = {
           meshId,
@@ -3914,8 +5762,9 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           lifecycle: "active",
           createdAt: now,
           updatedAt: now,
+          actingAccountId: principal.accountId,
+          humanSessionHash: principal.sessionHash,
         };
-        await repository?.upsertMesh?.(meshInput);
         const topicInput: RepositoryTopicInput = {
           topicId,
           meshId,
@@ -3925,24 +5774,39 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           tags: [],
           createdAt: now,
         };
-        await repository?.upsertTopic?.(topicInput);
-        await repository?.upsertMeshHumanRole?.({
-          meshId,
-          accountId: principal.accountId,
-          role: "owner",
-          createdAt: now,
-          updatedAt: now,
-        });
-        for (const agentId of agentIds) {
-          await repository?.upsertMeshAgentMembership?.({
-            meshId,
-            agentId,
-            status: "joined",
-            attentionPolicy: {},
-            admissionProvenance: "invite",
-            joinedAt: now,
-            updatedAt: now,
+        if (repository?.createMeshWithOwner) {
+          await repository.createMeshWithOwner({
+            mesh: meshInput,
+            topic: topicInput,
+            agentIds,
+            event: meshEvent,
+            audit: meshAudit,
           });
+        } else {
+          await repository?.upsertMesh?.(meshInput);
+          await repository?.upsertTopic?.(topicInput);
+          await repository?.upsertMeshHumanRole?.({
+            meshId,
+            accountId: principal.accountId,
+            role: "owner",
+            createdAt: now,
+            updatedAt: now,
+            actingAccountId: principal.accountId,
+            humanSessionHash: principal.sessionHash,
+          });
+          for (const agentId of agentIds) {
+            await repository?.upsertMeshAgentMembership?.({
+              meshId,
+              agentId,
+              status: "joined",
+              attentionPolicy: {},
+              admissionProvenance: "invite",
+              joinedAt: now,
+              updatedAt: now,
+              actingAccountId: principal.accountId,
+              humanSessionHash: principal.sessionHash,
+            });
+          }
         }
       });
       const mesh = database.transaction(() => {
@@ -3964,6 +5828,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         );
         for (const agentId of agentIds) memberInsert.run(meshId, agentId, now);
         emitAudit({
+          auditId: meshAuditId,
+          createdAt: now,
           actorType: "human",
           actorId: principal.accountId,
           sessionId: principal.sessionHash,
@@ -3971,12 +5837,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           resourceType: "mesh",
           resourceId: meshId,
           data: { visibility, joinPolicy },
+          durable: Boolean(repository?.createMeshWithOwner),
         });
-        emitEvent("mesh.created", null, meshId, topicId, {
-          meshId,
-          ownerAccountId: principal.accountId,
-          visibility,
-          joinPolicy,
+        emitEvent("mesh.created", null, meshId, topicId, meshEvent.payload, {
+          eventId: meshEventId,
+          occurredAt: now,
+          sessionId: principal.sessionHash,
+          durable: Boolean(repository?.createMeshWithOwner),
         });
         return { id: meshId, topicId };
       });
@@ -3993,9 +5860,36 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
 
     const meshGovernanceMatch = matchingPath(path, /^\/v1\/meshes\/([^/]+)\/governance$/);
     if (meshGovernanceMatch && (method === "GET" || method === "PUT")) {
-      const principal = await requireHuman(request);
+      // Governance is a sensitive metadata surface. Force a fresh durable
+      // projection so a public-to-private transition cannot leave stale local
+      // topics, members, or roles visible during the cache window.
+      const principal = await requireHuman(request, true);
       const meshId = decodeURIComponent(meshGovernanceMatch[1]);
-      const mesh = readMesh(meshId);
+      let mesh: ReturnType<typeof readMesh>;
+      if (repository?.findMeshById) {
+        let authoritativeMesh: RepositoryMeshInput | null;
+        try {
+          authoritativeMesh = await repository.findMeshById(meshId);
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "governance_store_unavailable",
+            error instanceof Error ? error.message : "The governance store is unavailable.",
+          );
+        }
+        if (!authoritativeMesh) throw new ApiError(404, "mesh_not_found", "Mesh not found.");
+        mesh = {
+          id: authoritativeMesh.meshId,
+          owner_account_id: authoritativeMesh.ownerAccountId,
+          name: authoritativeMesh.name,
+          description: authoritativeMesh.description,
+          visibility: authoritativeMesh.visibility,
+          join_policy: authoritativeMesh.admission,
+          created_at: authoritativeMesh.createdAt,
+        };
+      } else {
+        mesh = readMesh(meshId);
+      }
       if (method === "GET") {
         const role = await meshRoleForAuthoritatively(principal.accountId, meshId);
         if (!role && mesh.visibility !== "public") {
@@ -4047,6 +5941,31 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         throw new ApiError(400, "invalid_mesh", "joinPolicy is invalid.");
       }
       const now = database.now();
+      const governanceEventId = database.id("evt");
+      const governanceAuditId = database.id("audit");
+      const governancePayload = { meshId, visibility, joinPolicy };
+      const governanceEvent: RepositoryEventInput = {
+        eventId: governanceEventId,
+        type: "mesh.governance.updated",
+        meshId,
+        topicId: null,
+        agentId: null,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload: governancePayload,
+        occurredAt: now,
+      };
+      const governanceAudit: RepositoryAuditInput = {
+        auditId: governanceAuditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: "mesh.governance.updated",
+        resourceType: "mesh",
+        resourceId: meshId,
+        data: { visibility, joinPolicy },
+        createdAt: now,
+      };
       await durableWrite("mesh governance update", async () => {
         await repository?.upsertMesh?.({
           meshId,
@@ -4058,6 +5977,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           lifecycle: "active",
           createdAt: mesh.created_at,
           updatedAt: now,
+          actingAccountId: principal.accountId,
+          humanSessionHash: principal.sessionHash,
+          event: governanceEvent,
+          audit: governanceAudit,
         });
       });
       database.transaction(() => {
@@ -4065,6 +5988,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           `UPDATE meshes SET name = ?, description = ?, visibility = ?, join_policy = ? WHERE id = ?`,
         ).run(name, description, String(visibility), String(joinPolicy), meshId);
         emitAudit({
+          auditId: governanceAuditId,
+          createdAt: now,
           actorType: "human",
           actorId: principal.accountId,
           sessionId: principal.sessionHash,
@@ -4072,11 +5997,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           resourceType: "mesh",
           resourceId: meshId,
           data: { visibility, joinPolicy },
+          durable: Boolean(repository?.upsertMesh),
         });
-        emitEvent("mesh.governance.updated", null, meshId, null, {
-          meshId,
-          visibility,
-          joinPolicy,
+        emitEvent("mesh.governance.updated", null, meshId, null, governancePayload, {
+          eventId: governanceEventId,
+          occurredAt: now,
+          sessionId: principal.sessionHash,
+          durable: Boolean(repository?.upsertMesh),
         });
       });
       return { body: { mesh: meshSummary(readMesh(meshId), principal.accountId) } };
@@ -4084,7 +6011,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
 
     const meshRoleMatch = matchingPath(path, /^\/v1\/meshes\/([^/]+)\/roles\/([^/]+)$/);
     if ((method === "PUT" || method === "DELETE") && meshRoleMatch) {
-      const principal = await requireHuman(request);
+      const principal = await requireHuman(request, true);
       requireCsrf(request, principal);
       const meshId = decodeURIComponent(meshRoleMatch[1]);
       const accountId = decodeURIComponent(meshRoleMatch[2]);
@@ -4105,14 +6032,48 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           }
         }
         const now = database.now();
+        const roleRemovalEventId = database.id("evt");
+        const roleRemovalAuditId = database.id("audit");
+        const roleRemovalPayload = { meshId, accountId };
+        const roleRemovalEvent: RepositoryEventInput = {
+          eventId: roleRemovalEventId,
+          type: "mesh.role.removed",
+          meshId,
+          topicId: null,
+          agentId: null,
+          sessionId: principal.sessionHash,
+          runtimeKind: null,
+          payload: roleRemovalPayload,
+          occurredAt: now,
+        };
+        const roleRemovalAudit: RepositoryAuditInput = {
+          auditId: roleRemovalAuditId,
+          actorType: "human",
+          actorId: principal.accountId,
+          sessionId: principal.sessionHash,
+          action: "mesh.role.removed",
+          resourceType: "mesh_human_role",
+          resourceId: `${meshId}:${accountId}`,
+          data: { role: current },
+          createdAt: now,
+        };
         await durableWrite("mesh role removal", async () => {
-          await repository?.deleteMeshHumanRole?.(meshId, accountId);
+          await repository?.deleteMeshHumanRole?.(
+            meshId,
+            accountId,
+            principal.accountId,
+            principal.sessionHash,
+            roleRemovalEvent,
+            roleRemovalAudit,
+          );
         });
         database.transaction(() => {
           db.prepare("DELETE FROM mesh_human_roles WHERE mesh_id = ? AND account_id = ?")
             .run(meshId, accountId);
           syncCanonicalOwner(meshId);
           emitAudit({
+            auditId: roleRemovalAuditId,
+            createdAt: now,
             actorType: "human",
             actorId: principal.accountId,
             sessionId: principal.sessionHash,
@@ -4120,8 +6081,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             resourceType: "mesh_human_role",
             resourceId: `${meshId}:${accountId}`,
             data: { role: current },
+            durable: Boolean(repository?.deleteMeshHumanRole),
           });
-          emitEvent("mesh.role.removed", null, meshId, null, { meshId, accountId });
+          emitEvent("mesh.role.removed", null, meshId, null, roleRemovalPayload, {
+            eventId: roleRemovalEventId,
+            occurredAt: now,
+            sessionId: principal.sessionHash,
+            durable: Boolean(repository?.deleteMeshHumanRole),
+          });
         });
         return { body: { meshId, accountId, removed: true } };
       }
@@ -4140,6 +6107,31 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         }
       }
       const now = database.now();
+      const roleUpdateEventId = database.id("evt");
+      const roleUpdateAuditId = database.id("audit");
+      const roleUpdatePayload = { meshId, accountId, role };
+      const roleUpdateEvent: RepositoryEventInput = {
+        eventId: roleUpdateEventId,
+        type: "mesh.role.updated",
+        meshId,
+        topicId: null,
+        agentId: null,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload: roleUpdatePayload,
+        occurredAt: now,
+      };
+      const roleUpdateAudit: RepositoryAuditInput = {
+        auditId: roleUpdateAuditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: "mesh.role.updated",
+        resourceType: "mesh_human_role",
+        resourceId: `${meshId}:${accountId}`,
+        data: { role },
+        createdAt: now,
+      };
       await durableWrite("mesh role update", async () => {
         await repository?.upsertMeshHumanRole?.({
           meshId,
@@ -4147,6 +6139,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           role,
           createdAt: now,
           updatedAt: now,
+          actingAccountId: principal.accountId,
+          humanSessionHash: principal.sessionHash,
+          event: roleUpdateEvent,
+          audit: roleUpdateAudit,
         });
       });
       database.transaction(() => {
@@ -4157,6 +6153,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         ).run(meshId, accountId, role, now, now);
         syncCanonicalOwner(meshId);
         emitAudit({
+          auditId: roleUpdateAuditId,
+          createdAt: now,
           actorType: "human",
           actorId: principal.accountId,
           sessionId: principal.sessionHash,
@@ -4164,8 +6162,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           resourceType: "mesh_human_role",
           resourceId: `${meshId}:${accountId}`,
           data: { role },
+          durable: Boolean(repository?.upsertMeshHumanRole),
         });
-        emitEvent("mesh.role.updated", null, meshId, null, { meshId, accountId, role });
+        emitEvent("mesh.role.updated", null, meshId, null, roleUpdatePayload, {
+          eventId: roleUpdateEventId,
+          occurredAt: now,
+          sessionId: principal.sessionHash,
+          durable: Boolean(repository?.upsertMeshHumanRole),
+        });
       });
       return { body: { meshId, accountId, role } };
     }
@@ -4175,7 +6179,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       /^\/v1\/meshes\/([^/]+)\/agents\/([^/]+)$/,
     );
     if ((method === "PUT" || method === "DELETE") && meshAgentMembershipMatch) {
-      const principal = await requireHuman(request);
+      const principal = await requireHuman(request, true);
       requireCsrf(request, principal);
       const meshId = decodeURIComponent(meshAgentMembershipMatch[1]);
       const agentId = decodeURIComponent(meshAgentMembershipMatch[2]);
@@ -4198,6 +6202,31 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             throw new ApiError(429, "agent_mesh_limit_reached", "This agent has reached its mesh limit.");
           }
         }
+        const membershipEventId = database.id("evt");
+        const membershipAuditId = database.id("audit");
+        const membershipPayload = { meshId, agentId };
+        const membershipEvent: RepositoryEventInput = {
+          eventId: membershipEventId,
+          type: "mesh.agent.joined",
+          meshId,
+          topicId: null,
+          agentId,
+          sessionId: principal.sessionHash,
+          runtimeKind: null,
+          payload: membershipPayload,
+          occurredAt: now,
+        };
+        const membershipAudit: RepositoryAuditInput = {
+          auditId: membershipAuditId,
+          actorType: "human",
+          actorId: principal.accountId,
+          sessionId: principal.sessionHash,
+          action: "mesh.agent.added",
+          resourceType: "mesh_agent_membership",
+          resourceId: `${meshId}:${agentId}`,
+          data: membershipPayload,
+          createdAt: now,
+        };
         await durableWrite("mesh membership update", async () => {
           await repository?.upsertMeshAgentMembership?.({
             meshId,
@@ -4207,6 +6236,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             admissionProvenance: "invite",
             joinedAt: now,
             updatedAt: now,
+            actingAccountId: principal.accountId,
+            humanSessionHash: principal.sessionHash,
+            event: membershipEvent,
+            audit: membershipAudit,
           });
         });
         database.transaction(() => {
@@ -4214,6 +6247,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             "INSERT OR IGNORE INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)",
           ).run(meshId, agentId, now);
           emitAudit({
+            auditId: membershipAuditId,
+            createdAt: now,
             actorType: "human",
             actorId: principal.accountId,
             sessionId: principal.sessionHash,
@@ -4221,13 +6256,42 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             resourceType: "mesh_agent_membership",
             resourceId: `${meshId}:${agentId}`,
             data: { meshId, agentId },
+            durable: Boolean(repository?.upsertMeshAgentMembership),
           });
-          emitEvent("mesh.agent.joined", agentId, meshId, null, { meshId, agentId }, {
+          emitEvent("mesh.agent.joined", agentId, meshId, null, membershipPayload, {
+            eventId: membershipEventId,
+            occurredAt: now,
             sessionId: principal.sessionHash,
+            durable: Boolean(repository?.upsertMeshAgentMembership),
           });
         });
         return { status: existing ? 200 : 201, body: { meshId, agentId, status: "joined" } };
       }
+      const membershipRemovalEventId = database.id("evt");
+      const membershipRemovalAuditId = database.id("audit");
+      const membershipRemovalPayload = { meshId, agentId };
+      const membershipRemovalEvent: RepositoryEventInput = {
+        eventId: membershipRemovalEventId,
+        type: "mesh.agent.removed",
+        meshId,
+        topicId: null,
+        agentId,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload: membershipRemovalPayload,
+        occurredAt: now,
+      };
+      const membershipRemovalAudit: RepositoryAuditInput = {
+        auditId: membershipRemovalAuditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: "mesh.agent.removed",
+        resourceType: "mesh_agent_membership",
+        resourceId: `${meshId}:${agentId}`,
+        data: membershipRemovalPayload,
+        createdAt: now,
+      };
       await durableWrite("mesh membership removal", async () => {
         await repository?.upsertMeshAgentMembership?.({
           meshId,
@@ -4237,11 +6301,17 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           admissionProvenance: "invite",
           joinedAt: null,
           updatedAt: now,
+          actingAccountId: principal.accountId,
+          humanSessionHash: principal.sessionHash,
+          event: membershipRemovalEvent,
+          audit: membershipRemovalAudit,
         });
       });
       database.transaction(() => {
         db.prepare("DELETE FROM mesh_members WHERE mesh_id = ? AND agent_id = ?").run(meshId, agentId);
         emitAudit({
+          auditId: membershipRemovalAuditId,
+          createdAt: now,
           actorType: "human",
           actorId: principal.accountId,
           sessionId: principal.sessionHash,
@@ -4249,9 +6319,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           resourceType: "mesh_agent_membership",
           resourceId: `${meshId}:${agentId}`,
           data: { meshId, agentId },
+          durable: Boolean(repository?.upsertMeshAgentMembership),
         });
-        emitEvent("mesh.agent.removed", agentId, meshId, null, { meshId, agentId }, {
+        emitEvent("mesh.agent.removed", agentId, meshId, null, membershipRemovalPayload, {
+          eventId: membershipRemovalEventId,
+          occurredAt: now,
           sessionId: principal.sessionHash,
+          durable: Boolean(repository?.upsertMeshAgentMembership),
         });
       });
       return { body: { meshId, agentId, status: "removed" } };
@@ -4259,7 +6333,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
 
     const joinRequestListMatch = matchingPath(path, /^\/v1\/meshes\/([^/]+)\/join-requests$/);
     if (method === "GET" && joinRequestListMatch) {
-      const principal = await requireHuman(request);
+      const principal = await requireHuman(request, "cached");
       const meshId = decodeURIComponent(joinRequestListMatch[1]);
       await requireMeshRole(principal.accountId, meshId, ["owner", "steward"]);
       const durableRequests = await listJoinRequestsForRoute(meshId);
@@ -4292,7 +6366,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       /^\/v1\/meshes\/([^/]+)\/join-requests\/([^/]+)\/resolve$/,
     );
     if (method === "POST" && joinRequestResolveMatch) {
-      const principal = await requireHuman(request);
+      const principal = await requireHuman(request, true);
       requireCsrf(request, principal);
       const meshId = decodeURIComponent(joinRequestResolveMatch[1]);
       const requestId = decodeURIComponent(joinRequestResolveMatch[2]);
@@ -4303,11 +6377,40 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       }
       const decision = input.decision;
       const now = database.now();
+      const joinResolutionEventId = database.id("evt");
+      const joinResolutionAuditId = database.id("audit");
+      const joinResolutionPayload = { requestId, meshId, decision };
+      const joinResolutionEvent: RepositoryEventInput = {
+        eventId: joinResolutionEventId,
+        type: `mesh.agent.${decision}`,
+        meshId,
+        topicId: null,
+        agentId: null,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload: joinResolutionPayload,
+        occurredAt: now,
+      };
+      const joinResolutionAudit: RepositoryAuditInput = {
+        auditId: joinResolutionAuditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: `mesh.join_request.${decision}`,
+        resourceType: "mesh_join_request",
+        resourceId: requestId,
+        data: joinResolutionPayload,
+        createdAt: now,
+      };
       const authoritativeOutcome = await resolveJoinRequestForRoute({
         requestId,
         meshId,
         decision,
         resolvedAt: now,
+        actingAccountId: principal.accountId,
+        humanSessionHash: principal.sessionHash,
+        event: joinResolutionEvent,
+        audit: joinResolutionAudit,
       });
       if (authoritativeOutcome) {
         const resolvedRequest = await findJoinRequestForRoute(requestId);
@@ -4335,19 +6438,27 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             ).run(meshId, authoritativeOutcome.agentId, now);
           }
           emitAudit({
+            auditId: joinResolutionAuditId,
+            createdAt: now,
             actorType: "human",
             actorId: principal.accountId,
             sessionId: principal.sessionHash,
             action: `mesh.join_request.${decision}`,
             resourceType: "mesh_join_request",
             resourceId: requestId,
-            data: { agentId: authoritativeOutcome.agentId, meshId },
+            data: { agentId: authoritativeOutcome.agentId, meshId, decision },
+            durable: Boolean(repository?.resolveJoinRequest),
           });
           emitEvent(`mesh.agent.${decision}`, authoritativeOutcome.agentId, meshId, null, {
             requestId,
             agentId: authoritativeOutcome.agentId,
             meshId,
-          }, { sessionId: principal.sessionHash });
+          }, {
+            eventId: joinResolutionEventId,
+            occurredAt: now,
+            sessionId: principal.sessionHash,
+            durable: Boolean(repository?.resolveJoinRequest),
+          });
         });
         return {
           body: {
@@ -4416,6 +6527,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           status: resolvedRequest.status,
           createdAt: resolvedRequest.created_at,
           resolvedAt: resolvedRequest.resolved_at,
+          actingAccountId: principal.accountId,
+          humanSessionHash: principal.sessionHash,
         });
         if (resolvedRequest.status === "approved") {
           const joinedAgent = db.prepare("SELECT attention_json FROM agents WHERE id = ?")
@@ -4430,6 +6543,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             admissionProvenance: "approval",
             joinedAt: resolvedRequest.resolved_at,
             updatedAt: resolvedRequest.resolved_at ?? database.now(),
+            actingAccountId: principal.accountId,
+            humanSessionHash: principal.sessionHash,
           });
         }
       });
@@ -4473,8 +6588,42 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         updatedAt: now,
         resolvedAt: null,
       };
+      const moderationReportEventId = database.id("evt");
+      const moderationReportAuditId = database.id("audit");
+      const moderationReportPayload = {
+        caseId: moderationCase.caseId,
+        postId,
+        meshId: post.meshId,
+        reason,
+      };
+      const moderationReportEvent: RepositoryEventInput = {
+        eventId: moderationReportEventId,
+        type: "moderation.reported",
+        meshId: post.meshId,
+        topicId: post.topicId,
+        agentId: post.agentId,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload: moderationReportPayload,
+        occurredAt: now,
+      };
+      const moderationReportAudit: RepositoryAuditInput = {
+        auditId: moderationReportAuditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: "moderation.reported",
+        resourceType: "post",
+        resourceId: postId,
+        data: { caseId: moderationCase.caseId, meshId: post.meshId, reason },
+        createdAt: now,
+      };
       await durableWrite("moderation report", async () => {
-        await repository?.upsertModerationCase?.(moderationCase);
+        await repository?.upsertModerationCase?.({
+          ...moderationCase,
+          event: moderationReportEvent,
+          audit: moderationReportAudit,
+        });
       });
       if (localPostRecord(postId)) {
         database.transaction(() => {
@@ -4493,6 +6642,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             moderationCase.updatedAt,
           );
           emitAudit({
+            auditId: moderationReportAuditId,
+            createdAt: now,
             actorType: "human",
             actorId: principal.accountId,
             sessionId: principal.sessionHash,
@@ -4500,12 +6651,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             resourceType: "post",
             resourceId: postId,
             data: { caseId: moderationCase.caseId, meshId: post.meshId, reason },
+            durable: Boolean(repository?.upsertModerationCase),
           });
-          emitEvent("moderation.reported", post.agentId, post.meshId, post.topicId, {
-            caseId: moderationCase.caseId,
-            postId,
-            reason,
-          }, { sessionId: principal.sessionHash });
+          emitEvent("moderation.reported", post.agentId, post.meshId, post.topicId, moderationReportPayload, {
+            eventId: moderationReportEventId,
+            occurredAt: now,
+            sessionId: principal.sessionHash,
+            durable: Boolean(repository?.upsertModerationCase),
+          });
         });
       }
       return {
@@ -4534,7 +6687,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       /^\/v1\/meshes\/([^/]+)\/moderation\/([^/]+)$/,
     );
     if (method === "POST" && moderationActionMatch) {
-      const principal = await requireHuman(request);
+      const principal = await requireHuman(request, true);
       requireCsrf(request, principal);
       const meshId = decodeURIComponent(moderationActionMatch[1]);
       const caseId = decodeURIComponent(moderationActionMatch[2]);
@@ -4563,6 +6716,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         ? moderationCase.reason
         : (optionalString(input, "reason", 500) ?? moderationCase.reason);
       const now = database.now();
+      // Publication activity is materialized from bounded transition metadata,
+      // never from a moderation envelope containing the post body. Resolve the
+      // parent once so reply edges remain attributable after quarantine.
+      const parentPost = post.parentPostId
+        ? await findPostForModeration(post.parentPostId)
+        : null;
       const nextCaseState: RepositoryModerationCase["state"] = action === "start_review" ? "reviewing" : "resolved";
       const nextPostState = action === "publish"
         ? "published"
@@ -4574,6 +6733,44 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
               ? "redacted"
               : post.moderationState;
       const redactedBody = action === "redact" ? "[Content redacted by mesh moderation]" : undefined;
+      const moderationActionEventId = database.id("evt");
+      const moderationActionAuditId = database.id("audit");
+      const moderationActionPayload = {
+        caseId,
+        postId: post.postId,
+        meshId,
+        action,
+        state: nextPostState,
+        moderation_state: nextPostState,
+        previous_moderation_state: post.moderationState,
+        original_event_type: post.parentPostId ? "reply.created" : "post.created",
+        topic_id: post.topicId,
+        parent_post_id: post.parentPostId,
+        parent_agent_id: parentPost?.agentId ?? null,
+        parent_created_at: parentPost?.createdAt ?? null,
+      };
+      const moderationActionEvent: RepositoryEventInput = {
+        eventId: moderationActionEventId,
+        type: `moderation.${action}`,
+        meshId,
+        topicId: post.topicId,
+        agentId: post.agentId,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload: moderationActionPayload,
+        occurredAt: now,
+      };
+      const moderationActionAudit: RepositoryAuditInput = {
+        auditId: moderationActionAuditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: `moderation.${action}`,
+        resourceType: "moderation_case",
+        resourceId: caseId,
+        data: { meshId, postId: post.postId, role, reason },
+        createdAt: now,
+      };
       if (action === "start_review") {
         await durableWrite("moderation review", async () => {
           await repository?.upsertModerationCase?.({
@@ -4581,6 +6778,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             state: "reviewing",
             reason,
             updatedAt: now,
+            actingAccountId: principal.accountId,
+            humanSessionHash: principal.sessionHash,
+            event: moderationActionEvent,
+            audit: moderationActionAudit,
           });
         });
       } else {
@@ -4594,6 +6795,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             caseState: nextCaseState,
             resolution: action,
             updatedAt: now,
+            actingAccountId: principal.accountId,
+            humanSessionHash: principal.sessionHash,
+            event: moderationActionEvent,
+            audit: moderationActionAudit,
           });
         });
       }
@@ -4631,6 +6836,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             action === "start_review" ? null : action,
           );
           emitAudit({
+            auditId: moderationActionAuditId,
+            createdAt: now,
             actorType: "human",
             actorId: principal.accountId,
             sessionId: principal.sessionHash,
@@ -4638,12 +6845,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             resourceType: "moderation_case",
             resourceId: caseId,
             data: { meshId, postId: post.postId, role, reason },
+            durable: Boolean(action === "start_review" ? repository?.upsertModerationCase : repository?.updatePostModeration),
           });
-          emitEvent(`moderation.${action}`, post.agentId, meshId, post.topicId, {
-            caseId,
-            postId: post.postId,
-            state: nextPostState,
-          }, { sessionId: principal.sessionHash });
+          emitEvent(`moderation.${action}`, post.agentId, meshId, post.topicId, moderationActionPayload, {
+            eventId: moderationActionEventId,
+            occurredAt: now,
+            sessionId: principal.sessionHash,
+            durable: Boolean(action === "start_review" ? repository?.upsertModerationCase : repository?.updatePostModeration),
+          });
         });
       }
       const nextCase: RepositoryModerationCase = {
@@ -4684,6 +6893,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
 
     if (method === "POST" && path === "/v1/pairings") {
       assertCostProtectionAllows("pairing");
+      enforceEndpointRate(
+        pairingCreationLimiter,
+        requestClientKey(request),
+        "pairing_rate_limited",
+        "Too many pairing attempts from this network. Retry after the indicated delay.",
+      );
       const input = asObject(await readJson(request));
       for (const key of Object.keys(input)) {
         if (
@@ -4719,6 +6934,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           400,
           "invalid_definition_digest",
           "definitionDigest must be a lowercase SHA-256 hex digest.",
+        );
+      }
+      if (definitionDigest !== undefined && !requestedProfile) {
+        throw new ApiError(
+          400,
+          "profile_required_for_digest",
+          "A definitionDigest must be paired with the normalized agent profile it describes.",
         );
       }
       const id = database.id("pair");
@@ -4884,9 +7106,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           pairing.owner_account_id === principal.accountId &&
           pairing.agent_id
         ) {
-          const existingAgent = db
-            .prepare("SELECT * FROM agents WHERE id = ?")
-            .get(pairing.agent_id) as unknown as AgentRow;
+          const existingAgent = await hydrateDurableAgent(pairing.agent_id);
+          if (!existingAgent) {
+            throw new ApiError(503, "agent_store_unavailable", "The approved agent is not available yet.");
+          }
           return {
             body: {
               pairing: pairingRepresentation(pairing),
@@ -4897,14 +7120,35 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         throw new ApiError(409, "pairing_not_pending", "Pairing is no longer pending.");
       }
       const input = asObject(await readJson(request));
-      const rawProfile = input.profile ??
-        (pairing.requested_profile_json
-          ? (JSON.parse(pairing.requested_profile_json) as unknown)
-          : undefined);
-      if (!rawProfile) {
+      const storedProfile = pairing.requested_profile_json
+        ? completeProfile(
+            parseAgentProfile(JSON.parse(pairing.requested_profile_json) as unknown) as AgentProfileInput,
+          )
+        : undefined;
+      const suppliedProfile = input.profile === undefined
+        ? undefined
+        : completeProfile(parseAgentProfile(input.profile) as AgentProfileInput);
+      if (!storedProfile && !suppliedProfile) {
         throw new ApiError(400, "profile_required", "An agent profile is required to approve pairing.");
       }
-      const profile = completeProfile(parseAgentProfile(rawProfile) as AgentProfileInput);
+      // The profile and definition digest were presented by the native host
+      // during pairing and are the provenance for this binding. A browser
+      // approval may confirm that profile, but must not replace it while
+      // retaining the host's digest/key. Owner edits use the authenticated
+      // profile-edit/proposal flow instead, where the source digest and audit
+      // history are updated together.
+      if (
+        storedProfile &&
+        suppliedProfile &&
+        JSON.stringify(storedProfile) !== JSON.stringify(suppliedProfile)
+      ) {
+        throw new ApiError(
+          409,
+          "pairing_profile_changed",
+          "The approval profile differs from the native session definition; restart pairing after updating the agent definition.",
+        );
+      }
+      const profile = storedProfile ?? suppliedProfile!;
       const now = database.now();
       let agentId = database.id("agt");
       const matchingAgentBefore = db
@@ -4927,6 +7171,34 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           );
         }
       }
+      const approvalEventId = database.id("evt");
+      const approvalAuditId = database.id("audit");
+      const approvalEvent: RepositoryEventInput = {
+        eventId: approvalEventId,
+        type: "agent.binding.approved",
+        meshId: "mesh-public",
+        topicId: null,
+        agentId,
+        sessionId: principal.sessionHash,
+        runtimeKind: pairing.runtime,
+        payload: {
+          agentId,
+          bindingId: pairing.id,
+          replacedBinding: Boolean(matchingAgentBefore),
+        },
+        occurredAt: now,
+      };
+      const approvalAudit: RepositoryAuditInput = {
+        auditId: approvalAuditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: "agent.binding.approved",
+        resourceType: "agent_binding",
+        resourceId: pairing.id,
+        data: { agentId, replacedBinding: Boolean(matchingAgentBefore) },
+        createdAt: now,
+      };
       if (repository?.approvePairing) {
         // Firestore owns the approval race. Pairing, persistent identity,
         // binding revocation, session supersession, and commons membership
@@ -4936,6 +7208,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           const result = await repository.approvePairing!({
             pairingId: pairing.id,
             ownerAccountId: principal.accountId,
+            humanSessionHash: principal.sessionHash,
             agentId,
             profile: {
               name: profile.name,
@@ -4946,6 +7219,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
               attention: profile.attention as Record<string, unknown>,
             },
             approvedAt: now,
+            event: approvalEvent,
+            audit: approvalAudit,
           });
           agentId = result.agentId;
         });
@@ -5083,6 +7358,18 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             agentId,
             bindingId: pairing.id,
             replacedBinding: Boolean(matchingAgent),
+          }, { eventId: approvalEventId, occurredAt: now, runtimeKind: pairing.runtime, durable: Boolean(repository?.approvePairing) });
+          emitAudit({
+            auditId: approvalAuditId,
+            createdAt: now,
+            actorType: "human",
+            actorId: principal.accountId,
+            sessionId: principal.sessionHash,
+            action: "agent.binding.approved",
+            resourceType: "agent_binding",
+            resourceId: pairing.id,
+            data: { agentId, replacedBinding: Boolean(matchingAgent) },
+            durable: Boolean(repository?.approvePairing),
           });
         });
       } catch (error) {
@@ -5109,6 +7396,19 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     const challengeMatch = matchingPath(path, /^\/v1\/pairings\/([^/]+)\/challenges$/);
     if (method === "POST" && challengeMatch) {
       const id = decodeURIComponent(challengeMatch[1]);
+      const clientKey = requestClientKey(request);
+      enforceEndpointRate(
+        pairingChallengeIpLimiter,
+        clientKey,
+        "pairing_challenge_rate_limited",
+        "Too many pairing challenge attempts from this network. Retry after the indicated delay.",
+      );
+      enforceEndpointRate(
+        pairingChallengePairLimiter,
+        `${clientKey}:pairing:${id}`,
+        "pairing_challenge_rate_limited",
+        "Too many pairing challenges for this binding. Retry after the indicated delay.",
+      );
       const pairing = await requirePairing(request, id);
       if (pairing.status !== "approved" && pairing.status !== "claimed") {
         throw new ApiError(409, "pairing_not_approved", "Pairing has not been approved.");
@@ -5118,23 +7418,62 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       const requestedSessionId = input.sessionId === undefined
         ? undefined
         : requiredString(input, "sessionId", { max: 128 });
+      // A challenge bound to an already-active session is a renewal flow and
+      // remains available in cost-protection mode. A challenge without that
+      // binding would start a new runtime session, so pause it first.
+      if (requestedSessionId === undefined) assertCostProtectionAllows("session");
       if (requestedSessionId !== undefined) {
+        let activeExpiresAtMs: number | undefined;
+        // Keep the durable predecessor state separate from the disposable
+        // SQLite projection. A page WebMCP transfer is intentionally stored
+        // outside runtime_sessions, so a replica that has not hydrated the
+        // successor must still report `session_superseded` rather than
+        // treating the old native session as reclaimable.
+        let durableRequestedSessionSuperseded = false;
         let active = db
           .prepare(
-            `SELECT 1 FROM agent_sessions
+            `SELECT expires_at FROM agent_sessions
              WHERE session_id = ? AND pairing_id = ? AND status = 'active' AND expires_at > ?`,
           )
           .get(requestedSessionId, pairing.id, database.now());
+        if (active) {
+          const parsed = Date.parse(String((active as { expires_at?: unknown }).expires_at ?? ""));
+          if (Number.isFinite(parsed)) activeExpiresAtMs = parsed;
+        }
+        let recoverySuccessorId: string | null = null;
         if (repository?.findRuntimeSessionById) {
           try {
             const durableSession = await repository.findRuntimeSessionById(requestedSessionId);
+            if (
+              durableSession &&
+              durableSession.bindingId === pairing.id &&
+              durableSession.agentId === pairing.agent_id &&
+              durableSession.status === "superseded" &&
+              durableSession.supersedingSessionId
+            ) {
+              const successor = await repository.findRuntimeSessionById(durableSession.supersedingSessionId);
+              if (
+                successor &&
+                successor.bindingId === pairing.id &&
+                successor.agentId === pairing.agent_id &&
+                successor.status === "active" &&
+                Date.parse(successor.expiresAt) > Date.parse(database.now())
+              ) {
+                recoverySuccessorId = successor.sessionId;
+              }
+            }
+            durableRequestedSessionSuperseded = durableSession?.status === "superseded";
             active =
               durableSession &&
               durableSession.bindingId === pairing.id &&
               durableSession.status === "active" &&
               Date.parse(durableSession.expiresAt) > Date.parse(database.now())
-                ? { active: 1 }
+              ? { active: 1 }
                 : undefined;
+            if (durableSession && durableSession.status === "active") {
+              const parsed = Date.parse(durableSession.expiresAt);
+              if (Number.isFinite(parsed)) activeExpiresAtMs = parsed;
+            }
           } catch (error) {
             throw new ApiError(
               503,
@@ -5143,7 +7482,70 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             );
           }
         }
-        if (!active) throw new ApiError(401, "session_invalid", "The requested runtime session is not active.");
+        if (recoverySuccessorId) {
+          // A lost renewal response may leave the predecessor superseded while
+          // its deterministic successor is already active. Permit one more
+          // signed challenge so the host can recover that credential.
+        } else if (!active) {
+          if (durableRequestedSessionSuperseded) {
+            throw new ApiError(
+              401,
+              "session_superseded",
+              "This runtime session has been superseded by a newer session.",
+            );
+          }
+          const local = db
+            .prepare(
+              `SELECT status, superseded_by FROM agent_sessions
+               WHERE session_id = ? AND pairing_id = ? LIMIT 1`,
+            )
+            .get(requestedSessionId, pairing.id) as
+            | { status: string; superseded_by: string | null }
+            | undefined;
+          if (local?.status === "superseded" && local.superseded_by) {
+            const successor = db
+              .prepare(
+                `SELECT 1 FROM agent_sessions
+                 WHERE session_id = ? AND pairing_id = ? AND status = 'active' AND expires_at > ?`,
+              )
+              .get(local.superseded_by, pairing.id, database.now());
+            if (successor) {
+              recoverySuccessorId = local.superseded_by;
+            }
+          }
+        }
+        if (recoverySuccessorId) {
+          // Recovery challenge; the renewal endpoint will return the existing
+          // deterministic successor after verifying the signature.
+        } else if (!active) {
+          const localStatus = db
+            .prepare(
+              `SELECT status FROM agent_sessions
+               WHERE session_id = ? AND pairing_id = ? LIMIT 1`,
+            )
+            .get(requestedSessionId, pairing.id) as { status: string } | undefined;
+          if (localStatus?.status === "superseded") {
+            throw new ApiError(
+              401,
+              "session_superseded",
+              "This runtime session has been superseded by a newer session.",
+            );
+          }
+          throw new ApiError(401, "session_invalid", "The requested runtime session is not active.");
+        }
+        if (!recoverySuccessorId && active && activeExpiresAtMs !== undefined) {
+          const remainingSeconds = Math.ceil(
+            (activeExpiresAtMs - database.clock.now().getTime()) / 1_000,
+          );
+          if (remainingSeconds > 120) {
+            throw new ApiError(
+              429,
+              "renewal_too_early",
+              "The runtime session is still active; renew it during the final two minutes of its lifetime.",
+              Math.max(1, remainingSeconds - 120),
+            );
+          }
+        }
       }
       const challengeId = database.id("chal");
       const nonce = randomToken();
@@ -5174,7 +7576,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }
 
     if (method === "POST" && path === "/v1/agent-sessions") {
-      assertCostProtectionAllows("session");
+      enforceEndpointRate(
+        agentSessionIpLimiter,
+        requestClientKey(request),
+        "session_rate_limited",
+        "Too many runtime session attempts from this network. Retry after the indicated delay.",
+      );
       const input = asObject(await readJson(request));
       const pairingId = requiredString(input, "pairingId", { max: 128 });
       const challengeId = requiredString(input, "challengeId", { max: 128 });
@@ -5197,6 +7604,20 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (!verifyEd25519Signature(pairing.public_key_pem, challenge.message, signature)) {
         throw new ApiError(401, "signature_invalid", "Challenge signature is invalid.");
       }
+      // Renewal challenges are bound to the predecessor session and must use
+      // the fenced renewal endpoint.  Accepting one here would let a stale
+      // native host supersede a page WebMCP grant after control transferred.
+      const isRenewalChallenge = challenge.message.startsWith(
+        `meshr-agent-session:v1:renew:${pairing.id}:`,
+      );
+      if (isRenewalChallenge) {
+        throw new ApiError(
+          409,
+          "renewal_endpoint_required",
+          "This challenge renews an existing runtime session; use POST /v1/agent-sessions/renew.",
+        );
+      }
+      assertCostProtectionAllows("session");
       const token = randomToken();
       const sessionId = database.id("sess");
       const nowDate = database.clock.now();
@@ -5204,6 +7625,35 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       const expiresAt = addSeconds(nowDate, runtimeAgentSessionSeconds);
       const claimedAgentId = pairing.agent_id;
       let authoritativeEpoch: number | undefined;
+      const sessionEventId = database.id("evt");
+      const sessionAuditId = database.id("audit");
+      const sessionEvent: RepositoryEventInput = {
+        eventId: sessionEventId,
+        type: "agent.connected",
+        meshId: "mesh-public",
+        topicId: null,
+        agentId: claimedAgentId,
+        sessionId,
+        runtimeKind: pairing.runtime,
+        payload: {
+          agentId: claimedAgentId,
+          bindingId: pairing.id,
+          sessionId,
+          runtime: pairing.runtime,
+        },
+        occurredAt: now,
+      };
+      const sessionAudit: RepositoryAuditInput = {
+        auditId: sessionAuditId,
+        actorType: "agent",
+        actorId: claimedAgentId,
+        sessionId,
+        action: "agent.session.started",
+        resourceType: "agent",
+        resourceId: claimedAgentId,
+        data: { runtime: pairing.runtime },
+        createdAt: now,
+      };
       if (repository) {
         try {
           const committed = await repository.startRuntimeSession({
@@ -5215,6 +7665,9 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             expiresAt,
             challengeId: challenge.challengeId,
             challengeUsedAt: now,
+            claimPairing: true,
+            event: sessionEvent,
+            audit: sessionAudit,
           });
           authoritativeEpoch = committed.authorityEpoch;
         } catch (error) {
@@ -5224,6 +7677,19 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           if (error instanceof Error && error.message === "binding_invalid") {
             throw new ApiError(401, "agent_authentication_failed", "This agent binding is no longer valid.");
           }
+          if (error instanceof Error && error.message === "session_superseded") {
+            throw new ApiError(401, "session_superseded", "This runtime session has been superseded by a newer session.");
+          }
+          if (error instanceof Error && error.message === "page_authority_active") {
+            throw new ApiError(
+              409,
+              "page_authority_active",
+              "Page WebMCP currently controls this agent; wait for the grant to expire or revoke it before reconnecting the native host.",
+            );
+          }
+          if (error instanceof Error && error.message === "session_invalid") {
+            throw new ApiError(401, "agent_authentication_failed", "This runtime session is no longer active.");
+          }
           throw new ApiError(
             503,
             "session_store_unavailable",
@@ -5231,7 +7697,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           );
         }
       }
-      database.transaction(() => {
+      // Firestore is authoritative once startRuntimeSession has returned an
+      // epoch. The local SQLite block below is only a disposable projection;
+      // a stale page grant, pairing row, or challenge on this replica must
+      // never turn a committed session into a lost response.
+      const projectLocalSession = () => database.transaction(() => {
         const currentPairing = db
           .prepare("SELECT status, agent_id FROM pairings WHERE id = ?")
           .get(pairing.id) as
@@ -5243,6 +7713,19 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           currentPairing.agent_id !== pairing.agent_id
         ) {
           throw new ApiError(409, "pairing_not_approved", "Pairing has not been approved.");
+        }
+        const activePageGrant = db
+          .prepare(
+            `SELECT 1 FROM webmcp_grants
+             WHERE agent_id = ? AND revoked_at IS NULL AND expires_at > ? LIMIT 1`,
+          )
+          .get(claimedAgentId, now);
+        if (activePageGrant && authoritativeEpoch === undefined) {
+          throw new ApiError(
+            409,
+            "page_authority_active",
+            "Page WebMCP currently controls this agent; wait for the grant to expire or revoke it before reconnecting the native host.",
+          );
         }
         const consumed = db
           .prepare("UPDATE pairing_challenges SET used_at = ? WHERE id = ? AND used_at IS NULL")
@@ -5296,6 +7779,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
            WHERE id = ? AND status IN ('approved', 'claimed')`,
         ).run(now, pairing.id);
         emitAudit({
+          auditId: sessionAuditId,
+          createdAt: now,
           actorType: "agent",
           actorId: claimedAgentId,
           sessionId,
@@ -5303,20 +7788,28 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           resourceType: "agent",
           resourceId: claimedAgentId,
           data: { runtime: pairing.runtime, authorityEpoch },
+          durable: Boolean(repository),
         });
         emitEvent("agent.connected", claimedAgentId, "mesh-public", null, {
           agentId: claimedAgentId,
           bindingId: pairing.id,
           sessionId,
           runtime: pairing.runtime,
-        }, { sessionId, runtimeKind: pairing.runtime });
+        }, { sessionId, runtimeKind: pairing.runtime, eventId: sessionEventId, occurredAt: now, durable: Boolean(repository) });
       });
-      await durableWrite("pairing claim", async () => {
-        await repository?.updatePairing?.(pairing.id, {
-          status: "claimed",
-          claimedAt: now,
-        });
-      });
+      try {
+        projectLocalSession();
+      } catch (error) {
+        if (!repository || authoritativeEpoch === undefined) throw error;
+        console.warn("runtime session committed durably but local projection refresh failed", error);
+      }
+      if (repository && authoritativeEpoch !== undefined) {
+        try {
+          await hydrateDurableAgentSession(sha256(token), now);
+        } catch (error) {
+          console.warn("runtime session projection hydration failed", error);
+        }
+      }
       const agent = db
         .prepare("SELECT * FROM agents WHERE id = ?")
         .get(pairing.agent_id) as unknown as AgentRow;
@@ -5341,6 +7834,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         try {
           await repository.heartbeatRuntimeSession(principal.sessionId, now);
         } catch (error) {
+          if (error instanceof Error && error.message === "session_superseded") {
+            throw new ApiError(
+              401,
+              "session_superseded",
+              "This runtime session has been superseded by a newer session.",
+            );
+          }
           throw new ApiError(
             401,
             "agent_authentication_failed",
@@ -5393,7 +7893,9 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }
 
     if (method === "POST" && path === "/v1/agent-sessions/renew") {
-      assertCostProtectionAllows("session");
+      // Cost protection blocks new sessions, not renewal of an already
+      // authorized runtime. Keeping renewals alive lets existing agents drain
+      // safely while new connections are paused.
       const authorization = request.headers.authorization ?? "";
       if (!authorization.startsWith("Pairing ")) {
         throw new ApiError(
@@ -5417,7 +7919,6 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       const challenge = await loadPairingChallenge(challengeId, pairing.id);
       if (
         !challenge ||
-        challenge.usedAt ||
         Date.parse(challenge.expiresAt) <= database.clock.now().getTime() ||
         !challenge.message.startsWith(`meshr-agent-session:v1:renew:${pairing.id}:${sessionId}:`)
       ) {
@@ -5426,8 +7927,9 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (!verifyEd25519Signature(pairing.public_key_pem, challenge.message, signature)) {
         throw new ApiError(401, "signature_invalid", "Challenge signature is invalid.");
       }
-      const replacementToken = randomToken();
-      const replacementSessionId = database.id("sess");
+      const deterministicRenewal = renewalMaterial(sessionId);
+      const replacementToken = deterministicRenewal.token;
+      const replacementSessionId = deterministicRenewal.sessionId;
       const nowDate = database.clock.now();
       const now = nowDate.toISOString();
       const expiresAt = addSeconds(nowDate, runtimeAgentSessionSeconds);
@@ -5445,19 +7947,33 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             authority_epoch: number;
           }
         | undefined;
+      let durableRecovery = false;
       if (repository?.findRuntimeSessionById) {
         try {
           const durableCurrent = await repository.findRuntimeSessionById(sessionId);
+          const recoverable = Boolean(
+            durableCurrent?.status === "superseded" &&
+            durableCurrent.supersedingSessionId === replacementSessionId,
+          );
+          durableRecovery = recoverable;
           if (
             !durableCurrent ||
             durableCurrent.bindingId !== pairing.id ||
             durableCurrent.agentId !== pairing.agent_id ||
-            durableCurrent.status !== "active" ||
-            Date.parse(durableCurrent.expiresAt) <= Date.parse(now)
+            (!recoverable && (
+              durableCurrent.status !== "active" ||
+              Date.parse(durableCurrent.expiresAt) <= Date.parse(now)
+            ))
           ) {
-            throw new ApiError(401, "agent_authentication_failed", "Agent token is no longer current.");
+            throw new ApiError(
+              401,
+              durableCurrent?.status === "superseded" ? "session_superseded" : "agent_authentication_failed",
+              durableCurrent?.status === "superseded"
+                ? "This runtime session has been superseded by a newer session."
+                : "Agent token is no longer current.",
+            );
           }
-          if (!currentBefore || currentBefore.authority_epoch !== durableCurrent.authorityEpoch) {
+          if (!recoverable && (!currentBefore || currentBefore.authority_epoch !== durableCurrent.authorityEpoch)) {
             await hydrateDurableAgentSession(durableCurrent.tokenHash, now);
           }
         } catch (error) {
@@ -5483,10 +7999,150 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             authority_epoch: number;
           }
         | undefined;
-      if (!currentBeforeRow || currentBeforeRow.status !== "active") {
+      if (!currentBeforeRow && !challenge.usedAt) {
+        throw new ApiError(
+          401,
+          "agent_authentication_failed",
+          "Agent token is invalid.",
+        );
+      }
+      const recoveryPredecessorStatus = currentBeforeRow?.status ?? "superseded";
+      // A response can be lost after the durable transaction commits. The
+      // predecessor is then superseded and the challenge is consumed, but the
+      // deterministic successor can be safely returned after the signature
+      // check above. This path performs no second authority mutation.
+      const localRecoverySuccessor = db
+        .prepare(
+          `SELECT session_id, agent_id, pairing_id, runtime_kind, expires_at,
+                  authority_epoch, status
+           FROM agent_sessions
+           WHERE session_id = ? AND agent_id = ? AND pairing_id = ?
+             AND status = 'active' AND expires_at > ?`,
+        )
+        .get(replacementSessionId, pairing.agent_id, pairing.id, now) as
+        | {
+            session_id: string;
+            agent_id: string;
+            pairing_id: string;
+            runtime_kind: RuntimeKind;
+            expires_at: string;
+            authority_epoch: number;
+            status: string;
+          }
+        | undefined;
+      const canRecover = durableRecovery ||
+        (recoveryPredecessorStatus === "superseded" && Boolean(localRecoverySuccessor));
+      if (canRecover) {
+        // A fresh challenge is issued when the host retries after losing the
+        // original renewal response. Consume that challenge now so recovery
+        // remains single-use; an already-consumed challenge is the original
+        // transaction and needs no second write.
+        if (!challenge.usedAt) {
+          const consumed = await consumePairingChallenge(challenge.challengeId, pairing.id, now);
+          if (!consumed) {
+            throw new ApiError(401, "challenge_invalid", "Challenge was already used.");
+          }
+        }
+        let successor = db
+          .prepare(
+            `SELECT session_id, agent_id, pairing_id, runtime_kind, expires_at,
+                    authority_epoch, status
+             FROM agent_sessions WHERE session_id = ? AND agent_id = ? AND pairing_id = ?`,
+          )
+          .get(replacementSessionId, pairing.agent_id, pairing.id) as
+          | {
+              session_id: string;
+              agent_id: string;
+              pairing_id: string;
+              runtime_kind: RuntimeKind;
+              expires_at: string;
+              authority_epoch: number;
+              status: string;
+            }
+          | undefined;
+        if (repository?.findRuntimeSessionById) {
+          try {
+            const durableSuccessor = await repository.findRuntimeSessionById(replacementSessionId);
+            if (
+              durableSuccessor &&
+              durableSuccessor.agentId === pairing.agent_id &&
+              durableSuccessor.bindingId === pairing.id &&
+              durableSuccessor.status === "active" &&
+              durableSuccessor.tokenHash === sha256(replacementToken) &&
+              Date.parse(durableSuccessor.expiresAt) > Date.parse(now)
+            ) {
+              await hydrateDurableAgentSession(durableSuccessor.tokenHash, now);
+              successor = {
+                session_id: durableSuccessor.sessionId,
+                agent_id: durableSuccessor.agentId,
+                pairing_id: durableSuccessor.bindingId,
+                runtime_kind: durableSuccessor.runtimeKind,
+                expires_at: durableSuccessor.expiresAt,
+                authority_epoch: durableSuccessor.authorityEpoch,
+                status: durableSuccessor.status,
+              };
+            }
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "session_store_unavailable",
+              error instanceof Error ? error.message : "The session store is unavailable.",
+            );
+          }
+        }
+        if (
+          successor && successor.status === "active" &&
+          sha256(replacementToken) === (db.prepare("SELECT token_hash FROM agent_sessions WHERE session_id = ?").get(replacementSessionId) as { token_hash: string } | undefined)?.token_hash
+        ) {
+          const recoveredAgent = db.prepare("SELECT * FROM agents WHERE id = ?").get(pairing.agent_id) as unknown as AgentRow | undefined;
+          if (!recoveredAgent) throw new ApiError(503, "session_store_unavailable", "The agent projection is unavailable.");
+          return {
+            status: 200,
+            body: {
+              token: replacementToken,
+              tokenType: "Bearer",
+              bindingId: pairing.id,
+              sessionId: replacementSessionId,
+              expiresAt: successor.expires_at,
+              agent: agentFromRow(recoveredAgent),
+            },
+          };
+        }
+        throw new ApiError(401, "challenge_invalid", "The renewal transaction could not be recovered.");
+      }
+      if (!currentBeforeRow) {
         throw new ApiError(401, "agent_authentication_failed", "Agent token is invalid.");
       }
       let authoritativeEpoch: number | undefined;
+      const renewalEventId = database.id("evt");
+      const renewalAuditId = database.id("audit");
+      const renewalEvent: RepositoryEventInput = {
+        eventId: renewalEventId,
+        type: "agent.session.renewed",
+        meshId: null,
+        topicId: null,
+        agentId: currentBeforeRow.agent_id,
+        sessionId: replacementSessionId,
+        runtimeKind: currentBeforeRow.runtime_kind,
+        payload: {
+          agentId: currentBeforeRow.agent_id,
+          previousSessionId: sessionId,
+          sessionId: replacementSessionId,
+          runtime: currentBeforeRow.runtime_kind,
+        },
+        occurredAt: now,
+      };
+      const renewalAudit: RepositoryAuditInput = {
+        auditId: renewalAuditId,
+        actorType: "agent",
+        actorId: currentBeforeRow.agent_id,
+        sessionId: replacementSessionId,
+        action: "agent.session.renewed",
+        resourceType: "agent",
+        resourceId: currentBeforeRow.agent_id,
+        data: { previousSessionId: sessionId, runtime: currentBeforeRow.runtime_kind },
+        createdAt: now,
+      };
       if (repository) {
         try {
           const committed = await repository.startRuntimeSession({
@@ -5498,6 +8154,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             expiresAt,
             challengeId: challenge.challengeId,
             challengeUsedAt: now,
+            expectedSessionId: sessionId,
+            expectedAuthorityEpoch: currentBeforeRow.authority_epoch,
+            event: renewalEvent,
+            audit: renewalAudit,
           });
           authoritativeEpoch = committed.authorityEpoch;
         } catch (error) {
@@ -5506,6 +8166,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           }
           if (error instanceof Error && error.message === "binding_invalid") {
             throw new ApiError(401, "agent_authentication_failed", "This agent binding is no longer valid.");
+          }
+          if (error instanceof Error && error.message === "session_superseded") {
+            throw new ApiError(401, "session_superseded", "This runtime session has been superseded by a newer session.");
+          }
+          if (error instanceof Error && error.message === "session_invalid") {
+            throw new ApiError(401, "agent_authentication_failed", "This runtime session is no longer active.");
           }
           throw new ApiError(
             503,
@@ -5539,7 +8205,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           authority.session_id !== sessionId ||
           authority.epoch !== current.authority_epoch
         ) {
-          throw new ApiError(401, "agent_authentication_failed", "Agent token is no longer current.");
+          throw new ApiError(
+            401,
+            "session_superseded",
+            "This runtime session has been superseded by a newer session.",
+          );
         }
         const consumed = db
           .prepare("UPDATE pairing_challenges SET used_at = ? WHERE id = ? AND used_at IS NULL")
@@ -5586,6 +8256,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           authorityEpoch,
         );
         emitAudit({
+          auditId: renewalAuditId,
+          createdAt: now,
           actorType: "agent",
           actorId: current.agent_id,
           sessionId: replacementSessionId,
@@ -5593,13 +8265,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           resourceType: "agent",
           resourceId: current.agent_id,
           data: { previousSessionId: sessionId, authorityEpoch },
+          durable: Boolean(repository),
         });
         emitEvent("agent.session.renewed", pairing.agent_id, null, null, {
           agentId: pairing.agent_id,
           previousSessionId: sessionId,
           sessionId: replacementSessionId,
           runtime: current.runtime_kind,
-        }, { sessionId: replacementSessionId, runtimeKind: current.runtime_kind });
+        }, { sessionId: replacementSessionId, runtimeKind: current.runtime_kind, eventId: renewalEventId, occurredAt: now, durable: Boolean(repository) });
         return current;
       });
       const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(replaced.agent_id) as unknown as AgentRow;
@@ -5616,14 +8289,26 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }
 
     if (method === "GET" && path === "/v1/public/meshes") {
-      if (repository) {
+      if (repository?.listPublicMeshes) {
         try {
-          await hydrateProjection({});
+          const publicMeshes = await repository.listPublicMeshes();
+          return {
+            body: {
+              meshes: publicMeshes.map((mesh) => ({
+                id: mesh.meshId,
+                name: mesh.name,
+                description: mesh.description,
+                visibility: mesh.visibility,
+                joinPolicy: mesh.admission,
+                createdAt: mesh.createdAt,
+              })),
+            },
+          };
         } catch (error) {
           throw new ApiError(
-            503,
-            "projection_unavailable",
-            error instanceof Error ? error.message : "The public projection is unavailable.",
+            error instanceof Error && error.message === "mesh_not_found" ? 404 : 503,
+            error instanceof Error && error.message === "mesh_not_found" ? "mesh_not_found" : "projection_unavailable",
+            error instanceof Error ? error.message : "The public mesh directory is unavailable.",
           );
         }
       }
@@ -5649,18 +8334,31 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
 
     const publicTopicsMatch = matchingPath(path, /^\/v1\/public\/meshes\/([^/]+)\/topics$/);
     if (method === "GET" && publicTopicsMatch) {
-      if (repository) {
+      const meshId = decodeURIComponent(publicTopicsMatch[1]);
+      if (repository?.listPublicTopics) {
         try {
-          await hydrateProjection({});
+          const publicTopics = await repository.listPublicTopics(meshId);
+          return {
+            body: {
+              topics: publicTopics.map((topic) => ({
+                id: topic.topicId,
+                meshId: topic.meshId,
+                name: topic.name,
+                title: topic.title,
+                description: topic.description,
+                tags: topic.tags,
+                createdAt: topic.createdAt,
+              })),
+            },
+          };
         } catch (error) {
           throw new ApiError(
-            503,
-            "projection_unavailable",
-            error instanceof Error ? error.message : "The public projection is unavailable.",
+            error instanceof Error && error.message === "mesh_not_found" ? 404 : 503,
+            error instanceof Error && error.message === "mesh_not_found" ? "mesh_not_found" : "projection_unavailable",
+            error instanceof Error ? error.message : "The public topic directory is unavailable.",
           );
         }
       }
-      const meshId = decodeURIComponent(publicTopicsMatch[1]);
       const mesh = db
         .prepare("SELECT id FROM meshes WHERE id = ? AND visibility = 'public'")
         .get(meshId);
@@ -5766,12 +8464,28 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         const browse = requireBrowsePolicy(principal.agent);
         const rawMeshId = url.searchParams.get("meshId");
         let meshId: string | undefined;
+        let authorizedMeshIds: ReadonlySet<string> | undefined;
         if (rawMeshId !== null) {
           meshId = rawMeshId.trim();
           if (!meshId || meshId.length > 128) {
             throw new ApiError(400, "invalid_request", "meshId is invalid.");
           }
           await ensureAttentionMeshAccessAuthoritatively(principal.agent, principal.agentId, meshId);
+        } else if (repository?.listMeshesForAgent) {
+          try {
+            const visible = await repository.listMeshesForAgent(principal.agentId);
+            authorizedMeshIds = new Set(
+              visible
+                .filter(({ mesh, joined }) => browse === "joined" ? joined : mesh.visibility === "public" || joined)
+                .map(({ mesh }) => mesh.meshId),
+            );
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "authorization_store_unavailable",
+              error instanceof Error ? error.message : "The mesh authorization store is unavailable.",
+            );
+          }
         }
         return {
           body: readWebMcpActivity(db, {
@@ -5779,6 +8493,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             browse,
             generatedAt: database.now(),
             meshId,
+            authorizedMeshIds,
           }),
         };
       }
@@ -5789,9 +8504,47 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       );
       if (method === "GET" && webMcpReadPostsMatch) {
         const topicId = decodeURIComponent(webMcpReadPostsMatch[1]);
-        const topic = webMcpTopicWithAccess(principal, topicId);
+        const topic = await webMcpTopicForAccess(principal, topicId);
         await ensureAttentionMeshAccessAuthoritatively(principal.agent, principal.agentId, topic.mesh_id);
         const limit = parsePositiveInteger(url.searchParams.get("limit"), 10, 25, 1);
+        if (repository?.listPublishedPostsByTopic) {
+          let page;
+          try {
+            page = await repository.listPublishedPostsByTopic({
+              topicId,
+              now: database.now(),
+              limit,
+            });
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "post_store_unavailable",
+              error instanceof Error ? error.message : "The post store is unavailable.",
+            );
+          }
+          await revalidatePostReadAuthority(principal);
+          await revalidateTopicAccessAuthoritatively({
+            agent: principal.agent,
+            agentId: principal.agentId,
+            topicId,
+            expectedMeshId: topic.mesh_id,
+          });
+          return { body: { posts: formatAuthoritativeTopicPosts(page) } };
+        }
+        // Posts live in the authoritative Firestore database. Refresh this
+        // agent-scoped cache before reading so a page grant routed to another
+        // API replica cannot observe an older local SQLite snapshot.
+        if (repository?.loadProjection) {
+          try {
+            await hydrateProjection({ agentId: principal.agentId }, true);
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "projection_unavailable",
+              error instanceof Error ? error.message : "The durable projection is unavailable.",
+            );
+          }
+        }
         const rows = db
           .prepare(
             `SELECT recent.*, a.name AS agent_name, a.handle AS agent_handle
@@ -5806,6 +8559,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
              ORDER BY recent.created_at ASC, recent.id ASC`,
           )
           .all(topicId, database.now(), limit) as unknown as Array<Record<string, string | null>>;
+        await revalidatePostReadAuthority(principal);
+        await revalidateTopicAccessAuthoritatively({
+          agent: principal.agent,
+          agentId: principal.agentId,
+          topicId,
+          expectedMeshId: topic.mesh_id,
+        });
         return {
           body: {
             posts: rows.map((row) => ({
@@ -5841,7 +8601,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         const body = requiredString(input, "body", { max: 1_200 });
         await ensureMeshAccessAuthoritatively(principal.agentId, meshId);
         await ensureMeshMembershipAuthoritatively(principal.agentId, meshId);
-        const topic = topicWithAccess(principal.agentId, topicId);
+        const topic = await topicForAgentRoute(principal.agentId, topicId);
         if (topic.mesh_id !== meshId) {
           throw new ApiError(400, "topic_mesh_mismatch", "Topic does not belong to this mesh.");
         }
@@ -5857,12 +8617,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             body,
             eventType: "post.created",
           },
-          authorizeCommit: () => {
-          assertCurrentWebMcpGrant(principal);
-          requireAutonomousAttention(currentAgentForCommit(principal.agentId), "rootPosts");
-          ensureMeshAccess(principal.agentId, meshId);
-          ensureMeshMembership(principal.agentId, meshId);
-          },
+          authorizeCommit: repository
+            ? undefined
+            : () => {
+                assertCurrentWebMcpGrant(principal);
+                requireAutonomousAttention(currentAgentForCommit(principal.agentId), "rootPosts");
+                ensureMeshAccess(principal.agentId, meshId);
+                ensureMeshMembership(principal.agentId, meshId);
+              },
         });
       }
 
@@ -5882,13 +8644,39 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         }
         const key = requireIdempotencyKey(request);
         const body = requiredString(input, "body", { max: 1_200 });
-        const parent = db
-          .prepare(
-            `SELECT id, mesh_id, topic_id FROM posts
-             WHERE id = ? AND moderation_state = 'published'
-               AND (expires_at IS NULL OR expires_at > ?)`,
-          )
-          .get(parentId, database.now()) as { id: string; mesh_id: string; topic_id: string } | undefined;
+        let parent: { id: string; mesh_id: string; topic_id: string } | undefined;
+        if (repository?.findPostById) {
+          let durableParent: RepositoryPostRecord | null;
+          try {
+            durableParent = await repository.findPostById(parentId);
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "authorization_store_unavailable",
+              error instanceof Error ? error.message : "The post store is unavailable.",
+            );
+          }
+          const nowMs = Date.parse(database.now());
+          if (
+            durableParent &&
+            durableParent.moderationState === "published" &&
+            (durableParent.expiresAt === null || Date.parse(durableParent.expiresAt) > nowMs)
+          ) {
+            parent = {
+              id: durableParent.postId,
+              mesh_id: durableParent.meshId,
+              topic_id: durableParent.topicId,
+            };
+          }
+        } else {
+          parent = db
+            .prepare(
+              `SELECT id, mesh_id, topic_id FROM posts
+               WHERE id = ? AND moderation_state = 'published'
+                 AND (expires_at IS NULL OR expires_at > ?)`,
+            )
+            .get(parentId, database.now()) as { id: string; mesh_id: string; topic_id: string } | undefined;
+        }
         if (!parent) throw new ApiError(404, "post_not_found", "Post not found.");
         await ensureMeshAccessAuthoritatively(principal.agentId, parent.mesh_id);
         await ensureMeshMembershipAuthoritatively(principal.agentId, parent.mesh_id);
@@ -5905,12 +8693,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             body,
             eventType: "reply.created",
           },
-          authorizeCommit: () => {
-          assertCurrentWebMcpGrant(principal);
-          requireAutonomousAttention(currentAgentForCommit(principal.agentId), "replies");
-          ensureMeshAccess(principal.agentId, parent.mesh_id);
-          ensureMeshMembership(principal.agentId, parent.mesh_id);
-          },
+          authorizeCommit: repository
+            ? undefined
+            : () => {
+                assertCurrentWebMcpGrant(principal);
+                requireAutonomousAttention(currentAgentForCommit(principal.agentId), "replies");
+                ensureMeshAccess(principal.agentId, parent!.mesh_id);
+                ensureMeshMembership(principal.agentId, parent!.mesh_id);
+              },
         });
       }
 
@@ -5922,10 +8712,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         requireCsrf(request, principal.human);
         const topicId = decodeURIComponent(webMcpFollowMatch[1]);
         const key = requireIdempotencyKey(request);
-        const topic = webMcpTopicWithAccess(principal, topicId);
+        const topic = await webMcpTopicForAccess(principal, topicId);
         await ensureAttentionMeshAccessAuthoritatively(principal.agent, principal.agentId, topic.mesh_id);
         await ensureMeshMembershipAuthoritatively(principal.agentId, topic.mesh_id);
-        const result = idempotent(
+        const followEventId = `follow_${sha256(`page:${principal.agentId}:${topicId}:${key}`).slice(0, 40)}`;
+        const projectFollow = () => idempotent(
           principal,
           "topic.follow",
           key,
@@ -5937,36 +8728,53 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             emitEvent("topic.followed", principal.agentId, topic.mesh_id, topicId, {
               topicId,
               following: true,
-            }, { sessionId: principal.sessionId, runtimeKind: principal.runtime });
+            }, {
+              eventId: followEventId,
+              sessionId: principal.sessionId,
+              runtimeKind: principal.runtime,
+              // Firestore upsertFollow commits the event in the same
+              // authority transaction. Keep this SQLite write as a local
+              // projection only; appending it to the durable outbox again
+              // would double-publish the follow.
+              durable: Boolean(repository?.upsertFollow),
+            });
             return { status: 200, body: { topicId, following: true } };
           },
-          () => {
-            assertCurrentWebMcpGrant(principal);
-            ensureAttentionMeshAccess(
-              currentAgentForCommit(principal.agentId),
-              principal.agentId,
-              topic.mesh_id,
-            );
-            ensureMeshMembership(principal.agentId, topic.mesh_id);
-          },
+          repository?.upsertFollow
+            ? undefined
+            : () => {
+                assertCurrentWebMcpGrant(principal);
+                ensureAttentionMeshAccess(
+                  currentAgentForCommit(principal.agentId),
+                  principal.agentId,
+                  topic.mesh_id,
+                );
+                ensureMeshMembership(principal.agentId, topic.mesh_id);
+              },
         );
-        await durableWrite("topic follow", async () => {
-          await repository?.upsertFollow?.({
-            topicId,
-            agentId: principal.agentId,
-            meshId: topic.mesh_id,
-            following: true,
-            updatedAt: database.now(),
-            sessionId: principal.sessionId,
-            authorityEpoch: principal.authorityEpoch,
-            authorityKind: "page",
-            grantId: principal.grant.token_hash,
-            ownerAccountId: principal.ownerId,
-            humanSessionHash: principal.human.sessionHash,
-            eventId: `follow_${sha256(`page:${principal.agentId}:${topicId}:${key}`).slice(0, 40)}`,
+        if (repository?.upsertFollow) {
+          // Firestore must commit before this replica mutates its disposable
+          // follow/event projection. A rejected grant or unavailable store
+          // therefore cannot leave a ghost follow behind for later reads.
+          await durableWrite("topic follow", async () => {
+            await repository.upsertFollow!({
+              topicId,
+              agentId: principal.agentId,
+              meshId: topic.mesh_id,
+              following: true,
+              updatedAt: database.now(),
+              sessionId: principal.sessionId,
+              authorityEpoch: principal.authorityEpoch,
+              authorityKind: "page",
+              grantId: principal.grant.token_hash,
+              ownerAccountId: principal.ownerId,
+              humanSessionHash: principal.human.sessionHash,
+              eventId: followEventId,
+              idempotencyKey: key,
+            });
           });
-        });
-        return result;
+        }
+        return projectFollow();
       }
 
       const webMcpTrafficMatch = matchingPath(
@@ -6028,7 +8836,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }
 
     if (path.startsWith("/v1/agent/")) {
-      const principal = await requireAgent(request);
+      const principal = await requireAgent(request, {
+        // Every native route can consult attention policy or author identity.
+        // Refresh the small canonical agent document for each request, while
+        // deliberately avoiding the much larger projection read model.
+        refreshAgent: true,
+      });
       const actingAgent = db
         .prepare("SELECT * FROM agents WHERE id = ?")
         .get(principal.agentId) as unknown as AgentRow & { public_key_pem: string };
@@ -6039,12 +8852,23 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
 
       if (method === "PUT" && path === "/v1/agent/profile") {
         const profileInput = asObject(await readJson(request));
+        if (profileInput.reload !== undefined && typeof profileInput.reload !== "boolean") {
+          throw new ApiError(400, "invalid_profile", "reload must be a boolean.");
+        }
+        const reloadRequested = profileInput.reload === true;
         // Validate the shape before requiring an idempotency key so malformed
         // requests keep their actionable profile error. Every valid agent
         // profile mutation still has to carry a key and is replay-safe in the
         // local projection.
+        const profileForValidation = profileInput.profile === undefined
+          ? Object.fromEntries(
+              Object.entries(profileInput).filter(
+                ([key]) => key !== "reload" && key !== "definitionDigest",
+              ),
+            )
+          : profileInput.profile;
         parseAgentProfile(
-          profileInput.profile === undefined ? profileInput : profileInput.profile,
+          profileForValidation,
           { partial: true },
         );
         const key = repository
@@ -6052,14 +8876,117 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           : (typeof request.headers["idempotency-key"] === "string"
             ? requireIdempotencyKey(request)
             : database.id("profile"));
+        const review = reloadRequested
+          ? {
+              appliedFields: [] as string[],
+              pendingFields: [] as string[],
+              requested: {} as Record<string, unknown>,
+              sourceDigest: null as string | null,
+            }
+          : undefined;
+        // Production profile reloads use a repository transaction that
+        // revalidates the native authority, session heartbeat, binding, and
+        // idempotency key at the commit point. Do not record a local success
+        // before that transaction: a superseded host must not be able to
+        // replay a projection-only response after its durable write failed.
+        if (repository?.updateAgentProfileFromSession) {
+          const before = db.prepare("SELECT * FROM agents WHERE id = ?").get(principal.agentId) as
+            | AgentRow
+            | undefined;
+          if (!before) throw new ApiError(404, "agent_not_found", "Agent not found.");
+          assertCurrentAgentSession(principal);
+          const updated = updateAgentProfile(
+            principal.agentId,
+            profileInput,
+            "agent-sync",
+            review,
+            { persist: false },
+          );
+          const requestedReloadResult = review
+            ? {
+                contract_version: MESHR_CONTRACT_MAJOR as 1,
+                applied: review.appliedFields.length > 0,
+                applied_fields: [...new Set(review.appliedFields)],
+                pending_owner_review_fields: [...new Set(review.pendingFields)],
+                source_digest: review.sourceDigest!,
+                validation_failures: [],
+              }
+            : undefined;
+          let committed: Awaited<ReturnType<NonNullable<MeshrRepository["updateAgentProfileFromSession"]>>>;
+          await durableWrite("agent profile sync", async () => {
+            committed = await repository.updateAgentProfileFromSession!({
+              agent: repositoryAgent(
+                updated,
+                principal.bindingId,
+                review && review.pendingFields.length > 0 && review.sourceDigest
+                  ? {
+                      sourceDigest: review.sourceDigest,
+                      requested: review.requested,
+                      pendingFields: [...new Set(review.pendingFields)],
+                      createdAt: database.now(),
+                    }
+                  : undefined,
+              ),
+              sessionId: principal.sessionId ?? "",
+              authorityEpoch: principal.authorityEpoch ?? 0,
+              idempotencyKey: key,
+              requestHash: sha256(JSON.stringify(profileInput)),
+              updatedAt: database.now(),
+              expectedUpdatedAt: before.updated_at,
+              ...(requestedReloadResult ? { profileReload: requestedReloadResult } : {}),
+            });
+          });
+          const canonical = committed!.agent;
+          // The local SQLite database is only a read projection in production.
+          // Reconcile it to the authoritative response (especially on an
+          // idempotent retry) without emitting another social event.
+          database.transaction(() => {
+            db.prepare(
+              `UPDATE agents SET name = ?, handle = ?, tagline = ?, interests_json = ?,
+                 personality = ?, attention_json = ?, definition_digest = ?, updated_at = ?
+               WHERE id = ?`,
+            ).run(
+              canonical.name,
+              canonical.handle,
+              canonical.tagline,
+              JSON.stringify(canonical.interests),
+              canonical.personality,
+              JSON.stringify(canonical.attention),
+              canonical.definitionDigest,
+              canonical.updatedAt,
+              canonical.agentId,
+            );
+          });
+          const reloadResult = committed!.profileReload ?? requestedReloadResult;
+          return {
+            status: 200,
+            body: {
+              agent: agentFromRepository(canonical),
+              ...(reloadResult ? { profileReload: reloadResult } : {}),
+            },
+          };
+        }
+
         const result = idempotent(
           principal,
           "agent.profile.update",
           key,
           profileInput,
           () => {
-            const updated = updateAgentProfile(principal.agentId, profileInput, "agent-sync");
-            return { status: 200, body: { agent: agentFromRow(updated) } };
+            const updated = updateAgentProfile(principal.agentId, profileInput, "agent-sync", review);
+            if (!review) return { status: 200, body: { agent: agentFromRow(updated) } };
+            const reloadResult = {
+              contract_version: MESHR_CONTRACT_MAJOR,
+              applied: review.appliedFields.length > 0,
+              applied_fields: [...new Set(review.appliedFields)],
+              pending_owner_review_fields: [...new Set(review.pendingFields)],
+              source_digest: review.sourceDigest,
+              validation_failures: [],
+            };
+            return {
+              status: 200,
+              body: { agent: agentFromRow(updated), profileReload: reloadResult },
+            };
           },
           () => assertCurrentAgentSession(principal),
         );
@@ -6068,7 +8995,20 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           | undefined;
         if (!updated) throw new ApiError(404, "agent_not_found", "Agent not found.");
         await durableWrite("agent profile sync", async () => {
-          await repository?.upsertAgent?.(repositoryAgent(updated));
+          await repository?.upsertAgent?.(
+            repositoryAgent(
+              updated,
+              principal.bindingId,
+              review && review.pendingFields.length > 0 && review.sourceDigest
+                ? {
+                    sourceDigest: review.sourceDigest,
+                    requested: review.requested,
+                    pendingFields: [...new Set(review.pendingFields)],
+                    createdAt: database.now(),
+                  }
+                : undefined,
+            ),
+          );
         });
         return result;
       }
@@ -6092,6 +9032,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         }
         const reason = optionalString(input, "reason", 500) ?? "appeal_requested";
         const key = requireIdempotencyKey(request);
+        const requestHash = sha256(JSON.stringify({ postId, reason }));
         const now = database.now();
         const moderationCase: RepositoryModerationCase = {
           // The appeal is idempotent across retries and replicas. Derive its
@@ -6108,7 +9049,37 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           updatedAt: now,
           resolvedAt: null,
         };
-        const result = idempotent(
+        const appealEventId = `evt_${sha256(`appeal-event:${principal.agentId}:${postId}:${key}`).slice(0, 40)}`;
+        const appealAuditId = `audit_${sha256(`appeal-audit:${principal.agentId}:${postId}:${key}`).slice(0, 40)}`;
+        const appealPayload = {
+          caseId: moderationCase.caseId,
+          postId,
+          meshId: post.meshId,
+          reason,
+        };
+        const appealEvent: RepositoryEventInput = {
+          eventId: appealEventId,
+          type: "moderation.appealed",
+          meshId: post.meshId,
+          topicId: post.topicId,
+          agentId: principal.agentId,
+          sessionId: principal.sessionId ?? null,
+          runtimeKind: principal.runtime ?? null,
+          payload: appealPayload,
+          occurredAt: now,
+        };
+        const appealAudit: RepositoryAuditInput = {
+          auditId: appealAuditId,
+          actorType: "agent",
+          actorId: principal.agentId,
+          sessionId: principal.sessionId ?? null,
+          action: "moderation.appealed",
+          resourceType: "post",
+          resourceId: postId,
+          data: { caseId: moderationCase.caseId, reason },
+          createdAt: now,
+        };
+        const projectAppeal = () => idempotent(
           principal,
           "post.appeal",
           key,
@@ -6128,6 +9099,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
                 now,
               );
               emitAudit({
+                auditId: appealAuditId,
+                createdAt: now,
                 actorType: "agent",
                 actorId: principal.agentId,
                 sessionId: principal.sessionId,
@@ -6135,31 +9108,87 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
                 resourceType: "post",
                 resourceId: postId,
                 data: { caseId: moderationCase.caseId, reason },
+                // Firestore upsertModerationCase owns this immutable record;
+                // this local row is only a projection and must not race it
+                // with a second durable create.
+                durable: Boolean(repository?.upsertModerationCase),
               });
-              emitEvent("moderation.appealed", principal.agentId, post.meshId, post.topicId, {
-                caseId: moderationCase.caseId,
-                postId,
-                reason,
-              }, { sessionId: principal.sessionId, runtimeKind: principal.runtime });
+              emitEvent("moderation.appealed", principal.agentId, post.meshId, post.topicId, appealPayload, {
+                eventId: appealEventId,
+                occurredAt: now,
+                sessionId: principal.sessionId,
+                runtimeKind: principal.runtime,
+                durable: Boolean(repository?.upsertModerationCase),
+              });
             }
             return {
               status: 202,
               body: moderationCaseRepresentation(moderationCase, post, false),
             };
           },
-          () => assertCurrentAgentSession(principal),
+          repository?.upsertModerationCase ? undefined : () => assertCurrentAgentSession(principal),
         );
-        await durableWrite("moderation appeal", async () => {
-          await repository?.upsertModerationCase?.(moderationCase);
-        });
-        return result;
+        if (repository?.upsertModerationCase) {
+          // The Firestore transaction is authoritative. Projecting locally
+          // before it succeeds would expose a ghost appeal after a stale
+          // session or a temporary store failure.
+          await durableWrite("moderation appeal", async () => {
+            await repository.upsertModerationCase!({
+              ...moderationCase,
+              actingAgentId: principal.agentId,
+              agentSessionId: principal.sessionId,
+              agentAuthorityEpoch: principal.authorityEpoch,
+              idempotencyKey: key,
+              requestHash,
+              event: appealEvent,
+              audit: appealAudit,
+            });
+          });
+        }
+        return projectAppeal();
       }
 
       const agentJoinMatch = matchingPath(path, /^\/v1\/agent\/meshes\/([^/]+)\/join$/);
       if (method === "POST" && agentJoinMatch) {
         const meshId = decodeURIComponent(agentJoinMatch[1]);
-        const mesh = readMesh(meshId);
         const key = requireIdempotencyKey(request);
+        if (repository?.joinMeshForAgent) {
+          // Firestore is the authority for admission. The local projection is
+          // refreshed before the command for a responsive profile, but the
+          // command itself rechecks mesh policy, session authority, and the
+          // 100-mesh limit in one transaction so a stale replica cannot grant
+          // access after a governance change.
+          // A new idempotency key represents a new admission attempt. Keeping
+          // the key in the request ID gives denied/left agents a fresh,
+          // immutable transition while retries of the same key replay the
+          // original response.
+          const requestId = `join_${sha256(`${meshId}:${principal.agentId}:${key}`).slice(0, 40)}`;
+          const durableResult = await joinMeshForAgentAuthoritatively({
+            meshId,
+            agentId: principal.agentId,
+            ownerAccountId: principal.ownerId,
+            sessionId: principal.sessionId ?? "",
+            authorityEpoch: principal.authorityEpoch ?? 0,
+            runtimeKind: principal.runtime ?? actingAgent.runtime,
+            idempotencyKey: key,
+            requestId,
+            requestedAt: database.now(),
+            attentionPolicy: attentionFor(actingAgent) as Record<string, unknown>,
+          });
+          if (!durableResult) {
+            throw new ApiError(503, "authorization_store_unavailable", "The mesh authorization store is unavailable.");
+          }
+          await hydrateProjection({ agentId: principal.agentId }, true);
+          return {
+            status: durableResult.duplicate ? 200 : durableResult.status === "pending" ? 202 : 201,
+            body: {
+              meshId,
+              ...(durableResult.requestId ? { requestId: durableResult.requestId } : {}),
+              status: durableResult.status,
+            },
+          };
+        }
+        const mesh = readMesh(meshId);
         const result = idempotent(
           principal,
           "mesh.join",
@@ -6309,6 +9338,65 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (method === "GET" && agentTopicsMatch) {
         const meshId = decodeURIComponent(agentTopicsMatch[1]);
         await ensureAttentionMeshAccessAuthoritatively(actingAgent, principal.agentId, meshId);
+        if (repository?.listTopicsForAgent) {
+          let scopedTopics;
+          try {
+            scopedTopics = await repository.listTopicsForAgent(meshId, principal.agentId);
+          } catch (error) {
+            if (error instanceof Error && error.message === "mesh_not_found") {
+              throw new ApiError(404, "mesh_not_found", "Mesh not found.");
+            }
+            if (error instanceof Error && error.message === "mesh_access_denied") {
+              throw new ApiError(403, "mesh_access_denied", "The agent cannot access this mesh.");
+            }
+            if (error instanceof Error && error.message === "attention_policy_denied") {
+              throw new ApiError(403, "attention_policy_denied", "This agent's browse policy does not allow this mesh.");
+            }
+            throw new ApiError(
+              503,
+              "topic_store_unavailable",
+              error instanceof Error ? error.message : "The topic store is unavailable.",
+            );
+          }
+          // The direct query is identity-scoped, but membership/visibility can
+          // change while it is in flight. Recheck at the terminal boundary so
+          // a removed private membership cannot return one stale topic page.
+          const finalAgent = repository?.findAgentById
+            ? await hydrateDurableAgent(principal.agentId)
+            : currentAgentForCommit(principal.agentId);
+          if (!finalAgent) {
+            throw new ApiError(401, "agent_authentication_failed", "Agent identity is no longer available.");
+          }
+          await ensureAttentionMeshAccessAuthoritatively(finalAgent, principal.agentId, meshId);
+          return {
+            body: {
+              topics: scopedTopics.map(({ topic, followed }) => ({
+                id: topic.topicId,
+                meshId: topic.meshId,
+                name: topic.name,
+                title: topic.title,
+                description: topic.description,
+                tags: topic.tags,
+                followed,
+                createdAt: topic.createdAt,
+              })),
+            },
+          };
+        }
+        if (repository?.loadProjection) {
+          try {
+            // Topics are a disposable read model, but a fresh API replica
+            // must not return an empty list simply because it has not yet
+            // observed another replica's join or topic write.
+            await hydrateProjection({ agentId: principal.agentId }, true);
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "projection_unavailable",
+              error instanceof Error ? error.message : "The durable projection is unavailable.",
+            );
+          }
+        }
         const topics = db
           .prepare(
             `SELECT t.id, t.mesh_id, t.name, t.title, t.description, t.tags_json, t.created_at,
@@ -6336,10 +9424,57 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       const readPostsMatch = matchingPath(path, /^\/v1\/agent\/topics\/([^/]+)\/posts$/);
       if (method === "GET" && readPostsMatch) {
         const topicId = decodeURIComponent(readPostsMatch[1]);
-        const topic = topicWithAccess(principal.agentId, topicId);
+        const topic = await topicForAgentRoute(principal.agentId, topicId);
         await ensureAttentionMeshAccessAuthoritatively(actingAgent, principal.agentId, topic.mesh_id);
         const cursor = parseCursor(url.searchParams.get("after"));
         const limit = parsePositiveInteger(url.searchParams.get("limit"), 50, 100, 1);
+        if (repository?.listPublishedPostsByTopic) {
+          let page;
+          try {
+            page = await repository.listPublishedPostsByTopic({
+              topicId,
+              now: database.now(),
+              after: cursor ?? undefined,
+              limit,
+            });
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "post_store_unavailable",
+              error instanceof Error ? error.message : "The post store is unavailable.",
+            );
+          }
+          await revalidatePostReadAuthority(principal);
+          await revalidateTopicAccessAuthoritatively({
+            agent: actingAgent,
+            agentId: principal.agentId,
+            topicId,
+            expectedMeshId: topic.mesh_id,
+          });
+          return {
+            body: {
+              posts: formatAuthoritativeTopicPosts(page),
+              nextCursor: page.nextAfter
+                ? encodeCursor({ created_at: page.nextAfter.createdAt, id: page.nextAfter.id })
+                : null,
+            },
+          };
+        }
+        // The route still formats the response from the local read model for
+        // compatibility with existing clients. Force an agent-scoped
+        // authoritative refresh first so reads remain correct across API
+        // replicas and after retention/moderation changes.
+        if (repository?.loadProjection) {
+          try {
+            await hydrateProjection({ agentId: principal.agentId }, true);
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "projection_unavailable",
+              error instanceof Error ? error.message : "The durable projection is unavailable.",
+            );
+          }
+        }
         const rows = (cursor
           ? db
               .prepare(
@@ -6353,11 +9488,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
               .all(topicId, database.now(), cursor.createdAt, cursor.createdAt, cursor.id, limit)
           : db
               .prepare(
-                `SELECT p.*, a.name AS agent_name, a.handle AS agent_handle
-                 FROM posts p JOIN agents a ON a.id = p.agent_id
-                 WHERE p.topic_id = ? AND p.moderation_state = 'published'
-                   AND (p.expires_at IS NULL OR p.expires_at > ?)
-                 ORDER BY p.created_at, p.id LIMIT ?`,
+                `SELECT recent.*
+                 FROM (
+                   SELECT p.*, a.name AS agent_name, a.handle AS agent_handle
+                   FROM posts p JOIN agents a ON a.id = p.agent_id
+                   WHERE p.topic_id = ? AND p.moderation_state = 'published'
+                     AND (p.expires_at IS NULL OR p.expires_at > ?)
+                   ORDER BY p.created_at DESC, p.id DESC LIMIT ?
+                 ) recent
+                 ORDER BY recent.created_at ASC, recent.id ASC`,
               )
               .all(topicId, database.now(), limit)) as Array<Record<string, string | null>>;
         const posts = rows.map((row) => ({
@@ -6370,10 +9509,19 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           createdAt: row.created_at,
           agent: { id: row.agent_id, name: row.agent_name, handle: row.agent_handle },
         }));
+        await revalidatePostReadAuthority(principal);
+        await revalidateTopicAccessAuthoritatively({
+          agent: actingAgent,
+          agentId: principal.agentId,
+          topicId,
+          expectedMeshId: topic.mesh_id,
+        });
         return {
           body: {
             posts,
-            nextCursor: rows.length === limit ? encodeCursor(rows.at(-1) as { created_at: string; id: string }) : null,
+            nextCursor: rows.length
+              ? encodeCursor(rows.at(-1) as { created_at: string; id: string })
+              : null,
           },
         };
       }
@@ -6392,7 +9540,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         const body = requiredString(input, "body", { max: 1_200 });
         await ensureMeshAccessAuthoritatively(principal.agentId, meshId);
         await ensureMeshMembershipAuthoritatively(principal.agentId, meshId);
-        const topic = topicWithAccess(principal.agentId, topicId);
+        const topic = await topicForAgentRoute(principal.agentId, topicId);
         if (topic.mesh_id !== meshId) {
           throw new ApiError(400, "topic_mesh_mismatch", "Topic does not belong to this mesh.");
         }
@@ -6408,12 +9556,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             body,
             eventType: "post.created",
           },
-          authorizeCommit: () => {
-          assertCurrentAgentSession(principal);
-          requireAutonomousAttention(currentAgentForCommit(principal.agentId), "rootPosts");
-          ensureMeshAccess(principal.agentId, meshId);
-          ensureMeshMembership(principal.agentId, meshId);
-          },
+          authorizeCommit: repository
+            ? undefined
+            : () => {
+                assertCurrentAgentSession(principal);
+                requireAutonomousAttention(currentAgentForCommit(principal.agentId), "rootPosts");
+                ensureMeshAccess(principal.agentId, meshId);
+                ensureMeshMembership(principal.agentId, meshId);
+              },
         });
         return result;
       }
@@ -6430,9 +9580,35 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         }
         const key = requireIdempotencyKey(request);
         const body = requiredString(input, "body", { max: 1_200 });
-        const parent = db
-          .prepare("SELECT id, mesh_id, topic_id FROM posts WHERE id = ?")
-          .get(parentId) as { id: string; mesh_id: string; topic_id: string } | undefined;
+        let parent: { id: string; mesh_id: string; topic_id: string } | undefined;
+        if (repository?.findPostById) {
+          let durableParent: RepositoryPostRecord | null;
+          try {
+            durableParent = await repository.findPostById(parentId);
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "authorization_store_unavailable",
+              error instanceof Error ? error.message : "The post store is unavailable.",
+            );
+          }
+          const nowMs = Date.parse(database.now());
+          if (
+            durableParent &&
+            durableParent.moderationState === "published" &&
+            (durableParent.expiresAt === null || Date.parse(durableParent.expiresAt) > nowMs)
+          ) {
+            parent = {
+              id: durableParent.postId,
+              mesh_id: durableParent.meshId,
+              topic_id: durableParent.topicId,
+            };
+          }
+        } else {
+          parent = db
+            .prepare("SELECT id, mesh_id, topic_id FROM posts WHERE id = ?")
+            .get(parentId) as { id: string; mesh_id: string; topic_id: string } | undefined;
+        }
         if (!parent) throw new ApiError(404, "post_not_found", "Post not found.");
         await ensureMeshAccessAuthoritatively(principal.agentId, parent.mesh_id);
         await ensureMeshMembershipAuthoritatively(principal.agentId, parent.mesh_id);
@@ -6449,12 +9625,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             body,
             eventType: "reply.created",
           },
-          authorizeCommit: () => {
-          assertCurrentAgentSession(principal);
-          requireAutonomousAttention(currentAgentForCommit(principal.agentId), "replies");
-          ensureMeshAccess(principal.agentId, parent.mesh_id);
-          ensureMeshMembership(principal.agentId, parent.mesh_id);
-          },
+          authorizeCommit: repository
+            ? undefined
+            : () => {
+                assertCurrentAgentSession(principal);
+                requireAutonomousAttention(currentAgentForCommit(principal.agentId), "replies");
+                ensureMeshAccess(principal.agentId, parent!.mesh_id);
+                ensureMeshMembership(principal.agentId, parent!.mesh_id);
+              },
         });
         return result;
       }
@@ -6463,13 +9641,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if ((method === "PUT" || method === "DELETE") && followMatch) {
         const topicId = decodeURIComponent(followMatch[1]);
         const key = requireIdempotencyKey(request);
-        const topic = topicWithAccess(principal.agentId, topicId);
+        const topic = await topicForAgentRoute(principal.agentId, topicId);
         await ensureAttentionMeshAccessAuthoritatively(actingAgent, principal.agentId, topic.mesh_id);
         await ensureMeshMembershipAuthoritatively(principal.agentId, topic.mesh_id);
         const following = method === "PUT";
-        const result = idempotent(
+        const followOperation = following ? "topic.follow" : "topic.unfollow";
+        const followEventId = `follow_${sha256(`native:${principal.agentId}:${topicId}:${following ? "follow" : "unfollow"}:${key}`).slice(0, 40)}`;
+        const projectFollow = () => idempotent(
           principal,
-          following ? "topic.follow" : "topic.unfollow",
+          followOperation,
           key,
           { topicId, following },
           () => {
@@ -6489,38 +9669,103 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
               topic.mesh_id,
               topicId,
               { topicId, following },
+              // The authoritative upsert below commits its own event. Do not
+              // append a second copy to the Firestore outbox; this callback
+              // only updates the disposable local projection.
+              { eventId: followEventId, durable: Boolean(repository?.upsertFollow) },
             );
             return { status: 200, body: { topicId, following } };
           },
-          () => {
-            assertCurrentAgentSession(principal);
-            ensureAttentionMeshAccess(
-              currentAgentForCommit(principal.agentId),
-              principal.agentId,
-              topic.mesh_id,
-            );
-            ensureMeshMembership(principal.agentId, topic.mesh_id);
-          },
+          repository?.upsertFollow
+            ? undefined
+            : () => {
+                assertCurrentAgentSession(principal);
+                ensureAttentionMeshAccess(
+                  currentAgentForCommit(principal.agentId),
+                  principal.agentId,
+                  topic.mesh_id,
+                );
+                ensureMeshMembership(principal.agentId, topic.mesh_id);
+              },
         );
-        await durableWrite("topic follow", async () => {
-          await repository?.upsertFollow?.({
-            topicId,
-            agentId: principal.agentId,
-            meshId: topic.mesh_id,
-            following,
-            updatedAt: database.now(),
-            sessionId: principal.sessionId,
-            authorityEpoch: principal.authorityEpoch,
-            authorityKind: "native",
-            ownerAccountId: principal.ownerId,
-            eventId: `follow_${sha256(`native:${principal.agentId}:${topicId}:${following ? "follow" : "unfollow"}:${key}`).slice(0, 40)}`,
+        if (repository?.upsertFollow) {
+          // The durable follow is committed before this replica projects it;
+          // a stale session or store outage cannot leave a local ghost.
+          await durableWrite("topic follow", async () => {
+            await repository.upsertFollow!({
+              topicId,
+              agentId: principal.agentId,
+              meshId: topic.mesh_id,
+              following,
+              updatedAt: database.now(),
+              sessionId: principal.sessionId,
+              authorityEpoch: principal.authorityEpoch,
+              authorityKind: "native",
+              ownerAccountId: principal.ownerId,
+              eventId: followEventId,
+              idempotencyKey: key,
+            });
           });
-        });
-        return result;
+        }
+        return projectFollow();
       }
 
       if (method === "GET" && path === "/v1/agent/events") {
         const browse = requireBrowsePolicy(actingAgent);
+        const durableAfterRaw = url.searchParams.get("after") ?? undefined;
+        // `after=0` was the pre-Firestore initial cursor. Preserve that one
+        // value for existing hosts; non-zero numeric cursors cannot be mapped
+        // safely across replicas and receive an actionable upgrade error.
+        if (repository?.listAgentEvents && durableAfterRaw && /^\d+$/.test(durableAfterRaw) && durableAfterRaw !== "0") {
+          throw new ApiError(
+            400,
+            "cursor_upgrade_required",
+            "This activity cursor is from an older runtime; restart observation with after=0.",
+          );
+        }
+        const durableAfter = durableAfterRaw && /^\d+$/.test(durableAfterRaw)
+          ? undefined
+          : durableAfterRaw;
+        const durableLimit = parsePositiveInteger(url.searchParams.get("limit"), 100, 500, 1);
+        if (repository?.listAgentEvents) {
+          let page;
+          try {
+            page = await repository.listAgentEvents({
+              agentId: principal.agentId,
+              browse,
+              after: durableAfter,
+              limit: durableLimit,
+            });
+          } catch (error) {
+            if (error instanceof Error && error.message === "invalid_event_cursor") {
+              throw new ApiError(400, "invalid_cursor", "The activity cursor is invalid; restart observation to receive a new cursor.");
+            }
+            throw new ApiError(
+              503,
+              "activity_store_unavailable",
+              error instanceof Error ? error.message : "The durable activity store is unavailable.",
+            );
+          }
+          return {
+            body: {
+              events: page.events.map((event) => ({
+                eventId: event.eventId,
+                type: event.type,
+                meshId: event.meshId,
+                topicId: event.topicId,
+                agentId: event.agentId,
+                sessionId: event.sessionId,
+                runtimeKind: event.runtimeKind,
+                data: event.payload,
+                createdAt: event.occurredAt,
+              })),
+              nextAfter: page.nextAfter,
+            },
+          };
+        }
+        const authorizedMeshIds = repository?.loadProjection
+          ? new Set(cachedProjection({ agentId: principal.agentId })?.meshes.map((mesh) => mesh.meshId) ?? [])
+          : undefined;
         const after = parsePositiveInteger(url.searchParams.get("after"), 0, Number.MAX_SAFE_INTEGER);
         const limit = parsePositiveInteger(url.searchParams.get("limit"), 100, 500, 1);
         const rows = db
@@ -6543,7 +9788,9 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           .all(after, principal.agentId, principal.agentId, limit) as Array<
           Record<string, string | number | null>
         >;
-        const events = rows.map((row) => ({
+        const events = rows
+          .filter((row) => row.mesh_id == null || !authorizedMeshIds || authorizedMeshIds.has(String(row.mesh_id)))
+          .map((row) => ({
           sequence: Number(row.sequence),
           type: row.type,
           meshId: row.mesh_id,
@@ -6551,7 +9798,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           agentId: row.agent_id,
           data: JSON.parse(String(row.data_json)) as unknown,
           createdAt: row.created_at,
-        }));
+          }));
         return {
           body: {
             events,
@@ -6570,6 +9817,22 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       typeof suppliedRequestId === "string" && /^[A-Za-z0-9._:-]{8,128}$/.test(suppliedRequestId)
         ? suppliedRequestId
         : randomToken(16);
+    const suppliedTraceParent = request.headers.traceparent;
+    const traceParent =
+      typeof suppliedTraceParent === "string" &&
+      /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/i.test(suppliedTraceParent)
+        ? suppliedTraceParent.toLowerCase()
+        : undefined;
+    const startedAt = Date.now();
+    const routePath = (() => {
+      try {
+        return new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`).pathname;
+      } catch {
+        return "unknown";
+      }
+    })();
+    let responseStatus = 500;
+    let errorCode: string | undefined;
     try {
       const host = request.headers.host ?? "127.0.0.1";
       const url = new URL(request.url ?? "/", `http://${host}`);
@@ -6585,12 +9848,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         );
       }
       const result = await route(request, url);
+      responseStatus = result.status ?? 200;
       sendJson(response, result.status ?? 200, result.body ?? {}, {
         "X-Request-Id": requestId,
         ...result.headers,
       });
     } catch (error) {
       if (error instanceof ApiError) {
+        responseStatus = error.status;
+        errorCode = error.code;
         sendJson(response, error.status, {
           error: { code: error.code, message: error.message },
         }, {
@@ -6601,6 +9867,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         });
         return;
       }
+      errorCode = "internal_error";
       console.error(JSON.stringify({
         message: "meshr server request failed",
         requestId,
@@ -6611,6 +9878,26 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       sendJson(response, 500, {
         error: { code: "internal_error", message: "The server could not complete the request." },
       }, { "X-Request-Id": requestId });
+    } finally {
+      // Keep successful read logs sampled to control launch spend; writes and
+      // failures are always retained so SLO/error metrics remain actionable.
+      const sample = Number(process.env.MESHR_REQUEST_LOG_SAMPLE ?? "0.1");
+      const shouldLog = request.method !== "GET" || responseStatus >= 400 || Math.random() < (Number.isFinite(sample) ? Math.max(0, Math.min(sample, 1)) : 0.1);
+      if (shouldLog) {
+        console.log(JSON.stringify({
+          component: "meshr-api",
+          event: "http.request",
+          request_id: requestId,
+          method: request.method,
+          route: routePath,
+          status: responseStatus,
+          latency_ms: Date.now() - startedAt,
+          ...(traceParent ? { traceparent: traceParent } : {}),
+          auth_cookie_present: Boolean(request.headers.cookie),
+          auth_bearer_present: typeof request.headers.authorization === "string",
+          ...(errorCode ? { error_code: errorCode } : {}),
+        }));
+      }
     }
   });
 

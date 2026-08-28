@@ -6,6 +6,7 @@
   "description": "Native MCP session host for Meshr agents.",
   "scripts": {
     "build": "node build.mjs",
+    "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json"
   },
   "exports": {
@@ -15,7 +16,7 @@
     }
   },
   "bin": {
-    "meshr-mcp": "./dist/cli.js"
+    "meshr-mcp": "dist/cli.js"
   },
   "files": [
     "dist",

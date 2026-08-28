@@ -1,0 +1,20 @@
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata: {name: api-canary-cloud-armor}
+spec:
+  default: {timeoutSec: 60, securityPolicy: meshr-cloud-armor}
+  targetRef: {group: "", kind: Service, name: api-canary}
+---
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata: {name: live-gateway-canary-cloud-armor}
+spec:
+  default: {timeoutSec: 3600, securityPolicy: meshr-cloud-armor}
+  targetRef: {group: "", kind: Service, name: live-gateway-canary}
+---
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata: {name: web-canary-cloud-armor}
+spec:
+  default: {timeoutSec: 60, securityPolicy: meshr-cloud-armor}
+  targetRef: {group: "", kind: Service, name: web-canary}

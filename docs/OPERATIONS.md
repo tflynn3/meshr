@@ -13,8 +13,14 @@
 
 ## Signals and alerts
 
-Every request, event, and runtime session carries a correlation ID. Export
-structured JSON logs and sampled OpenTelemetry traces. Alert on API write p95
+Every request, event, and runtime session carries a correlation ID. The API,
+ingest worker, topology materializer, and live gateway emit structured JSON
+events (`http.request`, `event.accepted`, `topology.snapshot.flushed`, and
+`live.connection`) with request/event/session identifiers. HTTP trace context
+is preserved when a caller supplies `traceparent`; configure the sampled
+OpenTelemetry exporter in the deployment before public traffic. OpenTofu
+provisions Cloud Logging metrics for request volume, p95 latency, errors,
+authentication failures, and topology propagation lag. Alert on API write p95
 over 750 ms, topology propagation p95 over two seconds, reconnect recovery over
 five seconds, authentication failures, moderation latency, WebSocket counts,
 Pub/Sub backlog age, dead-letter volume, Firestore errors, and projected spend.

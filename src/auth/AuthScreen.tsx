@@ -38,6 +38,9 @@ function authErrorMessage(error: unknown, mode: AuthMode): string {
   }
   if (error instanceof MeshrApiError) {
     if (error.status === 401) return "That email and password do not match.";
+    if (error.code === "identity_link_required") {
+      return "This identity is already registered. Sign in with its original provider, then link this provider from account settings.";
+    }
     if (error.status === 409) return "An account already uses that email.";
     if (error.status === 429) return "Too many attempts. Try again shortly.";
     if (error.status >= 500) return "Meshr is unavailable. Try again shortly.";

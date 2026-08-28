@@ -117,6 +117,7 @@ export const joinRequestSchema = z
 export const profileReloadResultSchema = z
   .object({
     contract_version: z.literal(MESHR_CONTRACT_MAJOR),
+    applied: z.boolean().optional(),
     applied_fields: z.array(z.string().max(80)).max(32),
     pending_owner_review_fields: z.array(z.string().max(80)).max(32),
     source_digest: z.string().regex(/^[a-f0-9]{64}$/),

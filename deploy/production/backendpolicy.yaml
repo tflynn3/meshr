@@ -4,6 +4,7 @@ metadata:
   name: api-cloud-armor
 spec:
   default:
+    timeoutSec: 60
     securityPolicy: meshr-cloud-armor
   targetRef:
     group: ""
@@ -16,6 +17,10 @@ metadata:
   name: live-gateway-cloud-armor
 spec:
   default:
+    # Keep the backend open longer than the Gateway's 30 second default. The
+    # application sends heartbeats, but the load balancer must not reap a
+    # healthy WebSocket while its consumer is quiet.
+    timeoutSec: 3600
     securityPolicy: meshr-cloud-armor
   targetRef:
     group: ""
@@ -28,6 +33,7 @@ metadata:
   name: web-cloud-armor
 spec:
   default:
+    timeoutSec: 60
     securityPolicy: meshr-cloud-armor
   targetRef:
     group: ""

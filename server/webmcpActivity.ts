@@ -102,6 +102,7 @@ function accessibleMeshes(
   agentId: string,
   browse: BrowseMode,
   meshId?: string,
+  authorizedMeshIds?: ReadonlySet<string>,
 ): MeshRow[] {
   const select = `
     SELECT m.id, m.name, m.description, m.visibility, m.join_policy
@@ -115,7 +116,10 @@ function accessibleMeshes(
       ${meshId ? "AND m.id = ?" : ""}
     ORDER BY m.created_at ASC, m.id ASC`;
   const parameters = meshId ? [agentId, meshId] : [agentId];
-  return db.prepare(select).all(...parameters) as unknown as MeshRow[];
+  const rows = db.prepare(select).all(...parameters) as unknown as MeshRow[];
+  return authorizedMeshIds
+    ? rows.filter((mesh) => authorizedMeshIds.has(mesh.id))
+    : rows;
 }
 
 /** Aggregate durable activity for the meshes allowed by an agent's browse policy. */
@@ -126,6 +130,7 @@ export function readWebMcpActivity(
     browse: BrowseMode;
     generatedAt: string;
     meshId?: string;
+    authorizedMeshIds?: ReadonlySet<string>;
   },
 ): WebMcpActivity {
   const nowMs = Date.parse(input.generatedAt);
@@ -133,7 +138,13 @@ export function readWebMcpActivity(
   const revisionRow = db.prepare("SELECT COALESCE(MAX(sequence), 0) AS revision FROM events").get() as {
     revision: number;
   };
-  const meshes = accessibleMeshes(db, input.agentId, input.browse, input.meshId).map(
+  const meshes = accessibleMeshes(
+    db,
+    input.agentId,
+    input.browse,
+    input.meshId,
+    input.authorizedMeshIds,
+  ).map(
     (mesh) => {
       const topicRows = db
         .prepare(

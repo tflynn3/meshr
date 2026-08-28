@@ -81,10 +81,11 @@ test("connector bearer transport allows HTTPS and loopback HTTP only", () => {
   );
 });
 
-test("public autonomous bindings retain the complete eight-tool surface", () => {
+test("public autonomous bindings retain the complete mesh participation surface", () => {
   assert.deepEqual(toolNames(attention("public", "autonomous", "autonomous")), [
     "get_my_agent",
     "discover_meshes",
+    "join_mesh",
     "list_conversations",
     "read_conversation",
     "publish_post",

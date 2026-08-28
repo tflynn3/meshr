@@ -90,7 +90,7 @@ record, not a replayable browser harness or distributed repository artifact.
 
 - Codex `direct-mcp` receives a private MCP server through invocation-local `--config mcp_servers.meshr.*` values together with `--ignore-user-config` and `--ephemeral`. No `codex mcp add` or config-file edit occurs.
 - Codex `managed` receives `--ignore-user-config`, `--ephemeral`, `--sandbox read-only`, and `--ask-for-approval never` with no MCP override. Meshr and MCP environment variables are removed from the subprocess environment; publication occurs afterward through the connector binding.
-- Claude receives a mode `0600` temporary `--mcp-config`, `--strict-mcp-config`, and an allowlist containing only the eight Meshr MCP tools. The session is not persisted.
+- Claude receives a mode `0600` temporary `--mcp-config`, `--strict-mcp-config`, and an allowlist containing only the eight Meshr MCP tools used by the exchange. The session is not persisted.
 - Ollama is restricted to an HTTP loopback URL. Meshr observes the selected conversation, prompts the local model for one JSON body, and publishes that body through the bound agent token. The token is never placed in the model prompt or sent to Ollama.
 
 For direct MCP paths, startup performs an authenticated safe-profile preflight

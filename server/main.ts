@@ -6,7 +6,9 @@ import { startSqliteOutboxPublisher } from "./outboxPublisher.ts";
 import { productionSettings, assertProductionSettings } from "./production.ts";
 import { createFirestore } from "../platform/googleClients.ts";
 import { FirestoreMeshrRepository } from "./firestoreRepository.ts";
+import { loadRuntimeSecrets } from "../platform/runtimeSecrets.ts";
 
+loadRuntimeSecrets();
 const settings = productionSettings();
 assertProductionSettings(settings);
 const dbPath = resolve(process.env.MESHR_DB_PATH ?? ".meshr/meshr.db");
@@ -22,9 +24,17 @@ if (!Number.isSafeInteger(rawPort) || rawPort < 1 || rawPort > 65_535) {
 
 const firestore =
   settings.environment === "production" && settings.identityProjectId
-    ? createFirestore(settings.identityProjectId)
+    ? createFirestore(settings.identityProjectId, process.env.MESHR_FIRESTORE_DATABASE)
     : undefined;
-const repository = firestore ? new FirestoreMeshrRepository({ firestore }) : undefined;
+const topologyFirestore = firestore && settings.identityProjectId
+  ? createFirestore(
+      settings.identityProjectId,
+      process.env.MESHR_TOPOLOGY_FIRESTORE_DATABASE || process.env.MESHR_FIRESTORE_DATABASE,
+    )
+  : undefined;
+const repository = firestore
+  ? new FirestoreMeshrRepository({ firestore, topologyFirestore })
+  : undefined;
 if (firestore) {
   // Production starts empty apart from the public commons and system
   // taxonomy. No local prototype identities or content are imported.
@@ -72,12 +82,16 @@ console.log(`meshr server listening at ${address.baseUrl}`);
 console.log(`meshr projection database: ${projectionDbPath}`);
 console.log(`meshr web app: ${publicWebUrl}`);
 
+// The repository uses a distributed lease so multiple API replicas can run
+// this frequently without overlapping. Five-second cadence keeps the
+// thread-aware 90-day body-retention backlog bounded at launch throughput;
+// Firestore TTL remains the backstop for the auxiliary trace collections.
 const retentionSweep = repository?.purgeExpired
   ? setInterval(() => {
       repository
         ?.purgeExpired(new Date().toISOString())
         .catch((error: unknown) => console.error("meshr retention sweep failed", error));
-    }, 15 * 60 * 1_000)
+    }, 5 * 1_000)
   : undefined;
 retentionSweep?.unref();
 
@@ -89,6 +103,7 @@ const shutdown = async () => {
   outboxPublisher?.stop();
   await app.close();
   await firestore?.terminate();
+  if (topologyFirestore && topologyFirestore !== firestore) await topologyFirestore.terminate();
 };
 
 process.once("SIGINT", () => void shutdown().then(() => process.exit(0)));

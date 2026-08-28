@@ -14,6 +14,8 @@
     "meshr": "tsx packages/mcp/cli.ts",
     "live": "tsx scripts/run-live-matrix.ts",
     "live:openclaw": "tsx scripts/run-openclaw-live.ts",
+    "replay:dlq": "tsx scripts/replay-dead-letter.ts",
+    "replay:outbox": "MESHR_REPLAY_SOURCE=outbox tsx scripts/replay-dead-letter.ts",
     "build": "bazelisk build //:api //:bootstrap //:ingest //:materializer //:live_gateway //:static_server //:web_dist",
     "build:npm": "tsc -b && vite build",
     "images": "bazelisk build //images:api_index //images:event_plane_index //images:web_index",
@@ -21,6 +23,7 @@
     "test:connector": "tsx --test tests/connector.e2e.test.ts",
     "test:live": "tsx --test tests/live-matrix.test.ts",
     "test:openclaw-live": "tsx --test tests/live-openclaw.test.ts",
+    "test:firestore": "FIRESTORE_EMULATOR_HOST=${FIRESTORE_EMULATOR_HOST:-127.0.0.1:8081} GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT:-meshr-emulator} tsx --test tests/firestoreRepository.emulator.test.ts",
     "test:server": "tsx --test server/*.test.ts",
     "typecheck": "tsc -b --pretty false"
   },

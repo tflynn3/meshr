@@ -2,7 +2,7 @@ import { McpServer, type RegisteredTool } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { sign } from "node:crypto";
 import * as z from "zod/v4";
-import { MeshrApi } from "./api";
+import { MeshrApi, MeshrApiError } from "./api";
 import { ConnectorStateStore } from "./state";
 import { syncBindingDefinition } from "./profileSync";
 import { createRemoteAgentTools } from "./tools";
@@ -99,6 +99,22 @@ export function createMeshrMcpServerSession(
         annotations: { readOnlyHint: true },
       },
       () => call("discover_meshes"),
+    ),
+  );
+  register(
+    "join_mesh",
+    server.registerTool(
+      "join_mesh",
+      {
+        title: "Join a mesh",
+        description: description(
+          "join_mesh",
+          "Join an open mesh or request admission to an approval-based mesh.",
+        ),
+        inputSchema: { meshId: z.string().min(1) },
+        annotations: { readOnlyHint: false, openWorldHint: true },
+      },
+      (args) => call("join_mesh", args),
     ),
   );
   register(
@@ -202,7 +218,10 @@ export function createMeshrMcpServerSession(
           "Read durable activity events after an optional cursor.",
         ),
         inputSchema: {
-          after: z.number().int().min(0).optional(),
+          after: z.union([
+            z.number().int().min(0),
+            z.string().min(1).max(256).regex(/^[A-Za-z0-9_-]+$/),
+          ]).optional(),
           limit: z.number().int().min(1).max(100).optional(),
         },
         annotations: { readOnlyHint: true, openWorldHint: true },
@@ -222,8 +241,12 @@ export function createMeshrMcpServerSession(
       toolsByName = new Map(tools.map((tool) => [tool.name, tool]));
       for (const [name, registered] of registeredTools) {
         const enabled = toolsByName.has(name);
-        if (enabled && !registered.enabled) registered.enable();
-        if (!enabled && registered.enabled) registered.disable();
+        // The SDK's enabled flag is an implementation detail and can be stale
+        // across a tools/list notification. Apply the desired state
+        // unconditionally so a tightened .meshr attention policy takes effect
+        // in the same native session.
+        if (enabled) registered.enable();
+        else registered.disable();
       }
     },
   };
@@ -248,25 +271,111 @@ export async function serveBindingFromState(input: {
 }): Promise<void> {
   const store = new ConnectorStateStore(input.stateDirectory);
   let binding = await store.require(input.selector);
-  if (binding.status !== "connected" || !binding.agentToken) {
-    throw new Error(`Binding ${input.selector} is not connected.`);
+  if (
+    (binding.status !== "connected" && binding.status !== "approved") ||
+    (!binding.agentToken && (!binding.privateKeyPem || !binding.pairingSecret || !binding.pairingId))
+  ) {
+    throw new Error(`Binding ${input.selector} is not ready for a signed session.`);
   }
-  const initialSync = await syncBindingDefinition({ selector: input.selector, store });
-  binding = initialSync.binding;
   const api = new MeshrApi(binding.serverUrl);
+  const isSessionSuperseded = (error: unknown): boolean =>
+    error instanceof MeshrApiError &&
+    (error.code === "session_superseded" || error.message.includes("superseded"));
+
+  const renewStoredSession = async (options: { allowReclaim?: boolean } = {}): Promise<void> => {
+    if (!binding.privateKeyPem || !binding.pairingSecret || !binding.pairingId) {
+      throw new Error("Binding is missing signed renewal credentials.");
+    }
+    const signChallenge = async (sessionId?: string): Promise<Awaited<ReturnType<MeshrApi["createAgentSession"]>>> => {
+      const challenge = await api.createChallenge(binding, sessionId);
+      const signature = sign(
+        null,
+        Buffer.from(challenge.message, "utf8"),
+        binding.privateKeyPem,
+      ).toString("base64url");
+      if (sessionId) {
+        return api.renewAgentSession({
+          binding,
+          challengeId: challenge.challengeId,
+          sessionId,
+          signature,
+        });
+      }
+      return api.createAgentSession({
+        binding,
+        challengeId: challenge.challengeId,
+        signature,
+      });
+    };
+    let renewed: Awaited<ReturnType<MeshrApi["createAgentSession"]>>;
+    try {
+      renewed = await signChallenge(binding.sessionId);
+    } catch (error) {
+      // A process starting from persisted state may reclaim a stale session,
+      // but an already-running host must never take authority back after a
+      // deliberate page WebMCP transfer (or a newer native host).
+      if (options.allowReclaim === false ||
+          (!isSessionSuperseded(error) &&
+            (!binding.sessionId || !(error instanceof MeshrApiError) || ![401, 403, 404].includes(error.status)))) {
+        throw error;
+      }
+      // A fresh host process may deliberately reclaim after a page grant or
+      // predecessor session has expired/revoked. Same-process lifecycle ticks
+      // pass allowReclaim:false and never take authority back.
+      renewed = await signChallenge();
+    }
+    binding = await store.patch(input.selector, {
+      status: "connected",
+      agentToken: renewed.token,
+      agentTokenExpiresAt: renewed.expiresAt,
+      sessionId: renewed.sessionId,
+      bindingId: renewed.bindingId ?? binding.bindingId,
+      agentId: renewed.agent.id,
+    });
+  };
+  // OpenClaw persists an approved binding without a bearer after a local
+  // session observes supersession. Start a fresh signed session before the
+  // first profile sync so a deliberate host restart has a usable binding.
+  if (!binding.agentToken || binding.status !== "connected") {
+    await renewStoredSession();
+  }
+  let initialSync;
+  try {
+    initialSync = await syncBindingDefinition({
+      selector: input.selector,
+      store,
+      allowIdentityChanges: true,
+    });
+  } catch (error) {
+    if (!(error instanceof MeshrApiError) || ![401, 403, 404].includes(error.status)) throw error;
+    await renewStoredSession();
+    initialSync = await syncBindingDefinition({
+      selector: input.selector,
+      store,
+      allowIdentityChanges: true,
+    });
+  }
+  binding = initialSync.binding;
   const session = createMeshrMcpServerSession(
     binding,
     {
       reloadProfile: async () => {
-        const result = await syncBindingDefinition({ selector: input.selector, store });
+        const result = await syncBindingDefinition({
+          selector: input.selector,
+          store,
+          allowIdentityChanges: true,
+        });
         if (result.changed) {
           binding = result.binding;
           session.updateBinding(binding);
         }
         return {
-          applied: result.changed,
-          definitionDigest: result.binding.definitionDigest,
-          agent: result.response,
+          contract_version: 1,
+          applied: result.profileReload?.applied ?? result.changed,
+          applied_fields: result.profileReload?.applied_fields ?? [],
+          pending_owner_review_fields: result.profileReload?.pending_owner_review_fields ?? [],
+          source_digest: result.profileReload?.source_digest ?? result.binding.definitionDigest,
+          validation_failures: result.profileReload?.validation_failures ?? [],
         };
       },
     },
@@ -276,30 +385,38 @@ export async function serveBindingFromState(input: {
   let lifecycleWork: Promise<void> = Promise.resolve();
   const lifecycleTick = async (): Promise<void> => {
     if (stopped || !binding.agentToken) return;
+    let heartbeatSucceeded = false;
     try {
       await api.heartbeatAgentSession(binding);
-      const expiry = binding.agentTokenExpiresAt ? Date.parse(binding.agentTokenExpiresAt) : 0;
-      if (!binding.sessionId || !Number.isFinite(expiry) || expiry - Date.now() > 120_000) return;
-      const challenge = await api.createChallenge(binding, binding.sessionId);
-      const signature = sign(
-        null,
-        Buffer.from(challenge.message, "utf8"),
-        binding.privateKeyPem,
-      ).toString("base64url");
-      const renewed = await api.renewAgentSession({
-        binding,
-        challengeId: challenge.challengeId,
-        sessionId: binding.sessionId,
-        signature,
-      });
-      binding = await store.patch(input.selector, {
-        status: "connected",
-        agentToken: renewed.token,
-        agentTokenExpiresAt: renewed.expiresAt,
-        sessionId: renewed.sessionId,
-      });
-      session.updateBinding(binding);
+      heartbeatSucceeded = true;
     } catch (error) {
+      if (isSessionSuperseded(error)) {
+        stopped = true;
+        clearInterval(lifecycleTimer);
+        process.stderr.write(
+          "[meshr] native session superseded; stopping renewal until this host is restarted.\n",
+        );
+        return;
+      }
+      // Treat network and supersession errors alike here. Renewal below is
+      // signed and will either recover or leave the next tick to retry. The
+      // renewal path is explicitly forbidden from reclaiming authority.
+    }
+    try {
+      const expiry = binding.agentTokenExpiresAt ? Date.parse(binding.agentTokenExpiresAt) : 0;
+      if (!heartbeatSucceeded || !binding.sessionId || !Number.isFinite(expiry) || expiry - Date.now() <= 120_000) {
+        await renewStoredSession({ allowReclaim: false });
+        session.updateBinding(binding);
+      }
+    } catch (error) {
+      if (isSessionSuperseded(error)) {
+        stopped = true;
+        clearInterval(lifecycleTimer);
+        process.stderr.write(
+          "[meshr] native session superseded; stopping renewal until this host is restarted.\n",
+        );
+        return;
+      }
       process.stderr.write(
         `[meshr] native session heartbeat/renewal failed: ${error instanceof Error ? error.message : String(error)}\n`,
       );

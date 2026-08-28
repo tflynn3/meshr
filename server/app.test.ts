@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { createMeshrServer, type MeshrServer } from "./app.ts";
+import type { MeshrRepository, RepositoryProjection } from "./repository.ts";
 import type { Clock } from "./types.ts";
 
 class TestClock implements Clock {
@@ -84,7 +85,7 @@ test("health and public discovery expose a durable seeded commons", async () => 
 
   const health = await requestJson(baseUrl, "/healthz");
   assert.equal(health.response.status, 200);
-  assert.deepEqual(health.json, { status: "ok", database: "ok", schemaVersion: 2 });
+  assert.deepEqual(health.json, { status: "ok", database: "ok", schemaVersion: 10 });
   const journal = app.database.sqlite.prepare("PRAGMA journal_mode").get() as {
     journal_mode: string;
   };
@@ -104,6 +105,156 @@ test("health and public discovery expose a durable seeded commons", async () => 
     topics.json.topics.map((topic: any) => topic.id).sort(),
     ["topic-cross-pollination", "topic-small-discoveries"],
   );
+});
+
+test("durable projection refresh updates an existing moderation state", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "meshr-projection-test-"));
+  const clock = new TestClock();
+  const accountId = "acct-projection";
+  const post = {
+    postId: "post-projection",
+    meshId: "mesh-public",
+    topicId: "topic-small-discoveries",
+    agentId: "agent-projection",
+    sessionId: "session-projection",
+    parentPostId: null,
+    body: "A queued observation",
+    moderationState: "quarantined" as const,
+    moderationReason: "needs review",
+    createdAt: "2026-08-27T17:59:00.000Z",
+    expiresAt: "2026-08-28T18:00:00.000Z",
+  };
+  const projection: RepositoryProjection = {
+    accounts: [{
+      accountId,
+      email: "projection@example.test",
+      displayName: "Projection Owner",
+      createdAt: "2026-08-27T17:00:00.000Z",
+    }],
+    agents: [{
+      agentId: "agent-projection",
+      ownerAccountId: accountId,
+      name: "Projection Agent",
+      handle: "projection-agent",
+      tagline: "Tests durable convergence",
+      interests: ["testing"],
+      personality: "Precise",
+      attention: { browse: "public", rootPosts: "autonomous", replies: "autonomous" },
+      runtime: "local",
+      runtimeLabel: "Projection fixture",
+      runtimeSubject: "fixture:projection",
+      publicKeyPem: "fixture-key",
+      definitionDigest: null,
+      createdAt: "2026-08-27T17:00:00.000Z",
+      updatedAt: "2026-08-27T17:00:00.000Z",
+    }],
+    meshes: [{
+      meshId: "mesh-public",
+      ownerAccountId: null,
+      name: "Public mesh",
+      description: "The open commons for agent conversation.",
+      visibility: "public",
+      admission: "open",
+      lifecycle: "active",
+      createdAt: "2026-08-27T17:00:00.000Z",
+      updatedAt: "2026-08-27T17:00:00.000Z",
+    }],
+    topics: [{
+      topicId: "topic-small-discoveries",
+      meshId: "mesh-public",
+      name: "small-discoveries",
+      title: "Small discoveries",
+      description: "Useful things noticed along the way.",
+      tags: ["observations"],
+      createdAt: "2026-08-27T17:00:00.000Z",
+    }],
+    humanRoles: [],
+    memberships: [{
+      meshId: "mesh-public",
+      agentId: "agent-projection",
+      status: "joined",
+      attentionPolicy: { browse: "public", rootPosts: "autonomous", replies: "autonomous" },
+      admissionProvenance: "open",
+      joinedAt: "2026-08-27T17:00:00.000Z",
+      updatedAt: "2026-08-27T17:00:00.000Z",
+    }],
+    runtimeSessions: [],
+    posts: [post],
+    follows: [],
+  };
+  const projectionActivity = (): NonNullable<RepositoryProjection["activity"]> => {
+    const published = projection.posts.filter((candidate) => candidate.moderationState === "published");
+    const topicPosts = published.filter((candidate) => candidate.topicId === "topic-small-discoveries");
+    const participantAgentIds = [...new Set(topicPosts.map((candidate) => candidate.agentId))].sort();
+    return {
+      meshes: [{
+        meshId: "mesh-public",
+        postCount: published.length,
+        rootCount: published.filter((candidate) => candidate.parentPostId === null).length,
+        replyCount: published.filter((candidate) => candidate.parentPostId !== null).length,
+        recentPostCount: published.length,
+        lastActivityAt: published.at(-1)?.createdAt ?? null,
+      }],
+      topics: [{
+        topicId: "topic-small-discoveries",
+        meshId: "mesh-public",
+        postCount: topicPosts.length,
+        rootCount: topicPosts.filter((candidate) => candidate.parentPostId === null).length,
+        replyCount: topicPosts.filter((candidate) => candidate.parentPostId !== null).length,
+        recentPostCount: topicPosts.length,
+        participantAgentIds,
+        lastActivityAt: topicPosts.at(-1)?.createdAt ?? null,
+      }],
+      agents: participantAgentIds.map((agentId) => ({
+        agentId,
+        meshId: "mesh-public",
+        postCount: topicPosts.filter((candidate) => candidate.agentId === agentId).length,
+        lastPostAt: topicPosts.filter((candidate) => candidate.agentId === agentId).at(-1)?.createdAt ?? null,
+      })),
+      links: [],
+    };
+  };
+  const now = new Date().toISOString();
+  const repository = {
+    ensureEmptyProduction: async () => undefined,
+    findHumanSession: async () => ({
+      accountId,
+      csrfToken: "projection-csrf",
+      createdAt: now,
+      expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      absoluteExpiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      lastSeenAt: now,
+    }),
+    findAccountById: async () => ({
+      accountId,
+      email: "projection@example.test",
+      displayName: "Projection Owner",
+      createdAt: now,
+    }),
+    touchHumanSession: async () => undefined,
+    loadProjection: async (input: { includePosts?: boolean }) => ({
+      ...projection,
+      posts: input.includePosts === false ? [] : projection.posts,
+      activity: projectionActivity(),
+    }),
+  } as unknown as MeshrRepository;
+  const app = createMeshrServer({
+    dbPath: join(directory, "meshr.db"),
+    clock,
+    repository,
+  });
+  const { baseUrl } = await app.listen();
+  running.push({ app, baseUrl, directory, clock });
+  const cookie = "meshr_session=projection-test";
+
+  const before = await requestJson(baseUrl, "/v1/activity/public", { cookie });
+  assert.equal(before.response.status, 200);
+  assert.equal(before.json.meshes[0].postCount, 0);
+
+  projection.posts[0] = { ...post, moderationState: "published", moderationReason: null };
+  const after = await requestJson(baseUrl, "/v1/activity/public", { cookie });
+  assert.equal(after.response.status, 200);
+  assert.equal(after.json.meshes[0].postCount, 1);
 });
 
 test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event polling work end to end", async () => {

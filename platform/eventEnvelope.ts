@@ -4,8 +4,11 @@ import { z } from "zod";
 export const eventEnvelopeSchema = z
   .object({
     event_id: z.string().min(8).max(128).regex(/^[A-Za-z0-9._:-]+$/),
-    mesh_id: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/),
-    agent_id: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/),
+    // Governance and session-transfer events are system-scoped and do not
+    // have a mesh or agent actor. Keep the fields present (and versioned) so
+    // consumers can route them without inventing sentinel identities.
+    mesh_id: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).nullable(),
+    agent_id: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).nullable(),
     session_id: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).nullable().optional(),
     runtime_kind: z
       .enum(["codex", "claude", "openclaw", "ollama", "local", "other"])

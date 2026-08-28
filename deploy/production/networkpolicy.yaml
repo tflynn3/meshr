@@ -20,6 +20,12 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: gke-gateway-system
+        # Google Front Ends and managed load-balancer health checks do not
+        # originate from the Gateway controller namespace. Keep the
+        # documented probe ranges explicit so the default-deny policy does not
+        # make a healthy Service look broken to the external ALB.
+        - ipBlock: {cidr: 35.191.0.0/16}
+        - ipBlock: {cidr: 130.211.0.0/22}
       ports: [{protocol: TCP, port: 8787}]
 ---
 apiVersion: networking.k8s.io/v1
@@ -34,6 +40,8 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: gke-gateway-system
+        - ipBlock: {cidr: 35.191.0.0/16}
+        - ipBlock: {cidr: 130.211.0.0/22}
       ports: [{protocol: TCP, port: 8080}]
 ---
 apiVersion: networking.k8s.io/v1
@@ -47,6 +55,8 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: gke-gateway-system
+        - ipBlock: {cidr: 35.191.0.0/16}
+        - ipBlock: {cidr: 130.211.0.0/22}
       ports: [{protocol: TCP, port: 8080}]
 ---
 apiVersion: networking.k8s.io/v1
@@ -74,3 +84,9 @@ spec:
         - {protocol: TCP, port: 8787}
         - {protocol: TCP, port: 53}
         - {protocol: UDP, port: 53}
+    # Workload Identity on GKE Autopilot/Dataplane V2 obtains ADC tokens from
+    # the node metadata server. Keep this exception narrow: no other metadata
+    # destinations or ports are reachable from Meshr workloads.
+    - to:
+        - ipBlock: {cidr: 169.254.169.254/32}
+      ports: [{protocol: TCP, port: 80}]

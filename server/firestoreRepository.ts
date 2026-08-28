@@ -1,31 +1,46 @@
 import {
+  FieldPath,
   Firestore,
+  Timestamp,
   type DocumentReference,
   type DocumentSnapshot,
+  type Query,
 } from "@google-cloud/firestore";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { MESHR_CONTRACT_MAJOR } from "./contracts.ts";
 import type {
   MeshrRepository,
   RepositoryAgentInput,
+  RepositoryProfileReloadResult,
+  RepositoryProfileReviewProposal,
   RepositoryMeshInput,
   RepositoryPairingInput,
   RepositoryPairingChallenge,
   RepositoryTopicInput,
+  RepositoryAgentTopic,
+  RepositoryMeshDirectoryEntry,
   RepositoryRuntimeSession,
   RepositoryWebMcpGrant,
   RepositoryProjection,
+  RepositoryAgentEvent,
+  RepositoryAgentEventsPage,
+  RepositoryActivityProjection,
   RepositoryPostRecord,
+  RepositoryTopicPostsPage,
   RepositoryEventInput,
   RepositoryAuditInput,
+  RepositoryMutationArtifacts,
   RepositoryModerationCase,
   RepositoryJoinRequest,
+  RepositoryHumanActivityPreference,
 } from "./repository.ts";
 import type { Clock, RuntimeKind, SocialProvider } from "./types.ts";
 import { systemClock } from "./types.ts";
 
 export interface FirestoreRepositoryOptions {
   firestore: Firestore;
+  /** Optional aggregate-only topology database used for activity reads. */
+  topologyFirestore?: Firestore;
   clock?: Clock;
   collectionPrefix?: string;
 }
@@ -63,27 +78,130 @@ export interface RepositoryPostInput {
 export interface RepositoryPostResult {
   duplicate: boolean;
   post: Record<string, unknown>;
+  reviewQueued?: boolean;
 }
 
-const costProtectionMode = process.env.MESHR_COST_PROTECTION_MODE?.trim().toLowerCase();
-const agentPostLimit = costProtectionMode === "throttle" ? 30 : 60;
-const agentBurstLimit = costProtectionMode === "throttle" ? 5 : 10;
-const globalPostLimit = costProtectionMode === "throttle" ? 3_600 : 7_200;
-// The launch ceiling is 120 accepted posts/second with a 200/second burst
-// over ten seconds (2,000 posts per ten-second window).  Shard counters so a
-// single Firestore document does not become a write hotspot under fan-in.
-const globalBurstLimit = costProtectionMode === "throttle" ? 1_000 : 2_000;
+function readCostProtectionMode(): "normal" | "throttle" {
+  const value = process.env.MESHR_COST_PROTECTION_MODE?.trim().toLowerCase();
+  if (!value || value === "normal" || value === "protect") return "normal";
+  if (value === "throttle") return "throttle";
+  throw new Error("MESHR_COST_PROTECTION_MODE must be normal, protect, or throttle.");
+}
+
+function quotaConfig(): {
+  agentPostLimit: number;
+  agentBurstLimit: number;
+  globalPostLimit: number;
+  globalPeakLimit: number;
+  globalBurstCapacity: number;
+} {
+  const throttled = readCostProtectionMode() === "throttle";
+  return {
+    agentPostLimit: throttled ? 30 : 60,
+    agentBurstLimit: throttled ? 5 : 10,
+    globalPostLimit: throttled ? 3_600 : 7_200,
+    // The peak bucket enforces the hard per-second ceiling. The sustained
+    // bucket below carries the ten-second burst headroom, so an empty burst
+    // reserve cannot be spent as an unbounded instantaneous spike.
+    globalPeakLimit: throttled ? 6_000 : 12_000,
+    // The launch contract is 120 posts/s normally, with a temporary 200/s
+    // burst for ten seconds. A token bucket therefore needs ten seconds of
+    // *headroom* above the sustained rate: (200 - 120) * 10 = 800 tokens.
+    // Cost-protection mode keeps the same ten-second window at 100/s over a
+    // 60/s sustained rate, leaving 400 tokens of headroom.
+    globalBurstCapacity: throttled ? 400 : 800,
+  };
+}
+// Quotas use token buckets rather than wall-clock buckets. This prevents a
+// caller from doubling its allowance at a minute/ten-second boundary while
+// still allowing the documented 120/s rate and a 200/s burst for ten seconds.
+// The global limiter is a conservative partitioned budget: each shard owns a
+// fixed fraction of both timescales, so the sum of all shard capacities can
+// never exceed the launch ceiling. A post reads its stable agent shard and,
+// only when that shard is exhausted, one deterministic fallback shard; it
+// never scans the whole set. This keeps API replicas concurrent while making
+// a temporarily skewed shard fail closed with 429.
+const accountPostLimit = 1_500;
+const accountBurstCapacity = 50;
 const GLOBAL_QUOTA_SHARDS = 20;
+
+function quotaShardFor(value: string, salt = "primary"): number {
+  const digest = createHash("sha256").update(`${salt}:${value}`).digest();
+  return digest.readUInt32BE(0) % GLOBAL_QUOTA_SHARDS;
+}
+
+type AgentEventCursor = { createdAt: string; eventId: string };
+
+function encodeAgentEventCursor(cursor: AgentEventCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeAgentEventCursor(value: string | undefined): AgentEventCursor | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as Record<string, unknown>;
+    if (
+      typeof parsed.createdAt !== "string" ||
+      !Number.isFinite(Date.parse(parsed.createdAt)) ||
+      typeof parsed.eventId !== "string" ||
+      parsed.eventId.length === 0 ||
+      parsed.eventId.length > 256
+    ) return undefined;
+    return { createdAt: parsed.createdAt, eventId: parsed.eventId };
+  } catch {
+    return undefined;
+  }
+}
 const IDEMPOTENCY_RETENTION_SECONDS = 90 * 24 * 60 * 60;
 const RAW_EVENT_RETENTION_SECONDS = 30 * 24 * 60 * 60;
+const MODERATION_RETENTION_SECONDS = 90 * 24 * 60 * 60;
+const AUDIT_RETENTION_SECONDS = 365 * 24 * 60 * 60;
+const OUTBOX_READY_SHARDS = 32;
 
-function quotaShard(value: string): number {
-  let hash = 2_166_136_261;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 16_777_619);
-  }
-  return (hash >>> 0) % GLOBAL_QUOTA_SHARDS;
+function outboxReadyShard(eventId: string): number {
+  let hash = 0;
+  for (const character of eventId) hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+  return hash % OUTBOX_READY_SHARDS;
+}
+const BOOTSTRAP_TOPICS = [
+  ["topic-cross-pollination", "cross-pollination", "Unexpected connections", "Ideas crossing between different interests.", ["connections", "ideas"]],
+  ["topic-small-discoveries", "small-discoveries", "Small discoveries", "Useful things noticed along the way.", ["observations"]],
+] as const;
+const QUOTA_MINUTE_RETENTION_SECONDS = 2 * 60 * 60;
+const HUMAN_IDLE_SECONDS = 12 * 60 * 60;
+const NEW_IDENTITY_REVIEW_POSTS = 5;
+const NEW_IDENTITY_REVIEW_WINDOW_MS = 24 * 60 * 60 * 1_000;
+
+/**
+ * Firestore TTL only evaluates native timestamp values.  The public contract
+ * keeps ISO strings for portable JSON responses, so every expiring document
+ * also carries a private native timestamp field used exclusively by the TTL
+ * policy.  Keeping the two fields separate avoids turning an API string into
+ * an opaque Firestore Timestamp on read and makes the retention boundary
+ * explicit in infrastructure.
+ */
+function ttlTimestamp(iso: string): Timestamp {
+  const milliseconds = Date.parse(iso);
+  if (!Number.isFinite(milliseconds)) throw new Error("invalid_retention_timestamp");
+  return Timestamp.fromMillis(milliseconds);
+}
+
+function retentionTimestamp(iso: string, seconds = RAW_EVENT_RETENTION_SECONDS): Timestamp {
+  const milliseconds = Date.parse(iso);
+  if (!Number.isFinite(milliseconds)) throw new Error("invalid_retention_timestamp");
+  return Timestamp.fromMillis(milliseconds + seconds * 1_000);
+}
+
+function moderationRetentionTimestamp(iso: string): Timestamp {
+  return retentionTimestamp(iso, MODERATION_RETENTION_SECONDS);
+}
+
+function auditRetentionTimestamp(iso: string): Timestamp {
+  return retentionTimestamp(iso, AUDIT_RETENTION_SECONDS);
+}
+
+function quotaExpiryTimestamp(iso: string): Timestamp {
+  return retentionTimestamp(iso, QUOTA_MINUTE_RETENTION_SECONDS);
 }
 
 /**
@@ -94,17 +212,51 @@ function quotaShard(value: string): number {
  */
 export class FirestoreMeshrRepository implements MeshrRepository {
   readonly firestore: Firestore;
+  readonly topologyFirestore: Firestore;
   readonly clock: Clock;
   private readonly prefix: string;
+  // Public topology is identical for every authenticated viewer. Posts keep a
+  // short process-local cache, but the public-mesh snapshot is intentionally
+  // uncached: a visibility change on another API replica must take effect
+  // immediately rather than exposing a newly-private mesh for a cache TTL.
+  // These caches never contain private or unlisted records and are not used
+  // for authorization decisions.
+  private publicMeshesCache:
+    | { expiresAt: number; docs: DocumentSnapshot[]; truncated: boolean }
+    | undefined;
+  private publicPostsCache: { expiresAt: number; meshIds: string[]; docs: DocumentSnapshot[] } | undefined;
+  private activityProjectionCache = new Map<
+    string,
+    { expiresAt: number; projection: RepositoryActivityProjection }
+  >();
+  // Snapshot documents are aggregate-only and safe to share across callers
+  // in this API process. Caching by mesh (rather than by an account's entire
+  // visible-mesh set) prevents private-directory polling from multiplying the
+  // same topology read for every distinct membership combination.
+  private activitySnapshotCache = new Map<
+    string,
+    { expiresAt: number; document: DocumentSnapshot | null }
+  >();
 
   constructor(options: FirestoreRepositoryOptions) {
     this.firestore = options.firestore;
+    this.topologyFirestore = options.topologyFirestore ?? options.firestore;
     this.clock = options.clock ?? systemClock;
     this.prefix = options.collectionPrefix?.replace(/[^A-Za-z0-9_-]/g, "") || "";
   }
 
   async checkReady(): Promise<void> {
-    const taxonomy = await this.doc("system", "taxonomy").get();
+    const [taxonomy] = await Promise.all([
+      this.doc("system", "taxonomy").get(),
+      // A bounded projection read is intentionally valid when empty. It
+      // verifies the handle, database selection, IAM grant, and network path
+      // for the live topology instead of letting API pods report Ready while
+      // the gateway can never read its projection database.
+      this.topologyFirestore
+        .collection(this.collection("topology_activity_totals"))
+        .limit(1)
+        .get(),
+    ]);
     if (!taxonomy.exists) throw new Error("system taxonomy is not initialized");
   }
 
@@ -116,12 +268,720 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     return this.clock.now().toISOString();
   }
 
+  /**
+   * Recheck human moderation authority inside the same Firestore transaction
+   * as the state mutation. Route-level checks are intentionally insufficient:
+   * a steward can be demoted or their session revoked between the initial
+   * request read and the commit.
+   */
+  private async assertHumanModerator(
+    transaction: any,
+    meshId: string,
+    accountId: string | undefined,
+    sessionHash: string | undefined,
+    now = this.now(),
+  ): Promise<void> {
+    if (!accountId || !sessionHash) throw new Error("moderation_authorization_denied");
+    const [role, session] = await Promise.all([
+      transaction.get(this.doc("mesh_human_roles", `${meshId}:${accountId}`)),
+      transaction.get(this.doc("human_sessions", sessionHash)),
+    ]);
+    const nowMs = Date.parse(now);
+    const lastSeenAt = session.exists ? Date.parse(String(session.get("last_seen_at") ?? "")) : NaN;
+    const expiresAt = session.exists ? Date.parse(String(session.get("expires_at") ?? "")) : NaN;
+    const absoluteExpiresAt = session.exists
+      ? Date.parse(String(session.get("absolute_expires_at") ?? ""))
+      : NaN;
+    if (
+      !role.exists || !["owner", "steward"].includes(String(role.get("role"))) ||
+      !session.exists || session.get("account_id") !== accountId ||
+      !Number.isFinite(lastSeenAt) || !Number.isFinite(expiresAt) ||
+      !Number.isFinite(absoluteExpiresAt) || expiresAt <= nowMs ||
+      absoluteExpiresAt <= nowMs || lastSeenAt <= nowMs - HUMAN_IDLE_SECONDS * 1_000
+    ) {
+      throw new Error("moderation_authorization_denied");
+    }
+  }
+
+  /**
+   * Revalidate the authenticated human session at the same transaction
+   * boundary as governance state. A route-level check alone is vulnerable to
+   * a logout or role revocation while a request body is still being read.
+   */
+  private async assertHumanSession(
+    transaction: any,
+    accountId: string | undefined,
+    sessionHash: string | undefined,
+    now = this.now(),
+  ): Promise<void> {
+    if (!accountId || !sessionHash) throw new Error("mesh_governance_denied");
+    const session = await transaction.get(this.doc("human_sessions", sessionHash));
+    const nowMs = Date.parse(now);
+    const lastSeenAt = session.exists ? Date.parse(String(session.get("last_seen_at") ?? "")) : NaN;
+    const expiresAt = session.exists ? Date.parse(String(session.get("expires_at") ?? "")) : NaN;
+    const absoluteExpiresAt = session.exists
+      ? Date.parse(String(session.get("absolute_expires_at") ?? ""))
+      : NaN;
+    if (
+      !session.exists || session.get("account_id") !== accountId ||
+      !Number.isFinite(lastSeenAt) || !Number.isFinite(expiresAt) ||
+      !Number.isFinite(absoluteExpiresAt) || expiresAt <= nowMs ||
+      absoluteExpiresAt <= nowMs || lastSeenAt <= nowMs - HUMAN_IDLE_SECONDS * 1_000
+    ) {
+      throw new Error("mesh_governance_denied");
+    }
+  }
+
+  private async assertHumanRole(
+    transaction: any,
+    meshId: string,
+    accountId: string | undefined,
+    sessionHash: string | undefined,
+    roles: readonly string[],
+    now = this.now(),
+  ): Promise<void> {
+    await this.assertHumanSession(transaction, accountId, sessionHash, now);
+    if (!accountId) throw new Error("mesh_governance_denied");
+    const role = await transaction.get(this.doc("mesh_human_roles", `${meshId}:${accountId}`));
+    if (!role.exists || !roles.includes(String(role.get("role")))) {
+      throw new Error("mesh_governance_denied");
+    }
+  }
+
   private doc<T = Record<string, unknown>>(collection: string, id: string): DocumentReference<T> {
     return this.firestore.collection(this.collection(collection)).doc(id) as DocumentReference<T>;
   }
 
   private authorityRef(agentId: string): DocumentReference {
     return this.doc("agent_authority", agentId);
+  }
+
+  /**
+   * One compare-and-set fence per human session serializes page WebMCP
+   * transfers across agents and browser tabs. Per-agent authority alone is
+   * insufficient because a human can have page authority for agent A and
+   * agent B at the same time when two transfers race.
+   */
+  private webMcpAuthorityRef(humanSessionHash: string): DocumentReference {
+    return this.doc("webmcp_authority", humanSessionHash);
+  }
+
+  private liveAccessEpochRef(agentId?: string): DocumentReference {
+    return this.doc("live_access_epochs", agentId ? `agent:${agentId}` : "global");
+  }
+
+  private touchLiveAccessEpoch(
+    transaction: any,
+    updatedAt: string,
+    reason: string,
+    agentId?: string,
+  ): void {
+    // The live gateway watches this non-sensitive fence and marks only the
+    // affected agent sockets dirty when an agent id is present. Global human
+    // session revocations still use the singleton. No credential or
+    // membership data is copied into the event plane.
+    transaction.set(this.liveAccessEpochRef(agentId), {
+      contract_version: MESHR_CONTRACT_MAJOR,
+      ...(agentId ? { agent_id: agentId } : {}),
+      updated_at: updatedAt,
+      reason,
+    }, { merge: true });
+    // Mirror only the revocation fence through the existing ordered outbox.
+    // The topology consumer applies this metadata to its isolated projection
+    // database; no credential, account, or membership data crosses the
+    // boundary. A nonce is safe inside a Firestore transaction callback: a
+    // retry discards the failed attempt's writes and commits one final event.
+    const eventId = `evt_access_${randomUUID().replace(/-/g, "")}`;
+    const envelope = {
+      event_id: eventId,
+      schema_version: 1 as const,
+      mesh_id: null,
+      agent_id: agentId ?? null,
+      session_id: null,
+      runtime_kind: null,
+      type: "live.access.changed",
+      occurred_at: updatedAt,
+      payload: { reason },
+    };
+    transaction.create(this.doc("event_outbox", eventId), {
+      contract_version: MESHR_CONTRACT_MAJOR,
+      envelope,
+      mesh_id: null,
+      event_id: eventId,
+      status: "pending",
+      attempts: 0,
+      created_at: updatedAt,
+    });
+    this.queueOutboxReady(transaction, eventId, null, updatedAt);
+  }
+
+  /** Convert the authoritative agent document into the repository port shape.
+   * Keeping this conversion in one place is important for idempotent replay:
+   * a retry must return the persisted response rather than whichever local
+   * projection happens to be newest. */
+  private agentFromSnapshot(snapshot: DocumentSnapshot): RepositoryAgentInput {
+    const interests = snapshot.get("interests");
+    const attention = snapshot.get("attention_policy");
+    return {
+      agentId: String(snapshot.get("agent_id") ?? snapshot.id),
+      ownerAccountId: String(snapshot.get("owner_account_id") ?? ""),
+      name: String(snapshot.get("name") ?? ""),
+      handle: String(snapshot.get("handle") ?? ""),
+      tagline: String(snapshot.get("tagline") ?? ""),
+      interests: Array.isArray(interests) ? interests.map(String) : [],
+      personality: String(snapshot.get("personality") ?? ""),
+      attention: (attention && typeof attention === "object"
+        ? attention
+        : {}) as Record<string, unknown>,
+      runtime: String(snapshot.get("runtime") ?? "other") as RuntimeKind,
+      runtimeLabel: String(snapshot.get("runtime_label") ?? ""),
+      runtimeSubject: String(snapshot.get("runtime_subject") ?? ""),
+      publicKeyPem: String(snapshot.get("public_key_pem") ?? ""),
+      definitionDigest: snapshot.get("definition_digest") == null
+        ? null
+        : String(snapshot.get("definition_digest")),
+      createdAt: String(snapshot.get("created_at") ?? this.now()),
+      updatedAt: String(snapshot.get("updated_at") ?? this.now()),
+    };
+  }
+
+  private agentFromStoredResponse(
+    value: unknown,
+    fallback: RepositoryAgentInput,
+  ): RepositoryAgentInput {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return fallback;
+    const record = value as Record<string, unknown>;
+    const interests = record.interests;
+    const attention = record.attention_policy;
+    return {
+      ...fallback,
+      agentId: String(record.agent_id ?? fallback.agentId),
+      ownerAccountId: String(record.owner_account_id ?? fallback.ownerAccountId),
+      name: String(record.name ?? fallback.name),
+      handle: String(record.handle ?? fallback.handle),
+      tagline: String(record.tagline ?? fallback.tagline),
+      interests: Array.isArray(interests) ? interests.map(String) : fallback.interests,
+      personality: String(record.personality ?? fallback.personality),
+      attention: (attention && typeof attention === "object"
+        ? attention
+        : fallback.attention) as Record<string, unknown>,
+      runtime: String(record.runtime ?? fallback.runtime) as RuntimeKind,
+      runtimeLabel: String(record.runtime_label ?? fallback.runtimeLabel),
+      runtimeSubject: String(record.runtime_subject ?? fallback.runtimeSubject),
+      publicKeyPem: String(record.public_key_pem ?? fallback.publicKeyPem),
+      definitionDigest: record.definition_digest == null
+        ? fallback.definitionDigest
+        : String(record.definition_digest),
+      createdAt: String(record.created_at ?? fallback.createdAt),
+      updatedAt: String(record.updated_at ?? fallback.updatedAt),
+    };
+  }
+
+  private async publicMeshes(): Promise<{
+    docs: DocumentSnapshot[];
+    truncated: boolean;
+  }> {
+    if (this.publicMeshesCache && this.publicMeshesCache.expiresAt > Date.now()) {
+      return this.publicMeshesCache;
+    }
+    const snapshot = await this.firestore
+      .collection(this.collection("meshes"))
+      .where("visibility", "==", "public")
+      .where("lifecycle", "==", "active")
+      // Read one sentinel document so a bounded projection can distinguish a
+      // complete public snapshot from a capped one. A capped snapshot must
+      // not evict older public rows from the local cache.
+      .limit(2_001)
+      .get();
+    const truncated = snapshot.docs.length > 2_000;
+    const docs = snapshot.docs.slice(0, 2_000);
+    // Do not reuse this snapshot across requests. Cross-replica visibility
+    // changes are security-sensitive and have no local invalidation signal.
+    this.publicMeshesCache = { expiresAt: Date.now(), docs, truncated };
+    return this.publicMeshesCache;
+  }
+
+  private async publicPosts(
+    meshIds: string[],
+    now: string,
+    force = false,
+  ): Promise<DocumentSnapshot[]> {
+    const unique = [...new Set(meshIds)].filter(Boolean).sort();
+    const cached = this.publicPostsCache;
+    if (
+      !force &&
+      cached &&
+      cached.expiresAt > Date.now() &&
+      cached.meshIds.length === unique.length &&
+      cached.meshIds.every((meshId, index) => meshId === unique[index])
+    ) {
+      return cached.docs;
+    }
+    const docs: DocumentSnapshot[] = [];
+    for (let index = 0; index < unique.length; index += 30) {
+      const group = unique.slice(index, index + 30);
+      const snapshot = await this.firestore
+        .collection(this.collection("posts"))
+        .where("mesh_id", "in", group)
+        .where("moderation_state", "==", "published")
+        .where("expires_at", ">", now)
+        // The projection is a bounded recent snapshot. Ordering by expiry
+        // ascending would preferentially retain the oldest still-live rows
+        // and make a busy mesh look stale once the 5,000-row cap is reached.
+        .orderBy("expires_at", "desc")
+        .orderBy("created_at", "desc")
+        .limit(5_000)
+        .get();
+      docs.push(...snapshot.docs);
+    }
+    const sorted = docs
+      .sort((left, right) =>
+        String(right.get("created_at") ?? "").localeCompare(String(left.get("created_at") ?? "")),
+      )
+      .slice(0, 5_000);
+    this.publicPostsCache = { expiresAt: Date.now() + 5_000, meshIds: unique, docs: sorted };
+    return sorted;
+  }
+
+  /**
+   * Read the aggregate-only topology projection for the caller's already
+   * authorized meshes. The event plane keeps a one-document-per-mesh read
+   * snapshot backed by sharded lifetime/recent counters, so activity reads
+   * never scan expiring post bodies or fan out over every minute bucket.
+   */
+  private async loadActivityProjection(
+    meshIds: string[],
+    now: string,
+  ): Promise<RepositoryActivityProjection | undefined> {
+    const unique = [...new Set(meshIds)].filter(Boolean).sort();
+    if (!unique.length) return undefined;
+    const cacheKey = unique.join("\u001f");
+    const cached = this.activityProjectionCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return cached.projection;
+    const nowMs = Date.parse(now);
+    const cutoff = new Date(nowMs - 15 * 60 * 1_000).toISOString();
+    const chunks = <T>(values: T[], size = 30): T[][] => {
+      const result: T[][] = [];
+      for (let index = 0; index < values.length; index += size) result.push(values.slice(index, index + size));
+      return result;
+    };
+    const ACTIVITY_PAGE_SIZE = 1_000;
+    // A bounded read keeps an unexpectedly large public directory from
+    // turning every browser refresh into an unbounded Firestore bill. The
+    // result explicitly carries `truncated` when the cap is reached, so the
+    // UI never presents a partial aggregate as complete.
+    const MAX_ACTIVITY_TOTAL_DOCS = 100_000;
+    const MAX_ACTIVITY_BUCKET_DOCS = 100_000;
+    const readPages = async (
+      baseQuery: Query,
+      maxDocs: number,
+    ): Promise<{ docs: DocumentSnapshot[]; truncated: boolean }> => {
+      if (maxDocs <= 0) return { docs: [], truncated: true };
+      const docs: DocumentSnapshot[] = [];
+      let cursor: DocumentSnapshot | undefined;
+      while (docs.length < maxDocs) {
+        const remaining = maxDocs - docs.length;
+        // Ask for one sentinel beyond the remaining budget. That lets us
+        // distinguish an exhausted query from a capped one without a second
+        // unbounded scan.
+        const pageLimit = Math.min(ACTIVITY_PAGE_SIZE, remaining + 1);
+        let query = baseQuery.limit(pageLimit);
+        if (cursor) query = query.startAfter(cursor);
+        const page = await query.get();
+        if (!page.docs.length) return { docs, truncated: false };
+        if (page.docs.length > remaining) {
+          docs.push(...page.docs.slice(0, remaining));
+          return { docs, truncated: true };
+        }
+        docs.push(...page.docs);
+        if (page.docs.length < pageLimit) return { docs, truncated: false };
+        cursor = page.docs[page.docs.length - 1];
+      }
+      return { docs, truncated: true };
+    };
+    // The materializer flushes one bounded snapshot per mesh about once per
+    // second. A viewer normally pays one document per mesh; the sharded
+    // counters/buckets remain the replayable fallback while a mesh warms or
+    // an older materializer is still draining.
+    const snapshotDocs: DocumentSnapshot[] = [];
+    const snapshotResults: Array<{ docs: DocumentSnapshot[]; truncated: boolean }> = [];
+    const missingSnapshotMeshIds: string[] = [];
+    const cacheNow = Date.now();
+    for (const meshId of unique) {
+      const cachedSnapshot = this.activitySnapshotCache.get(meshId);
+      if (cachedSnapshot && cachedSnapshot.expiresAt > cacheNow) {
+        if (cachedSnapshot.document) snapshotDocs.push(cachedSnapshot.document);
+      } else {
+        missingSnapshotMeshIds.push(meshId);
+      }
+    }
+    for (const group of chunks(missingSnapshotMeshIds)) {
+      const result = await readPages(
+        this.topologyFirestore.collection(this.collection("topology_activity_snapshots"))
+          .where("mesh_id", "in", group),
+        MAX_ACTIVITY_TOTAL_DOCS,
+      );
+      snapshotResults.push(result);
+      const byMesh = new Map<string, DocumentSnapshot>();
+      for (const document of result.docs) {
+        const meshId = String(document.get("mesh_id") ?? document.id);
+        if (meshId && !byMesh.has(meshId)) byMesh.set(meshId, document);
+      }
+      for (const meshId of group) {
+        const document = byMesh.get(meshId) ?? null;
+        // Do not cache a missing snapshot: a newly active mesh can receive
+        // its first materializer flush between two browser reads, and a
+        // negative cache would hide that activity for the TTL window.
+        if (document) {
+          this.activitySnapshotCache.set(meshId, {
+            expiresAt: Date.now() + 1_000,
+            document,
+          });
+        } else {
+          this.activitySnapshotCache.delete(meshId);
+        }
+        if (document) snapshotDocs.push(document);
+      }
+    }
+    const freshSnapshotDocs = snapshotDocs
+      .filter((document) => {
+        const generatedAt = Date.parse(String(document.get("generated_at") ?? ""));
+        // A stopped materializer must not leave the browser on an old
+        // topology forever. Fall back to the replayable shards after a short
+        // freshness budget; normal flush cadence is about one second.
+        return Number.isFinite(generatedAt) && nowMs - generatedAt <= 5_000;
+      });
+    const snapshotMeshIds = new Set(freshSnapshotDocs.map((document) => String(document.get("mesh_id") ?? document.id)));
+    const fallbackMeshIds = unique.filter((meshId) => !snapshotMeshIds.has(meshId));
+    const totalResults = await Promise.all(chunks(fallbackMeshIds).map((group) =>
+      readPages(
+        this.topologyFirestore.collection(this.collection("topology_activity_totals"))
+          .where("mesh_id", "in", group),
+        MAX_ACTIVITY_TOTAL_DOCS,
+      ),
+    ));
+    // Rolling recent shards collapse the fifteen minute window from 15 * 32
+    // reads per mesh to 32 reads per mesh. Minute buckets remain the durable
+    // replay/fallback source while a new mesh is warming its recent shards.
+    const recentResults = await Promise.all(chunks(fallbackMeshIds).map((group) =>
+      readPages(
+        this.topologyFirestore.collection(this.collection("topology_activity_recent"))
+          .where("mesh_id", "in", group),
+        MAX_ACTIVITY_TOTAL_DOCS,
+      ),
+    ));
+    const recentDocs = recentResults.flatMap((result) => result.docs);
+    const recentMeshIds = new Set(recentDocs.map((document) => String(document.get("mesh_id") ?? "")));
+    const bucketFallbackMeshIds = fallbackMeshIds.filter((meshId) => !recentMeshIds.has(meshId));
+    // Read bucket groups serially so the global cap is real rather than a
+    // per-query cap multiplied by the number of `in` chunks. A normal launch
+    // population (100 agents) is far below this ceiling; larger directories
+    // receive an explicit truncated marker instead of silent undercounting.
+    const bucketDocs: DocumentSnapshot[] = [];
+    let bucketQueryTruncated = false;
+    for (const group of chunks(bucketFallbackMeshIds)) {
+      const remaining = MAX_ACTIVITY_BUCKET_DOCS - bucketDocs.length;
+      if (remaining <= 0) {
+        bucketQueryTruncated = true;
+        break;
+      }
+      const result = await readPages(
+        this.topologyFirestore.collection(this.collection("topology_activity_buckets"))
+          .where("mesh_id", "in", group)
+          .where("bucket_start", ">=", cutoff)
+          .where("bucket_start", "<=", now),
+        remaining,
+      );
+      bucketDocs.push(...result.docs);
+      if (result.truncated) {
+        bucketQueryTruncated = true;
+        break;
+      }
+    }
+    const totalDocs = totalResults.flatMap((result) => result.docs);
+    if (!snapshotDocs.length && !totalDocs.length && !recentDocs.length && !bucketDocs.length) return undefined;
+    type MutableTopic = {
+      topicId: string;
+      meshId: string;
+      postCount: number;
+      rootCount: number;
+      replyCount: number;
+      recentPostCount: number;
+      participantAgentIds: Set<string>;
+      lastActivityAt: string | null;
+    };
+    type MutableAgent = { agentId: string; meshId: string; postCount: number; lastPostAt: string | null };
+    type MutableMesh = { meshId: string; postCount: number; rootCount: number; replyCount: number; recentPostCount: number; lastActivityAt: string | null };
+    type MutableLink = {
+      meshId: string;
+      sourceAgentId: string;
+      targetAgentId: string;
+      topicIds: Set<string>;
+      eventCount: number;
+      recentEventCount: number;
+      delaySumMs: number;
+      delayCount: number;
+      delayBuckets: number[];
+      lastEventAt: string;
+    };
+    const meshes = new Map<string, MutableMesh>();
+    const topics = new Map<string, MutableTopic>();
+    const agents = new Map<string, MutableAgent>();
+    const links = new Map<string, MutableLink>();
+    let truncated = bucketQueryTruncated ||
+      snapshotResults.some((result) => result.truncated) ||
+      totalResults.some((result) => result.truncated) ||
+      recentResults.some((result) => result.truncated);
+    const maxTimestamp = (current: string | null, candidate: unknown): string | null => {
+      const value = typeof candidate === "string" ? candidate : "";
+      return value && (!current || value > current) ? value : current;
+    };
+    const number = (value: unknown): number => Number.isFinite(Number(value)) ? Number(value) : 0;
+    const record = (value: unknown): Record<string, any> =>
+      value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : {};
+    const applyData = (data: Record<string, any>, recent: boolean): void => {
+      if (data.activity_truncated === true) truncated = true;
+      const meshId = String(data.mesh_id ?? "");
+      if (!unique.includes(meshId)) return;
+      const mesh = meshes.get(meshId) ?? {
+        meshId,
+        postCount: 0,
+        rootCount: 0,
+        replyCount: 0,
+        recentPostCount: 0,
+        lastActivityAt: null,
+      } satisfies MutableMesh;
+      const postCount = number(data.post_count);
+      if (recent) mesh.recentPostCount += postCount;
+      else {
+        mesh.postCount += postCount;
+        mesh.rootCount += number(data.root_count);
+        mesh.replyCount += number(data.reply_count);
+      }
+      mesh.lastActivityAt = maxTimestamp(mesh.lastActivityAt, data.last_activity_at);
+      meshes.set(meshId, mesh);
+      for (const [topicId, raw] of Object.entries(record(data.topics))) {
+        const value = record(raw);
+        const key = `${meshId}:${topicId}`;
+        const topic = topics.get(key) ?? {
+          topicId,
+          meshId,
+          postCount: 0,
+          rootCount: 0,
+          replyCount: 0,
+          recentPostCount: 0,
+          participantAgentIds: new Set<string>(),
+          lastActivityAt: null,
+        } satisfies MutableTopic;
+        if (recent) topic.recentPostCount += number(value.post_count);
+        else {
+          topic.postCount += number(value.post_count);
+          topic.rootCount += number(value.root_count);
+          topic.replyCount += number(value.reply_count);
+        }
+        topic.lastActivityAt = maxTimestamp(topic.lastActivityAt, value.last_activity_at);
+        for (const [agentId, present] of Object.entries(record(value.participants))) {
+          if (present === true) topic.participantAgentIds.add(agentId);
+        }
+        topics.set(key, topic);
+      }
+      for (const [agentId, raw] of Object.entries(record(data.agents))) {
+        const value = record(raw);
+        const key = `${meshId}:${agentId}`;
+        const agent = agents.get(key) ?? { agentId, meshId, postCount: 0, lastPostAt: null } satisfies MutableAgent;
+        if (!recent) agent.postCount += number(value.post_count);
+        agent.lastPostAt = maxTimestamp(agent.lastPostAt, value.last_post_at);
+        agents.set(key, agent);
+      }
+      for (const [linkId, raw] of Object.entries(record(data.links))) {
+        const value = record(raw);
+        const sourceAgentId = String(value.source_agent_id ?? linkId.split(">", 1)[0] ?? "");
+        const targetAgentId = String(value.target_agent_id ?? linkId.split(">")[1] ?? "");
+        if (!sourceAgentId || !targetAgentId) continue;
+        const key = `${meshId}:${sourceAgentId}:${targetAgentId}`;
+        const link = links.get(key) ?? {
+          meshId,
+          sourceAgentId,
+          targetAgentId,
+          topicIds: new Set<string>(),
+          eventCount: 0,
+          recentEventCount: 0,
+          delaySumMs: 0,
+          delayCount: 0,
+          delayBuckets: [],
+          lastEventAt: "",
+        } satisfies MutableLink;
+        const count = number(value.event_count);
+        if (recent) link.recentEventCount += count;
+        else {
+          link.eventCount += count;
+          link.delaySumMs += number(value.delay_sum_ms);
+          link.delayCount += number(value.delay_count);
+          const buckets = Array.isArray(value.delay_buckets) ? value.delay_buckets : [];
+          for (let index = 0; index < buckets.length; index += 1) {
+            link.delayBuckets[index] = (link.delayBuckets[index] ?? 0) + number(buckets[index]);
+          }
+        }
+        for (const [topicId, present] of Object.entries(record(value.topic_ids))) {
+          if (present === true) link.topicIds.add(topicId);
+        }
+        link.lastEventAt = maxTimestamp(link.lastEventAt || null, value.last_event_at) ?? link.lastEventAt;
+        links.set(key, link);
+      }
+    };
+    const apply = (document: DocumentSnapshot, recent: boolean): void => {
+      applyData((document.data() ?? {}) as Record<string, any>, recent);
+    };
+    const applySnapshot = (document: DocumentSnapshot): void => {
+      const data = (document.data() ?? {}) as Record<string, any>;
+      if (data.activity_truncated === true) truncated = true;
+      const meshId = String(data.mesh_id ?? document.id);
+      if (!unique.includes(meshId)) return;
+      const totals = record(data.totals);
+      const recent = record(data.recent);
+      if (Object.keys(totals).length) applyData({ ...totals, mesh_id: meshId }, false);
+      if (Object.keys(recent).length) applyData({ ...recent, mesh_id: meshId }, true);
+    };
+    freshSnapshotDocs.forEach((document) => applySnapshot(document));
+    totalDocs.forEach((document) => apply(document, false));
+    recentDocs.forEach((document) => apply(document, true));
+    bucketDocs.forEach((document) => apply(document, true));
+    const projection: RepositoryActivityProjection = {
+      ...(truncated ? { truncated: true } : {}),
+      meshes: [...meshes.values()].map((mesh) => ({ ...mesh })),
+      topics: [...topics.values()].map((topic) => ({
+        ...topic,
+        participantAgentIds: [...topic.participantAgentIds].sort(),
+      })),
+      agents: [...agents.values()],
+      links: [...links.values()].map((link) => ({
+        ...link,
+        topicIds: [...link.topicIds].sort(),
+      })),
+    };
+    // Aggregate topology is safe to share across viewers with the same
+    // authorized mesh set. Keep the window below the two-second propagation
+    // target while collapsing the 15-second browser poll fan-out.
+    this.activityProjectionCache.set(cacheKey, { expiresAt: Date.now() + 1_000, projection });
+    return projection;
+  }
+
+  private eventEnvelope(input: RepositoryEventInput): Record<string, unknown> {
+    const rawPayload =
+      input.payload && typeof input.payload === "object" && !Array.isArray(input.payload)
+        ? input.payload as Record<string, unknown>
+        : { value: input.payload };
+    // Raw delivery/topology traces must not become a second long-lived copy of
+    // a post body. Keep attribution and moderation metadata, but strip body
+    // text before it enters Firestore event collections.
+    const payload = { ...rawPayload };
+    const post = payload.post;
+    if (post && typeof post === "object" && !Array.isArray(post)) {
+      const { body: _body, ...postReference } = post as Record<string, unknown>;
+      payload.post = postReference;
+    }
+    return {
+      event_id: input.eventId,
+      schema_version: 1 as const,
+      mesh_id: input.meshId,
+      agent_id: input.agentId,
+      session_id: input.sessionId,
+      runtime_kind: input.runtimeKind,
+      type: input.type,
+      occurred_at: input.occurredAt,
+      payload,
+    };
+  }
+
+  private eventOutboxDocument(input: RepositoryEventInput): Record<string, unknown> {
+    return {
+      contract_version: MESHR_CONTRACT_MAJOR,
+      envelope: this.eventEnvelope(input),
+      // Keep the ordering key denormalized at the document root so the
+      // publisher can serialize a mesh without opening every envelope.
+      mesh_id: input.meshId,
+      event_id: input.eventId,
+      status: "pending",
+      attempts: 0,
+      created_at: input.occurredAt,
+      // Do not attach a TTL while delivery is pending. The ingest publisher
+      // adds retention_at only after Pub/Sub acknowledges the event so an
+      // outage cannot delete an accepted write before it is delivered.
+    };
+  }
+
+  private queueOutboxReady(
+    transaction: any,
+    eventId: string,
+    meshId: string | null | undefined,
+    occurredAt: string,
+  ): void {
+    // One immutable ready marker per event avoids a hot per-mesh document on
+    // the social-write path. The ingest publisher groups these markers by
+    // ordering key and still serializes the authoritative outbox query.
+    const orderingKey = meshId ?? "system";
+    transaction.set(
+      this.doc("event_outbox_ready", eventId),
+      {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        event_id: eventId,
+        mesh_id: meshId ?? null,
+        ordering_key: orderingKey,
+        ready_shard: outboxReadyShard(eventId),
+        status: "pending",
+        next_attempt_at: occurredAt,
+        created_at: occurredAt,
+        updated_at: occurredAt,
+      },
+      { merge: true },
+    );
+  }
+
+  private auditDocument(input: RepositoryAuditInput): Record<string, unknown> {
+    return {
+      contract_version: MESHR_CONTRACT_MAJOR,
+      audit_id: input.auditId,
+      actor_type: input.actorType,
+      actor_id: input.actorId,
+      session_id: input.sessionId,
+      action: input.action,
+      resource_type: input.resourceType,
+      resource_id: input.resourceId,
+      data: input.data,
+      created_at: input.createdAt,
+      retention_at: auditRetentionTimestamp(input.createdAt),
+    };
+  }
+
+  /**
+   * Persist immutable command records inside the caller's transaction.  The
+   * outbox and audit collections are intentionally written after all reads
+   * have been performed so a governance state change can never commit without
+   * its trace.  Event IDs are allocated by the command boundary and therefore
+   * remain stable if Firestore retries the transaction callback.
+   */
+  private writeMutationArtifacts(
+    transaction: any,
+    artifacts: RepositoryMutationArtifacts,
+  ): void {
+    if (artifacts.event) {
+      transaction.create(
+        this.doc("event_outbox", artifacts.event.eventId),
+        this.eventOutboxDocument(artifacts.event),
+      );
+      this.queueOutboxReady(
+        transaction,
+        artifacts.event.eventId,
+        artifacts.event.meshId,
+        artifacts.event.occurredAt,
+      );
+    }
+    if (artifacts.audit) {
+      transaction.create(
+        this.doc("audit_events", artifacts.audit.auditId),
+        this.auditDocument(artifacts.audit),
+      );
+    }
   }
 
   private pairingFromSnapshot(snapshot: DocumentSnapshot): RepositoryPairingInput {
@@ -174,12 +1034,16 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       expires_at: input.expiresAt,
       approved_at: input.approvedAt,
       claimed_at: input.claimedAt,
+      // Only pending pairings receive this TTL marker. Approved/claimed
+      // bindings can outlive the short pairing-code window for renewals.
+      pending_expires_at_ttl: input.status === "pending" ? ttlTimestamp(input.expiresAt) : null,
     });
   }
 
   async approvePairing(input: {
     pairingId: string;
     ownerAccountId: string;
+    humanSessionHash: string;
     agentId: string;
     profile: {
       name: string;
@@ -190,17 +1054,38 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       attention: Record<string, unknown>;
     };
     approvedAt: string;
+    event?: RepositoryEventInput;
+    audit?: RepositoryAuditInput;
   }): Promise<{ agentId: string; replaced: boolean }> {
     const pairingRef = this.doc("pairings", input.pairingId);
     const handleKey = input.profile.handle.trim().normalize("NFKC").toLowerCase();
     const handleRef = this.doc("agent_handles", handleKey);
     const meshRef = this.doc("meshes", "mesh-public");
+    const humanSessionRef = this.doc("human_sessions", input.humanSessionHash);
     return this.firestore.runTransaction(async (transaction) => {
-      const [pairing, handle, mesh] = await Promise.all([
+      const [pairing, handle, mesh, humanSession] = await Promise.all([
         transaction.get(pairingRef),
         transaction.get(handleRef),
         transaction.get(meshRef),
+        transaction.get(humanSessionRef),
       ]);
+      const approvedAtMs = Date.parse(input.approvedAt);
+      const lastSeenAt = humanSession.exists ? Date.parse(String(humanSession.get("last_seen_at") ?? "")) : NaN;
+      const expiresAt = humanSession.exists ? Date.parse(String(humanSession.get("expires_at") ?? "")) : NaN;
+      const absoluteExpiresAt = humanSession.exists ? Date.parse(String(humanSession.get("absolute_expires_at") ?? "")) : NaN;
+      if (
+        !humanSession.exists ||
+        humanSession.get("account_id") !== input.ownerAccountId ||
+        !Number.isFinite(approvedAtMs) ||
+        !Number.isFinite(lastSeenAt) ||
+        !Number.isFinite(expiresAt) ||
+        !Number.isFinite(absoluteExpiresAt) ||
+        expiresAt <= approvedAtMs ||
+        absoluteExpiresAt <= approvedAtMs ||
+        lastSeenAt <= approvedAtMs - HUMAN_IDLE_SECONDS * 1_000
+      ) {
+        throw new Error("pairing_authorization_denied");
+      }
       if (!pairing.exists || pairing.get("status") !== "pending") {
         throw new Error("pairing_not_pending");
       }
@@ -232,6 +1117,14 @@ export class FirestoreMeshrRepository implements MeshrRepository {
               .collection(this.collection("pairings"))
               .where("agent_id", "==", selectedAgentId)
               .where("status", "in", ["approved", "claimed"]),
+        )
+        : undefined;
+      const priorBindings = replaced
+        ? await transaction.get(
+            this.firestore
+              .collection(this.collection("agent_bindings"))
+              .where("agent_id", "==", selectedAgentId)
+              .where("revoked_at", "==", null),
           )
         : undefined;
       const activeSessions = replaced
@@ -255,17 +1148,30 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           if (prior.id !== input.pairingId) transaction.update(prior.ref, { status: "revoked", revoked_at: input.approvedAt });
         }
       }
+      if (priorBindings) {
+        for (const prior of priorBindings.docs) {
+          if (prior.id !== input.pairingId) {
+            transaction.update(prior.ref, { revoked_at: input.approvedAt, updated_at: input.approvedAt });
+          }
+        }
+      }
       if (activeSessions) {
         for (const session of activeSessions.docs) {
           transaction.update(session.ref, {
             status: "superseded",
-            superseded_by: input.pairingId,
+            superseding_session_id: input.pairingId,
             expires_at: input.approvedAt,
           });
         }
       }
       if (activeGrants) {
         for (const grant of activeGrants.docs) transaction.update(grant.ref, { revoked_at: input.approvedAt });
+      }
+      // Rebinding an existing identity revokes native/page authority without a
+      // mesh.* event. Wake live gateways in the same transaction so sockets
+      // cannot continue using a cached grant until their heartbeat.
+      if ((activeSessions?.size ?? 0) > 0 || (activeGrants?.size ?? 0) > 0 || (priorBindings?.size ?? 0) > 0) {
+        this.touchLiveAccessEpoch(transaction, input.approvedAt, "agent_binding_replaced", selectedAgentId);
       }
       transaction.set(agentRef, {
         contract_version: MESHR_CONTRACT_MAJOR,
@@ -306,6 +1212,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         owner_account_id: input.ownerAccountId,
         agent_id: selectedAgentId,
         approved_at: input.approvedAt,
+        pending_expires_at_ttl: null,
       });
       transaction.set(
         this.doc("mesh_agent_memberships", "mesh-public:" + selectedAgentId),
@@ -321,6 +1228,36 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         },
         { merge: true },
       );
+      // The durable transaction may resolve a normalized handle to a
+      // different canonical agent than the local projection suggested. Never
+      // let caller-supplied audit/outbox attribution name that stale ID.
+      const event = input.event
+        ? {
+            ...input.event,
+            agentId: selectedAgentId,
+            payload: {
+              ...(input.event.payload && typeof input.event.payload === "object"
+                ? input.event.payload as Record<string, unknown>
+                : {}),
+              agentId: selectedAgentId,
+              bindingId: input.pairingId,
+              replacedBinding: replaced,
+            },
+          }
+        : undefined;
+      const audit = input.audit
+        ? {
+            ...input.audit,
+            data: {
+              ...(input.audit.data && typeof input.audit.data === "object"
+                ? input.audit.data as Record<string, unknown>
+                : {}),
+              agentId: selectedAgentId,
+              replacedBinding: replaced,
+            },
+          }
+        : undefined;
+      this.writeMutationArtifacts(transaction, { event, audit });
       return { agentId: selectedAgentId, replaced };
     });
   }
@@ -338,10 +1275,20 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     if (patch.publicKeyPem !== undefined) update.public_key_pem = patch.publicKeyPem;
     if (patch.requestedProfile !== undefined) update.requested_profile = patch.requestedProfile;
     if (patch.definitionDigest !== undefined) update.definition_digest = patch.definitionDigest;
-    if (patch.status !== undefined) update.status = patch.status;
+    if (patch.status !== undefined) {
+      update.status = patch.status;
+      update.pending_expires_at_ttl = patch.status === "pending"
+        ? ttlTimestamp(patch.expiresAt ?? this.now())
+        : null;
+    }
     if (patch.ownerAccountId !== undefined) update.owner_account_id = patch.ownerAccountId;
     if (patch.agentId !== undefined) update.agent_id = patch.agentId;
-    if (patch.expiresAt !== undefined) update.expires_at = patch.expiresAt;
+    if (patch.expiresAt !== undefined) {
+      update.expires_at = patch.expiresAt;
+      if (patch.status === undefined) {
+        update.pending_expires_at_ttl = ttlTimestamp(patch.expiresAt);
+      }
+    }
     if (patch.approvedAt !== undefined) update.approved_at = patch.approvedAt;
     if (patch.claimedAt !== undefined) update.claimed_at = patch.claimedAt;
     update.updated_at = this.now();
@@ -375,6 +1322,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       created_at: input.createdAt,
       expires_at: input.expiresAt,
       used_at: input.usedAt,
+      expires_at_ttl: ttlTimestamp(input.expiresAt),
     });
   }
 
@@ -426,12 +1374,48 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     const agentRef = this.doc("agents", input.agentId);
     const handleKey = input.handle.trim().normalize("NFKC").toLowerCase();
     const handleRef = this.doc("agent_handles", handleKey);
-    const bindingRef = this.doc("agent_bindings", input.bindingId ?? input.agentId);
+    const inputBindingRef = input.bindingId
+      ? this.doc("agent_bindings", input.bindingId)
+      : undefined;
     await this.firestore.runTransaction(async (transaction) => {
-      const [agent, handle] = await Promise.all([
+      const [agent, handle, bindings, inputBinding] = await Promise.all([
         transaction.get(agentRef),
         transaction.get(handleRef),
+        input.bindingId
+          ? Promise.resolve({ docs: [] as DocumentSnapshot[] })
+          : transaction.get(
+              this.firestore
+                .collection(this.collection("agent_bindings"))
+                .where("agent_id", "==", input.agentId)
+                .limit(25),
+            ),
+        inputBindingRef ? transaction.get(inputBindingRef) : Promise.resolve(undefined),
       ]);
+      // Owner profile edits do not carry a runtime binding. Preserve the
+      // approved binding instead of silently creating an agent-id binding
+      // that would orphan the actual pairing key. Active runtime syncs pass
+      // their binding explicitly through the authenticated session.
+      const existingBinding = bindings.docs
+        .filter((document) => document.get("revoked_at") == null)
+        .sort((left, right) =>
+          String(right.get("updated_at") ?? right.get("approved_at") ?? "")
+            .localeCompare(String(left.get("updated_at") ?? left.get("approved_at") ?? "")),
+        )[0];
+      if (input.actingAccountId || input.humanSessionHash) {
+        await this.assertHumanSession(
+          transaction,
+          input.actingAccountId,
+          input.humanSessionHash,
+          input.updatedAt,
+        );
+        if (input.actingAccountId !== input.ownerAccountId) {
+          throw new Error("mesh_governance_denied");
+        }
+        if (agent.exists && agent.get("owner_account_id") !== input.ownerAccountId) {
+          throw new Error("agent_access_denied");
+        }
+      }
+      const bindingId = input.bindingId ?? existingBinding?.id ?? (!agent.exists ? input.agentId : undefined);
       if (!agent.exists) {
         // The API performs an early limit check for friendly errors, but the
         // authoritative transaction must enforce it as well so concurrent
@@ -458,6 +1442,21 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           transaction.delete(previousHandleRef);
         }
       }
+      const currentUpdatedAt = agent.exists ? String(agent.get("updated_at") ?? "") : "";
+      const attentionChanged = agent.exists &&
+        JSON.stringify(agent.get("attention_policy") ?? {}) !== JSON.stringify(input.attention);
+      if (input.expectedUpdatedAt !== undefined && currentUpdatedAt !== input.expectedUpdatedAt) {
+        throw new Error("profile_conflict");
+      }
+      const currentUpdatedMs = Date.parse(currentUpdatedAt);
+      const requestedUpdatedMs = Date.parse(input.updatedAt);
+      const effectiveUpdatedAt = agent.exists && Number.isFinite(currentUpdatedMs) &&
+          (!Number.isFinite(requestedUpdatedMs) || requestedUpdatedMs <= currentUpdatedMs)
+        ? new Date(currentUpdatedMs + 1).toISOString()
+        : input.updatedAt;
+      if (attentionChanged) {
+        this.touchLiveAccessEpoch(transaction, effectiveUpdatedAt, "agent_attention_policy_changed", input.agentId);
+      }
       transaction.set(agentRef, {
         contract_version: MESHR_CONTRACT_MAJOR,
         agent_id: input.agentId,
@@ -474,29 +1473,410 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         public_key_pem: input.publicKeyPem,
         definition_digest: input.definitionDigest,
         created_at: input.createdAt,
-        updated_at: input.updatedAt,
+        updated_at: effectiveUpdatedAt,
       }, { merge: true });
       transaction.set(handleRef, {
         contract_version: MESHR_CONTRACT_MAJOR,
         handle: input.handle,
         agent_id: input.agentId,
-        updated_at: input.updatedAt,
+        updated_at: effectiveUpdatedAt,
       }, { merge: true });
-      transaction.set(bindingRef, {
-        contract_version: MESHR_CONTRACT_MAJOR,
-        binding_id: input.bindingId ?? input.agentId,
-        agent_id: input.agentId,
-        public_key: input.publicKeyPem,
-        runtime_kind: input.runtime,
-        approved_at: input.createdAt,
-        revoked_at: null,
-        updated_at: input.updatedAt,
-      }, { merge: true });
+      if (bindingId) {
+        // A profile edit must never revive a revoked binding. Runtime syncs
+        // pass the currently authenticated binding; owner edits preserve an
+        // existing active binding and create one only for a brand-new agent.
+        const bindingRef = this.doc("agent_bindings", bindingId);
+        const binding = input.bindingId ? inputBinding : existingBinding;
+        if (!binding || !binding.exists) {
+          transaction.set(bindingRef, {
+            contract_version: MESHR_CONTRACT_MAJOR,
+            binding_id: bindingId,
+            agent_id: input.agentId,
+            public_key: input.publicKeyPem,
+            runtime_kind: input.runtime,
+            approved_at: input.createdAt,
+            ...(binding?.exists && binding.get("revoked_at") != null
+              ? { revoked_at: binding.get("revoked_at") }
+              : { revoked_at: null }),
+            updated_at: effectiveUpdatedAt,
+          }, { merge: true });
+        } else if (binding.get("revoked_at") == null) {
+          // The binding key, runtime provenance, and approval timestamp are
+          // immutable authority facts. A profile edit may only refresh a
+          // bookkeeping timestamp on an already-approved binding.
+          transaction.update(bindingRef, { updated_at: effectiveUpdatedAt });
+        }
+      }
+      if (input.profileReviewProposal) {
+        const proposal = input.profileReviewProposal;
+        transaction.set(
+          this.doc("profile_review_proposals", proposal.proposalId),
+          {
+            contract_version: MESHR_CONTRACT_MAJOR,
+            proposal_id: proposal.proposalId,
+            agent_id: input.agentId,
+            owner_account_id: input.ownerAccountId,
+            source_digest: proposal.sourceDigest,
+            requested: proposal.requested,
+            pending_fields: proposal.pendingFields,
+            status: "pending",
+            resolution: null,
+            resolved_at: null,
+            created_at: proposal.createdAt,
+            updated_at: effectiveUpdatedAt,
+          },
+          { merge: true },
+        );
+      }
     });
   }
 
-  async revokeAgent(agentId: string, revokedAt: string): Promise<void> {
+  async updateAgentProfileFromSession(input: {
+    agent: RepositoryAgentInput;
+    sessionId: string;
+    authorityEpoch: number;
+    idempotencyKey: string;
+    requestHash: string;
+    updatedAt: string;
+    expectedUpdatedAt?: string;
+    profileReload?: RepositoryProfileReloadResult;
+  }): Promise<{
+    agent: RepositoryAgentInput;
+    duplicate: boolean;
+    profileReload?: RepositoryProfileReloadResult;
+  }> {
+    const agent = input.agent;
+    if (!agent.bindingId) throw new Error("binding_invalid");
+    const agentRef = this.doc("agents", agent.agentId);
+    const authorityRef = this.authorityRef(agent.agentId);
+    const sessionRef = this.doc("runtime_sessions", input.sessionId);
+    const bindingRef = this.doc("agent_bindings", agent.bindingId);
+    const handleRef = this.doc("agent_handles", agent.handle.trim().normalize("NFKC").toLowerCase());
+    const idempotencyRef = this.doc("idempotency", `${agent.agentId}:agent.profile.update:${input.idempotencyKey}`);
+    return this.firestore.runTransaction(async (transaction) => {
+      const [current, authority, session, binding, handle, existing] = await Promise.all([
+        transaction.get(agentRef),
+        transaction.get(authorityRef),
+        transaction.get(sessionRef),
+        transaction.get(bindingRef),
+        transaction.get(handleRef),
+        transaction.get(idempotencyRef),
+      ]);
+      const nowMs = Date.parse(input.updatedAt);
+      if (
+        !authority.exists ||
+        authority.get("authority_kind") !== "native" ||
+        authority.get("session_id") !== input.sessionId ||
+        Number(authority.get("epoch") ?? 0) !== input.authorityEpoch ||
+        !session.exists ||
+        session.get("agent_id") !== agent.agentId ||
+        session.get("status") !== "active" ||
+        Date.parse(String(session.get("expires_at"))) <= nowMs ||
+        Date.parse(String(session.get("last_seen_at"))) < nowMs - 90_000 ||
+        !binding.exists ||
+        binding.get("agent_id") !== agent.agentId ||
+        binding.get("revoked_at") != null ||
+        !current.exists ||
+        current.get("owner_account_id") !== agent.ownerAccountId
+      ) {
+        throw new Error("session_superseded");
+      }
+      if (existing.exists) {
+        if (existing.get("request_hash") !== input.requestHash) throw new Error("idempotency_conflict");
+        const storedReload = existing.get("profile_reload");
+        return {
+          duplicate: true,
+          agent: this.agentFromStoredResponse(existing.get("response_agent"), {
+            ...this.agentFromSnapshot(current),
+            bindingId: agent.bindingId,
+          }),
+          ...(storedReload && typeof storedReload === "object"
+            ? { profileReload: storedReload as RepositoryProfileReloadResult }
+            : {}),
+        };
+      }
+      // A native host builds its profile from a local snapshot. Reject a
+      // stale snapshot instead of overwriting an owner edit that committed
+      // after the host read it. Replays return their stored response above
+      // after the authority check, so a revoked/superseded session cannot be
+      // used as a read oracle while ordinary retries remain idempotent.
+      if (
+        input.expectedUpdatedAt !== undefined &&
+        String(current.get("updated_at") ?? "") !== input.expectedUpdatedAt
+      ) {
+        throw new Error("profile_conflict");
+      }
+      // ISO wall-clock values can collide under a fixed clock or two
+      // same-millisecond requests. Make the persisted revision strictly
+      // monotonic so the compare-and-set guard still rejects the loser after
+      // Firestore retries the transaction.
+      const currentUpdatedAt = String(current.get("updated_at") ?? "");
+      const currentUpdatedMs = Date.parse(currentUpdatedAt);
+      const requestedUpdatedMs = Date.parse(input.updatedAt);
+      const effectiveUpdatedAt = Number.isFinite(currentUpdatedMs) &&
+          (!Number.isFinite(requestedUpdatedMs) || requestedUpdatedMs <= currentUpdatedMs)
+        ? new Date(currentUpdatedMs + 1).toISOString()
+        : input.updatedAt;
+      const attentionChanged = JSON.stringify(current.get("attention_policy") ?? {}) !== JSON.stringify(agent.attention);
+      if (attentionChanged) {
+        this.touchLiveAccessEpoch(transaction, effectiveUpdatedAt, "agent_attention_policy_changed", agent.agentId);
+      }
+      if (handle.exists && String(handle.get("agent_id")) !== agent.agentId) {
+        throw new Error("handle_unavailable");
+      }
+      transaction.update(agentRef, {
+        name: agent.name,
+        handle: agent.handle,
+        tagline: agent.tagline,
+        interests: agent.interests,
+        personality: agent.personality,
+        attention_policy: agent.attention,
+        definition_digest: agent.definitionDigest,
+        updated_at: effectiveUpdatedAt,
+      });
+      transaction.set(handleRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        handle: agent.handle,
+        agent_id: agent.agentId,
+        updated_at: effectiveUpdatedAt,
+      }, { merge: true });
+      if (agent.profileReviewProposal) {
+        const proposal = agent.profileReviewProposal;
+        transaction.set(
+          this.doc("profile_review_proposals", proposal.proposalId),
+          {
+            contract_version: MESHR_CONTRACT_MAJOR,
+            proposal_id: proposal.proposalId,
+            agent_id: agent.agentId,
+            owner_account_id: agent.ownerAccountId,
+            source_digest: proposal.sourceDigest,
+            requested: proposal.requested,
+            pending_fields: proposal.pendingFields,
+            status: "pending",
+            // Reopening the same digest starts a fresh review; stale terminal
+            // metadata must not make it appear already resolved.
+            resolution: null,
+            resolved_at: null,
+            created_at: proposal.createdAt,
+            updated_at: effectiveUpdatedAt,
+          },
+          { merge: true },
+        );
+      }
+      const responseAgent = {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        agent_id: agent.agentId,
+        owner_account_id: agent.ownerAccountId,
+        name: agent.name,
+        handle: agent.handle,
+        tagline: agent.tagline,
+        interests: agent.interests,
+        personality: agent.personality,
+        attention_policy: agent.attention,
+        runtime: agent.runtime,
+        runtime_label: agent.runtimeLabel,
+        runtime_subject: agent.runtimeSubject,
+        public_key_pem: agent.publicKeyPem,
+        definition_digest: agent.definitionDigest,
+        created_at: current.get("created_at") ?? agent.createdAt,
+        updated_at: effectiveUpdatedAt,
+      };
+      const response = { ...agent, createdAt: String(responseAgent.created_at), updatedAt: effectiveUpdatedAt };
+      transaction.create(idempotencyRef, {
+        request_hash: input.requestHash,
+        response_status: 200,
+        response_agent: responseAgent,
+        ...(input.profileReload ? { profile_reload: input.profileReload } : {}),
+        created_at: effectiveUpdatedAt,
+        expires_at: new Date(Date.parse(effectiveUpdatedAt) + IDEMPOTENCY_RETENTION_SECONDS * 1_000).toISOString(),
+        expires_at_ttl: ttlTimestamp(new Date(Date.parse(effectiveUpdatedAt) + IDEMPOTENCY_RETENTION_SECONDS * 1_000).toISOString()),
+      });
+      return {
+        agent: response,
+        duplicate: false,
+        ...(input.profileReload ? { profileReload: input.profileReload } : {}),
+      };
+    });
+  }
+
+  private profileReviewProposalFromSnapshot(snapshot: DocumentSnapshot): RepositoryProfileReviewProposal {
+    const requested = snapshot.get("requested");
+    const pendingFields = snapshot.get("pending_fields");
+    const status = String(snapshot.get("status") ?? "pending");
+    const resolution = snapshot.get("resolution");
+    return {
+      proposalId: String(snapshot.get("proposal_id") ?? snapshot.id),
+      agentId: String(snapshot.get("agent_id") ?? ""),
+      ownerAccountId: String(snapshot.get("owner_account_id") ?? ""),
+      sourceDigest: String(snapshot.get("source_digest") ?? ""),
+      requested: requested && typeof requested === "object" && !Array.isArray(requested)
+        ? requested as Record<string, unknown>
+        : {},
+      pendingFields: Array.isArray(pendingFields) ? pendingFields.map(String) : [],
+      status: status === "approved" || status === "denied" ? status : "pending",
+      createdAt: String(snapshot.get("created_at") ?? this.now()),
+      updatedAt: String(snapshot.get("updated_at") ?? this.now()),
+      resolvedAt: snapshot.get("resolved_at") == null ? null : String(snapshot.get("resolved_at")),
+      resolution: resolution === "approved" || resolution === "denied" ? resolution : null,
+    };
+  }
+
+  async listProfileReviewProposals(input: {
+    agentId: string;
+    ownerAccountId: string;
+    humanSessionHash: string;
+  }): Promise<RepositoryProfileReviewProposal[]> {
+    return this.firestore.runTransaction(async (transaction) => {
+      await this.assertHumanSession(transaction, input.ownerAccountId, input.humanSessionHash);
+      const snapshot = await transaction.get(
+        this.firestore
+          .collection(this.collection("profile_review_proposals"))
+          .where("agent_id", "==", input.agentId)
+          .where("owner_account_id", "==", input.ownerAccountId)
+          .limit(100),
+      );
+      return snapshot.docs
+        .map((document) => this.profileReviewProposalFromSnapshot(document))
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.proposalId.localeCompare(right.proposalId));
+    });
+  }
+
+  async resolveProfileReviewProposal(input: {
+    proposalId: string;
+    agentId: string;
+    ownerAccountId: string;
+    humanSessionHash: string;
+    decision: "approved" | "denied";
+    resolvedAt: string;
+    event?: RepositoryEventInput;
+    audit?: RepositoryAuditInput;
+  }): Promise<{ proposal: RepositoryProfileReviewProposal; agent: RepositoryAgentInput }> {
+    return this.firestore.runTransaction(async (transaction) => {
+      const proposalRef = this.doc("profile_review_proposals", input.proposalId);
+      const agentRef = this.doc("agents", input.agentId);
+      const [proposalSnapshot, agentSnapshot] = await Promise.all([
+        transaction.get(proposalRef),
+        transaction.get(agentRef),
+      ]);
+      await this.assertHumanSession(transaction, input.ownerAccountId, input.humanSessionHash, input.resolvedAt);
+      if (
+        !proposalSnapshot.exists ||
+        proposalSnapshot.get("agent_id") !== input.agentId ||
+        proposalSnapshot.get("owner_account_id") !== input.ownerAccountId
+      ) throw new Error("profile_proposal_not_found");
+      if (!agentSnapshot.exists || agentSnapshot.get("owner_account_id") !== input.ownerAccountId) {
+        throw new Error("agent_not_found");
+      }
+      const proposal = this.profileReviewProposalFromSnapshot(proposalSnapshot);
+      if (proposal.status !== "pending") throw new Error("profile_proposal_not_pending");
+      const current = this.agentFromSnapshot(agentSnapshot);
+      // A proposal is tied to the agent revision produced by the reload that
+      // created it. If an owner edit or newer reload committed afterwards,
+      // do not apply the older identity/policy request on top of it.
+      if (proposal.updatedAt !== current.updatedAt) {
+        throw new Error("profile_proposal_stale");
+      }
+      // Resolution is also an agent revision. Firestore transactions may
+      // retry under the same fixed clock, so never move the durable revision
+      // backwards (or collide with the proposal's source revision).
+      const currentUpdatedMs = Date.parse(current.updatedAt);
+      const requestedResolvedMs = Date.parse(input.resolvedAt);
+      const effectiveResolvedAt = Number.isFinite(currentUpdatedMs) &&
+          (!Number.isFinite(requestedResolvedMs) || requestedResolvedMs <= currentUpdatedMs)
+        ? new Date(currentUpdatedMs + 1).toISOString()
+        : input.resolvedAt;
+      let next = current;
+      let newHandleRef: DocumentReference | undefined;
+      let oldHandleRef: DocumentReference | undefined;
+      let oldHandleSnapshot: DocumentSnapshot | undefined;
+      if (input.decision === "approved") {
+        const requested = proposal.requested;
+        const nextName = requested.name === undefined ? current.name : String(requested.name);
+        const nextHandle = requested.handle === undefined ? current.handle : String(requested.handle);
+        if (!nextName.trim() || !nextHandle.trim() || nextName.length > 100 || nextHandle.length > 80) {
+          throw new Error("profile_proposal_invalid");
+        }
+        const nextAttention = { ...current.attention };
+        if (requested.attention && typeof requested.attention === "object" && !Array.isArray(requested.attention)) {
+          const attention = requested.attention as Record<string, unknown>;
+          for (const field of ["browse", "rootPosts", "replies"] as const) {
+            if (attention[field] !== undefined) nextAttention[field] = attention[field];
+          }
+        }
+        const nextHandleKey = nextHandle.trim().normalize("NFKC").toLowerCase();
+        newHandleRef = this.doc("agent_handles", nextHandleKey);
+        const nextHandleSnapshot = await transaction.get(newHandleRef);
+        if (nextHandleSnapshot.exists && nextHandleSnapshot.get("agent_id") !== input.agentId) {
+          throw new Error("handle_unavailable");
+        }
+        const oldHandleKey = current.handle.trim().normalize("NFKC").toLowerCase();
+        if (oldHandleKey && oldHandleKey !== nextHandleKey) {
+          oldHandleRef = this.doc("agent_handles", oldHandleKey);
+          oldHandleSnapshot = await transaction.get(oldHandleRef);
+        }
+        next = {
+          ...current,
+          name: nextName,
+          handle: nextHandle,
+          attention: nextAttention,
+          definitionDigest: proposal.sourceDigest || current.definitionDigest,
+          updatedAt: effectiveResolvedAt,
+        };
+        if (JSON.stringify(next.attention) !== JSON.stringify(current.attention)) {
+          this.touchLiveAccessEpoch(
+            transaction,
+            effectiveResolvedAt,
+            "agent_attention_policy_changed",
+            input.agentId,
+          );
+        }
+        transaction.update(agentRef, {
+          name: next.name,
+          handle: next.handle,
+          attention_policy: next.attention,
+          definition_digest: next.definitionDigest,
+          updated_at: next.updatedAt,
+        });
+        if (oldHandleRef && oldHandleSnapshot?.exists && oldHandleSnapshot.get("agent_id") === input.agentId) {
+          transaction.delete(oldHandleRef);
+        }
+        transaction.set(newHandleRef, {
+          contract_version: MESHR_CONTRACT_MAJOR,
+          handle: next.handle,
+          agent_id: input.agentId,
+          updated_at: effectiveResolvedAt,
+        }, { merge: true });
+      }
+      transaction.update(proposalRef, {
+        status: input.decision,
+        resolution: input.decision,
+        resolved_at: effectiveResolvedAt,
+        updated_at: effectiveResolvedAt,
+      });
+      this.writeMutationArtifacts(transaction, input);
+      return {
+        proposal: {
+          ...proposal,
+          status: input.decision,
+          resolution: input.decision,
+          resolvedAt: effectiveResolvedAt,
+          updatedAt: effectiveResolvedAt,
+        },
+        agent: next,
+      };
+    });
+  }
+
+  async revokeAgent(
+    agentId: string,
+    revokedAt: string,
+    event?: RepositoryEventInput,
+    audit?: RepositoryAuditInput,
+    actingAccountId?: string,
+    humanSessionHash?: string,
+  ): Promise<void> {
     await this.firestore.runTransaction(async (transaction) => {
+      const agentRef = this.doc("agents", agentId);
       const bindingQuery = this.firestore
         .collection(this.collection("agent_bindings"))
         .where("agent_id", "==", agentId);
@@ -508,12 +1888,24 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         .collection(this.collection("webmcp_grants"))
         .where("agent_id", "==", agentId)
         .where("revoked_at", "==", null);
-      const [bindings, sessions, grants, authority] = await Promise.all([
+      const pairingQuery = this.firestore
+        .collection(this.collection("pairings"))
+        .where("agent_id", "==", agentId)
+        .where("status", "in", ["approved", "claimed"]);
+      const [agent, bindings, sessions, grants, pairings, authority] = await Promise.all([
+        transaction.get(agentRef),
         transaction.get(bindingQuery),
         transaction.get(sessionQuery),
         transaction.get(grantQuery),
+        transaction.get(pairingQuery),
         transaction.get(this.authorityRef(agentId)),
       ]);
+      if (actingAccountId || humanSessionHash) {
+        await this.assertHumanSession(transaction, actingAccountId, humanSessionHash, revokedAt);
+        if (!agent.exists || agent.get("owner_account_id") !== actingAccountId) {
+          throw new Error("agent_access_denied");
+        }
+      }
       if (bindings.empty) {
         transaction.set(
           this.doc("agent_bindings", agentId),
@@ -533,6 +1925,12 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         transaction.update(session.ref, { status: "revoked", expires_at: revokedAt });
       }
       for (const grant of grants.docs) transaction.update(grant.ref, { revoked_at: revokedAt });
+      // Revoking an agent must also revoke every approved pairing. Otherwise
+      // an old signed challenge could be used to mint a fresh session after
+      // the binding was disconnected and a later profile edit touched it.
+      for (const pairing of pairings.docs) {
+        transaction.update(pairing.ref, { status: "revoked", revoked_at: revokedAt });
+      }
       transaction.set(
         this.authorityRef(agentId),
         {
@@ -545,78 +1943,37 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         },
         { merge: true },
       );
+      this.touchLiveAccessEpoch(transaction, revokedAt, "agent_revoked", agentId);
+      this.writeMutationArtifacts(transaction, { event, audit });
     });
   }
 
   async appendEvent(input: RepositoryEventInput): Promise<void> {
-    const rawPayload =
-      input.payload && typeof input.payload === "object" && !Array.isArray(input.payload)
-        ? input.payload as Record<string, unknown>
-        : { value: input.payload };
-    // Raw delivery/topology traces must not become a second long-lived copy of
-    // a post body. Keep attribution and moderation metadata, but strip body
-    // text before it enters Firestore event collections.
-    const payload = { ...rawPayload };
-    const post = payload.post;
-    if (post && typeof post === "object" && !Array.isArray(post)) {
-      const { body: _body, ...postReference } = post as Record<string, unknown>;
-      payload.post = postReference;
-    }
-    if (input.meshId && input.agentId) {
-      const envelope = {
-        event_id: input.eventId,
-        schema_version: 1 as const,
-        mesh_id: input.meshId,
-        agent_id: input.agentId,
-        session_id: input.sessionId,
-        runtime_kind: input.runtimeKind,
-        type: input.type,
-        occurred_at: input.occurredAt,
-        payload,
-      };
-      await this.doc("event_outbox", input.eventId).create({
-        contract_version: MESHR_CONTRACT_MAJOR,
-        envelope,
-        status: "pending",
-        attempts: 0,
-        created_at: input.occurredAt,
-      }).catch((error: unknown) => {
-        // Duplicate event delivery is safe; conflicting IDs are not.
-        if (!(error instanceof Error) || !/already exists|ALREADY_EXISTS/i.test(error.message)) throw error;
-      });
-      return;
-    }
-    // Governance/account/session events have no agent or mesh and therefore
-    // must not be silently dropped by the topology envelope publisher.
-    await this.doc("governance_events", input.eventId).create({
-      contract_version: MESHR_CONTRACT_MAJOR,
-      event_id: input.eventId,
-      type: input.type,
-      mesh_id: input.meshId,
-      topic_id: input.topicId,
-      agent_id: input.agentId,
-      session_id: input.sessionId,
-      runtime_kind: input.runtimeKind,
-      payload,
-      occurred_at: input.occurredAt,
-    }).catch((error: unknown) => {
-      if (!(error instanceof Error) || !/already exists|ALREADY_EXISTS/i.test(error.message)) throw error;
+    // Every event, including governance/session events without an agent or
+    // mesh, enters the same durable outbox. A single envelope contract lets
+    // the independent audit/moderation/topology/notification consumers see
+    // the same immutable event stream and gives operators one replay path.
+    const outboxRef = this.doc("event_outbox", input.eventId);
+    await this.firestore.runTransaction(async (transaction) => {
+      const existing = await transaction.get(outboxRef);
+      if (existing.exists) {
+        const stored = existing.get("envelope");
+        if (JSON.stringify(stored) !== JSON.stringify(this.eventEnvelope(input))) {
+          throw new Error("event_id_conflict");
+        }
+        // The immutable ready marker is the durable discovery signal. It is
+        // safe to recreate/merge on an idempotent retry without maintaining a
+        // hot per-mesh head document.
+        this.queueOutboxReady(transaction, input.eventId, input.meshId, input.occurredAt);
+        return;
+      }
+      transaction.create(outboxRef, this.eventOutboxDocument(input));
+      this.queueOutboxReady(transaction, input.eventId, input.meshId, input.occurredAt);
     });
   }
 
   async appendAuditEvent(input: RepositoryAuditInput): Promise<void> {
-    await this.doc("audit_events", input.auditId).create({
-      contract_version: MESHR_CONTRACT_MAJOR,
-      audit_id: input.auditId,
-      actor_type: input.actorType,
-      actor_id: input.actorId,
-      session_id: input.sessionId,
-      action: input.action,
-      resource_type: input.resourceType,
-      resource_id: input.resourceId,
-      data: input.data,
-      created_at: input.createdAt,
-    }).catch((error: unknown) => {
+    await this.doc("audit_events", input.auditId).create(this.auditDocument(input)).catch((error: unknown) => {
       if (!(error instanceof Error) || !/already exists|ALREADY_EXISTS/i.test(error.message)) throw error;
     });
   }
@@ -636,23 +1993,98 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     };
   }
 
-  async upsertModerationCase(input: RepositoryModerationCase): Promise<void> {
-    await this.doc("moderation_cases", input.caseId).set(
-      {
-        contract_version: MESHR_CONTRACT_MAJOR,
-        case_id: input.caseId,
-        post_id: input.postId,
-        mesh_id: input.meshId,
-        reason: input.reason,
-        state: input.state,
-        severity: input.severity,
-        resolution: input.resolution,
-        created_at: input.createdAt,
-        updated_at: input.updatedAt,
-        resolved_at: input.resolvedAt,
-      },
-      { merge: true },
-    );
+  async upsertModerationCase(input: RepositoryModerationCase & {
+    actingAccountId?: string;
+    humanSessionHash?: string;
+    actingAgentId?: string;
+    agentSessionId?: string;
+    agentAuthorityEpoch?: number;
+    idempotencyKey?: string;
+    requestHash?: string;
+  } & RepositoryMutationArtifacts): Promise<void> {
+    const data = {
+      contract_version: MESHR_CONTRACT_MAJOR,
+      case_id: input.caseId,
+      post_id: input.postId,
+      mesh_id: input.meshId,
+      reason: input.reason,
+      state: input.state,
+      severity: input.severity,
+      resolution: input.resolution,
+      created_at: input.createdAt,
+      updated_at: input.updatedAt,
+      resolved_at: input.resolvedAt,
+      retention_at: moderationRetentionTimestamp(input.createdAt),
+    };
+    await this.firestore.runTransaction(async (transaction) => {
+      const agentAppeal = input.actingAgentId !== undefined;
+      const postRef = agentAppeal ? this.doc("posts", input.postId) : undefined;
+      const authorityRef = agentAppeal ? this.authorityRef(input.actingAgentId!) : undefined;
+      const sessionRef = agentAppeal && input.agentSessionId
+        ? this.doc("runtime_sessions", input.agentSessionId)
+        : undefined;
+      const idempotencyRef = agentAppeal && input.idempotencyKey
+        ? this.doc("idempotency", `${input.actingAgentId}:post.appeal:${input.idempotencyKey}`)
+        : undefined;
+      const [post, authority, runtimeSession, idempotency] = await Promise.all([
+        postRef ? transaction.get(postRef) : Promise.resolve(undefined),
+        authorityRef ? transaction.get(authorityRef) : Promise.resolve(undefined),
+        sessionRef ? transaction.get(sessionRef) : Promise.resolve(undefined),
+        idempotencyRef ? transaction.get(idempotencyRef) : Promise.resolve(undefined),
+      ]);
+      if (input.actingAccountId || input.humanSessionHash) {
+        await this.assertHumanModerator(
+          transaction,
+          input.meshId,
+          input.actingAccountId,
+          input.humanSessionHash,
+        );
+      }
+      if (agentAppeal) {
+        const nowMs = Date.parse(input.updatedAt);
+        if (
+          !post?.exists ||
+          post.get("agent_id") !== input.actingAgentId ||
+          post.get("mesh_id") !== input.meshId ||
+          post.get("moderation_state") === "published"
+        ) throw new Error("post_authorization_denied");
+        if (
+          !authority?.exists ||
+          authority.get("authority_kind") !== "native" ||
+          authority.get("session_id") !== input.agentSessionId ||
+          Number(authority.get("epoch") ?? -1) !== Number(input.agentAuthorityEpoch ?? -2)
+        ) throw new Error("session_superseded");
+        if (
+          !runtimeSession?.exists ||
+          runtimeSession.get("agent_id") !== input.actingAgentId ||
+          runtimeSession.get("status") !== "active" ||
+          Date.parse(String(runtimeSession.get("expires_at") ?? "")) <= nowMs ||
+          Date.parse(String(runtimeSession.get("last_seen_at") ?? "")) < nowMs - 90_000
+        ) throw new Error("session_invalid");
+        if (idempotency?.exists) {
+          if (idempotency.get("request_hash") !== input.requestHash) {
+            throw new Error("idempotency_conflict");
+          }
+          return;
+        }
+      }
+      transaction.set(this.doc("moderation_cases", input.caseId), data, { merge: true });
+      this.writeMutationArtifacts(transaction, input);
+      if (idempotencyRef && input.requestHash) {
+        const expiresAt = new Date(
+          Date.parse(input.updatedAt) + IDEMPOTENCY_RETENTION_SECONDS * 1_000,
+        ).toISOString();
+        transaction.create(idempotencyRef, {
+          contract_version: MESHR_CONTRACT_MAJOR,
+          request_hash: input.requestHash,
+          response_status: 202,
+          response_body: { caseId: input.caseId, postId: input.postId, reason: input.reason },
+          created_at: input.updatedAt,
+          expires_at: expiresAt,
+          expires_at_ttl: ttlTimestamp(expiresAt),
+        });
+      }
+    });
   }
 
   async findModerationCase(caseId: string): Promise<RepositoryModerationCase | null> {
@@ -680,7 +2112,9 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     caseState: RepositoryModerationCase["state"];
     resolution: string | null;
     updatedAt: string;
-  }): Promise<void> {
+    actingAccountId: string;
+    humanSessionHash: string;
+  } & RepositoryMutationArtifacts): Promise<void> {
     await this.firestore.runTransaction(async (transaction) => {
       const postRef = this.doc("posts", input.postId);
       const caseRef = this.doc("moderation_cases", input.caseId);
@@ -692,6 +2126,17 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       if (moderationCase.exists && moderationCase.get("post_id") !== input.postId) {
         throw new Error("moderation_case_mismatch");
       }
+      const meshId = String(post.get("mesh_id"));
+      if (moderationCase.exists && String(moderationCase.get("mesh_id")) !== meshId) {
+        throw new Error("moderation_case_mismatch");
+      }
+      await this.assertHumanModerator(
+        transaction,
+        meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        input.updatedAt,
+      );
       const postUpdate: Record<string, unknown> = {
         moderation_state: input.state,
         moderation_reason: input.reason,
@@ -703,7 +2148,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         contract_version: MESHR_CONTRACT_MAJOR,
         case_id: input.caseId,
         post_id: input.postId,
-        mesh_id: String(post.get("mesh_id")),
+        mesh_id: meshId,
         reason: input.reason ?? "policy_review",
         state: input.caseState,
         severity: String(moderationCase.exists ? moderationCase.get("severity") ?? "low" : "low"),
@@ -713,9 +2158,15 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           : input.updatedAt,
         updated_at: input.updatedAt,
         resolved_at: input.caseState === "resolved" ? input.updatedAt : null,
+        retention_at: moderationRetentionTimestamp(
+          moderationCase.exists
+            ? String(moderationCase.get("created_at") ?? input.updatedAt)
+            : input.updatedAt,
+        ),
       };
       if (moderationCase.exists) transaction.set(caseRef, caseData, { merge: true });
       else transaction.create(caseRef, caseData);
+      this.writeMutationArtifacts(transaction, input);
     });
   }
 
@@ -737,10 +2188,262 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     };
   }
 
-  async upsertMesh(input: RepositoryMeshInput): Promise<void> {
+  async listPublishedPostsByTopic(input: {
+    topicId: string;
+    now: string;
+    after?: { createdAt: string; id: string };
+    limit: number;
+  }): Promise<RepositoryTopicPostsPage> {
+    const limit = Math.min(Math.max(Math.floor(input.limit), 1), 100);
+    // Expired documents can remain briefly while Firestore TTL runs. Scan a
+    // bounded number of ordered rows, filtering expiry in-process, so stale
+    // TTL rows cannot starve a quiet topic forever or turn a request into an
+    // unbounded collection walk.
+    const scanBatch = Math.min(Math.max(limit * 3, 50), 500);
+    const scanCap = 10_000;
+    const nowMs = Date.parse(input.now);
+    const latestWindow = !input.after;
+    let after = input.after;
+    let scanned = 0;
+    let exhausted = false;
+    const posts: RepositoryPostRecord[] = [];
+    let nextAfter: { createdAt: string; id: string } | null = null;
+    while (posts.length < limit && scanned < scanCap) {
+      let query: Query = this.firestore
+        .collection(this.collection("posts"))
+        .where("topic_id", "==", input.topicId)
+        .where("moderation_state", "==", "published")
+        .orderBy("created_at", latestWindow ? "desc" : "asc")
+        .orderBy(FieldPath.documentId(), latestWindow ? "desc" : "asc");
+      if (after) query = query.startAfter(after.createdAt, after.id);
+      const snapshot = await query.limit(scanBatch).get();
+      if (!snapshot.docs.length) {
+        exhausted = true;
+        break;
+      }
+      let lastScanned: { createdAt: string; id: string } | undefined;
+      for (const document of snapshot.docs) {
+        const createdAt = String(document.get("created_at") ?? "");
+        lastScanned = { createdAt, id: document.id };
+        scanned += 1;
+        const expiresAt = document.get("expires_at");
+        const expiresMs = expiresAt == null ? undefined : Date.parse(String(expiresAt));
+        if (expiresMs !== undefined && Number.isFinite(expiresMs) && expiresMs <= nowMs) continue;
+        posts.push({
+          postId: String(document.get("post_id") ?? document.id),
+          meshId: String(document.get("mesh_id") ?? ""),
+          topicId: String(document.get("topic_id") ?? input.topicId),
+          agentId: String(document.get("agent_id") ?? ""),
+          sessionId: String(document.get("session_id") ?? ""),
+          parentPostId: document.get("parent_post_id") == null ? null : String(document.get("parent_post_id")),
+          body: String(document.get("body") ?? ""),
+          moderationState: "published",
+          moderationReason: document.get("moderation_reason") == null ? null : String(document.get("moderation_reason")),
+          createdAt,
+          expiresAt: expiresAt == null ? null : String(expiresAt),
+        });
+        if (posts.length >= limit) {
+          nextAfter = lastScanned;
+          break;
+        }
+      }
+      if (posts.length >= limit) break;
+      if (snapshot.docs.length < scanBatch || !lastScanned) {
+        exhausted = true;
+        break;
+      }
+      after = lastScanned;
+    }
+    if (!nextAfter && !exhausted && after) nextAfter = after;
+    const agentIds = [...new Set(posts.map((post) => post.agentId).filter(Boolean))];
+    const agentDocs = agentIds.length
+      ? await this.firestore.getAll(...agentIds.map((agentId) => this.doc("agents", agentId)))
+      : [];
+    const orderedPosts = latestWindow ? posts.reverse() : posts;
+    const newest = orderedPosts.at(-1);
+    return {
+      posts: orderedPosts,
+      // A cursorless call is a latest-window read, but it still exposes the
+      // newest returned row as a forward cursor. Hosts can then observe posts
+      // appended while the initial page was in flight without replaying the
+      // whole window.
+      nextAfter: latestWindow ? newest
+        ? { createdAt: newest.createdAt, id: newest.postId }
+        : null : posts.length >= limit
+        ? nextAfter
+        : exhausted
+          ? null
+          : nextAfter,
+      agents: agentDocs.filter((document) => document.exists).map((document) => this.agentFromSnapshot(document)),
+    };
+  }
+
+  async findTopicById(topicId: string): Promise<RepositoryTopicInput | null> {
+    const snapshot = await this.doc("topics", topicId).get();
+    if (!snapshot.exists) return null;
+    const tags = snapshot.get("tags") ?? snapshot.get("tags_json") ?? [];
+    return {
+      topicId: String(snapshot.get("topic_id") ?? snapshot.id),
+      meshId: String(snapshot.get("mesh_id")),
+      name: String(snapshot.get("name") ?? ""),
+      title: String(snapshot.get("title") ?? snapshot.get("name") ?? ""),
+      description: String(snapshot.get("description") ?? ""),
+      tags: Array.isArray(tags) ? tags.map(String) : [],
+      createdAt: String(snapshot.get("created_at") ?? this.now()),
+    };
+  }
+
+  async listTopicsForAgent(meshId: string, agentId: string): Promise<RepositoryAgentTopic[]> {
+    // This is deliberately mesh-scoped. The agent topic route is a hot read
+    // path and must not hydrate the account-wide projection (or its post
+    // bodies) merely to render topic names and follow state.
+    const [mesh, agent, membership, topics] = await Promise.all([
+      this.doc("meshes", meshId).get(),
+      this.doc("agents", agentId).get(),
+      this.doc("mesh_agent_memberships", `${meshId}:${agentId}`).get(),
+      this.firestore
+        .collection(this.collection("topics"))
+        .where("mesh_id", "==", meshId)
+        .limit(2_000)
+        .get(),
+    ]);
+    if (!mesh.exists || mesh.get("lifecycle") !== "active") throw new Error("mesh_not_found");
+    if (!agent.exists) throw new Error("agent_not_found");
+    const joined = membership.exists && membership.get("status") === "joined";
+    const visibility = String(mesh.get("visibility") ?? "private");
+    if (visibility !== "public" && !joined) throw new Error("mesh_access_denied");
+    const attention = agent.get("attention_policy");
+    const browse = attention && typeof attention === "object" && !Array.isArray(attention)
+      ? String((attention as Record<string, unknown>).browse ?? "")
+      : "";
+    if (browse !== "public" && browse !== "joined") throw new Error("attention_policy_denied");
+    if (browse === "joined" && !joined) throw new Error("attention_policy_denied");
+    const topicRows: RepositoryAgentTopic[] = topics.docs.map((document) => {
+      const tags = document.get("tags") ?? document.get("tags_json") ?? [];
+      let normalizedTags: string[] = [];
+      if (Array.isArray(tags)) normalizedTags = tags.map(String);
+      else if (typeof tags === "string") {
+        try {
+          const parsed = JSON.parse(tags) as unknown;
+          if (Array.isArray(parsed)) normalizedTags = parsed.map(String);
+        } catch {
+          normalizedTags = [];
+        }
+      }
+      return {
+        topic: {
+          topicId: String(document.get("topic_id") ?? document.id),
+          meshId: String(document.get("mesh_id") ?? meshId),
+          name: String(document.get("name") ?? ""),
+          title: String(document.get("title") ?? document.get("name") ?? ""),
+          description: String(document.get("description") ?? ""),
+          tags: normalizedTags,
+          createdAt: String(document.get("created_at") ?? this.now()),
+        },
+        followed: false,
+      };
+    });
+    const topicIds = new Set(topicRows.map(({ topic }) => topic.topicId));
+    if (topicIds.size) {
+      const follows = await this.firestore
+        .collection(this.collection("follows"))
+        .where("agent_id", "==", agentId)
+        .where("following", "==", true)
+        .limit(2_000)
+        .get();
+      const followedIds = new Set(
+        follows.docs
+          .map((document) => String(document.get("topic_id") ?? ""))
+          .filter((topicId) => topicIds.has(topicId)),
+      );
+      for (const row of topicRows) row.followed = followedIds.has(row.topic.topicId);
+    }
+    return topicRows.sort((left, right) =>
+      left.topic.title.localeCompare(right.topic.title) || left.topic.topicId.localeCompare(right.topic.topicId));
+  }
+
+  async listPublicMeshes(): Promise<RepositoryMeshInput[]> {
+    const snapshot = await this.firestore
+      .collection(this.collection("meshes"))
+      .where("visibility", "==", "public")
+      .where("lifecycle", "==", "active")
+      .limit(2_000)
+      .get();
+    return snapshot.docs.map((document) => ({
+      meshId: String(document.get("mesh_id") ?? document.id),
+      ownerAccountId: document.get("owner_account_id") == null ? null : String(document.get("owner_account_id")),
+      name: String(document.get("name") ?? ""),
+      description: String(document.get("description") ?? ""),
+      visibility: "public" as const,
+      admission: String(document.get("admission") ?? "invite_only") as RepositoryMeshInput["admission"],
+      lifecycle: "active" as const,
+      createdAt: String(document.get("created_at") ?? this.now()),
+      updatedAt: String(document.get("updated_at") ?? this.now()),
+    })).sort((left, right) => left.name.localeCompare(right.name) || left.meshId.localeCompare(right.meshId));
+  }
+
+  async listPublicTopics(meshId: string): Promise<RepositoryTopicInput[]> {
+    const mesh = await this.doc("meshes", meshId).get();
+    if (!mesh.exists || mesh.get("lifecycle") !== "active" || mesh.get("visibility") !== "public") {
+      throw new Error("mesh_not_found");
+    }
+    const snapshot = await this.firestore
+      .collection(this.collection("topics"))
+      .where("mesh_id", "==", meshId)
+      .limit(2_000)
+      .get();
+    // A public-to-private transition may race the topic query. Re-read the
+    // mesh at the response boundary so an unauthenticated directory request
+    // cannot return one stale private topic page.
+    const finalMesh = await this.doc("meshes", meshId).get();
+    if (!finalMesh.exists || finalMesh.get("lifecycle") !== "active" || finalMesh.get("visibility") !== "public") {
+      throw new Error("mesh_not_found");
+    }
+    return snapshot.docs.map((document) => {
+      const tags = document.get("tags") ?? document.get("tags_json") ?? [];
+      let normalizedTags: string[] = [];
+      if (Array.isArray(tags)) normalizedTags = tags.map(String);
+      else if (typeof tags === "string") {
+        try {
+          const parsed = JSON.parse(tags) as unknown;
+          if (Array.isArray(parsed)) normalizedTags = parsed.map(String);
+        } catch {
+          normalizedTags = [];
+        }
+      }
+      return {
+        topicId: String(document.get("topic_id") ?? document.id),
+        meshId,
+        name: String(document.get("name") ?? ""),
+        title: String(document.get("title") ?? document.get("name") ?? ""),
+        description: String(document.get("description") ?? ""),
+        tags: normalizedTags,
+        createdAt: String(document.get("created_at") ?? this.now()),
+      };
+    }).sort((left, right) => left.title.localeCompare(right.title) || left.topicId.localeCompare(right.topicId));
+  }
+
+  async upsertMesh(input: RepositoryMeshInput & RepositoryMutationArtifacts): Promise<void> {
     const meshRef = this.doc("meshes", input.meshId);
     await this.firestore.runTransaction(async (transaction) => {
       const existing = await transaction.get(meshRef);
+      if (input.actingAccountId) {
+        await this.assertHumanSession(
+          transaction,
+          input.actingAccountId,
+          input.humanSessionHash,
+          input.updatedAt,
+        );
+        if (!input.ownerAccountId || (!existing.exists && input.actingAccountId !== input.ownerAccountId)) {
+          throw new Error("mesh_governance_denied");
+        }
+        const actorRole = await transaction.get(
+          this.doc("mesh_human_roles", `${input.meshId}:${input.actingAccountId}`),
+        );
+        if (existing.exists && (!actorRole.exists || actorRole.get("role") !== "owner")) {
+          throw new Error("mesh_governance_denied");
+        }
+      }
       if (!existing.exists && input.ownerAccountId) {
         const ownedMeshes = await transaction.get(
           this.firestore
@@ -762,6 +2465,103 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         created_at: existing.exists ? existing.get("created_at") : input.createdAt,
         updated_at: input.updatedAt,
       }, { merge: true });
+      this.writeMutationArtifacts(transaction, input);
+    });
+  }
+
+  async createMeshWithOwner(input: {
+    mesh: RepositoryMeshInput;
+    topic: RepositoryTopicInput;
+    agentIds: string[];
+  } & RepositoryMutationArtifacts): Promise<void> {
+    const { mesh, topic } = input;
+    const agentIds = [...new Set(input.agentIds)];
+    await this.firestore.runTransaction(async (transaction) => {
+      const meshRef = this.doc("meshes", mesh.meshId);
+      const topicRef = this.doc("topics", topic.topicId);
+      const roleRef = this.doc("mesh_human_roles", `${mesh.meshId}:${mesh.ownerAccountId}`);
+      const existingMesh = await transaction.get(meshRef);
+      if (existingMesh.exists) throw new Error("mesh_already_exists");
+      if (!mesh.ownerAccountId) throw new Error("owner_required");
+      await this.assertHumanSession(
+        transaction,
+        mesh.actingAccountId,
+        mesh.humanSessionHash,
+        mesh.updatedAt,
+      );
+      if (mesh.actingAccountId !== mesh.ownerAccountId) throw new Error("mesh_governance_denied");
+      const owner = await transaction.get(this.doc("accounts", mesh.ownerAccountId));
+      if (!owner.exists) throw new Error("account_not_found");
+      const ownedMeshes = await transaction.get(
+        this.firestore
+          .collection(this.collection("meshes"))
+          .where("owner_account_id", "==", mesh.ownerAccountId)
+          .limit(11),
+      );
+      if (ownedMeshes.size >= 10) throw new Error("mesh_limit_reached");
+      const agentRefs = agentIds.map((agentId) => this.doc("agents", agentId));
+      const agents = agentRefs.length
+        ? await transaction.getAll(...agentRefs)
+        : [];
+      if (agents.some((agent) => !agent.exists || agent.get("owner_account_id") !== mesh.ownerAccountId)) {
+        throw new Error("agent_access_denied");
+      }
+      const joinedCounts = await Promise.all(agentIds.map(async (agentId) => transaction.get(
+        this.firestore
+          .collection(this.collection("mesh_agent_memberships"))
+          .where("agent_id", "==", agentId)
+          .where("status", "==", "joined")
+          .limit(101),
+      )));
+      if (joinedCounts.some((snapshot) => snapshot.size >= 100)) {
+        throw new Error("agent_mesh_limit_reached");
+      }
+      const now = mesh.createdAt;
+      transaction.create(meshRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        mesh_id: mesh.meshId,
+        owner_account_id: mesh.ownerAccountId,
+        name: mesh.name,
+        description: mesh.description,
+        visibility: mesh.visibility,
+        admission: mesh.admission,
+        lifecycle: mesh.lifecycle,
+        created_at: now,
+        updated_at: mesh.updatedAt,
+      });
+      transaction.create(topicRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        topic_id: topic.topicId,
+        mesh_id: topic.meshId,
+        name: topic.name,
+        title: topic.title,
+        description: topic.description,
+        tags: topic.tags,
+        created_at: topic.createdAt,
+      });
+      transaction.create(roleRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        mesh_id: mesh.meshId,
+        account_id: mesh.ownerAccountId,
+        role: "owner",
+        created_at: now,
+        updated_at: mesh.updatedAt,
+      });
+      for (let index = 0; index < agentIds.length; index += 1) {
+        const agentId = agentIds[index]!;
+        const agent = agents[index]!;
+        transaction.create(this.doc("mesh_agent_memberships", `${mesh.meshId}:${agentId}`), {
+          contract_version: MESHR_CONTRACT_MAJOR,
+          mesh_id: mesh.meshId,
+          agent_id: agentId,
+          status: "joined",
+          attention_policy: agent.get("attention_policy") ?? {},
+          admission_provenance: "invite",
+          joined_at: now,
+          updated_at: mesh.updatedAt,
+        });
+      }
+      this.writeMutationArtifacts(transaction, input);
     });
   }
 
@@ -787,13 +2587,25 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     role: "owner" | "steward" | "observer";
     createdAt: string;
     updatedAt: string;
-  }): Promise<void> {
+    actingAccountId?: string;
+    humanSessionHash?: string;
+  } & RepositoryMutationArtifacts): Promise<void> {
     await this.firestore.runTransaction(async (transaction) => {
       const roleRef = this.doc("mesh_human_roles", input.meshId + ":" + input.accountId);
       const meshRef = this.doc("meshes", input.meshId);
       const mesh = await transaction.get(meshRef);
       if (!mesh.exists) throw new Error("mesh_not_found");
       const existing = await transaction.get(roleRef);
+      if (input.actingAccountId) {
+        await this.assertHumanRole(
+          transaction,
+          input.meshId,
+          input.actingAccountId,
+          input.humanSessionHash,
+          ["owner"],
+          input.updatedAt,
+        );
+      }
       if (existing.exists && existing.get("role") === "owner" && input.role !== "owner") {
         const owners = await transaction.get(
           this.firestore
@@ -811,9 +2623,34 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           transaction.update(meshRef, { owner_account_id: replacement, updated_at: input.updatedAt });
         }
       } else if (input.role === "owner") {
-        // Setting an owner role is an explicit ownership transfer. This
-        // keeps the denormalized creator field from granting stale private
-        // access after the previous owner is demoted or removed.
+        if (!existing.exists || existing.get("role") !== "owner") {
+          const ownedMeshes = await transaction.get(
+            this.firestore
+              .collection(this.collection("mesh_human_roles"))
+              .where("account_id", "==", input.accountId)
+              .where("role", "==", "owner")
+              .limit(11),
+          );
+          if (ownedMeshes.size >= 10) throw new Error("mesh_limit_reached");
+        }
+        // Setting an owner role is an explicit ownership transfer. Demote the
+        // previous canonical owner in the same transaction so a collaborator
+        // cannot accumulate owner roles while the mesh's display field moves.
+        const previousOwnerId = mesh.get("owner_account_id");
+        if (previousOwnerId && previousOwnerId !== input.accountId) {
+          const previousOwnerRef = this.doc(
+            "mesh_human_roles",
+            `${input.meshId}:${String(previousOwnerId)}`,
+          );
+          const previousOwner = await transaction.get(previousOwnerRef);
+          if (previousOwner.exists && previousOwner.get("role") === "owner") {
+            transaction.set(
+              previousOwnerRef,
+              { role: "steward", updated_at: input.updatedAt },
+              { merge: true },
+            );
+          }
+        }
         transaction.update(meshRef, {
           owner_account_id: input.accountId,
           updated_at: input.updatedAt,
@@ -827,16 +2664,33 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         created_at: existing.exists ? existing.get("created_at") : input.createdAt,
         updated_at: input.updatedAt,
       });
+      this.writeMutationArtifacts(transaction, input);
     });
   }
 
-  async deleteMeshHumanRole(meshId: string, accountId: string): Promise<void> {
+  async deleteMeshHumanRole(
+    meshId: string,
+    accountId: string,
+    actingAccountId?: string,
+    humanSessionHash?: string,
+    event?: RepositoryEventInput,
+    audit?: RepositoryAuditInput,
+  ): Promise<void> {
     await this.firestore.runTransaction(async (transaction) => {
       const roleRef = this.doc("mesh_human_roles", meshId + ":" + accountId);
       const meshRef = this.doc("meshes", meshId);
       const mesh = await transaction.get(meshRef);
       const existing = await transaction.get(roleRef);
       if (!existing.exists) return;
+      if (actingAccountId) {
+        await this.assertHumanRole(
+          transaction,
+          meshId,
+          actingAccountId,
+          humanSessionHash,
+          ["owner"],
+        );
+      }
       if (existing.get("role") === "owner") {
         const owners = await transaction.get(
           this.firestore
@@ -855,6 +2709,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         }
       }
       transaction.delete(roleRef);
+      this.writeMutationArtifacts(transaction, { event, audit });
     });
   }
 
@@ -866,7 +2721,9 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     admissionProvenance: "open" | "approval" | "invite";
     joinedAt: string | null;
     updatedAt: string;
-  }): Promise<void> {
+    actingAccountId?: string;
+    humanSessionHash?: string;
+  } & RepositoryMutationArtifacts): Promise<void> {
     const membershipRef = this.doc("mesh_agent_memberships", input.meshId + ":" + input.agentId);
     await this.firestore.runTransaction(async (transaction) => {
       const [existing, mesh, agent] = await Promise.all([
@@ -876,6 +2733,16 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       ]);
       if (!mesh.exists) throw new Error("mesh_not_found");
       if (!agent.exists) throw new Error("agent_not_found");
+      if (input.actingAccountId) {
+        await this.assertHumanRole(
+          transaction,
+          input.meshId,
+          input.actingAccountId,
+          input.humanSessionHash,
+          ["owner", "steward"],
+          input.updatedAt,
+        );
+      }
       if (input.status === "joined" && (!existing.exists || existing.get("status") !== "joined")) {
         const joined = await transaction.get(
           this.firestore
@@ -898,6 +2765,260 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           : input.joinedAt,
         updated_at: input.updatedAt,
       }, { merge: true });
+      this.writeMutationArtifacts(transaction, input);
+    });
+  }
+
+  async joinMeshForAgent(input: {
+    meshId: string;
+    agentId: string;
+    ownerAccountId: string;
+    sessionId: string;
+    authorityEpoch: number;
+    runtimeKind: RuntimeKind;
+    idempotencyKey: string;
+    requestId: string;
+    requestedAt: string;
+    attentionPolicy: Record<string, unknown>;
+  }): Promise<{ status: "joined" | "pending"; requestId?: string; duplicate: boolean }> {
+    const requestHash = createHash("sha256")
+      .update(JSON.stringify({ meshId: input.meshId }))
+      .digest("hex");
+    const idempotencyRef = this.doc(
+      "idempotency",
+      `${input.agentId}:mesh.join:${input.idempotencyKey}`,
+    );
+    const meshRef = this.doc("meshes", input.meshId);
+    const membershipRef = this.doc(
+      "mesh_agent_memberships",
+      `${input.meshId}:${input.agentId}`,
+    );
+    const requestRef = this.doc("mesh_join_requests", input.requestId);
+    const authorityRef = this.authorityRef(input.agentId);
+    const sessionRef = this.doc("runtime_sessions", input.sessionId);
+    const now = input.requestedAt;
+    if (!Number.isFinite(Date.parse(now))) throw new Error("invalid_request_timestamp");
+
+    return this.firestore.runTransaction(async (transaction) => {
+    const [existingIdempotency, authority, session, mesh, agent, membership, pendingRequests] =
+        await Promise.all([
+          transaction.get(idempotencyRef),
+          transaction.get(authorityRef),
+          transaction.get(sessionRef),
+          transaction.get(meshRef),
+          transaction.get(this.doc("agents", input.agentId)),
+          transaction.get(membershipRef),
+          transaction.get(
+            this.firestore
+              .collection(this.collection("mesh_join_requests"))
+              .where("mesh_id", "==", input.meshId)
+              .where("agent_id", "==", input.agentId)
+              .where("status", "==", "pending")
+              .limit(1),
+          ),
+        ]);
+
+      if (
+        !authority.exists ||
+        authority.get("authority_kind") !== "native" ||
+        authority.get("session_id") !== input.sessionId ||
+        Number(authority.get("epoch") ?? -1) !== input.authorityEpoch
+      ) {
+        throw new Error("session_superseded");
+      }
+      if (
+        !session.exists ||
+        session.get("status") !== "active" ||
+        session.get("agent_id") !== input.agentId ||
+        Number(session.get("authority_epoch") ?? -1) !== input.authorityEpoch ||
+        Date.parse(String(session.get("expires_at") ?? "")) <= Date.parse(now) ||
+        Date.parse(String(session.get("last_seen_at") ?? "")) < Date.parse(now) - 90 * 1_000
+      ) {
+        throw new Error("session_invalid");
+      }
+      if (!mesh.exists) throw new Error("mesh_not_found");
+      if (mesh.get("lifecycle") !== "active") throw new Error("mesh_unavailable");
+      if (!agent.exists) throw new Error("agent_not_found");
+      if (String(agent.get("owner_account_id")) !== input.ownerAccountId) {
+        throw new Error("agent_access_denied");
+      }
+
+      // Authentication and current authority are deliberately checked before
+      // replaying an idempotency record. A token captured before a session
+      // supersession must not regain even a previously accepted response.
+      if (existingIdempotency.exists) {
+        const expiresAt = String(existingIdempotency.get("expires_at") ?? "");
+        if (expiresAt && Date.parse(expiresAt) <= Date.parse(now)) {
+          throw new Error("idempotency_expired");
+        }
+        if (String(existingIdempotency.get("request_hash") ?? "") !== requestHash) {
+          throw new Error("idempotency_conflict");
+        }
+        const body = existingIdempotency.get("response_body");
+        const status = String(existingIdempotency.get("response_status")) === "pending"
+          ? "pending"
+          : "joined";
+        return {
+          status,
+          ...(status === "pending"
+            ? { requestId: typeof body === "object" && body && "requestId" in body
+              ? String((body as Record<string, unknown>).requestId)
+              : input.requestId }
+            : {}),
+          duplicate: true,
+        };
+      }
+
+      const currentMembershipStatus = membership.exists
+        ? String(membership.get("status"))
+        : null;
+      if (currentMembershipStatus === "joined") {
+        const body = { meshId: input.meshId, status: "joined" as const };
+        transaction.create(idempotencyRef, {
+          contract_version: MESHR_CONTRACT_MAJOR,
+          request_hash: requestHash,
+          response_status: "joined",
+          response_body: body,
+          created_at: now,
+          expires_at: new Date(Date.parse(now) + IDEMPOTENCY_RETENTION_SECONDS * 1_000).toISOString(),
+          expires_at_ttl: ttlTimestamp(
+            new Date(Date.parse(now) + IDEMPOTENCY_RETENTION_SECONDS * 1_000).toISOString(),
+          ),
+        });
+        return { status: "joined", duplicate: false };
+      }
+
+      const admission = String(mesh.get("admission") ?? "invite_only");
+      if (admission === "invite_only") throw new Error("invite_required");
+
+      if (admission === "approval") {
+        const pendingRequest = pendingRequests.docs[0];
+        const requestIsPending = Boolean(pendingRequest);
+        const requestId = pendingRequest
+          ? String(pendingRequest.get("request_id") ?? pendingRequest.id)
+          : input.requestId;
+        const body = { meshId: input.meshId, requestId, status: "pending" as const };
+        if (!requestIsPending) {
+          transaction.set(requestRef, {
+            contract_version: MESHR_CONTRACT_MAJOR,
+            request_id: requestId,
+            mesh_id: input.meshId,
+            agent_id: input.agentId,
+            requested_by_account_id: input.ownerAccountId,
+            status: "pending",
+            created_at: now,
+            resolved_at: null,
+          }, { merge: true });
+        }
+        transaction.set(membershipRef, {
+          contract_version: MESHR_CONTRACT_MAJOR,
+          mesh_id: input.meshId,
+          agent_id: input.agentId,
+          status: "pending",
+          attention_policy: input.attentionPolicy,
+          admission_provenance: "approval",
+          joined_at: null,
+          updated_at: now,
+        }, { merge: true });
+        const eventId = `evt_${createHash("sha256")
+          .update(`mesh.join_requested:${input.meshId}:${input.agentId}:${requestId}`)
+          .digest("hex")
+          .slice(0, 40)}`;
+        const envelope = {
+          event_id: eventId,
+          schema_version: 1 as const,
+          mesh_id: input.meshId,
+          agent_id: input.agentId,
+          session_id: input.sessionId,
+          runtime_kind: input.runtimeKind,
+          type: "mesh.join_requested",
+          occurred_at: now,
+          payload: { requestId, meshId: input.meshId, agentId: input.agentId },
+        };
+        if (!requestIsPending) {
+          transaction.create(this.doc("event_outbox", eventId), {
+            contract_version: MESHR_CONTRACT_MAJOR,
+            envelope,
+            mesh_id: input.meshId,
+            event_id: eventId,
+            status: "pending",
+            attempts: 0,
+            created_at: now,
+          });
+        this.queueOutboxReady(transaction, eventId, input.meshId, now);
+        }
+        transaction.create(idempotencyRef, {
+          contract_version: MESHR_CONTRACT_MAJOR,
+          request_hash: requestHash,
+          response_status: "pending",
+          response_body: body,
+          created_at: now,
+          expires_at: new Date(Date.parse(now) + IDEMPOTENCY_RETENTION_SECONDS * 1_000).toISOString(),
+          expires_at_ttl: ttlTimestamp(
+            new Date(Date.parse(now) + IDEMPOTENCY_RETENTION_SECONDS * 1_000).toISOString(),
+          ),
+        });
+        return { status: "pending", requestId, duplicate: false };
+      }
+
+      const joined = await transaction.get(
+        this.firestore
+          .collection(this.collection("mesh_agent_memberships"))
+          .where("agent_id", "==", input.agentId)
+          .where("status", "==", "joined")
+          .limit(101),
+      );
+      if (joined.size >= 100) throw new Error("agent_mesh_limit_reached");
+      transaction.set(membershipRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        mesh_id: input.meshId,
+        agent_id: input.agentId,
+        status: "joined",
+        attention_policy: input.attentionPolicy,
+        admission_provenance: "open",
+        joined_at: membership.exists && membership.get("joined_at") != null
+          ? membership.get("joined_at")
+          : now,
+        updated_at: now,
+      }, { merge: true });
+      const body = { meshId: input.meshId, status: "joined" as const };
+      const eventId = `evt_${createHash("sha256")
+        .update(`mesh.agent.joined:${input.meshId}:${input.agentId}:${input.idempotencyKey}`)
+        .digest("hex")
+        .slice(0, 40)}`;
+      const envelope = {
+        event_id: eventId,
+        schema_version: 1 as const,
+        mesh_id: input.meshId,
+        agent_id: input.agentId,
+        session_id: input.sessionId,
+        runtime_kind: input.runtimeKind,
+        type: "mesh.agent.joined",
+        occurred_at: now,
+        payload: { meshId: input.meshId, agentId: input.agentId },
+      };
+      transaction.create(this.doc("event_outbox", eventId), {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        envelope,
+        mesh_id: input.meshId,
+        event_id: eventId,
+        status: "pending",
+        attempts: 0,
+        created_at: now,
+      });
+      this.queueOutboxReady(transaction, eventId, input.meshId, now);
+      transaction.create(idempotencyRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        request_hash: requestHash,
+        response_status: "joined",
+        response_body: body,
+        created_at: now,
+        expires_at: new Date(Date.parse(now) + IDEMPOTENCY_RETENTION_SECONDS * 1_000).toISOString(),
+        expires_at_ttl: ttlTimestamp(
+          new Date(Date.parse(now) + IDEMPOTENCY_RETENTION_SECONDS * 1_000).toISOString(),
+        ),
+      });
+      return { status: "joined", duplicate: false };
     });
   }
 
@@ -909,16 +3030,43 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     status: "pending" | "approved" | "denied" | "cancelled";
     createdAt: string;
     resolvedAt: string | null;
-  }): Promise<void> {
-    await this.doc("mesh_join_requests", input.requestId).set({
-      contract_version: MESHR_CONTRACT_MAJOR,
-      request_id: input.requestId,
-      mesh_id: input.meshId,
-      agent_id: input.agentId,
-      requested_by_account_id: input.requestedByAccountId,
-      status: input.status,
-      created_at: input.createdAt,
-      resolved_at: input.resolvedAt,
+    actingAccountId?: string;
+    humanSessionHash?: string;
+  } & RepositoryMutationArtifacts): Promise<void> {
+    const requestRef = this.doc("mesh_join_requests", input.requestId);
+    await this.firestore.runTransaction(async (transaction) => {
+      const [mesh, agent, existing] = await Promise.all([
+        transaction.get(this.doc("meshes", input.meshId)),
+        transaction.get(this.doc("agents", input.agentId)),
+        transaction.get(requestRef),
+      ]);
+      if (!mesh.exists) throw new Error("mesh_not_found");
+      if (!agent.exists || agent.get("owner_account_id") !== input.requestedByAccountId) {
+        throw new Error("agent_access_denied");
+      }
+      if (input.actingAccountId) {
+        await this.assertHumanRole(
+          transaction,
+          input.meshId,
+          input.actingAccountId,
+          input.humanSessionHash,
+          ["owner", "steward"],
+        );
+      } else if (input.status !== "pending" && input.requestedByAccountId !== input.actingAccountId) {
+        // Non-human callers may only create/retain their own pending request.
+        throw new Error("mesh_governance_denied");
+      }
+      transaction.set(requestRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        request_id: input.requestId,
+        mesh_id: input.meshId,
+        agent_id: input.agentId,
+        requested_by_account_id: input.requestedByAccountId,
+        status: input.status,
+        created_at: existing.exists ? existing.get("created_at") : input.createdAt,
+        resolved_at: input.resolvedAt,
+      }, { merge: true });
+      this.writeMutationArtifacts(transaction, input);
     });
   }
 
@@ -955,7 +3103,9 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     meshId: string;
     decision: "approved" | "denied";
     resolvedAt: string;
-  }): Promise<{ agentId: string; status: "approved" | "denied" }> {
+    actingAccountId?: string;
+    humanSessionHash?: string;
+  } & RepositoryMutationArtifacts): Promise<{ agentId: string; status: "approved" | "denied" }> {
     const requestRef = this.doc("mesh_join_requests", input.requestId);
     return this.firestore.runTransaction(async (transaction) => {
       const request = await transaction.get(requestRef);
@@ -965,6 +3115,18 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         request.get("status") !== "pending"
       ) {
         throw new Error("join_request_not_pending");
+      }
+      if (input.actingAccountId) {
+        await this.assertHumanRole(
+          transaction,
+          input.meshId,
+          input.actingAccountId,
+          input.humanSessionHash,
+          ["owner", "steward"],
+          input.resolvedAt,
+        );
+      } else {
+        throw new Error("mesh_governance_denied");
       }
       const agentId = String(request.get("agent_id"));
       if (input.decision === "approved") {
@@ -1001,6 +3163,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         status: input.decision,
         resolved_at: input.resolvedAt,
       });
+      this.writeMutationArtifacts(transaction, input);
       return { agentId, status: input.decision };
     });
   }
@@ -1019,6 +3182,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     humanSessionHash?: string;
     /** Idempotency-scoped event ID used to atomically publish the social write. */
     eventId?: string;
+    idempotencyKey?: string;
   }): Promise<void> {
     const ref = this.doc("follows", input.topicId + ":" + input.agentId);
     if (!input.sessionId) {
@@ -1036,6 +3200,15 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       return;
     }
     const sessionId = input.sessionId;
+    const idempotencyKey = input.idempotencyKey;
+    const idempotencyRef = idempotencyKey
+      ? this.doc("idempotency", `${input.agentId}:topic.follow:${idempotencyKey}`)
+      : undefined;
+    const requestHash = idempotencyKey
+      ? createHash("sha256")
+          .update(JSON.stringify({ topicId: input.topicId, following: input.following }))
+          .digest("hex")
+      : undefined;
     await this.firestore.runTransaction(async (transaction) => {
       const topicRef = this.doc("topics", input.topicId);
       const agentRef = this.doc("agents", input.agentId);
@@ -1043,12 +3216,17 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         ? this.doc("mesh_agent_memberships", input.meshId + ":" + input.agentId)
         : undefined;
       const authorityRef = this.authorityRef(input.agentId);
+      const fenceRef = input.humanSessionHash
+        ? this.webMcpAuthorityRef(input.humanSessionHash)
+        : undefined;
       const eventRef = input.eventId ? this.doc("event_outbox", input.eventId) : undefined;
-      const [topic, agent, membership, authority] = await Promise.all([
+      const [topic, agent, membership, authority, fence, existingIdempotency] = await Promise.all([
         transaction.get(topicRef),
         transaction.get(agentRef),
         membershipRef ? transaction.get(membershipRef) : Promise.resolve(undefined),
         transaction.get(authorityRef),
+        fenceRef ? transaction.get(fenceRef) : Promise.resolve(undefined),
+        idempotencyRef ? transaction.get(idempotencyRef) : Promise.resolve(undefined),
       ]);
       const event = eventRef ? await transaction.get(eventRef) : undefined;
       if (!topic.exists || (input.meshId && topic.get("mesh_id") !== input.meshId)) {
@@ -1057,6 +3235,17 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       if (!agent.exists || agent.get("owner_account_id") == null) throw new Error("agent_not_found");
       if (!membership || !membership.exists || membership.get("status") !== "joined") {
         throw new Error("mesh_membership_required");
+      }
+      // Following is a browse capability. Re-read the durable attention
+      // policy inside the same transaction as the follow write so a profile
+      // reload that tightens browsing to mention-only cannot be raced by a
+      // stale host replica after its preflight check.
+      const attention = agent.get("attention_policy");
+      const browse = attention && typeof attention === "object" && !Array.isArray(attention)
+        ? String((attention as Record<string, unknown>).browse ?? "")
+        : "";
+      if (browse !== "public" && browse !== "joined") {
+        throw new Error("attention_policy_denied");
       }
       const authorityKind = input.authorityKind ?? "native";
       if (
@@ -1082,6 +3271,9 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         const humanSession = input.humanSessionHash
           ? await transaction.get(this.doc("human_sessions", input.humanSessionHash))
           : undefined;
+        const fence = input.humanSessionHash
+          ? await transaction.get(this.webMcpAuthorityRef(input.humanSessionHash))
+          : undefined;
         if (
           !grant ||
           !grant.exists ||
@@ -1098,6 +3290,21 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           Date.parse(String(humanSession.get("absolute_expires_at"))) <= Date.parse(input.updatedAt) ||
           Date.parse(String(humanSession.get("last_seen_at"))) < Date.parse(input.updatedAt) - 12 * 60 * 60 * 1_000
         ) throw new Error("session_invalid");
+        if (
+          !fence ||
+          !fence.exists ||
+          fence.get("agent_id") !== input.agentId ||
+          fence.get("session_id") !== sessionId ||
+          fence.get("revoked_at") != null ||
+          Number(fence.get("epoch") ?? -1) !== Number(authority.get("epoch") ?? -2) ||
+          (input.grantId !== undefined && fence.get("grant_id") !== input.grantId)
+        ) throw new Error("session_invalid");
+      }
+      if (existingIdempotency?.exists) {
+        if (existingIdempotency.get("request_hash") !== requestHash) {
+          throw new Error("idempotency_conflict");
+        }
+        return;
       }
       if (input.following) {
         transaction.set(ref, {
@@ -1128,59 +3335,171 @@ export class FirestoreMeshrRepository implements MeshrRepository {
               following: input.following,
             },
           },
+          mesh_id: input.meshId ?? String(topic.get("mesh_id")),
+          event_id: input.eventId,
           status: "pending",
           attempts: 0,
           created_at: occurredAt,
+        });
+        this.queueOutboxReady(
+          transaction,
+          eventRef.id,
+          input.meshId ?? String(topic.get("mesh_id")),
+          occurredAt,
+        );
+      }
+      if (idempotencyRef && requestHash) {
+        const expiresAt = new Date(
+          Date.parse(input.updatedAt) + IDEMPOTENCY_RETENTION_SECONDS * 1_000,
+        ).toISOString();
+        transaction.create(idempotencyRef, {
+          contract_version: MESHR_CONTRACT_MAJOR,
+          request_hash: requestHash,
+          response_status: 200,
+          response_body: { topicId: input.topicId, following: input.following },
+          created_at: input.updatedAt,
+          expires_at: expiresAt,
+          expires_at_ttl: ttlTimestamp(expiresAt),
         });
       }
     });
   }
 
-  async revokeHumanSession(tokenHash: string, revokedAt: string): Promise<void> {
-    await this.doc("human_sessions", tokenHash).set(
-      { revoked_at: revokedAt, expires_at: revokedAt },
+  async listHumanActivityPreferences(accountId: string): Promise<RepositoryHumanActivityPreference[]> {
+    const snapshot = await this.firestore
+      .collection(this.collection("human_activity_preferences"))
+      .where("account_id", "==", accountId)
+      .limit(500)
+      .get();
+    return snapshot.docs
+      .map((document) => ({
+        accountId: String(document.get("account_id")),
+        kind: String(document.get("kind")) as RepositoryHumanActivityPreference["kind"],
+        resourceId: String(document.get("resource_id")),
+        watching: document.get("watching") === true,
+        muted: document.get("muted") === true,
+        updatedAt: String(document.get("updated_at") ?? this.now()),
+      }))
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  async upsertHumanActivityPreference(input: RepositoryHumanActivityPreference): Promise<void> {
+    const id = createHash("sha256")
+      .update(`${input.accountId}\u0000${input.kind}\u0000${input.resourceId}`)
+      .digest("hex");
+    await this.doc("human_activity_preferences", id).set(
+      {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        account_id: input.accountId,
+        kind: input.kind,
+        resource_id: input.resourceId,
+        watching: input.watching,
+        muted: input.muted,
+        updated_at: input.updatedAt,
+      },
       { merge: true },
     );
   }
 
+  async revokeHumanSession(tokenHash: string, revokedAt: string): Promise<void> {
+    await this.firestore.runTransaction(async (transaction) => {
+      transaction.set(
+        this.doc("human_sessions", tokenHash),
+        { revoked_at: revokedAt, expires_at: revokedAt },
+        { merge: true },
+      );
+      this.touchLiveAccessEpoch(transaction, revokedAt, "human_session_revoked");
+    });
+  }
+
   async revokeWebMcpGrants(humanSessionHash: string, revokedAt: string): Promise<void> {
-    const grants = await this.firestore
-      .collection(this.collection("webmcp_grants"))
-      .where("human_session_hash", "==", humanSessionHash)
-      .where("revoked_at", "==", null)
-      .get();
-    if (grants.empty) return;
-    const batch = this.firestore.batch();
-    for (const grant of grants.docs) batch.update(grant.ref, { revoked_at: revokedAt });
-    await batch.commit();
+    // The fence is read and written in the same transaction as grant
+    // revocation. A concurrent transfer therefore retries against the newer
+    // epoch instead of creating a grant after this query has completed.
+    await this.firestore.runTransaction(async (transaction) => {
+      const fenceRef = this.webMcpAuthorityRef(humanSessionHash);
+      const fence = await transaction.get(fenceRef);
+      const grants = await transaction.get(
+        this.firestore
+          .collection(this.collection("webmcp_grants"))
+          .where("human_session_hash", "==", humanSessionHash)
+          .where("revoked_at", "==", null),
+      );
+      for (const grant of grants.docs) transaction.update(grant.ref, { revoked_at: revokedAt });
+      const epoch = Number(fence.exists ? fence.get("epoch") ?? 0 : 0) + 1;
+      transaction.set(fenceRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        human_session_hash: humanSessionHash,
+        epoch,
+        grant_id: null,
+        agent_id: null,
+        session_id: null,
+        updated_at: revokedAt,
+        revoked_at: revokedAt,
+      }, { merge: true });
+      this.touchLiveAccessEpoch(transaction, revokedAt, "webmcp_grants_revoked");
+    });
   }
 
   async findAgentById(agentId: string): Promise<RepositoryAgentInput | null> {
     const snapshot = await this.doc("agents", agentId).get();
     if (!snapshot.exists) return null;
-    const interests = snapshot.get("interests");
-    const attention = snapshot.get("attention_policy");
-    return {
-      agentId,
-      ownerAccountId: String(snapshot.get("owner_account_id")),
-      name: String(snapshot.get("name")),
-      handle: String(snapshot.get("handle")),
-      tagline: String(snapshot.get("tagline") ?? ""),
-      interests: Array.isArray(interests) ? interests.map(String) : [],
-      personality: String(snapshot.get("personality") ?? ""),
-      attention: (attention && typeof attention === "object"
-        ? attention
-        : {}) as Record<string, unknown>,
-      runtime: String(snapshot.get("runtime") ?? "other") as RuntimeKind,
-      runtimeLabel: String(snapshot.get("runtime_label") ?? ""),
-      runtimeSubject: String(snapshot.get("runtime_subject") ?? ""),
-      publicKeyPem: String(snapshot.get("public_key_pem") ?? ""),
-      definitionDigest: snapshot.get("definition_digest") == null
-        ? null
-        : String(snapshot.get("definition_digest")),
-      createdAt: String(snapshot.get("created_at")),
-      updatedAt: String(snapshot.get("updated_at")),
-    };
+    return this.agentFromSnapshot(snapshot);
+  }
+
+  async listAgentsForAccount(accountId: string): Promise<RepositoryAgentInput[]> {
+    const snapshot = await this.firestore
+      .collection(this.collection("agents"))
+      .where("owner_account_id", "==", accountId)
+      .limit(25)
+      .get();
+    return snapshot.docs
+      .map((document) => this.agentFromSnapshot(document))
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.agentId.localeCompare(right.agentId));
+  }
+
+  async listRuntimeSessionsForAgents(
+    agentIds: string[],
+    now: string,
+    offlineAfter: string,
+  ): Promise<RepositoryRuntimeSession[]> {
+    const unique = [...new Set(agentIds)].filter(Boolean);
+    const sessions: RepositoryRuntimeSession[] = [];
+    for (let index = 0; index < unique.length; index += 30) {
+      const group = unique.slice(index, index + 30);
+      if (!group.length) continue;
+      const snapshot = await this.firestore
+        .collection(this.collection("runtime_sessions"))
+        .where("agent_id", "in", group)
+        .where("status", "==", "active")
+        .limit(group.length * 2)
+        .get();
+      for (const document of snapshot.docs) {
+        const session = {
+          tokenHash: String(document.get("token_hash") ?? ""),
+          agentId: String(document.get("agent_id") ?? ""),
+          bindingId: String(document.get("binding_id") ?? document.get("pairing_id") ?? ""),
+          sessionId: String(document.get("session_id") ?? document.id),
+          runtimeKind: String(document.get("runtime_kind") ?? "other") as RuntimeKind,
+          authorityEpoch: Number(document.get("authority_epoch") ?? 0),
+          createdAt: String(document.get("created_at") ?? now),
+          expiresAt: String(document.get("expires_at") ?? now),
+          lastSeenAt: String(document.get("last_seen_at") ?? now),
+          status: String(document.get("status") ?? "active") as RepositoryRuntimeSession["status"],
+          supersedingSessionId: document.get("superseding_session_id") == null
+            ? null
+            : String(document.get("superseding_session_id")),
+        } satisfies RepositoryRuntimeSession;
+        if (
+          Date.parse(session.expiresAt) > Date.parse(now) &&
+          Date.parse(session.lastSeenAt) >= Date.parse(offlineAfter)
+        ) {
+          sessions.push(session);
+        }
+      }
+    }
+    return sessions.sort((left, right) =>
+      left.lastSeenAt.localeCompare(right.lastSeenAt) || left.sessionId.localeCompare(right.sessionId));
   }
 
   async findMeshById(meshId: string): Promise<RepositoryMeshInput | null> {
@@ -1264,6 +3583,141 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         joined: joinedSet.has(snapshot.id),
       }))
       .sort((left, right) => left.mesh.name.localeCompare(right.mesh.name) || left.mesh.meshId.localeCompare(right.mesh.meshId));
+  }
+
+  async listAgentEvents(input: {
+    agentId: string;
+    browse: "public" | "joined" | "mentions";
+    after?: string;
+    limit: number;
+  }): Promise<RepositoryAgentEventsPage> {
+    const cursor = decodeAgentEventCursor(input.after);
+    if (input.after !== undefined && !cursor) throw new Error("invalid_event_cursor");
+    if (input.browse === "mentions") return { events: [], nextAfter: null };
+    const limit = Math.max(1, Math.min(100, Math.trunc(input.limit)));
+    const [publicMeshes, memberships] = await Promise.all([
+      this.firestore
+        .collection(this.collection("meshes"))
+        .where("visibility", "==", "public")
+        .where("lifecycle", "==", "active")
+        .limit(2_000)
+        .get(),
+      this.firestore
+        .collection(this.collection("mesh_agent_memberships"))
+        .where("agent_id", "==", input.agentId)
+        .where("status", "==", "joined")
+        .limit(100)
+        .get(),
+    ]);
+    const publicMeshIds = new Set(
+      publicMeshes.docs.map((document) => String(document.get("mesh_id") ?? document.id)),
+    );
+    const joinedMeshIds = new Set(
+      memberships.docs.map((document) => String(document.get("mesh_id"))),
+    );
+    const visibleMeshIds = input.browse === "joined"
+      ? joinedMeshIds
+      : new Set([...publicMeshIds, ...joinedMeshIds]);
+    const scanLimit = Math.min(2_000, Math.max(limit * 8, limit));
+    const eventCollection = this.firestore.collection(this.collection("event_outbox"));
+    const visibleMeshChunks: string[][] = [];
+    const visibleIds = [...visibleMeshIds];
+    for (let index = 0; index < visibleIds.length; index += 30) {
+      visibleMeshChunks.push(visibleIds.slice(index, index + 30));
+    }
+    // Query only meshes this agent can see. A global event_outbox scan would
+    // make every observer pay for unrelated private traffic as the commons
+    // grows. Firestore's `in` operator is capped at 30 values, so merge the
+    // bounded chunks with the system/null stream below.
+    const queries = [
+      eventCollection.where("mesh_id", "==", null),
+      ...visibleMeshChunks.map((chunk) => eventCollection.where("mesh_id", "in", chunk)),
+    ].map((baseQuery) => {
+      let query = baseQuery.orderBy("created_at", "asc").orderBy(FieldPath.documentId(), "asc");
+      if (cursor) query = query.startAfter(cursor.createdAt, cursor.eventId);
+      return query.limit(scanLimit).get();
+    });
+    const snapshots = await Promise.all(queries);
+    const documents = [...new Map(
+      snapshots
+        .flatMap((snapshot) => snapshot.docs)
+        .map((document) => [document.id, document]),
+    ).values()].sort((left, right) => {
+      const createdCompare = String(left.get("created_at") ?? "").localeCompare(String(right.get("created_at") ?? ""));
+      return createdCompare || left.id.localeCompare(right.id);
+    }).slice(0, scanLimit);
+    const events: RepositoryAgentEvent[] = [];
+    let lastScanned: AgentEventCursor | undefined;
+    for (const document of documents) {
+      const raw = document.data() as Record<string, unknown>;
+      const envelope = raw.envelope && typeof raw.envelope === "object" && !Array.isArray(raw.envelope)
+        ? raw.envelope as Record<string, unknown>
+        : raw;
+      const eventId = String(raw.event_id ?? envelope.event_id ?? document.id);
+      const occurredAt = String(envelope.occurred_at ?? raw.created_at ?? "");
+      const createdAt = String(raw.created_at ?? occurredAt);
+      lastScanned = { createdAt, eventId: document.id };
+      const meshId = envelope.mesh_id == null ? null : String(envelope.mesh_id);
+      const eventAgentId = envelope.agent_id == null ? null : String(envelope.agent_id);
+      const visible = meshId === null
+        ? eventAgentId === null || eventAgentId === input.agentId
+        : visibleMeshIds.has(meshId);
+      if (!visible) continue;
+      events.push({
+        eventId,
+        type: String(envelope.type ?? raw.type ?? "unknown"),
+        meshId,
+        topicId: envelope.topic_id == null ? null : String(envelope.topic_id),
+        agentId: eventAgentId,
+        sessionId: envelope.session_id == null ? null : String(envelope.session_id),
+        runtimeKind: envelope.runtime_kind == null ? null : String(envelope.runtime_kind) as RuntimeKind,
+        payload: envelope.payload ?? {},
+        occurredAt,
+      });
+      if (events.length >= limit) break;
+    }
+    // Visibility and membership can change while the bounded outbox queries
+    // above are in flight. Re-read those authority records at the terminal
+    // boundary and filter the page again; otherwise a private-mesh removal or
+    // public-to-private transition could leak one stale event from this
+    // request. The cursor still advances over the scanned high-water mark so
+    // a later poll does not replay events that were intentionally hidden.
+    const [finalPublicMeshes, finalMemberships] = await Promise.all([
+      this.firestore
+        .collection(this.collection("meshes"))
+        .where("visibility", "==", "public")
+        .where("lifecycle", "==", "active")
+        .limit(2_000)
+        .get(),
+      this.firestore
+        .collection(this.collection("mesh_agent_memberships"))
+        .where("agent_id", "==", input.agentId)
+        .where("status", "==", "joined")
+        .limit(100)
+        .get(),
+    ]);
+    const finalPublicMeshIds = new Set(
+      finalPublicMeshes.docs.map((document) => String(document.get("mesh_id") ?? document.id)),
+    );
+    const finalJoinedMeshIds = new Set(
+      finalMemberships.docs.map((document) => String(document.get("mesh_id"))),
+    );
+    const finalVisibleMeshIds = input.browse === "joined"
+      ? finalJoinedMeshIds
+      : new Set([...finalPublicMeshIds, ...finalJoinedMeshIds]);
+    const visibleEvents = events.filter((event) =>
+      event.meshId === null
+        ? event.agentId === null || event.agentId === input.agentId
+        : finalVisibleMeshIds.has(event.meshId),
+    );
+    return {
+      events: visibleEvents,
+      // Always return a high-water mark. A short page or an empty page may
+      // still have scanned private/unjoined events; dropping the cursor would
+      // make the next poll replay the stream from the beginning. When nothing
+      // new was scanned, preserve the caller's cursor verbatim.
+      nextAfter: lastScanned ? encodeAgentEventCursor(lastScanned) : cursor ? encodeAgentEventCursor(cursor) : null,
+    };
   }
 
   async findRuntimeSessionByTokenHash(
@@ -1357,15 +3811,25 @@ export class FirestoreMeshrRepository implements MeshrRepository {
   ): Promise<RepositoryWebMcpGrant | null> {
     const snapshot = await this.doc("webmcp_grants", tokenHash).get();
     if (!snapshot.exists || snapshot.get("human_session_hash") !== humanSessionHash) return null;
+    const revokedAt = snapshot.get("revoked_at");
+    const expiresAt = String(snapshot.get("expires_at") ?? "");
+    if (revokedAt != null || !Number.isFinite(Date.parse(expiresAt)) || Date.parse(expiresAt) <= Date.parse(this.now())) {
+      return null;
+    }
     const agentId = String(snapshot.get("agent_id"));
     const sessionId = String(snapshot.get("session_id"));
     const authorityEpoch = Number(snapshot.get("authority_epoch") ?? 0);
     const authority = await this.authorityRef(agentId).get();
+    const fence = await this.webMcpAuthorityRef(humanSessionHash).get();
     if (
       !authority.exists ||
       authority.get("authority_kind") !== "page" ||
       authority.get("session_id") !== sessionId ||
-      Number(authority.get("epoch") ?? 0) !== authorityEpoch
+      Number(authority.get("epoch") ?? 0) !== authorityEpoch ||
+      !fence.exists ||
+      fence.get("grant_id") !== tokenHash ||
+      Number(fence.get("epoch") ?? 0) !== authorityEpoch ||
+      fence.get("revoked_at") != null
     ) {
       return null;
     }
@@ -1378,19 +3842,24 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       createdAt: String(snapshot.get("created_at")),
       expiresAt: String(snapshot.get("expires_at")),
       lastUsedAt: String(snapshot.get("last_used_at")),
-      revokedAt: snapshot.get("revoked_at") == null ? null : String(snapshot.get("revoked_at")),
+      revokedAt: null,
     };
   }
 
   async loadProjection(input: {
     accountId?: string;
     agentId?: string;
+    forcePublicPosts?: boolean;
+    includePosts?: boolean;
+    includeActivity?: boolean;
   }): Promise<RepositoryProjection> {
     // Never turn an authenticated request into a full database scan. The
     // browser projection is intentionally bounded to the caller's visible
     // meshes and a recent post window; the authoritative reads for a single
     // post/session remain transaction-scoped elsewhere.
     const now = this.now();
+    const includePosts = input.includePosts !== false;
+    const includeActivity = input.includeActivity !== false;
     const chunks = <T>(values: T[], size = 30): T[][] => {
       const result: T[][] = [];
       for (let index = 0; index < values.length; index += size) {
@@ -1420,17 +3889,18 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       return result;
     };
 
-    const publicMeshesSnapshot = await this.firestore
-      .collection(this.collection("meshes"))
-      .where("visibility", "==", "public")
-      .where("lifecycle", "==", "active")
-      .limit(2_000)
-      .get();
-    let meshDocs: DocumentSnapshot[] = publicMeshesSnapshot.docs;
+    const publicMeshSnapshot = await this.publicMeshes();
+    const publicMeshDocs = publicMeshSnapshot.docs;
+    let meshDocs: DocumentSnapshot[] = publicMeshDocs;
     let roleDocs: DocumentSnapshot[] = [];
     let membershipDocs: DocumentSnapshot[] = [];
     let agentDocs: DocumentSnapshot[] = [];
     let followDocs: DocumentSnapshot[] = [];
+    // Keep the caller's own role set separate from the all-member role rows
+    // loaded later for governance views. Using the latter for authorization
+    // would let any member's role make a private mesh visible to the caller.
+    let callerRoleMeshIds = new Set<string>();
+    let terminalAgentJoinedMeshIds: Set<string> | undefined;
     if (input.accountId) {
       const [accountRoles, ownedAgents] = await Promise.all([
         this.firestore
@@ -1445,18 +3915,34 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           .get(),
       ]);
       roleDocs = accountRoles.docs;
+      callerRoleMeshIds = new Set(
+        accountRoles.docs.map((document) => String(document.get("mesh_id"))),
+      );
       const visibleMeshIds = [
         ...roleDocs.map((document) => String(document.get("mesh_id"))),
-        ...publicMeshesSnapshot.docs.map((document) => String(document.get("mesh_id") ?? document.id)),
+        ...publicMeshDocs.map((document) => String(document.get("mesh_id") ?? document.id)),
       ];
       meshDocs = await getByIds("meshes", visibleMeshIds);
       agentDocs = ownedAgents.docs;
-      membershipDocs = await queryByIds(
-        "mesh_agent_memberships",
-        "mesh_id",
-        visibleMeshIds,
-        (query) => query.where("status", "in", ["joined", "pending"]),
-      );
+      // Avoid combining a 30-value `in` clause with a two-value status `in`
+      // clause: Firestore expands that into 60 disjunctions and rejects the
+      // query once a human can see more than fifteen meshes. Two equality
+      // queries keep each chunk within the 30-disjunction limit.
+      const [joinedMemberships, pendingMemberships] = await Promise.all([
+        queryByIds(
+          "mesh_agent_memberships",
+          "mesh_id",
+          visibleMeshIds,
+          (query) => query.where("status", "==", "joined"),
+        ),
+        queryByIds(
+          "mesh_agent_memberships",
+          "mesh_id",
+          visibleMeshIds,
+          (query) => query.where("status", "==", "pending"),
+        ),
+      ]);
+      membershipDocs = [...joinedMemberships, ...pendingMemberships];
       followDocs = await queryByIds(
         "follows",
         "agent_id",
@@ -1479,7 +3965,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       membershipDocs = memberships.docs;
       const visibleMeshIds = [
         ...membershipDocs.map((document) => String(document.get("mesh_id"))),
-        ...publicMeshesSnapshot.docs.map((document) => String(document.get("mesh_id") ?? document.id)),
+        ...publicMeshDocs.map((document) => String(document.get("mesh_id") ?? document.id)),
       ];
       meshDocs = await getByIds("meshes", visibleMeshIds);
       roleDocs = await queryByIds("mesh_human_roles", "mesh_id", visibleMeshIds);
@@ -1487,33 +3973,147 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     }
     const meshIds = [...new Set(meshDocs.map((document) => String(document.get("mesh_id") ?? document.id)))];
     const topicDocs = await queryByIds("topics", "mesh_id", meshIds);
-    // Query posts by the already-authorized mesh IDs. A global posts query can
-    // silently evict a visible mesh from a busy public commons when the first
-    // 5,000 documents belong to other meshes, and it also turns every browser
-    // refresh into an unbounded collection scan.
-    const postDocs = (
-      await queryByIds(
-        "posts",
-        "mesh_id",
-        meshIds,
-        (query) => query
-          .where("moderation_state", "==", "published")
-          .where("expires_at", ">", now)
-          .orderBy("expires_at", "asc")
-          .orderBy("created_at", "desc")
-          .limit(5_000),
-      )
-    )
-      .sort((left, right) =>
-        String(right.get("created_at") ?? "").localeCompare(String(left.get("created_at") ?? "")),
-      )
-      .slice(0, 5_000);
+    const activity = includeActivity ? await this.loadActivityProjection(meshIds, now) : undefined;
+    // Query posts by the already-authorized mesh IDs only when the caller needs
+    // post bodies. Directory and topology reads use the aggregate projection
+    // below and must never pay for a 5,000-row public body scan.
+    const publicMeshIdSet = new Set(
+      publicMeshDocs.map((document) => String(document.get("mesh_id") ?? document.id)),
+    );
+    const publicMeshIds = meshIds.filter((meshId) => publicMeshIdSet.has(meshId));
+    const privateMeshIds = meshIds.filter((meshId) => !publicMeshIdSet.has(meshId));
+    // Public discovery is intentionally capped as one shared feed, but an
+    // authorized private/unlisted mesh must not lose its entire conversation
+    // merely because the public commons is busy. Query those meshes separately
+    // with a per-mesh cap, then combine the bounded slices for the local read
+    // projection. Aggregate topology remains the source for long-lived counts.
+    const PRIVATE_POSTS_PER_MESH = 1_000;
+    const retainedPostDocs = includePosts
+      ? [
+          ...await this.publicPosts(publicMeshIds, now, input.forcePublicPosts === true),
+          ...await Promise.all(privateMeshIds.map((meshId) =>
+            this.firestore
+              .collection(this.collection("posts"))
+              .where("mesh_id", "==", meshId)
+              .where("moderation_state", "==", "published")
+              .where("expires_at", ">", now)
+              .orderBy("expires_at", "desc")
+              .orderBy("created_at", "desc")
+              .limit(PRIVATE_POSTS_PER_MESH)
+              .get(),
+          )).then((pages) => pages.flatMap((page) => page.docs)),
+        ].sort((left, right) =>
+          String(right.get("created_at") ?? "").localeCompare(String(left.get("created_at") ?? "")),
+        )
+      : [];
+    // A reply can outlive its parent by design. Expand only the ancestor
+    // chains of retained posts so expired/redacted parents remain as empty
+    // topology placeholders instead of making the child disappear or
+    // leaking an expired body. The bounded walk keeps refreshes predictable
+    // even if a malformed thread contains an unbounded cycle.
+    const postDocsById = new Set(retainedPostDocs.map((document) => document.id));
+    const expectedMeshByParent = new Map<string, string>();
+    for (const document of retainedPostDocs) {
+      const parentId = document.get("parent_post_id");
+      const meshId = String(document.get("mesh_id") ?? "");
+      if (typeof parentId === "string" && parentId && meshId) {
+        expectedMeshByParent.set(parentId, meshId);
+      }
+    }
+    const ancestorDocs: DocumentSnapshot[] = [];
+    let frontier = [...expectedMeshByParent.keys()];
+    while (includePosts && frontier.length && ancestorDocs.length < 1_000) {
+      const nextExpected = new Map<string, string>();
+      for (const group of chunks(frontier)) {
+        const documents = await getByIds("posts", group);
+        for (const document of documents) {
+          if (postDocsById.has(document.id)) continue;
+          const meshId = String(document.get("mesh_id") ?? "");
+          const expectedMeshId = expectedMeshByParent.get(document.id);
+          if (!expectedMeshId || expectedMeshId !== meshId || !meshIds.includes(meshId)) continue;
+          postDocsById.add(document.id);
+          ancestorDocs.push(document);
+          const parentId = document.get("parent_post_id");
+          if (typeof parentId === "string" && parentId && !postDocsById.has(parentId)) {
+            nextExpected.set(parentId, meshId);
+          }
+          if (ancestorDocs.length >= 1_000) break;
+        }
+        if (ancestorDocs.length >= 1_000) break;
+      }
+      frontier = [...nextExpected.keys()];
+      for (const [parentId, meshId] of nextExpected) expectedMeshByParent.set(parentId, meshId);
+    }
+    const postDocs = [...retainedPostDocs, ...ancestorDocs];
     const referencedAgentIds = [
       ...agentDocs.map((document) => String(document.get("agent_id") ?? document.id)),
       ...membershipDocs.map((document) => String(document.get("agent_id"))),
       ...postDocs.map((document) => String(document.get("agent_id"))),
+      ...(activity?.agents.map((agent) => agent.agentId) ?? []),
     ];
     agentDocs = await getByIds("agents", referencedAgentIds);
+    const agentIdsForPresence = [...new Set(
+      agentDocs.map((document) => String(document.get("agent_id") ?? document.id)),
+    )];
+    const runtimeSessionDocs = await queryByIds(
+      "runtime_sessions",
+      "agent_id",
+      agentIdsForPresence,
+      (query) => query.where("status", "==", "active").limit(100),
+    );
+    // Terminal authorization barrier. The initial discovery queries may race
+    // a role revocation or a public-to-private transition on another API
+    // replica. Re-read the caller's roles and candidate mesh lifecycle in one
+    // Firestore transaction immediately before building the response so a
+    // stale all-member role row cannot widen access.
+    let terminalMeshState = new Map<string, { visibility: string; lifecycle: string }>();
+    {
+      const terminal = await this.firestore.runTransaction(async (transaction) => {
+        const rolesSnapshot = input.accountId
+          ? await transaction.get(
+              this.firestore
+                .collection(this.collection("mesh_human_roles"))
+                .where("account_id", "==", input.accountId)
+                .limit(500),
+            )
+          : undefined;
+        const membershipsSnapshot = input.agentId
+          ? await transaction.get(
+              this.firestore
+                .collection(this.collection("mesh_agent_memberships"))
+                .where("agent_id", "==", input.agentId)
+                .where("status", "==", "joined")
+                .limit(100),
+            )
+          : undefined;
+        const meshSnapshots: DocumentSnapshot[] = [];
+        for (const meshId of meshIds) {
+          meshSnapshots.push(await transaction.get(this.doc("meshes", meshId)));
+        }
+        return {
+          roleMeshIds: new Set(
+            rolesSnapshot?.docs.map((document) => String(document.get("mesh_id"))) ?? [],
+          ),
+          joinedMeshIds: new Set(
+            membershipsSnapshot?.docs.map((document) => String(document.get("mesh_id"))) ?? [],
+          ),
+          meshState: new Map(
+            meshSnapshots
+              .filter((document) => document.exists)
+              .map((document) => [
+                String(document.get("mesh_id") ?? document.id),
+                {
+                  visibility: String(document.get("visibility") ?? "private"),
+                  lifecycle: String(document.get("lifecycle") ?? "active"),
+                },
+              ]),
+          ),
+        };
+      });
+      callerRoleMeshIds = terminal.roleMeshIds;
+      terminalAgentJoinedMeshIds = terminal.joinedMeshIds;
+      terminalMeshState = terminal.meshState;
+    }
     const roleAccountIds = [...new Set(roleDocs.map((document) => String(document.get("account_id"))))];
     const accountIds = input.accountId ? [input.accountId, ...roleAccountIds] : roleAccountIds;
     const accountDocs = await getByIds("accounts", accountIds);
@@ -1553,7 +4153,6 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         createdAt: String(document.get("created_at") ?? this.now()),
         updatedAt: String(document.get("updated_at") ?? this.now()),
       }));
-    const roleMeshIds = new Set(roles.map((role) => role.meshId));
     const memberships = membershipDocs.map((document) => ({
       meshId: String(document.get("mesh_id")),
       agentId: String(document.get("agent_id")),
@@ -1580,14 +4179,24 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         updatedAt: String(document.get("updated_at") ?? this.now()),
       }))
       .filter((mesh) =>
-        mesh.lifecycle === "active" &&
-        (!input.accountId && !input.agentId
-          ? true
-          : mesh.visibility === "public" ||
-            roleMeshIds.has(mesh.meshId) ||
-            joinedMeshIds.has(mesh.meshId)),
+        // The terminal transaction is the only visibility authority for the
+        // response. Initial discovery may have raced a public-to-private or
+        // archive transition; never fall back to the earlier snapshot.
+        terminalMeshState.get(mesh.meshId)?.lifecycle === "active" &&
+        (terminalMeshState.get(mesh.meshId)?.visibility === "public" ||
+          Boolean(input.accountId && callerRoleMeshIds.has(mesh.meshId)) ||
+          Boolean(input.agentId && (terminalAgentJoinedMeshIds ?? joinedMeshIds).has(mesh.meshId))),
       );
     const scopedMeshIds = new Set(meshes.map((mesh) => mesh.meshId));
+    const scopedActivity = activity
+      ? {
+          ...activity,
+          meshes: activity.meshes.filter((mesh) => scopedMeshIds.has(mesh.meshId)),
+          topics: activity.topics.filter((topic) => scopedMeshIds.has(topic.meshId)),
+          agents: activity.agents.filter((agent) => scopedMeshIds.has(agent.meshId)),
+          links: activity.links.filter((link) => scopedMeshIds.has(link.meshId)),
+        }
+      : undefined;
     const topics = topicDocs
       .map((document) => {
         const tags = document.get("tags");
@@ -1614,6 +4223,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         };
       })
       .filter((topic) => scopedMeshIds.has(topic.meshId));
+    const nowMs = Date.parse(now);
     const posts = postDocs
       .map((document) => ({
         postId: String(document.get("post_id") ?? document.id),
@@ -1628,7 +4238,13 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         createdAt: String(document.get("created_at") ?? this.now()),
         expiresAt: document.get("expires_at") == null ? null : String(document.get("expires_at")),
       }))
-      .filter((post) => scopedMeshIds.has(post.meshId));
+      .filter((post) => scopedMeshIds.has(post.meshId))
+      .map((post) => {
+        const expired = post.expiresAt != null && Date.parse(post.expiresAt) <= nowMs;
+        return expired || post.moderationState !== "published"
+          ? { ...post, body: "" }
+          : post;
+      });
     const follows = followDocs
       .filter((document) => document.get("following") !== false && agentIds.has(String(document.get("agent_id"))))
       .map((document) => ({
@@ -1636,7 +4252,85 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         agentId: String(document.get("agent_id")),
         updatedAt: String(document.get("updated_at") ?? this.now()),
       }));
-    return { accounts, agents, meshes, topics, humanRoles: roles, memberships, posts, follows };
+    const runtimeSessions = runtimeSessionDocs.map((document) => ({
+      tokenHash: String(document.get("token_hash") ?? ""),
+      agentId: String(document.get("agent_id")),
+      bindingId: String(document.get("binding_id") ?? document.get("pairing_id") ?? ""),
+      sessionId: String(document.get("session_id") ?? document.id),
+      runtimeKind: String(document.get("runtime_kind") ?? "other") as RuntimeKind,
+      authorityEpoch: Number(document.get("authority_epoch") ?? 0),
+      createdAt: String(document.get("created_at") ?? this.now()),
+      expiresAt: String(document.get("expires_at") ?? this.now()),
+      lastSeenAt: String(document.get("last_seen_at") ?? this.now()),
+      status: String(document.get("status") ?? "active") as RepositoryRuntimeSession["status"],
+      supersedingSessionId: document.get("superseding_session_id") == null
+        ? null
+        : String(document.get("superseding_session_id")),
+    }));
+    return {
+      accounts,
+      agents,
+      meshes,
+      topics,
+      humanRoles: roles.filter((role) => scopedMeshIds.has(role.meshId)),
+      memberships: memberships.filter((membership) => scopedMeshIds.has(membership.meshId)),
+      runtimeSessions,
+      posts,
+      follows,
+      ...(scopedActivity ? { activity: scopedActivity } : {}),
+      publicMeshesTruncated: publicMeshSnapshot.truncated,
+    };
+  }
+
+  /**
+   * Browser mesh navigation needs names, roles, members, topics, and
+   * aggregate counts, but never post bodies. Reuse the bounded projection
+   * assembler with posts disabled so polling this endpoint cannot fan out
+   * into the retained social-write collection.
+   */
+  async listMeshDirectoryForAccount(accountId: string): Promise<RepositoryMeshDirectoryEntry[]> {
+    const projection = await this.loadProjection({ accountId, includePosts: false });
+    const accounts = new Map(projection.accounts.map((account) => [account.accountId, account]));
+    const activity = projection.activity;
+    return projection.meshes.map((mesh) => {
+      const role = projection.humanRoles.find(
+        (candidate) => candidate.meshId === mesh.meshId && candidate.accountId === accountId,
+      )?.role ?? null;
+      const memberAgentIds = projection.memberships
+        .filter((membership) => membership.meshId === mesh.meshId && membership.status === "joined")
+        .map((membership) => membership.agentId)
+        .sort();
+      const topics = projection.topics
+        .filter((topic) => topic.meshId === mesh.meshId)
+        .map((topic) => {
+          const aggregate = activity?.topics.find(
+            (candidate) => candidate.meshId === mesh.meshId && candidate.topicId === topic.topicId,
+          );
+          return {
+            topic,
+            activityCount: aggregate?.postCount ?? 0,
+            recentActivityCount: aggregate?.recentPostCount ?? 0,
+            participantAgentIds: aggregate?.participantAgentIds ?? [],
+            lastActivityAt: aggregate?.lastActivityAt ?? null,
+          };
+        })
+        .sort((left, right) => left.topic.title.localeCompare(right.topic.title) || left.topic.topicId.localeCompare(right.topic.topicId));
+      const roles = projection.humanRoles
+        .filter((candidate) => candidate.meshId === mesh.meshId)
+        .map((candidate) => {
+          const account = accounts.get(candidate.accountId);
+          return {
+            accountId: candidate.accountId,
+            role: candidate.role,
+            displayName: account?.displayName ?? "",
+            email: account?.email ?? "",
+            createdAt: candidate.createdAt,
+            updatedAt: candidate.updatedAt,
+          };
+        })
+        .sort((left, right) => left.role.localeCompare(right.role) || left.accountId.localeCompare(right.accountId));
+      return { mesh, role, memberAgentIds, topics, roles } satisfies RepositoryMeshDirectoryEntry;
+    });
   }
 
   async ensureEmptyProduction(): Promise<void> {
@@ -1656,36 +4350,99 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         "human_sessions",
         "runtime_sessions",
         "webmcp_grants",
+        "webmcp_authority",
+        "live_access_epochs",
+        "profile_review_proposals",
+        "agent_handles",
+        "agent_authority",
+        "pairing_challenges",
         "mesh_human_roles",
         "mesh_agent_memberships",
         "mesh_join_requests",
         "posts",
+        "follows",
+        "human_activity_preferences",
+        "idempotency",
+        "quota_counters",
         "event_outbox",
+        "event_outbox_heads",
+        "event_outbox_ready",
+        "mesh_access_epochs",
+        "topology_shards",
+        "topology_events",
+        "topology_activity_totals",
+        "topology_activity_buckets",
+        "processed_events",
+        "moderation_inbox",
+        "moderation_dlq",
+        "notification_outbox",
+        "event_audit",
         "governance_events",
         "audit_events",
         "moderation_cases",
+        "retention_leases",
       ];
-      const [protectedSnapshots, meshes, topics] = await Promise.all([
+      const readAll = async (name: string): Promise<DocumentSnapshot[]> => {
+        const documents: DocumentSnapshot[] = [];
+        let query = this.firestore
+          .collection(this.collection(name))
+          .orderBy(FieldPath.documentId())
+          .limit(500);
+        while (true) {
+          const page = await query.get();
+          documents.push(...page.docs);
+          if (page.size < 500) return documents;
+          query = query.startAfter(page.docs[page.docs.length - 1]!);
+        }
+      };
+      const [protectedSnapshots, meshes, topics, systemDocs] = await Promise.all([
         Promise.all(
           protectedCollections.map((name) =>
             this.firestore.collection(this.collection(name)).limit(1).get(),
           ),
         ),
-        this.firestore
-          .collection(this.collection("meshes"))
-          .where("mesh_id", "!=", "mesh-public")
-          .limit(1)
-          .get(),
-        this.firestore
-          .collection(this.collection("topics"))
-          .where("mesh_id", "!=", "mesh-public")
-          .limit(1)
-          .get(),
+        readAll("meshes"),
+        readAll("topics"),
+        readAll("system"),
       ]);
+      const canonicalMesh = meshes.find((document) => document.id === "mesh-public");
+      const meshMatches = !canonicalMesh || (
+        canonicalMesh.get("mesh_id") === "mesh-public" &&
+        canonicalMesh.get("name") === "Public mesh" &&
+        canonicalMesh.get("description") === "The open commons for agent conversation." &&
+        canonicalMesh.get("visibility") === "public" &&
+        canonicalMesh.get("admission") === "open" &&
+        canonicalMesh.get("lifecycle") === "active" &&
+        canonicalMesh.get("owner_account_id") == null
+      );
+      const unexpectedMeshes = meshes.length !== (canonicalMesh ? 1 : 0) || !meshMatches;
+      const expectedTopicIds = new Set(BOOTSTRAP_TOPICS.map(([id]) => id));
+      const unexpectedTopics = topics.length > expectedTopicIds.size || topics.some((document) => {
+        const definition = BOOTSTRAP_TOPICS.find(([id]) => id === document.id);
+        if (!definition) return true;
+        const [, name, title, description, tags] = definition;
+        return document.get("topic_id") !== document.id ||
+          document.get("mesh_id") !== "mesh-public" ||
+          document.get("name") !== name ||
+          document.get("title") !== title ||
+          document.get("description") !== description ||
+          document.get("tags_json") !== JSON.stringify(tags);
+      });
+      const taxonomy = systemDocs.find((document) => document.id === "taxonomy");
+      const taxonomyTopics = taxonomy?.get("topics");
+      const taxonomyMatches = !taxonomy || (
+        taxonomy.get("key") === "taxonomy" &&
+        Array.isArray(taxonomyTopics) &&
+        JSON.stringify(taxonomyTopics) === JSON.stringify(["connections", "ideas", "observations"])
+      );
+      const unexpectedSystem = systemDocs.some((document) =>
+        document.id !== "taxonomy" && document.id !== "bootstrap",
+      ) || !taxonomyMatches;
       if (
         protectedSnapshots.some((snapshot) => !snapshot.empty) ||
-        !meshes.empty ||
-        !topics.empty
+        unexpectedMeshes ||
+        unexpectedTopics ||
+        unexpectedSystem
       ) {
         throw new Error("production_store_not_empty");
       }
@@ -1694,7 +4451,16 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       const existingBootstrap = await transaction.get(bootstrapRef);
       if (existingBootstrap.exists) return;
       const meshRef = this.doc("meshes", "mesh-public");
-      const mesh = await transaction.get(meshRef);
+      const taxonomyRef = this.doc("system", "taxonomy");
+      const topicRefs = BOOTSTRAP_TOPICS.map(([id]) => this.doc("topics", id));
+      // Firestore transactions require every read to happen before the first
+      // write. Read the complete bootstrap set up front so an empty clean
+      // project can initialize without a transaction-ordering failure.
+      const [mesh, taxonomy, topicSnapshots] = await Promise.all([
+        transaction.get(meshRef),
+        transaction.get(taxonomyRef),
+        Promise.all(topicRefs.map((ref) => transaction.get(ref))),
+      ]);
       if (!mesh.exists) {
         transaction.create(meshRef, {
           contract_version: MESHR_CONTRACT_MAJOR,
@@ -1709,8 +4475,6 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           updated_at: now,
         });
       }
-      const taxonomyRef = this.doc("system", "taxonomy");
-      const taxonomy = await transaction.get(taxonomyRef);
       if (!taxonomy.exists) {
         transaction.create(taxonomyRef, {
           contract_version: MESHR_CONTRACT_MAJOR,
@@ -1719,13 +4483,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           created_at: now,
         });
       }
-      const topics = [
-        ["topic-cross-pollination", "cross-pollination", "Unexpected connections", "Ideas crossing between different interests.", ["connections", "ideas"]],
-        ["topic-small-discoveries", "small-discoveries", "Small discoveries", "Useful things noticed along the way.", ["observations"]],
-      ] as const;
-      const topicRefs = topics.map(([id]) => this.doc("topics", id));
-      const topicSnapshots = await Promise.all(topicRefs.map((ref) => transaction.get(ref)));
-      for (const [index, [id, name, title, description, tags]] of topics.entries()) {
+      for (const [index, [id, name, title, description, tags]] of BOOTSTRAP_TOPICS.entries()) {
         const topicRef = topicRefs[index]!;
         const topic = topicSnapshots[index]!;
         if (!topic.exists) {
@@ -1842,12 +4600,42 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     provider: SocialProvider;
     subject: string;
     email: string;
+    humanSessionHash?: string;
+    reauthProvider?: SocialProvider;
+    reauthSubject?: string;
+    linkedAt?: string;
   }): Promise<void> {
-    const now = this.now();
+    const now = input.linkedAt ?? this.now();
     const identityRef = this.doc("provider_identities", input.provider + ":" + input.subject);
     await this.firestore.runTransaction(async (transaction) => {
-      const account = await transaction.get(this.doc("accounts", input.accountId));
+      const accountRef = this.doc("accounts", input.accountId);
+      const account = await transaction.get(accountRef);
       if (!account.exists) throw new Error("account_not_found");
+      if ((input.reauthProvider === undefined) !== (input.reauthSubject === undefined)) {
+        throw new Error("identity_reauthentication_required");
+      }
+      if (input.humanSessionHash) {
+        const session = await transaction.get(this.doc("human_sessions", input.humanSessionHash));
+        const nowMs = Date.parse(now);
+        const valid = session.exists &&
+          session.get("account_id") === input.accountId &&
+          Number.isFinite(nowMs) &&
+          Date.parse(String(session.get("expires_at") ?? "")) > nowMs &&
+          Date.parse(String(session.get("absolute_expires_at") ?? "")) > nowMs &&
+          Date.parse(String(session.get("last_seen_at") ?? "")) > nowMs - HUMAN_IDLE_SECONDS * 1_000;
+        if (!valid) throw new Error("human_session_invalid");
+      }
+      const reauthIdentity = input.reauthProvider && input.reauthSubject
+        ? await transaction.get(
+            this.doc("provider_identities", input.reauthProvider + ":" + input.reauthSubject),
+          )
+        : undefined;
+      if (
+        input.reauthProvider && input.reauthSubject &&
+        (!reauthIdentity?.exists || reauthIdentity.get("account_id") !== input.accountId)
+      ) {
+        throw new Error("identity_reauthentication_required");
+      }
       const identity = await transaction.get(identityRef);
       if (identity.exists && identity.get("account_id") !== input.accountId) {
         throw new Error("identity_already_linked");
@@ -1862,6 +4650,26 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         last_seen_at: now,
       });
     });
+  }
+
+  async listProviderIdentities(accountId: string): Promise<Array<{
+    provider: SocialProvider;
+    email: string;
+    linkedAt: string;
+  }>> {
+    const snapshot = await this.firestore
+      .collection(this.collection("provider_identities"))
+      .where("account_id", "==", accountId)
+      .limit(10)
+      .get();
+    return snapshot.docs
+      .map((document) => ({
+        provider: String(document.get("provider")) as SocialProvider,
+        email: String(document.get("email") ?? ""),
+        linkedAt: String(document.get("created_at") ?? this.now()),
+      }))
+      .filter((identity) => identity.provider === "google" || identity.provider === "github")
+      .sort((left, right) => left.provider.localeCompare(right.provider));
   }
 
   async createHumanSession(input: {
@@ -1917,6 +4725,11 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     expiresAt: string;
     challengeId?: string;
     challengeUsedAt?: string;
+    expectedSessionId?: string;
+    expectedAuthorityEpoch?: number;
+    claimPairing?: boolean;
+    event?: RepositoryEventInput;
+    audit?: RepositoryAuditInput;
   }): Promise<{ authorityEpoch: number }> {
     const now = this.now();
     return this.firestore.runTransaction(async (transaction) => {
@@ -1961,6 +4774,26 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       }
       const authorityRef = this.authorityRef(input.agentId);
       const authority = await transaction.get(authorityRef);
+      if (input.expectedSessionId !== undefined || input.expectedAuthorityEpoch !== undefined) {
+        if (
+          !authority.exists ||
+          authority.get("authority_kind") !== "native" ||
+          authority.get("session_id") !== input.expectedSessionId ||
+          authority.get("epoch") !== input.expectedAuthorityEpoch
+        ) {
+          throw new Error("session_superseded");
+        }
+        const predecessor = await transaction.get(this.doc("runtime_sessions", input.expectedSessionId!));
+        if (
+          !predecessor.exists ||
+          predecessor.get("status") !== "active" ||
+          predecessor.get("agent_id") !== input.agentId ||
+          predecessor.get("authority_epoch") !== input.expectedAuthorityEpoch ||
+          Date.parse(String(predecessor.get("expires_at") ?? "")) <= Date.parse(now)
+        ) {
+          throw new Error("session_invalid");
+        }
+      }
       const epoch = Number(authority.exists ? authority.get("epoch") ?? 0 : 0) + 1;
       const active = await transaction.get(
         this.firestore
@@ -1974,11 +4807,27 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           .where("agent_id", "==", input.agentId)
           .where("revoked_at", "==", null),
       );
+      // A page WebMCP handoff is a one-hour, non-renewing authority grant.
+      // Do not let a restarted native host silently take control back while
+      // that grant is still active; the human must let it expire or revoke it.
+      if (grants.docs.some((grant) => Date.parse(String(grant.get("expires_at") ?? "")) > Date.parse(now))) {
+        throw new Error("page_authority_active");
+      }
+      // All reads must precede writes in a Firestore transaction. Keep the
+      // pairing claim in this final write phase so the signed challenge,
+      // session authority, and pairing lifecycle commit atomically.
+      if (input.claimPairing !== false) {
+      transaction.update(pairingRef, {
+          status: "claimed",
+          claimed_at: pairing.get("claimed_at") ?? now,
+          pending_expires_at_ttl: null,
+        });
+      }
       if (challengeRef) transaction.update(challengeRef, { used_at: input.challengeUsedAt ?? now });
       for (const previous of active.docs) {
         transaction.update(previous.ref, {
           status: "superseded",
-          superseded_by: input.sessionId,
+          superseding_session_id: input.sessionId,
           expires_at: now,
         });
       }
@@ -2006,6 +4855,10 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         created_at: now,
       });
       for (const grant of grants.docs) transaction.update(grant.ref, { revoked_at: now });
+      if (active.size || grants.size) {
+        this.touchLiveAccessEpoch(transaction, now, "native_session_replaced", input.agentId);
+      }
+      this.writeMutationArtifacts(transaction, { event: input.event, audit: input.audit });
       return { authorityEpoch: epoch };
     });
   }
@@ -2033,24 +4886,42 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     grantId: string;
     humanSessionHash: string;
     expiresAt: string;
+    sessionId?: string;
+    event?: RepositoryEventInput;
+    audit?: RepositoryAuditInput;
   }): Promise<{ authorityEpoch: number; sessionId: string }> {
     const now = this.now();
-    const sessionId = "page_" +
-      createHash("sha256")
-        .update(input.agentId + ":" + input.grantId + ":" + now)
-        .digest("hex")
-        .slice(0, 24);
+    const sessionId = input.sessionId ??
+      "page_" +
+        createHash("sha256")
+          .update(input.agentId + ":" + input.grantId + ":" + now)
+          .digest("hex")
+          .slice(0, 24);
     return this.firestore.runTransaction(async (transaction) => {
       const humanSessionRef = this.doc("human_sessions", input.humanSessionHash);
       const agentRef = this.doc("agents", input.agentId);
-      const [humanSession, agent, nativeSessions] = await Promise.all([
+      const authorityRef = this.authorityRef(input.agentId);
+      const fenceRef = this.webMcpAuthorityRef(input.humanSessionHash);
+      const [humanSession, agent, authority, fence, nativeSessions, humanGrants] = await Promise.all([
         transaction.get(humanSessionRef),
         transaction.get(agentRef),
+        transaction.get(authorityRef),
+        transaction.get(fenceRef),
         transaction.get(
           this.firestore
             .collection(this.collection("runtime_sessions"))
             .where("agent_id", "==", input.agentId)
             .where("status", "==", "active"),
+        ),
+        // A browser session has one active page-control grant at a time. A
+        // newly selected agent must revoke every grant issued to this human
+        // session, not only grants for the selected agent; otherwise a stale
+        // tab can keep posting through the previously selected agent.
+        transaction.get(
+          this.firestore
+            .collection(this.collection("webmcp_grants"))
+            .where("human_session_hash", "==", input.humanSessionHash)
+            .where("revoked_at", "==", null),
         ),
       ]);
       if (
@@ -2064,44 +4935,82 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       if (!agent.exists || agent.get("owner_account_id") !== humanSession.get("account_id")) {
         throw new Error("session_invalid");
       }
-      if (nativeSessions.empty) throw new Error("session_invalid");
-      const authorityRef = this.authorityRef(input.agentId);
-      const authority = await transaction.get(authorityRef);
-      const epoch = Number(authority.exists ? authority.get("epoch") ?? 0 : 0) + 1;
-      const grants = await transaction.get(
-        this.firestore
-          .collection(this.collection("webmcp_grants"))
-          .where("agent_id", "==", input.agentId)
-          .where("revoked_at", "==", null),
+      const nowMs = Date.parse(now);
+      const currentNative = nativeSessions.docs.find((session) =>
+        authority.exists &&
+        authority.get("authority_kind") === "native" &&
+        authority.get("session_id") === session.get("session_id") &&
+        Number(authority.get("epoch") ?? 0) === Number(session.get("authority_epoch") ?? 0) &&
+        Date.parse(String(session.get("expires_at"))) > nowMs &&
+        Date.parse(String(session.get("last_seen_at"))) >= nowMs - 90_000,
       );
+      if (!currentNative) throw new Error("session_invalid");
+      // The human-scoped fence, rather than the selected agent's epoch, is the
+      // serialization point for tab races across different agents.
+      const epoch = Number(fence.exists ? fence.get("epoch") ?? 0 : 0) + 1;
       for (const previous of nativeSessions.docs) {
         transaction.update(previous.ref, {
           status: "superseded",
-          superseded_by: sessionId,
+          superseding_session_id: sessionId,
           expires_at: now,
         });
       }
-      for (const grant of grants.docs) transaction.update(grant.ref, { revoked_at: now });
+      for (const grant of humanGrants.docs) transaction.update(grant.ref, { revoked_at: now });
       transaction.set(authorityRef, {
         contract_version: MESHR_CONTRACT_MAJOR,
         agent_id: input.agentId,
         epoch,
         authority_kind: "page",
         session_id: sessionId,
+        // Preserve the originating runtime for every page-originated event;
+        // page control changes who may write, not what host the agent came
+        // from.
+        runtime_kind: currentNative.get("runtime_kind") ?? agent.get("runtime") ?? "other",
         updated_at: now,
       });
-      transaction.create(this.doc("webmcp_grants", input.grantId), {
+      transaction.set(fenceRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        human_session_hash: input.humanSessionHash,
+        epoch,
+        grant_id: input.grantId,
+        agent_id: input.agentId,
+        session_id: sessionId,
+        updated_at: now,
+        revoked_at: null,
+      }, { merge: true });
+      this.touchLiveAccessEpoch(transaction, now, "page_authority_transferred", input.agentId);
+      // Grant material is stable for a human/agent pair, so a retry after a
+      // committed handoff can recover the same bearer without storing its
+      // plaintext. Revocation and the epoch fence still make old grants
+      // unusable while this write refreshes the one-hour expiry.
+      transaction.set(this.doc("webmcp_grants", input.grantId), {
         contract_version: MESHR_CONTRACT_MAJOR,
         grant_id: input.grantId,
         agent_id: input.agentId,
         human_session_hash: input.humanSessionHash,
         session_id: sessionId,
         authority_epoch: epoch,
+        runtime_kind: currentNative.get("runtime_kind") ?? agent.get("runtime") ?? "other",
         created_at: now,
         expires_at: input.expiresAt,
         last_used_at: now,
         revoked_at: null,
-      });
+      }, { merge: false });
+      // The handoff, its immutable audit record, and the outbox envelope must
+      // commit together. A crash between authority transfer and a later
+      // fire-and-forget append would otherwise make the transfer untraceable.
+      if (input.event) {
+        transaction.create(this.doc("event_outbox", input.event.eventId), this.eventOutboxDocument(input.event));
+        this.queueOutboxReady(
+          transaction,
+          input.event.eventId,
+          input.event.meshId,
+          input.event.occurredAt,
+        );
+      }
+      if (input.audit) {
+        transaction.create(this.doc("audit_events", input.audit.auditId), this.auditDocument(input.audit));
+      }
       return { authorityEpoch: epoch, sessionId };
     });
   }
@@ -2141,6 +5050,9 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         const humanSession = input.humanSessionHash
           ? await transaction.get(this.doc("human_sessions", input.humanSessionHash))
           : undefined;
+        const fence = input.humanSessionHash
+          ? await transaction.get(this.webMcpAuthorityRef(input.humanSessionHash))
+          : undefined;
         if (grant) {
           if (
             !grant.exists ||
@@ -2170,6 +5082,15 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           Date.parse(String(humanSession.get("absolute_expires_at"))) <= Date.parse(now) ||
           Date.parse(String(humanSession.get("last_seen_at"))) < Date.parse(now) - 12 * 60 * 60 * 1_000
         ) throw new Error("session_invalid");
+        if (
+          !fence ||
+          !fence.exists ||
+          fence.get("agent_id") !== input.agentId ||
+          fence.get("session_id") !== input.sessionId ||
+          fence.get("revoked_at") != null ||
+          Number(fence.get("epoch") ?? -1) !== Number(authority.get("epoch") ?? -2) ||
+          (input.grantId !== undefined && fence.get("grant_id") !== input.grantId)
+        ) throw new Error("session_invalid");
       }
 
       // Replays still have to prove current authority. Otherwise an
@@ -2190,13 +5111,20 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           // compatibility path while new records never duplicate post bodies.
           const legacyPost = existing.get("post");
           if (legacyPost && typeof legacyPost === "object") {
-            return { duplicate: true, post: legacyPost as Record<string, unknown> };
+          return {
+            duplicate: true,
+            post: legacyPost as Record<string, unknown>,
+            reviewQueued: legacyPost && typeof legacyPost === "object"
+              ? (legacyPost as Record<string, unknown>).reviewQueued === true
+              : false,
+          };
           }
           throw new Error("idempotency_expired");
         }
         return {
           duplicate: true,
           post: existingPost.data() as Record<string, unknown>,
+          reviewQueued: existing.get("review_queued") === true,
         };
       }
 
@@ -2237,6 +5165,8 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       ) {
         throw new Error("attention_policy_denied");
       }
+      let parentAgentId: string | null = null;
+      let parentCreatedAt: string | null = null;
       if (input.parentPostId) {
         const parent = await transaction.get(this.doc("posts", input.parentPostId));
         if (
@@ -2248,34 +5178,141 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         ) {
           throw new Error("post_not_found");
         }
+        parentAgentId = String(parent.get("agent_id") ?? "") || null;
+        parentCreatedAt = String(parent.get("created_at") ?? "") || null;
       }
 
-      const minute = now.slice(0, 16);
-      const tenSecondWindow = String(Math.floor(Date.parse(now) / 10_000));
-      const globalShard = quotaShard(input.postId);
-      const quotaKeys = [
-        "agent:" + input.agentId + ":" + minute,
-        "agent10:" + input.agentId + ":" + tenSecondWindow,
-        ...(input.ownerAccountId ? ["account:" + input.ownerAccountId + ":" + minute] : []),
-        "global:" + minute + ":" + globalShard,
-        "global10:" + tenSecondWindow + ":" + globalShard,
-      ];
-      const quotaRefs = quotaKeys.map((key) => this.doc("quota_counters", key));
-      const quotaSnapshots = [];
-      for (const ref of quotaRefs) quotaSnapshots.push(await transaction.get(ref));
-      const quotaLimits = [
+      const nowMs = Date.parse(now);
+      // New identities and their first few writes receive asynchronous
+      // screening even when synchronous policy checks pass. The bounded read
+      // is part of this transaction so a concurrent post cannot bypass the
+      // launch safety rule on a different API replica.
+      const priorPosts = await transaction.get(
+        this.firestore
+          .collection(this.collection("posts"))
+          .where("agent_id", "==", input.agentId)
+          .limit(NEW_IDENTITY_REVIEW_POSTS),
+      );
+      const createdAtMs = Date.parse(String(agent.get("created_at") ?? ""));
+      const newIdentityReview = priorPosts.size < NEW_IDENTITY_REVIEW_POSTS ||
+        (Number.isFinite(createdAtMs) && createdAtMs >= nowMs - NEW_IDENTITY_REVIEW_WINDOW_MS);
+      const {
         agentPostLimit,
         agentBurstLimit,
-        ...(input.ownerAccountId ? [1_500] : []),
-        globalPostLimit / GLOBAL_QUOTA_SHARDS,
-        globalBurstLimit / GLOBAL_QUOTA_SHARDS,
+        globalPostLimit,
+        globalPeakLimit,
+        globalBurstCapacity,
+      } = quotaConfig();
+      // Per-agent and per-account buckets remain independent. Global admission
+      // uses two token buckets on one stable shard per agent:
+      // `global:<shard>:peak` caps instantaneous throughput at 200/s in
+      // aggregate (100/s in protection mode), while `...:sustained` carries
+      // exactly the extra ten-second headroom above the 120/s (60/s) sustained
+      // rate. If an agent shard is exhausted, read one deterministic fallback
+      // shard. The transaction never scans all shards, so independent API
+      // replicas can make progress concurrently; the partitioned budgets are
+      // conservative and may fail closed with 429 under skew.
+      const quotaBuckets = [
+        {
+          key: "agent:" + input.agentId,
+          ratePerSecond: agentPostLimit / 60,
+          capacity: agentBurstLimit,
+          global: false as const,
+        },
+        ...(input.ownerAccountId
+          ? [{
+              key: "account:" + input.ownerAccountId,
+              ratePerSecond: accountPostLimit / 60,
+              capacity: accountBurstCapacity,
+              global: false as const,
+            }]
+          : []),
       ];
-      for (let index = 0; index < quotaSnapshots.length; index += 1) {
-        const current = Number(
-          quotaSnapshots[index]!.exists ? quotaSnapshots[index]!.get("count") ?? 0 : 0,
-        );
-        if (current >= quotaLimits[index]!) throw new Error("rate_limited");
+      const quotaSnapshots: DocumentSnapshot[] = [];
+      for (const bucket of quotaBuckets) {
+        quotaSnapshots.push(await transaction.get(this.doc("quota_counters", bucket.key)));
       }
+      const availableQuotaTokens: number[] = [];
+      for (let index = 0; index < quotaSnapshots.length; index += 1) {
+        const bucket = quotaBuckets[index]!;
+        const snapshot = quotaSnapshots[index]!;
+        const previousTokens = snapshot.exists
+          ? Number(snapshot.get("tokens") ?? bucket.capacity)
+          : bucket.capacity;
+        const previousRefillMs = snapshot.exists
+          ? Number(snapshot.get("last_refill_ms") ?? nowMs)
+          : nowMs;
+        const elapsedSeconds = Math.max(0, (nowMs - previousRefillMs) / 1_000);
+        const available = Math.min(
+          bucket.capacity,
+          (Number.isFinite(previousTokens) ? previousTokens : bucket.capacity) +
+            elapsedSeconds * bucket.ratePerSecond,
+        );
+        availableQuotaTokens.push(available);
+        if (available < 1) throw new Error("rate_limited");
+      }
+      const readAvailableTokens = (
+        bucket: { capacity: number; ratePerSecond: number },
+        snapshot: DocumentSnapshot,
+      ): number => {
+        const previousTokens = snapshot.exists
+          ? Number(snapshot.get("tokens") ?? bucket.capacity)
+          : bucket.capacity;
+        const previousRefillMs = snapshot.exists
+          ? Number(snapshot.get("last_refill_ms") ?? nowMs)
+          : nowMs;
+        const elapsedSeconds = Math.max(0, (nowMs - previousRefillMs) / 1_000);
+        return Math.min(
+          bucket.capacity,
+          (Number.isFinite(previousTokens) ? previousTokens : bucket.capacity) +
+            elapsedSeconds * bucket.ratePerSecond,
+        );
+      };
+      const globalPeakRate = globalPeakLimit / 60 / GLOBAL_QUOTA_SHARDS;
+      const globalSustainedRate = globalPostLimit / 60 / GLOBAL_QUOTA_SHARDS;
+      const globalPeakCapacity = globalPeakRate;
+      const globalSustainedCapacity = globalBurstCapacity / GLOBAL_QUOTA_SHARDS;
+      const primaryShard = quotaShardFor(input.agentId);
+      const fallbackOffset = 1 + (quotaShardFor(input.postId, "fallback") % (GLOBAL_QUOTA_SHARDS - 1));
+      const fallbackShard = (primaryShard + fallbackOffset) % GLOBAL_QUOTA_SHARDS;
+      const globalCandidates = [primaryShard, fallbackShard];
+      let selectedGlobalShard: number | undefined;
+      let selectedGlobalPeakTokens = 0;
+      let selectedGlobalSustainedTokens = 0;
+      for (let candidateIndex = 0; candidateIndex < globalCandidates.length; candidateIndex += 1) {
+        const shard = globalCandidates[candidateIndex]!;
+        const peakBucket = {
+          key: `global:${shard}:peak`,
+          ratePerSecond: globalPeakRate,
+          capacity: globalPeakCapacity,
+        };
+        const sustainedBucket = {
+          key: `global:${shard}:sustained`,
+          ratePerSecond: globalSustainedRate,
+          capacity: globalSustainedCapacity,
+        };
+        const peakSnapshot = await transaction.get(this.doc("quota_counters", peakBucket.key));
+        const sustainedSnapshot = await transaction.get(this.doc("quota_counters", sustainedBucket.key));
+        const peakTokens = readAvailableTokens(peakBucket, peakSnapshot);
+        const sustainedTokens = readAvailableTokens(sustainedBucket, sustainedSnapshot);
+        if (peakTokens >= 1 && sustainedTokens >= 1) {
+          selectedGlobalShard = shard;
+          selectedGlobalPeakTokens = peakTokens;
+          selectedGlobalSustainedTokens = sustainedTokens;
+          break;
+        }
+      }
+      if (selectedGlobalShard === undefined) throw new Error("rate_limited");
+      const selectedGlobalPeakBucket = {
+        key: `global:${selectedGlobalShard}:peak`,
+        ratePerSecond: globalPeakRate,
+        capacity: globalPeakCapacity,
+      };
+      const selectedGlobalSustainedBucket = {
+        key: `global:${selectedGlobalShard}:sustained`,
+        ratePerSecond: globalSustainedRate,
+        capacity: globalSustainedCapacity,
+      };
       const post = {
         contract_version: MESHR_CONTRACT_MAJOR,
         post_id: input.postId,
@@ -2284,13 +5321,26 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         agent_id: input.agentId,
         session_id: input.sessionId,
         parent_post_id: input.parentPostId,
+        parent_agent_id: parentAgentId,
+        parent_created_at: parentCreatedAt,
         reference_ids: [],
         body: input.body,
         moderation_state: input.moderationState,
         moderation_reason: input.moderationReason ?? null,
         created_at: now,
+        updated_at: now,
         expires_at: input.expiresAt,
+        // Keep the retention sweep's range query disjoint from redacted
+        // moderation tombstones, which intentionally carry a null expiry.
+        expiry_pending: true,
       };
+      // Post retention is thread-aware.  Do not attach a native Firestore TTL
+      // to individual posts: a TTL worker could delete a parent while a live
+      // reply still points at it.  The retention sweeper below tombstones a
+      // parent until its complete descendant tree has expired, then deletes
+      // it transactionally.  Keep the portable `expires_at` field as the
+      // single source of truth for that sweep.
+      const storedPost = { ...post };
       const envelope = {
         event_id: input.postId,
         mesh_id: input.meshId,
@@ -2304,17 +5354,24 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           post_id: input.postId,
           topic_id: input.topicId,
           parent_post_id: input.parentPostId,
-          review_queued: input.reviewQueued === true,
+          parent_agent_id: parentAgentId,
+          parent_created_at: parentCreatedAt,
+          moderation_state: input.moderationState,
+          review_queued: input.reviewQueued === true || newIdentityReview,
+          ...(newIdentityReview ? { review_reason: "new_identity" } : {}),
         },
       };
-      transaction.create(postRef, post);
+      transaction.create(postRef, storedPost);
       transaction.create(outboxRef, {
         contract_version: MESHR_CONTRACT_MAJOR,
         envelope,
+        event_id: input.postId,
+        mesh_id: input.meshId,
         status: "pending",
         attempts: 0,
         created_at: now,
       });
+      this.queueOutboxReady(transaction, input.postId, input.meshId, now);
       if (input.moderationState === "quarantined" || input.moderationReason) {
         transaction.create(this.doc("moderation_cases", input.postId), {
           contract_version: MESHR_CONTRACT_MAJOR,
@@ -2326,99 +5383,298 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           state: "queued",
           created_at: now,
           updated_at: now,
+          retention_at: moderationRetentionTimestamp(now),
         });
       }
-      for (let index = 0; index < quotaRefs.length; index += 1) {
-        const ref = quotaRefs[index]!;
-        const current = Number(
-          quotaSnapshots[index]!.exists ? quotaSnapshots[index]!.get("count") ?? 0 : 0,
-        );
+      for (let index = 0; index < quotaBuckets.length; index += 1) {
+        const bucket = quotaBuckets[index]!;
+        const ref = this.doc("quota_counters", bucket.key);
         transaction.set(
           ref,
           {
             contract_version: MESHR_CONTRACT_MAJOR,
-            bucket: quotaKeys[index],
-            count: current + 1,
-            window_started_at:
-              quotaKeys[index]!.includes("10:")
-                ? new Date(Number(tenSecondWindow) * 10_000).toISOString()
-                : minute + ":00.000Z",
+            bucket: bucket.key,
+            tokens: availableQuotaTokens[index]! - 1,
+            last_refill_ms: nowMs,
             updated_at: now,
+            expires_at_ttl: quotaExpiryTimestamp(now),
           },
           { merge: true },
         );
       }
+      for (const [bucket, tokens] of [
+        [selectedGlobalPeakBucket, selectedGlobalPeakTokens],
+        [selectedGlobalSustainedBucket, selectedGlobalSustainedTokens],
+      ] as const) {
+        transaction.set(
+          this.doc("quota_counters", bucket.key),
+          {
+            contract_version: MESHR_CONTRACT_MAJOR,
+            bucket: bucket.key,
+            tokens: tokens - 1,
+            last_refill_ms: nowMs,
+            updated_at: now,
+            expires_at_ttl: quotaExpiryTimestamp(now),
+          },
+          { merge: true },
+        );
+      }
+      const idempotencyExpiresAt = new Date(
+        Date.parse(now) + IDEMPOTENCY_RETENTION_SECONDS * 1_000,
+      ).toISOString();
       transaction.create(idempotencyRef, {
         request_hash: input.requestHash,
         post_id: input.postId,
         response_status: input.moderationState === "quarantined" ? 202 : 201,
+        review_queued: input.reviewQueued === true || newIdentityReview,
         created_at: now,
-        expires_at: new Date(Date.parse(now) + IDEMPOTENCY_RETENTION_SECONDS * 1_000).toISOString(),
+        expires_at: idempotencyExpiresAt,
+        expires_at_ttl: ttlTimestamp(idempotencyExpiresAt),
       });
-      return { duplicate: false, post };
+      return {
+        duplicate: false,
+        post,
+        reviewQueued: input.reviewQueued === true || newIdentityReview,
+      };
     });
   }
 
   async purgeExpired(now: string): Promise<number> {
+    // API replicas share the authority database. A short distributed lease
+    // prevents both replicas from walking the same expired-thread page while
+    // still recovering automatically after a crash.
+    const sweepId = `retention_${randomUUID()}`;
+    const leaseRef = this.doc("retention_leases", "posts");
+    const leaseUntil = new Date(Date.parse(now) + 60_000).toISOString();
+    const acquired = await this.firestore.runTransaction(async (transaction) => {
+      const current = await transaction.get(leaseRef);
+      const currentUntil = Date.parse(String(current.get("lease_until") ?? ""));
+      if (current.exists && Number.isFinite(currentUntil) && currentUntil > Date.parse(now)) return false;
+      transaction.set(leaseRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        lease_id: sweepId,
+        lease_until: leaseUntil,
+        updated_at: now,
+      }, { merge: true });
+      return true;
+    });
+    if (!acquired) return 0;
     let removed = 0;
+    const cutoff = ttlTimestamp(now);
+    // Firestore batches are capped at 500 writes. Keep the cleanup helper
+    // below that ceiling because one expired post may also have a report,
+    // appeal, and quarantine case document.
+    const deleteRefs = async (refs: DocumentReference[]): Promise<number> => {
+      let deleted = 0;
+      for (let index = 0; index < refs.length; index += 450) {
+        const batch = this.firestore.batch();
+        const chunk = refs.slice(index, index + 450);
+        for (const ref of chunk) batch.delete(ref);
+        await batch.commit();
+        deleted += chunk.length;
+      }
+      return deleted;
+    };
     const expired = await this.firestore
       .collection(this.collection("posts"))
+      // `expires_at` is intentionally an ISO string in the public contract.
+      // ISO UTC timestamps sort lexicographically, so this query remains
+      // portable while avoiding a per-post native TTL race with replies.
+      .where("expiry_pending", "==", true)
       .where("expires_at", "<=", now)
-      .limit(500)
+      .limit(1_000)
       .get();
-    if (!expired.empty) {
-      const batch = this.firestore.batch();
-      for (const post of expired.docs) {
-        batch.delete(post.ref);
-        batch.delete(this.doc("moderation_cases", post.id));
+    const postCollection = this.firestore.collection(this.collection("posts"));
+    const retentionExtensionMs = 90 * 24 * 60 * 60 * 1_000;
+    const sweepExpiredPost = async (expiredPost: DocumentSnapshot): Promise<number> =>
+      this.firestore.runTransaction(async (transaction) => {
+        const root = await transaction.get(expiredPost.ref);
+        if (!root.exists) return 0;
+
+        // Firestore `in` queries accept at most 30 values. Walk the reply
+        // graph in bounded chunks. If a pathological thread exceeds our
+        // transaction read budget, treating it as non-empty is the safe
+        // outcome: the root is retained and retried on the next sweep.
+        const descendants: DocumentSnapshot[] = [];
+        const seen = new Set<string>([expiredPost.id]);
+        let frontier = [expiredPost.id];
+        let truncated = false;
+        while (frontier.length && descendants.length < 450) {
+          const next: string[] = [];
+          for (let index = 0; index < frontier.length; index += 30) {
+            const chunk = frontier.slice(index, index + 30);
+            const snapshot = await transaction.get(
+              postCollection.where("parent_post_id", "in", chunk).limit(450),
+            );
+            for (const document of snapshot.docs) {
+              if (seen.has(document.id)) continue;
+              seen.add(document.id);
+              descendants.push(document);
+              next.push(document.id);
+              if (descendants.length >= 450) break;
+            }
+            if (snapshot.size >= 450 || descendants.length >= 450) {
+              truncated = true;
+              break;
+            }
+          }
+          frontier = next;
+        }
+        if (frontier.length && descendants.length >= 450) truncated = true;
+
+        if (descendants.length || truncated) {
+          const futureDescendantExpiry = descendants
+            .map((document) => String(document.get("expires_at") ?? ""))
+            .filter((value) => Number.isFinite(Date.parse(value)) && Date.parse(value) > Date.parse(now))
+            .sort()
+            .at(-1);
+          const retainedUntil = futureDescendantExpiry ??
+            new Date(Date.parse(now) + retentionExtensionMs).toISOString();
+          transaction.update(expiredPost.ref, {
+            body: "",
+            moderation_state: "removed",
+            moderation_reason: "retention_expired",
+            expires_at: retainedUntil,
+            expiry_pending: true,
+            // Clear any legacy TTL marker. New posts never receive one, but
+            // this prevents a pre-launch record from being deleted underneath
+            // the thread-aware policy while it is being compacted.
+            expires_at_ttl: null,
+            updated_at: now,
+          });
+          return 0;
+        }
+
+        const moderationCases = await transaction.get(
+          this.firestore
+            .collection(this.collection("moderation_cases"))
+            .where("post_id", "==", expiredPost.id)
+            .limit(1),
+        );
+        if (!moderationCases.empty) {
+          transaction.update(expiredPost.ref, {
+            body: "",
+            moderation_state: "removed",
+            moderation_reason: "retention_expired",
+            // The moderation case owns its own retention window.
+            expires_at: null,
+            expiry_pending: false,
+            expires_at_ttl: null,
+            updated_at: now,
+          });
+          return 0;
+        }
+        transaction.delete(expiredPost.ref);
+        return 1;
+      });
+    // Process independent threads concurrently. Transactions that race on a
+    // shared parent/descendant safely retry on the next sweep rather than
+    // blocking the rest of the page.
+    for (let index = 0; index < expired.docs.length; index += 32) {
+      const results = await Promise.allSettled(
+        expired.docs.slice(index, index + 32).map(sweepExpiredPost),
+      );
+      for (const result of results) {
+        if (result.status === "fulfilled") removed += result.value;
+        else console.error("expired post cleanup transaction failed", result.reason);
       }
-      await batch.commit();
-      removed += expired.size;
     }
     const expiredIdempotency = await this.firestore
       .collection(this.collection("idempotency"))
-      .where("expires_at", "<=", now)
+      .where("expires_at_ttl", "<=", cutoff)
       .limit(500)
       .get();
     if (!expiredIdempotency.empty) {
-      const idempotencyBatch = this.firestore.batch();
-      for (const record of expiredIdempotency.docs) idempotencyBatch.delete(record.ref);
-      await idempotencyBatch.commit();
-      removed += expiredIdempotency.size;
+      removed += await deleteRefs(expiredIdempotency.docs.map((record) => record.ref));
     }
-    const traceCutoff = new Date(Date.parse(now) - RAW_EVENT_RETENTION_SECONDS * 1_000).toISOString();
-    const traceCollections: Array<{ name: string; timestampField: string }> = [
-      { name: "topology_events", timestampField: "recorded_at" },
-      { name: "processed_events", timestampField: "processed_at" },
-      { name: "moderation_inbox", timestampField: "queued_at" },
-      { name: "notification_outbox", timestampField: "created_at" },
+    // Pairing codes and signed challenges are short-lived credential material.
+    // Native Firestore TTL is the eventual backstop; this bounded sweep keeps
+    // expired records from accumulating when TTL processing is delayed. Only
+    // pending pairings carry the marker, so an approved/claimed binding needed
+    // for session renewal is never removed by this path.
+    const expiredPairings = await this.firestore
+      .collection(this.collection("pairings"))
+      .where("pending_expires_at_ttl", "<=", cutoff)
+      .limit(500)
+      .get();
+    const deletablePairings = expiredPairings.docs.filter((record) =>
+      ["pending", "expired", "revoked"].includes(String(record.get("status"))),
+    );
+    if (deletablePairings.length) {
+      removed += await deleteRefs(deletablePairings.map((record) => record.ref));
+    }
+    const expiredChallenges = await this.firestore
+      .collection(this.collection("pairing_challenges"))
+      .where("expires_at_ttl", "<=", cutoff)
+      .limit(500)
+      .get();
+    if (!expiredChallenges.empty) {
+      removed += await deleteRefs(expiredChallenges.docs.map((record) => record.ref));
+    }
+    const traceCollections: Array<{ name: string }> = [
+      { name: "topology_events" },
+      { name: "processed_events" },
+      { name: "moderation_inbox" },
+      { name: "moderation_dlq" },
+      { name: "notification_outbox" },
+      { name: "event_audit" },
+      { name: "audit_events" },
+      { name: "moderation_cases" },
     ];
     for (const traceCollection of traceCollections) {
       const traces = await this.firestore
         .collection(this.collection(traceCollection.name))
-        .where(traceCollection.timestampField, "<=", traceCutoff)
+        .where("retention_at", "<=", cutoff)
         .limit(500)
         .get();
       if (traces.empty) continue;
-      const traceBatch = this.firestore.batch();
-      for (const trace of traces.docs) traceBatch.delete(trace.ref);
-      await traceBatch.commit();
-      removed += traces.size;
+      removed += await deleteRefs(traces.docs.map((trace) => trace.ref));
+    }
+    // A moderation case can keep a redacted post tombstone alive after the
+    // post body's retention window. Once the case itself expires, remove the
+    // non-reconstructive tombstone too; otherwise a null-expiry document would
+    // survive every `expires_at <= now` sweep indefinitely.
+    const orphanedTombstones = await this.firestore
+      .collection(this.collection("posts"))
+      .where("expires_at", "==", null)
+      .where("moderation_state", "==", "removed")
+      .limit(500)
+      .get();
+    for (const tombstone of orphanedTombstones.docs) {
+      removed += await this.firestore.runTransaction(async (transaction) => {
+        const current = await transaction.get(tombstone.ref);
+        if (
+          !current.exists ||
+          current.get("body") !== "" ||
+          current.get("moderation_state") !== "removed" ||
+          current.get("expires_at") != null
+        ) return 0;
+        const cases = await transaction.get(
+          this.firestore
+            .collection(this.collection("moderation_cases"))
+            .where("post_id", "==", tombstone.id)
+            .limit(1),
+        );
+        if (!cases.empty) return 0;
+        transaction.delete(tombstone.ref);
+        return 1;
+      });
     }
     const publishedOutbox = await this.firestore
       .collection(this.collection("event_outbox"))
-      .where("created_at", "<=", traceCutoff)
+      .where("retention_at", "<=", cutoff)
       .limit(500)
       .get();
     const deletableOutbox = publishedOutbox.docs.filter(
       (document) => document.get("status") === "published",
     );
     if (deletableOutbox.length) {
-      const outboxBatch = this.firestore.batch();
-      for (const record of deletableOutbox) outboxBatch.delete(record.ref);
-      await outboxBatch.commit();
-      removed += deletableOutbox.length;
+      removed += await deleteRefs(deletableOutbox.map((record) => record.ref));
     }
+    await this.firestore.runTransaction(async (transaction) => {
+      const current = await transaction.get(leaseRef);
+      if (current.exists && current.get("lease_id") === sweepId) transaction.delete(leaseRef);
+    });
     return removed;
   }
 }

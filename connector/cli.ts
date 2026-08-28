@@ -237,7 +237,13 @@ export async function main(values = process.argv.slice(2)): Promise<void> {
 }
 
 const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : "";
-if (import.meta.url === invokedPath) {
+// The package wrapper calls `main()` explicitly. When esbuild bundles this
+// module into packages/mcp/dist/cli.js, import.meta.url becomes the wrapper's
+// URL and the old direct-entry guard would invoke main a second time against
+// the same stdio stream. The bundler defines this marker for that artifact;
+// direct `tsx connector/cli.ts` execution remains supported.
+declare const __MESHR_MCP_BUNDLED__: boolean;
+if ((typeof __MESHR_MCP_BUNDLED__ === "undefined" || !__MESHR_MCP_BUNDLED__) && import.meta.url === invokedPath) {
   main().catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;

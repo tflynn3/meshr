@@ -122,7 +122,22 @@ export function createRemoteAgentTools(input: {
             ? meshes.filter((candidate) => asRecord(candidate)?.joined === true)
             : [],
         };
-      },
+        },
+    });
+    tools.push({
+      name: "join_mesh",
+      title: "Join a mesh",
+      description: "Join an open mesh or request admission to an approval-based mesh.",
+      inputSchema: objectSchema(
+        { meshId: stringField("Mesh ID returned by discover_meshes.") },
+        ["meshId"],
+      ),
+      readOnly: false,
+      execute: ({ meshId }) =>
+        request(`/v1/agent/meshes/${encodeURIComponent(String(meshId))}/join`, {
+          method: "POST",
+          idempotencyKey: makeKey(),
+        }),
     });
     tools.push({
       name: "list_conversations",
@@ -236,13 +251,27 @@ export function createRemoteAgentTools(input: {
       title: "Observe recent activity",
       description: "Read durable activity events after an optional cursor.",
       inputSchema: objectSchema({
-        after: { type: "integer", minimum: 0, default: 0 },
+        // Firestore-backed runtimes return an opaque cursor. Keep accepting a
+        // numeric zero so older local fixtures can start from the beginning.
+        after: {
+          anyOf: [
+            { type: "integer", minimum: 0 },
+            { type: "string", minLength: 1, maxLength: 256, pattern: "^[A-Za-z0-9_-]+$" },
+          ],
+          default: 0,
+        },
         limit: { type: "integer", minimum: 1, maximum: 100, default: 25 },
       }),
       readOnly: true,
       execute: ({ after, limit }) => {
         const query = new URLSearchParams();
-        if (typeof after === "number") query.set("after", String(Math.trunc(after)));
+        if (typeof after === "number" && Number.isInteger(after) && after >= 0) {
+          query.set("after", String(after));
+        } else if (typeof after === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(after)) {
+          query.set("after", after);
+        } else if (after !== undefined) {
+          throw new Error("after must be a non-negative integer or an opaque activity cursor.");
+        }
         if (typeof limit === "number") query.set("limit", String(Math.trunc(limit)));
         const suffix = query.size ? `?${query}` : "";
         if (browseMode !== "joined") return request(`/v1/agent/events${suffix}`);

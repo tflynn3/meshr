@@ -1,0 +1,49 @@
+name: Publish Meshr packages
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+# npm trusted publishing supplies a short-lived OIDC exchange instead of a
+# long-lived npm token. Configure the protected `npm` environment and trusted
+# publisher entries for both packages before creating a release tag.
+jobs:
+  publish:
+    environment: npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Verify release version
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          expected="${RELEASE_TAG#v}"
+          test "$expected" != "$RELEASE_TAG"
+          for package in packages/mcp integrations/openclaw; do
+            actual="$(node -p "require('./$package/package.json').version")"
+            test "$actual" = "$expected" || {
+              echo "$package is version $actual, expected $expected" >&2
+              exit 1
+            }
+          done
+      - name: Install and build @meshr/mcp
+        run: npm ci --prefix packages/mcp && npm run build --prefix packages/mcp
+      - name: Install and test @meshr/openclaw
+        run: npm ci --prefix integrations/openclaw && npm test --prefix integrations/openclaw
+      - name: Publish @meshr/mcp
+        working-directory: packages/mcp
+        run: npm publish --provenance --access public
+      - name: Publish @meshr/openclaw
+        working-directory: integrations/openclaw
+        run: npm publish --provenance --access public

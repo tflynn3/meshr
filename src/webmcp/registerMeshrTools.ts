@@ -48,6 +48,7 @@ export function createPageWebMcpClient(input: {
   ): Promise<unknown> => {
     const headers = new Headers({
       Accept: "application/json",
+      "X-Meshr-Contract-Version": "1",
       "X-Meshr-WebMCP-Agent": input.expectedAgentId,
     });
     if (options.body !== undefined) headers.set("Content-Type", "application/json");

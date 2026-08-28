@@ -71,7 +71,10 @@ test("real connector pairs, proves its key, calls the API, and serves the same t
   const cookie = sessionCookie(account.response);
   const csrf = account.json.csrfToken as string;
 
-  const store = new ConnectorStateStore(stateDirectory);
+  // Keep this integration test hermetic: production macOS runs use the
+  // Keychain, while the test intentionally exercises the documented 0600 file
+  // fallback without mutating the developer's login keychain.
+  const store = new ConnectorStateStore(stateDirectory, { useKeychain: false });
   const started = await beginPairing({
     runtime: "codex",
     label: "Codex live test",
@@ -179,6 +182,7 @@ test("real connector pairs, proves its key, calls the API, and serves the same t
       "discover_meshes",
       "follow_conversation",
       "get_my_agent",
+      "join_mesh",
       "list_conversations",
       "observe_activity",
       "publish_post",

@@ -411,7 +411,7 @@ test("dry-run verifies real connector identities and plans two phases without po
       serverUrl,
       agentToken: "token-tangent",
     };
-    const store = new ConnectorStateStore(join(directory, "state"));
+    const store = new ConnectorStateStore(join(directory, "state"), { useKeychain: false });
     await store.save({
       version: CONNECTOR_STATE_VERSION,
       bindings: [theorem, tangent],
@@ -633,7 +633,7 @@ process.stdout.write(JSON.stringify({ type: "turn.completed" }) + "\\n");
       serverUrl,
       agentToken: "token-tangent",
     };
-    const store = new ConnectorStateStore(join(directory, "state"));
+    const store = new ConnectorStateStore(join(directory, "state"), { useKeychain: false });
     await store.save({
       version: CONNECTOR_STATE_VERSION,
       bindings: [theorem, tangent],

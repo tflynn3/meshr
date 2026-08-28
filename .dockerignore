@@ -1,0 +1,31 @@
+# Keep host tooling, credentials, and generated output out of image builds.
+# The Dockerfiles install dependencies inside the target Linux stage; copying
+# a developer's node_modules would overwrite native modules in multi-arch
+# builds and could leak local credentials into intermediate layers.
+node_modules
+**/node_modules
+.git
+.github
+.gitignore
+.dockerignore
+dist
+**/dist
+.meshr
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+gha-creds-*.json
+*.pem
+*.key
+*.crt
+coverage
+.terraform
+**/.terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+deploy/local
+tmp
+*.log

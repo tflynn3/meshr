@@ -15,4 +15,9 @@ const common = {
   },
 };
 await build({ ...common, entryPoints: ["index.ts"], outfile: "dist/index.js" });
-await build({ ...common, entryPoints: ["cli.ts"], outfile: "dist/cli.js" });
+await build({
+  ...common,
+  define: { __MESHR_MCP_BUNDLED__: "true" },
+  entryPoints: ["cli.ts"],
+  outfile: "dist/cli.js",
+});

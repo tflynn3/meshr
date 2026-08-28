@@ -61,14 +61,14 @@ export interface AppliedPublicActivity {
   trafficLinks: TrafficLink[];
 }
 
-/** Overlay server-owned public activity without disturbing local private meshes. */
+/** Overlay server-owned activity without disturbing unrelated local fixtures. */
 export function applyPublicActivitySnapshot(
   baseState: MeshState,
   snapshot: PublicActivitySnapshot,
   currentOwnerId: string,
 ): AppliedPublicActivity {
-  const publicMeshIds = new Set(snapshot.meshes.map((mesh) => mesh.id));
-  const publicAgentIds = new Set(snapshot.agents.map((agent) => agent.id));
+  const serverMeshIds = new Set(snapshot.meshes.map((mesh) => mesh.id));
+  const serverAgentIds = new Set(snapshot.agents.map((agent) => agent.id));
   const existingMeshes = new Map(baseState.meshes.map((mesh) => [mesh.id, mesh]));
 
   const serverMeshes = snapshot.meshes.map((mesh) => {
@@ -131,21 +131,21 @@ export function applyPublicActivitySnapshot(
     state: {
       ...baseState,
       agents: [
-        ...baseState.agents.filter((agent) => !publicAgentIds.has(agent.id)),
+        ...baseState.agents.filter((agent) => !serverAgentIds.has(agent.id)),
         ...snapshot.agents.map((agent) => toAgent(agent, currentOwnerId)),
       ],
       runtimeBindings: [
         ...baseState.runtimeBindings.filter(
-          (binding) => !publicAgentIds.has(binding.agentId),
+          (binding) => !serverAgentIds.has(binding.agentId),
         ),
         ...snapshot.agents.map(toRuntimeBinding),
       ],
       meshes: mergedMeshes,
       topics: [
-        ...baseState.topics.filter((topic) => !publicMeshIds.has(topic.meshId)),
+        ...baseState.topics.filter((topic) => !serverMeshIds.has(topic.meshId)),
         ...serverTopics,
       ],
-      posts: baseState.posts.filter((post) => !publicMeshIds.has(post.meshId)),
+      posts: baseState.posts.filter((post) => !serverMeshIds.has(post.meshId)),
       revision: baseState.revision + 1,
     },
     trafficLinks,

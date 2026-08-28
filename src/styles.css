@@ -253,6 +253,22 @@ button:focus-visible {
   color: #f5f6ef;
   background: #29332a;
 }
+.rail-account-settings {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #9ca399;
+  display: grid;
+  place-items: center;
+  padding: 0;
+}
+.rail-account-settings:hover {
+  color: #f5f6ef;
+  background: #29332a;
+}
 
 /* Portfolio */
 .portfolio-view {
@@ -1376,6 +1392,131 @@ button:focus-visible {
 }
 
 /* Modals */
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(12, 18, 13, 0.64);
+  backdrop-filter: blur(5px);
+  display: grid;
+  place-items: center;
+  padding: 18px;
+}
+.account-dialog {
+  width: min(520px, 96vw);
+  max-height: 92vh;
+  overflow: auto;
+  border: 1px solid #d4d5ce;
+  border-radius: 14px;
+  background: #fbfaf7;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.28);
+  padding: 22px 24px;
+}
+.account-dialog > header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 16px;
+}
+.account-dialog > header p {
+  margin: 0 0 5px;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: #6a6f66;
+}
+.account-dialog > header h2 {
+  margin: 0;
+  font: 500 26px Georgia, "Times New Roman", serif;
+}
+.dialog-close {
+  border: 0;
+  background: transparent;
+  padding: 2px;
+  color: var(--muted);
+}
+.account-dialog-copy {
+  margin: 17px 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+.linked-provider-list {
+  display: grid;
+  gap: 8px;
+}
+.linked-provider {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 12px;
+  border: 1px solid #d9dbd3;
+  border-radius: 8px;
+  background: #fff;
+}
+.linked-provider-icon {
+  width: 31px;
+  height: 31px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  background: #edf1df;
+  color: #354225;
+}
+.linked-provider > div {
+  min-width: 0;
+  flex: 1;
+}
+.linked-provider strong,
+.linked-provider small {
+  display: block;
+}
+.linked-provider strong {
+  font-size: 11px;
+}
+.linked-provider small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.linked-provider .secondary {
+  min-height: 32px;
+  padding: 0 11px;
+}
+.linked-provider-state {
+  color: #5b7c2d;
+  font-size: 9px;
+  font-weight: 700;
+}
+.dialog-error {
+  margin: 13px 0 0;
+  color: #a54f3e;
+  font-size: 9px;
+}
+.account-dialog > footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 18px;
+  padding-top: 15px;
+  border-top: 1px solid var(--line);
+}
+.account-dialog .secondary {
+  min-height: 36px;
+  border: 1px solid #c6c7c0;
+  border-radius: 6px;
+  background: #fff;
+  padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: 650;
+}
+.account-dialog .secondary:disabled {
+  opacity: 0.5;
+}
 .modal-backdrop {
   position: fixed;
   inset: 0;

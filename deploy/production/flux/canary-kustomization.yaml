@@ -1,0 +1,53 @@
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: meshr-canary
+  namespace: flux-system
+spec:
+  interval: 1m
+  path: ./deploy/canary
+  prune: true
+  wait: true
+  timeout: 5m
+  sourceRef:
+    kind: GitRepository
+    name: meshr-main
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: api-canary
+      namespace: meshr-canary
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: live-gateway-canary
+      namespace: meshr-canary
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: web-canary
+      namespace: meshr-canary
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: ingest-canary
+      namespace: meshr-canary
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: topology-materializer-canary
+      namespace: meshr-canary
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: moderation-worker-canary
+      namespace: meshr-canary
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: audit-worker-canary
+      namespace: meshr-canary
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: notification-worker-canary
+      namespace: meshr-canary
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: meshr-canary-image-digests
+      - kind: ConfigMap
+        name: meshr-canary-runtime-values

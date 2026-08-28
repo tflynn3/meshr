@@ -53,7 +53,7 @@ function binding(input: {
 async function stateStore(t: test.TestContext): Promise<ConnectorStateStore> {
   const directory = await mkdtemp(join(tmpdir(), "meshr-state-test-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  return new ConnectorStateStore(directory);
+  return new ConnectorStateStore(directory, { useKeychain: false });
 }
 
 test("handle lookup prefers the newest viable retry over an expired first attempt", async (t) => {

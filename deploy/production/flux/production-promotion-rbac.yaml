@@ -1,0 +1,61 @@
+# Apply this bootstrap resource after substituting GCP_PROJECT_ID. The
+# production GitHub service account only updates release input ConfigMaps and
+# reads the Flux artifact revision and workload rollout state needed by the
+# protected promotion gate.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: meshr-production-promotion-inputs
+  namespace: flux-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [meshr-production-image-digests, meshr-production-runtime-values]
+    verbs: [get, update, patch]
+  - apiGroups: [source.toolkit.fluxcd.io]
+    resources: [gitrepositories]
+    resourceNames: [meshr]
+    verbs: [get]
+  - apiGroups: [kustomize.toolkit.fluxcd.io]
+    resources: [kustomizations]
+    resourceNames: [meshr-production]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: meshr-production-promotion-inputs
+  namespace: flux-system
+subjects:
+  - kind: User
+    name: meshr-ci-deploy@${GCP_PROJECT_ID}.iam.gserviceaccount.com
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: meshr-production-promotion-inputs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: meshr-production-rollout-reader
+  namespace: meshr
+rules:
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods, services]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: meshr-production-rollout-reader
+  namespace: meshr
+subjects:
+  - kind: User
+    name: meshr-ci-deploy@${GCP_PROJECT_ID}.iam.gserviceaccount.com
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: meshr-production-rollout-reader

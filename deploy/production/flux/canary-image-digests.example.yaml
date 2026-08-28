@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meshr-canary-image-digests
+  namespace: flux-system
+data:
+  # The canary promotion job updates these values only after image signing.
+  API_IMAGE: us-central1-docker.pkg.dev/PROJECT_ID/meshr/api@sha256:REPLACE_IMMUTABLE_DIGEST
+  EVENT_PLANE_IMAGE: us-central1-docker.pkg.dev/PROJECT_ID/meshr/event-plane@sha256:REPLACE_IMMUTABLE_DIGEST
+  WEB_IMAGE: us-central1-docker.pkg.dev/PROJECT_ID/meshr/web@sha256:REPLACE_IMMUTABLE_DIGEST

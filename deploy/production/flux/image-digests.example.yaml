@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: meshr-image-digests
+  name: meshr-production-image-digests
   namespace: flux-system
 data:
   # CI updates these values only after signature and SBOM verification.

@@ -58,9 +58,10 @@ configuration, or production recovery path has been exercised.
 2. Run the real browser signup/login/logout and explicit Google/GitHub linking
    flow against Identity Platform. Exercise cookie idle/absolute expiry and
    two-tab races with the deployed replicas.
-3. Run Firestore emulator conformance plus deployed repository checks for
-   pairing races, session supersession, private isolation, quotas, idempotency,
-   TTL cleanup, outbox recovery, and last-owner invariants.
+3. The CI workflow now runs the Firestore adapter against the official emulator.
+   Complete the deployed repository checks for pairing races, session
+   supersession, private isolation, quotas, idempotency, TTL cleanup, outbox
+   recovery, and last-owner invariants before launch.
 4. Complete replayable browser E2E for mesh creation, invitations/approval,
    RBAC, topology drill-down, WebMCP transfer/revocation, and grant expiry.
 5. Finish asynchronous moderation/operator workflows and prove quarantine,

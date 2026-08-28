@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meshr-runtime-canary
+data:
+  MESHR_ENV: production
+  MESHR_STORAGE: firestore
+  MESHR_SOCIAL_AUTH_ONLY: "1"
+  MESHR_SECURE_COOKIES: "1"
+  MESHR_WEBMCP_SESSION_TRANSFER: "1"
+  MESHR_FIRESTORE_DATABASE: meshr-canary
+  MESHR_TOPOLOGY_FIRESTORE_DATABASE: meshr-canary-projections
+  MESHR_COST_PROTECTION_MODE: ${MESHR_COST_PROTECTION_MODE}
+  MESHR_HOST: 0.0.0.0
+  MESHR_WEB_URL: https://staging.meshr.social/
+  MESHR_API_URL: http://api-canary.meshr-canary.svc.cluster.local:8787
+  GOOGLE_CLOUD_PROJECT: ${GCP_PROJECT_ID}
+  MESHR_IDENTITY_PROJECT_ID: ${GCP_PROJECT_ID}
+  MESHR_IDENTITY_AUTH_DOMAIN: ${GCP_PROJECT_ID}.firebaseapp.com
+  MESHR_EVENT_INGEST_URL: http://ingest-canary.meshr-canary.svc.cluster.local:8080
+  MESHR_EVENTS_TOPIC: mesh-events-canary
+  MESHR_TOPOLOGY_SUBSCRIPTION: topology-materializer-canary
+  MESHR_MODERATION_SUBSCRIPTION: moderation-worker-canary
+  MESHR_AUDIT_SUBSCRIPTION: audit-worker-canary
+  MESHR_NOTIFICATIONS_SUBSCRIPTION: notification-worker-canary
+  MESHR_MODERATION_REQUIRED: "1"
+  MESHR_MODERATION_ENDPOINT: ${MESHR_MODERATION_ENDPOINT}
+  MESHR_DEAD_LETTER_TOPIC: mesh-events-canary-dlq
+  MESHR_ALLOWED_ORIGINS: https://staging.meshr.social
+  MESHR_LIVE_MAX_CLIENTS: "256"
+  MESHR_LIVE_MAX_CONNECTIONS_PER_CREDENTIAL: "8"
+  MESHR_LIVE_MAX_CONNECTIONS_PER_IP: "32"
+  MESHR_LIVE_AUTH_RECHECK_MS: "60000"

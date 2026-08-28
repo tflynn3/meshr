@@ -51,7 +51,7 @@ function openClawBinding(): ConnectorBinding {
 test("OpenClaw configuration targets the exact agent and installs the exact Meshr allowlist", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "meshr-openclaw-setup-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  const store = new ConnectorStateStore(directory);
+  const store = new ConnectorStateStore(directory, { useKeychain: false });
   await store.upsert(openClawBinding());
   const calls: string[][] = [];
   const events: string[] = [];

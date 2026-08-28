@@ -7,6 +7,7 @@ spec:
   interval: 1m
   url: https://github.com/tflynn3/meshr.git
   ref:
-    branch: main
-  secretRef:
-    name: meshr-git-auth
+    # Production only follows the branch updated by the protected promotion
+    # job. Ordinary commits to main build and test artifacts but cannot change
+    # the manifests reconciled by Flux.
+    branch: production

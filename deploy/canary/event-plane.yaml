@@ -1,0 +1,166 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest-canary
+  labels: {app.kubernetes.io/name: ingest-canary, app.kubernetes.io/part-of: meshr}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app.kubernetes.io/name: ingest-canary}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: ingest-canary, app.kubernetes.io/part-of: meshr}}
+    spec:
+      serviceAccountName: meshr-ingest-canary
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: ingest
+          image: ${EVENT_PLANE_IMAGE}
+          args: ["ingest"]
+          envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
+          env:
+            - {name: MESHR_INTERNAL_TOKEN_FILE, value: /var/run/secrets/meshr/internal-token}
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
+          securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+          volumeMounts:
+            - {name: meshr-event-secrets, mountPath: /var/run/secrets/meshr, readOnly: true}
+      volumes:
+        - name: meshr-event-secrets
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes: {secretProviderClass: meshr-event-secrets-canary}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: ingest-canary}
+spec:
+  selector: {app.kubernetes.io/name: ingest-canary}
+  ports: [{name: http, port: 8080, targetPort: http}]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: ingest-canary}
+spec:
+  minReplicas: 2
+  maxReplicas: 3
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: ingest-canary}
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 65}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: topology-materializer-canary
+  labels: {app.kubernetes.io/name: topology-materializer-canary, app.kubernetes.io/part-of: meshr}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: topology-materializer-canary}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: topology-materializer-canary, app.kubernetes.io/part-of: meshr}}
+    spec:
+      serviceAccountName: meshr-topology-materializer-canary
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: materializer
+          image: ${EVENT_PLANE_IMAGE}
+          args: ["materializer", "topology"]
+          envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
+          securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
+          resources: {requests: {cpu: 150m, memory: 192Mi}, limits: {cpu: "1", memory: 512Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moderation-worker-canary
+  labels: {app.kubernetes.io/name: moderation-worker-canary, app.kubernetes.io/part-of: meshr}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: moderation-worker-canary}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: moderation-worker-canary, app.kubernetes.io/part-of: meshr}}
+    spec:
+      serviceAccountName: meshr-moderation-worker-canary
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: moderation-worker
+          image: ${EVENT_PLANE_IMAGE}
+          args: ["materializer", "moderation"]
+          envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
+          # Keep endpoint rotation in the pod template so Flux rolls existing
+          # workers instead of leaving them on a retired screening adapter.
+          env:
+            - name: MESHR_MODERATION_ENDPOINT
+              value: ${MESHR_MODERATION_ENDPOINT}
+            - name: MESHR_MODERATION_AUTH
+              value: adc
+            - name: MESHR_MODERATION_TOKEN_TYPE
+              value: access_token
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
+          securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit-worker-canary
+  labels: {app.kubernetes.io/name: audit-worker-canary, app.kubernetes.io/part-of: meshr}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: audit-worker-canary}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: audit-worker-canary, app.kubernetes.io/part-of: meshr}}
+    spec:
+      serviceAccountName: meshr-audit-worker-canary
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: audit-worker
+          image: ${EVENT_PLANE_IMAGE}
+          args: ["materializer", "audit"]
+          envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
+          securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
+          resources: {requests: {cpu: 75m, memory: 96Mi}, limits: {cpu: 300m, memory: 192Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-worker-canary
+  labels: {app.kubernetes.io/name: notification-worker-canary, app.kubernetes.io/part-of: meshr}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: notification-worker-canary}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: notification-worker-canary, app.kubernetes.io/part-of: meshr}}
+    spec:
+      serviceAccountName: meshr-notification-worker-canary
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: notification-worker
+          image: ${EVENT_PLANE_IMAGE}
+          args: ["materializer", "notifications"]
+          envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
+          securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
+          resources: {requests: {cpu: 75m, memory: 96Mi}, limits: {cpu: 300m, memory: 192Mi}}

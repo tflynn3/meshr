@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { RuntimeKind } from "./types.ts";
+import type { RepositoryActivityProjection } from "./repository.ts";
 
 export const PUBLIC_ACTIVITY_WINDOW_MINUTES = 15;
 
@@ -7,7 +8,7 @@ interface PublicMeshRow {
   id: string;
   name: string;
   description: string;
-  visibility: "public";
+  visibility: "public" | "unlisted" | "private";
   join_policy: "open" | "approval" | "invite_only";
 }
 
@@ -74,7 +75,7 @@ export interface PublicActivityMesh {
   id: string;
   name: string;
   description: string;
-  visibility: "public";
+  visibility: "public" | "unlisted" | "private";
   joinPolicy: "open" | "approval" | "invite_only";
   memberAgentIds: string[];
   postCount: number;
@@ -117,6 +118,9 @@ export interface PublicActivitySnapshot {
   meshes: PublicActivityMesh[];
   agents: PublicActivityAgent[];
   links: PublicActivityLink[];
+  /** Present when a bounded live-gateway mesh slice was requested. */
+  meshId?: string;
+  truncated?: boolean;
 }
 
 const asCount = (value: number): number => Number(value ?? 0);
@@ -129,105 +133,212 @@ const median = (values: number[]): number => {
   return Math.round(((sorted[midpoint - 1] ?? 0) + (sorted[midpoint] ?? 0)) / 2);
 };
 
+const approximateMedian = (buckets: number[], total: number): number => {
+  if (!total || !buckets.length) return 0;
+  const boundaries = [0, 1_000, 5_000, 30_000, 120_000, 600_000, 3_600_000, 21_600_000, 86_400_000, 259_200_000, 604_800_000, 2_592_000_000];
+  const midpoint = (index: number): number => {
+    const lower = boundaries[index] ?? boundaries.at(-1) ?? 0;
+    const upper = boundaries[index + 1] ?? Math.max(lower, lower * 2);
+    return Math.round((lower + upper) / 2);
+  };
+  const target = Math.ceil(total / 2);
+  let seen = 0;
+  for (let index = 0; index < buckets.length; index += 1) {
+    seen += Number(buckets[index] ?? 0);
+    if (seen >= target) return midpoint(index);
+  }
+  return midpoint(buckets.length - 1);
+};
+
 /** Build the aggregate-only public topology visible to a signed-in human. */
 export function readPublicActivity(
   db: DatabaseSync,
   accountId: string,
   generatedAt: string,
+  authorizedMeshIds?: ReadonlySet<string>,
+  durablePresence?: ReadonlyMap<string, { lastSeenAt: string; connected: boolean }>,
+  meshId?: string,
+  aggregate?: RepositoryActivityProjection,
 ): PublicActivitySnapshot {
   const nowMs = Date.parse(generatedAt);
   const cutoffMs = nowMs - PUBLIC_ACTIVITY_WINDOW_MINUTES * 60 * 1_000;
   const onlineCutoff = new Date(nowMs - 90 * 1_000).toISOString();
+  // The live gateway calls this with no authorization set and therefore gets
+  // public-only topology. Authenticated browser calls pass the durable mesh
+  // set for the signed-in human, which adds their unlisted/private meshes.
+  const authorizedIds = authorizedMeshIds ? [...authorizedMeshIds] : [];
+  const visibleMeshPredicate = (alias = "") => {
+    const prefix = alias ? `${alias}.` : "";
+    if (!authorizedMeshIds) return `${prefix}visibility = 'public'`;
+    const placeholders = authorizedIds.length
+      ? authorizedIds.map(() => "?").join(",")
+      : "NULL";
+    return `(${prefix}visibility = 'public' OR ${prefix}id IN (${placeholders}))`;
+  };
+  const visibilityArgs = (): string[] => (authorizedMeshIds ? authorizedIds : []);
 
   const meshRows = db
     .prepare(
       `SELECT id, name, description, visibility, join_policy
        FROM meshes
-       WHERE visibility = 'public'
+       WHERE ${visibleMeshPredicate()}
        ORDER BY created_at ASC, id ASC`,
     )
-    .all() as unknown as PublicMeshRow[];
+    .all(...visibilityArgs()) as unknown as PublicMeshRow[];
+  const isAuthorizedMesh = (meshId: string): boolean =>
+    meshRows.some((row) => row.id === meshId);
+  const visibleMeshRows = meshRows.filter((row) => isAuthorizedMesh(row.id));
 
-  const topicRows = db
-    .prepare(
-      `SELECT t.id, t.mesh_id, t.name, t.title, t.description, t.tags_json,
-              COUNT(p.id) AS post_count,
-              COALESCE(SUM(CASE WHEN p.id IS NOT NULL AND p.parent_post_id IS NULL THEN 1 ELSE 0 END), 0) AS root_count,
-              COALESCE(SUM(CASE WHEN p.parent_post_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS reply_count,
-              COALESCE(SUM(CASE WHEN p.created_at >= ? AND p.created_at <= ? THEN 1 ELSE 0 END), 0) AS recent_post_count,
-              MAX(p.created_at) AS last_activity_at
-       FROM topics t
-       JOIN meshes m ON m.id = t.mesh_id AND m.visibility = 'public'
-       LEFT JOIN posts p ON p.topic_id = t.id
-         AND p.moderation_state = 'published'
-         AND (p.expires_at IS NULL OR p.expires_at > ?)
-       GROUP BY t.id
-       ORDER BY t.created_at ASC, t.id ASC`,
-    )
-    .all(new Date(cutoffMs).toISOString(), generatedAt, generatedAt) as unknown as PublicTopicRow[];
+  const topicRows = aggregate
+    ? db
+      .prepare(
+        `SELECT t.id, t.mesh_id, t.name, t.title, t.description, t.tags_json,
+                0 AS post_count, 0 AS root_count, 0 AS reply_count,
+                0 AS recent_post_count, NULL AS last_activity_at
+         FROM topics t
+         JOIN meshes m ON m.id = t.mesh_id AND ${visibleMeshPredicate("m")}
+         ORDER BY t.created_at ASC, t.id ASC`,
+      )
+      .all(...visibilityArgs()) as unknown as PublicTopicRow[]
+    : db
+      .prepare(
+        `SELECT t.id, t.mesh_id, t.name, t.title, t.description, t.tags_json,
+                COUNT(p.id) AS post_count,
+                COALESCE(SUM(CASE WHEN p.id IS NOT NULL AND p.parent_post_id IS NULL THEN 1 ELSE 0 END), 0) AS root_count,
+                COALESCE(SUM(CASE WHEN p.parent_post_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS reply_count,
+                COALESCE(SUM(CASE WHEN p.created_at >= ? AND p.created_at <= ? THEN 1 ELSE 0 END), 0) AS recent_post_count,
+                MAX(p.created_at) AS last_activity_at
+         FROM topics t
+         JOIN meshes m ON m.id = t.mesh_id AND ${visibleMeshPredicate("m")}
+         LEFT JOIN posts p ON p.topic_id = t.id
+           AND p.moderation_state = 'published'
+           AND (p.expires_at IS NULL OR p.expires_at > ?)
+         GROUP BY t.id
+         ORDER BY t.created_at ASC, t.id ASC`,
+      )
+      .all(
+        new Date(cutoffMs).toISOString(),
+        generatedAt,
+        ...visibilityArgs(),
+        generatedAt,
+      ) as unknown as PublicTopicRow[];
+  const visibleTopicRows = topicRows.filter((row) => isAuthorizedMesh(row.mesh_id));
 
-  const participantRows = db
-    .prepare(
-      `SELECT DISTINCT p.topic_id, p.agent_id
-       FROM posts p
-       JOIN meshes m ON m.id = p.mesh_id AND m.visibility = 'public'
-       WHERE p.moderation_state = 'published'
-         AND (p.expires_at IS NULL OR p.expires_at > ?)
-       ORDER BY p.topic_id ASC, p.agent_id ASC`,
-    )
-    .all(generatedAt) as unknown as TopicParticipantRow[];
+  const participantRows = aggregate
+    ? []
+    : db
+      .prepare(
+        `SELECT DISTINCT p.topic_id, p.agent_id
+         FROM posts p
+         JOIN meshes m ON m.id = p.mesh_id AND ${visibleMeshPredicate("m")}
+         WHERE p.moderation_state = 'published'
+           AND (p.expires_at IS NULL OR p.expires_at > ?)
+         ORDER BY p.topic_id ASC, p.agent_id ASC`,
+      )
+      .all(...visibilityArgs(), generatedAt) as unknown as TopicParticipantRow[];
+  const visibleParticipantRows = participantRows.filter((row) => {
+    const topic = visibleTopicRows.find((candidate) => candidate.id === row.topic_id);
+    return topic ? isAuthorizedMesh(topic.mesh_id) : !authorizedMeshIds;
+  });
 
-  const agentRows = db
-    .prepare(
-      `SELECT a.id, a.owner_account_id, a.name, a.handle, a.tagline,
-              a.interests_json, a.runtime, a.runtime_label, mm.mesh_id,
-              (SELECT MAX(s.last_seen_at) FROM agent_sessions s
-               WHERE s.agent_id = a.id AND s.status = 'active') AS last_seen_at,
-              EXISTS(
-                SELECT 1 FROM agent_sessions s
-                WHERE s.agent_id = a.id AND s.status = 'active'
-                  AND s.expires_at > ? AND s.last_seen_at >= ?
-              ) AS connected,
-              COUNT(p.id) AS post_count,
-              MAX(p.created_at) AS last_post_at
-       FROM mesh_members mm
-       JOIN meshes m ON m.id = mm.mesh_id AND m.visibility = 'public'
-       JOIN agents a ON a.id = mm.agent_id
-       LEFT JOIN posts p ON p.agent_id = a.id AND p.mesh_id = mm.mesh_id
-         AND p.moderation_state = 'published'
-         AND (p.expires_at IS NULL OR p.expires_at > ?)
-       GROUP BY a.id, mm.mesh_id
-       ORDER BY COALESCE(last_post_at, a.created_at) DESC, a.id ASC`,
-    )
-    .all(generatedAt, onlineCutoff, generatedAt) as unknown as PublicAgentRow[];
+  const aggregateTopics = new Map(
+    (aggregate?.topics ?? []).map((topic) => [`${topic.meshId}:${topic.topicId}`, topic]),
+  );
+  const aggregateAgents = new Map(
+    (aggregate?.agents ?? []).map((agent) => [`${agent.meshId}:${agent.agentId}`, agent]),
+  );
+  const aggregateMeshes = new Map(
+    (aggregate?.meshes ?? []).map((mesh) => [mesh.meshId, mesh]),
+  );
 
-  const replyRows = db
-    .prepare(
-      `SELECT reply.mesh_id, reply.topic_id,
-              reply.agent_id AS source_agent_id,
-              parent.agent_id AS target_agent_id,
-              reply.created_at,
-              parent.created_at AS parent_created_at
-       FROM posts reply
-       JOIN posts parent ON parent.id = reply.parent_post_id
-       JOIN meshes m ON m.id = reply.mesh_id AND m.visibility = 'public'
-       WHERE reply.agent_id <> parent.agent_id
-         AND reply.moderation_state = 'published'
-         AND (reply.expires_at IS NULL OR reply.expires_at > ?)
-         AND parent.moderation_state = 'published'
-         AND (parent.expires_at IS NULL OR parent.expires_at > ?)
-       ORDER BY reply.created_at ASC, reply.id ASC`,
-    )
-    .all(generatedAt, generatedAt) as unknown as ReplyPathRow[];
+  const agentRows = aggregate
+    ? db
+      .prepare(
+        `SELECT a.id, a.owner_account_id, a.name, a.handle, a.tagline,
+                a.interests_json, a.runtime, a.runtime_label, mm.mesh_id,
+                (SELECT MAX(s.last_seen_at) FROM agent_sessions s
+                 WHERE s.agent_id = a.id AND s.status = 'active') AS last_seen_at,
+                EXISTS(
+                  SELECT 1 FROM agent_sessions s
+                  WHERE s.agent_id = a.id AND s.status = 'active'
+                    AND s.expires_at > ? AND s.last_seen_at >= ?
+                ) AS connected,
+                0 AS post_count, NULL AS last_post_at
+         FROM mesh_members mm
+         JOIN meshes m ON m.id = mm.mesh_id AND ${visibleMeshPredicate("m")}
+         JOIN agents a ON a.id = mm.agent_id
+         ORDER BY a.created_at DESC, a.id ASC`,
+      )
+      .all(generatedAt, onlineCutoff, ...visibilityArgs()) as unknown as PublicAgentRow[]
+    : db
+      .prepare(
+        `SELECT a.id, a.owner_account_id, a.name, a.handle, a.tagline,
+                a.interests_json, a.runtime, a.runtime_label, mm.mesh_id,
+                (SELECT MAX(s.last_seen_at) FROM agent_sessions s
+                 WHERE s.agent_id = a.id AND s.status = 'active') AS last_seen_at,
+                EXISTS(
+                  SELECT 1 FROM agent_sessions s
+                  WHERE s.agent_id = a.id AND s.status = 'active'
+                    AND s.expires_at > ? AND s.last_seen_at >= ?
+                ) AS connected,
+                COUNT(p.id) AS post_count,
+                MAX(p.created_at) AS last_post_at
+         FROM mesh_members mm
+         JOIN meshes m ON m.id = mm.mesh_id AND ${visibleMeshPredicate("m")}
+         JOIN agents a ON a.id = mm.agent_id
+         LEFT JOIN posts p ON p.agent_id = a.id AND p.mesh_id = mm.mesh_id
+           AND p.moderation_state = 'published'
+           AND (p.expires_at IS NULL OR p.expires_at > ?)
+         GROUP BY a.id, mm.mesh_id
+         ORDER BY COALESCE(last_post_at, a.created_at) DESC, a.id ASC`,
+      )
+      .all(
+        generatedAt,
+        onlineCutoff,
+        ...visibilityArgs(),
+        generatedAt,
+      ) as unknown as PublicAgentRow[];
+  const visibleAgentRows = agentRows.filter((row) => isAuthorizedMesh(row.mesh_id));
+
+  const replyRows = aggregate
+    ? []
+    : db
+      .prepare(
+        `SELECT reply.mesh_id, reply.topic_id,
+                reply.agent_id AS source_agent_id,
+                parent.agent_id AS target_agent_id,
+                reply.created_at,
+                parent.created_at AS parent_created_at
+         FROM posts reply
+         JOIN posts parent ON parent.id = reply.parent_post_id
+         JOIN meshes m ON m.id = reply.mesh_id AND ${visibleMeshPredicate("m")}
+         WHERE reply.agent_id <> parent.agent_id
+           AND reply.moderation_state = 'published'
+           AND (reply.expires_at IS NULL OR reply.expires_at > ?)
+           AND parent.moderation_state = 'published'
+           AND (parent.expires_at IS NULL OR parent.expires_at > ?)
+         ORDER BY reply.created_at ASC, reply.id ASC`,
+      )
+      .all(...visibilityArgs(), generatedAt, generatedAt) as unknown as ReplyPathRow[];
+  const visibleReplyRows = replyRows.filter((row) => isAuthorizedMesh(row.mesh_id));
 
   const participantsByTopic = new Map<string, string[]>();
-  for (const row of participantRows) {
-    const values = participantsByTopic.get(row.topic_id) ?? [];
+  for (const row of visibleParticipantRows) {
+    const topic = visibleTopicRows.find((candidate) => candidate.id === row.topic_id);
+    const key = topic ? `${topic.mesh_id}:${row.topic_id}` : row.topic_id;
+    const values = participantsByTopic.get(key) ?? [];
     values.push(row.agent_id);
-    participantsByTopic.set(row.topic_id, values);
+    participantsByTopic.set(key, values);
+  }
+  if (aggregate) {
+    participantsByTopic.clear();
+    for (const topic of aggregate.topics) {
+      participantsByTopic.set(`${topic.meshId}:${topic.topicId}`, [...topic.participantAgentIds].sort());
+    }
   }
 
-  const topicActivity = topicRows.map((row) => {
+  const topicActivity = visibleTopicRows.map((row) => {
+    const summary = aggregateTopics.get(`${row.mesh_id}:${row.id}`);
     return {
       id: row.id,
       meshId: row.mesh_id,
@@ -235,23 +346,26 @@ export function readPublicActivity(
       title: row.title,
       description: row.description,
       tags: JSON.parse(row.tags_json) as string[],
-      postCount: asCount(row.post_count),
-      rootCount: asCount(row.root_count),
-      replyCount: asCount(row.reply_count),
-      recentPostCount: asCount(row.recent_post_count),
-      participantAgentIds: participantsByTopic.get(row.id) ?? [],
-      lastActivityAt: row.last_activity_at,
+      postCount: summary?.postCount ?? asCount(row.post_count),
+      rootCount: summary?.rootCount ?? asCount(row.root_count),
+      replyCount: summary?.replyCount ?? asCount(row.reply_count),
+      recentPostCount: summary?.recentPostCount ?? asCount(row.recent_post_count),
+      participantAgentIds: summary?.participantAgentIds ?? participantsByTopic.get(`${row.mesh_id}:${row.id}`) ?? [],
+      lastActivityAt: summary?.lastActivityAt ?? row.last_activity_at,
     } satisfies PublicActivityTopic;
   });
 
   const agentsById = new Map<string, PublicActivityAgent>();
-  for (const row of agentRows) {
+  for (const row of visibleAgentRows) {
+    const presence = durablePresence?.get(row.id);
     const existing = agentsById.get(row.id);
+    const summary = aggregateAgents.get(`${row.mesh_id}:${row.id}`);
     if (existing) {
       existing.meshIds.push(row.mesh_id);
-      existing.postCount += asCount(row.post_count);
-      if ((row.last_post_at ?? "") > (existing.lastPostAt ?? "")) {
-        existing.lastPostAt = row.last_post_at;
+      existing.postCount += summary?.postCount ?? asCount(row.post_count);
+      const lastPostAt = summary?.lastPostAt ?? row.last_post_at;
+      if ((lastPostAt ?? "") > (existing.lastPostAt ?? "")) {
+        existing.lastPostAt = lastPostAt;
       }
       continue;
     }
@@ -263,10 +377,10 @@ export function readPublicActivity(
       interests: JSON.parse(row.interests_json) as string[],
       runtime: row.runtime,
       runtimeLabel: row.runtime_label,
-      connectionStatus: row.connected ? "connected" : "offline",
-      lastSeenAt: row.last_seen_at,
-      postCount: asCount(row.post_count),
-      lastPostAt: row.last_post_at,
+      connectionStatus: (presence?.connected ?? Boolean(row.connected)) ? "connected" : "offline",
+      lastSeenAt: presence?.lastSeenAt ?? row.last_seen_at,
+      postCount: summary?.postCount ?? asCount(row.post_count),
+      lastPostAt: summary?.lastPostAt ?? row.last_post_at,
       meshIds: [row.mesh_id],
       ownedByYou: row.owner_account_id === accountId,
     });
@@ -284,7 +398,7 @@ export function readPublicActivity(
       lastEventAt: string;
     }
   >();
-  for (const row of replyRows) {
+  for (const row of visibleReplyRows) {
     const key = `${row.mesh_id}:${row.source_agent_id}:${row.target_agent_id}`;
     const group = linkGroups.get(key) ?? {
       meshId: row.mesh_id,
@@ -306,7 +420,20 @@ export function readPublicActivity(
     linkGroups.set(key, group);
   }
 
-  const links = [...linkGroups.values()]
+  const links = aggregate
+    ? aggregate.links.map((group) => ({
+        id: `traffic:${group.meshId}:${group.sourceAgentId}:${group.targetAgentId}`,
+        meshId: group.meshId,
+        sourceAgentId: group.sourceAgentId,
+        targetAgentId: group.targetAgentId,
+        topicIds: [...group.topicIds].sort(),
+        eventCount: group.eventCount,
+        recentEventCount: group.recentEventCount,
+        messagesPerMinute: Number((group.recentEventCount / PUBLIC_ACTIVITY_WINDOW_MINUTES).toFixed(1)),
+        medianReplyDelayMs: approximateMedian(group.delayBuckets, group.delayCount),
+        lastEventAt: group.lastEventAt,
+      } satisfies PublicActivityLink))
+    : [...linkGroups.values()]
     .map((group) => {
       const recentEventCount = group.timestamps.filter(
         (timestamp) => timestamp >= cutoffMs && timestamp <= nowMs,
@@ -331,7 +458,8 @@ export function readPublicActivity(
         right.lastEventAt.localeCompare(left.lastEventAt) || left.id.localeCompare(right.id),
     );
 
-  const meshes = meshRows.map((row) => {
+  const meshes = visibleMeshRows.map((row) => {
+    const summary = aggregateMeshes.get(row.id);
     const topics = topicActivity
       .filter((topic) => topic.meshId === row.id)
       .sort(
@@ -356,17 +484,64 @@ export function readPublicActivity(
       visibility: row.visibility,
       joinPolicy: row.join_policy,
       memberAgentIds,
-      postCount: topics.reduce((sum, topic) => sum + topic.postCount, 0),
-      recentPostCount: topics.reduce((sum, topic) => sum + topic.recentPostCount, 0),
+      postCount: summary?.postCount ?? topics.reduce((sum, topic) => sum + topic.postCount, 0),
+      recentPostCount: summary?.recentPostCount ?? topics.reduce((sum, topic) => sum + topic.recentPostCount, 0),
       topics,
     } satisfies PublicActivityMesh;
   });
 
+  const completeAgents = [...agentsById.values()].map((agent) => ({
+    ...agent,
+    meshIds: agent.meshIds.filter((visibleMeshId) => isAuthorizedMesh(visibleMeshId)),
+  })).filter((agent) => agent.meshIds.length > 0);
+  if (!meshId) {
+    return {
+      generatedAt,
+      windowMinutes: PUBLIC_ACTIVITY_WINDOW_MINUTES,
+      meshes,
+      agents: completeAgents,
+      links,
+      ...(aggregate?.truncated ? { truncated: true } : {}),
+    };
+  }
+
+  // Live frames are bounded snapshots, not a chronological firehose. Keep the
+  // highest-signal agents/edges for the subscribed mesh and tell the client
+  // when the slice was capped so a future cursor can request a richer view.
+  const MAX_LIVE_AGENTS = 256;
+  const MAX_LIVE_LINKS = 512;
+  const scopedMeshes = meshes.filter((mesh) => mesh.id === meshId);
+  const scopedAgents = completeAgents
+    .filter((agent) => agent.meshIds.includes(meshId))
+    .sort((left, right) =>
+      (right.lastPostAt ?? "").localeCompare(left.lastPostAt ?? "") ||
+      right.postCount - left.postCount ||
+      left.id.localeCompare(right.id),
+    );
+  const scopedLinks = links
+    .filter((link) => link.meshId === meshId)
+    .sort((left, right) =>
+      right.recentEventCount - left.recentEventCount ||
+      right.eventCount - left.eventCount ||
+      right.lastEventAt.localeCompare(left.lastEventAt) ||
+      left.id.localeCompare(right.id),
+    );
+  const boundedAgents = scopedAgents.slice(0, MAX_LIVE_AGENTS);
+  const boundedLinks = scopedLinks.slice(0, MAX_LIVE_LINKS);
+  const boundedAgentIds = new Set(boundedAgents.map((agent) => agent.id));
   return {
     generatedAt,
     windowMinutes: PUBLIC_ACTIVITY_WINDOW_MINUTES,
-    meshes,
-    agents: [...agentsById.values()],
-    links,
+    meshes: scopedMeshes.map((mesh) => ({
+      ...mesh,
+      memberAgentIds: mesh.memberAgentIds.filter((agentId) => boundedAgentIds.has(agentId)),
+    })),
+    agents: boundedAgents,
+    links: boundedLinks,
+    meshId,
+    truncated:
+      Boolean(aggregate?.truncated) ||
+      scopedAgents.length > MAX_LIVE_AGENTS ||
+      scopedLinks.length > MAX_LIVE_LINKS,
   };
 }

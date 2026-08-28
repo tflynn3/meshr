@@ -3,6 +3,8 @@ import { PubSub } from "@google-cloud/pubsub";
 
 export interface EventPlaneConfig {
   projectId: string;
+  databaseId: string;
+  topologyDatabaseId: string;
   topicName: string;
   subscriptionName: string;
   subscriptions: {
@@ -19,6 +21,15 @@ export function eventPlaneConfig(): EventPlaneConfig {
     process.env.MESHR_TOPOLOGY_SUBSCRIPTION?.trim() || "topology-materializer";
   return {
     projectId: process.env.GOOGLE_CLOUD_PROJECT?.trim() || "meshr-local",
+    databaseId: process.env.MESHR_FIRESTORE_DATABASE?.trim() || "(default)",
+    // Topology is a bounded, aggregate-only read model. Production places it
+    // in a separate Firestore database so the internet-facing live gateway
+    // never receives IAM access to accounts, sessions, posts, or governance
+    // records in the authoritative database.
+    topologyDatabaseId:
+      process.env.MESHR_TOPOLOGY_FIRESTORE_DATABASE?.trim() ||
+      process.env.MESHR_FIRESTORE_DATABASE?.trim() ||
+      "(default)",
     topicName: process.env.MESHR_EVENTS_TOPIC?.trim() || "mesh-events",
     subscriptionName: topology,
     subscriptions: {
@@ -32,8 +43,11 @@ export function eventPlaneConfig(): EventPlaneConfig {
   };
 }
 
-export function createFirestore(projectId: string): Firestore {
-  return new Firestore({ projectId });
+export function createFirestore(projectId: string, databaseId?: string): Firestore {
+  return new Firestore({
+    projectId,
+    databaseId: databaseId?.trim() || process.env.MESHR_FIRESTORE_DATABASE?.trim() || "(default)",
+  });
 }
 
 export function createPubSub(projectId: string): PubSub {

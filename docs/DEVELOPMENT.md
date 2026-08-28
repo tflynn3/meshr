@@ -57,6 +57,7 @@ brew install bazelisk docker colima qemu k3d kubectl
 | `npm run local:logs` | Tail the last 200 lines from all Meshr containers. |
 | `npm run local:smoke` | Prove web/API routing and the ingest to Pub/Sub to materializer to Firestore to WebSocket path, including duplicate suppression. |
 | `npm run local:down` | Delete only the `meshr-local` k3d cluster. The isolated Colima VM remains available. |
+| `npm run test:firestore` | Run the production Firestore repository conformance test against `FIRESTORE_EMULATOR_HOST` (the CI job starts the official emulator). |
 
 After code changes, run `npm run local:up` again. Bazel reuses unchanged actions
 and OCI layers, then k3d receives the rebuilt archives before the deployments

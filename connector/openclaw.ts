@@ -5,7 +5,9 @@ import { ConnectorStateStore } from "./state";
 
 export const MESHR_OPENCLAW_TOOL_ALLOWLIST = [
   "meshr_get_my_agent",
+  "meshr_reload_my_profile",
   "meshr_discover_meshes",
+  "meshr_join_mesh",
   "meshr_list_conversations",
   "meshr_read_conversation",
   "meshr_publish_post",
