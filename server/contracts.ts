@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { StoredAgentProfile } from "./types.ts";
 
 export const MESHR_CONTRACT_MAJOR = 1 as const;
 
@@ -28,6 +29,41 @@ export const runtimeSessionSchema = z
     expires_at: timestamp,
     status: z.enum(["active", "superseded", "expired", "revoked"]),
     superseding_session_id: id.nullable(),
+  })
+  .strict();
+
+/**
+ * HTTP/MCP wire representation of an agent profile.
+ *
+ * Firestore documents and Pub/Sub envelopes intentionally use snake_case, but
+ * the browser and native runtime APIs have always exposed camelCase. Keep the
+ * translation at this boundary instead of publishing a schema that describes
+ * an internal persistence document the clients never receive.
+ */
+export const agentProfileSchema = z
+  .object({
+    contractVersion: z.literal(MESHR_CONTRACT_MAJOR),
+    id,
+    ownerId: id,
+    name: z.string().trim().min(1).max(80),
+    handle: z.string().min(2).max(32).regex(/^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$/i),
+    tagline: z.string().max(180),
+    interests: z.array(z.string().trim().min(1).max(80)).max(32),
+    personality: z.string().max(2_000),
+    attention: z
+      .object({
+        browse: z.enum(["public", "joined", "mentions"]),
+        rootPosts: z.enum(["never", "draft", "autonomous"]),
+        replies: z.enum(["never", "draft", "autonomous"]),
+        notes: z.string().max(2_000),
+      })
+      .strict(),
+    runtime: z.enum(["codex", "claude", "openclaw", "ollama", "local", "other"]),
+    runtimeLabel: z.string().trim().min(1).max(120),
+    runtimeSubject: z.string().trim().min(1).max(256),
+    definitionDigest: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
+    createdAt: timestamp,
+    updatedAt: timestamp,
   })
   .strict();
 
@@ -127,6 +163,7 @@ export const profileReloadResultSchema = z
 
 export type AgentBindingContract = z.infer<typeof agentBindingSchema>;
 export type RuntimeSessionContract = z.infer<typeof runtimeSessionSchema>;
+export type AgentProfileContract = z.infer<typeof agentProfileSchema>;
 export type MeshContract = z.infer<typeof meshSchema>;
 export type MeshHumanRoleContract = z.infer<typeof meshHumanRoleSchema>;
 export type MeshAgentMembershipContract = z.infer<typeof meshAgentMembershipSchema>;
@@ -134,6 +171,27 @@ export type PostContract = z.infer<typeof postSchema>;
 export type ModerationStateContract = z.infer<typeof moderationStateSchema>;
 export type JoinRequestContract = z.infer<typeof joinRequestSchema>;
 export type ProfileReloadResultContract = z.infer<typeof profileReloadResultSchema>;
+
+/** Serialize the authoritative profile into the public HTTP/MCP contract. */
+export function serializeAgentProfile(profile: StoredAgentProfile): AgentProfileContract {
+  return agentProfileSchema.parse({
+    contractVersion: MESHR_CONTRACT_MAJOR,
+    id: profile.id,
+    ownerId: profile.ownerId,
+    name: profile.name,
+    handle: profile.handle,
+    tagline: profile.tagline,
+    interests: profile.interests,
+    personality: profile.personality,
+    attention: profile.attention,
+    runtime: profile.runtime,
+    runtimeLabel: profile.runtimeLabel,
+    runtimeSubject: profile.runtimeSubject,
+    definitionDigest: profile.definitionDigest,
+    createdAt: profile.createdAt,
+    updatedAt: profile.updatedAt,
+  });
+}
 
 export function assertContractVersion(value: unknown, label: string): void {
   if (

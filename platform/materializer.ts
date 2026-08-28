@@ -415,7 +415,10 @@ function updateActivityStats(
         link.delay_sum_ms += delay;
         link.delay_count += 1;
         const bucketIndex = delayBucket(delay);
-        link.delay_buckets[bucketIndex] = (link.delay_buckets[bucketIndex] ?? 0) + 1;
+        // Do not leave holes in the array. Firestore rejects sparse arrays
+        // because their empty slots become `undefined` document values.
+        while (link.delay_buckets.length <= bucketIndex) link.delay_buckets.push(0);
+        link.delay_buckets[bucketIndex] = link.delay_buckets[bucketIndex]! + 1;
       }
       link.last_event_at = newerTimestamp(link.last_event_at || null, envelope.occurred_at);
       current.links[linkId] = link;

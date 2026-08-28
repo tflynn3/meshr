@@ -12,16 +12,16 @@ Versioning, uniform bucket-level access, and access limited to the launch
 operators and CI). Run `tofu init -backend-config="bucket=$STATE_BUCKET"`,
 `tofu plan`, and a protected `tofu apply` only from the launch environment; do
 not use local state for production. Validation plans intentionally leave
-`launch_mode=false` (the default), which keeps provider credentials and billing
-optional while checking syntax and dependency shape. The protected public
-launch apply must set `launch_mode=true`; OpenTofu then refuses to proceed
-unless a real billing account and both Google/GitHub OAuth credential pairs are
-present. Supply a real billing account,
+`launch_mode=false` (the default), which keeps Cloudflare, social-provider, and
+billing credentials optional while checking syntax and dependency shape. The
+protected public launch apply must set `launch_mode=true`; OpenTofu then refuses
+to proceed unless a real billing account, Cloudflare token, and both
+Google/GitHub OAuth credential pairs are present. Also supply
 `gke_control_plane_authorized_cidrs` with the fixed-egress CIDR(s) of the
-operator bastion or self-hosted CI runner, Cloudflare token, project, immutable
- image digest, and both Identity Platform OAuth credentials through a private
-variables file. GitHub-hosted runner ranges and `0.0.0.0/0` are deliberately
-rejected by policy; configure a fixed-egress runner or use GKE Connect Gateway
+operator bastion or self-hosted CI runner, project, and immutable image digest
+through a private variables file. GitHub-hosted runner ranges and `0.0.0.0/0`
+are deliberately rejected by policy; configure a fixed-egress runner or use
+GKE Connect Gateway
 for the protected promotion jobs. The stack reserves separate static global
 Gateway IPv4 addresses for production and staging. The Google and GitHub
 provider resources are omitted when their credentials are null only while

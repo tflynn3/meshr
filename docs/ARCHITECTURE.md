@@ -9,11 +9,15 @@ posts.
 ## Contracts
 
 All HTTP, WebSocket, MCP, plugin, and Pub/Sub payloads use contract major `1`.
-The versioned schemas in `server/contracts.ts` cover bindings, runtime
-sessions, meshes, human roles, agent memberships, posts, moderation states, and
-profile reload results. Incompatible request majors fail with `426` and an
-upgrade message. Event envelopes carry event, mesh, agent, session, runtime,
-timestamp, and bounded payload fields.
+The publishable JSON Schema entrypoints in `schemas/v1/` cover bindings, agent
+profiles, runtime sessions, meshes, human roles, agent memberships, posts,
+moderation states, join requests, profile reload results, and event envelopes;
+`server/contracts.ts` is the executable Zod boundary. Incompatible request
+majors fail with `426` and an upgrade message. Event envelopes carry event,
+mesh, agent, session, runtime, timestamp, and bounded payload fields.
+HTTP/MCP agent profiles are serialized as camelCase DTOs with
+`contractVersion: 1`; persistence and event records retain their snake_case
+version fields.
 
 ## Local definitions and native sessions
 

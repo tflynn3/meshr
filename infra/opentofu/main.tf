@@ -388,6 +388,10 @@ locals {
     "172.64.0.0/13",
     "131.0.72.0/22",
   ]
+  # Validation plans can omit Cloudflare entirely. Any launch or explicitly
+  # managed DNS apply turns this on and is guarded below so a missing token
+  # cannot produce a partial public edge.
+  cloudflare_enabled = var.launch_mode || var.manage_production_dns_records || var.manage_staging_dns_records
 }
 
 data "google_project" "current" {
@@ -420,6 +424,19 @@ resource "terraform_data" "launch_guard" {
         trimspace(value) != ""
       ])
       error_message = "launch_mode=true requires project_id, billing_account_id, and both Google/GitHub OAuth client ID and secret values. Leave launch_mode=false only for validation plans."
+    }
+  }
+}
+
+resource "terraform_data" "cloudflare_guard" {
+  count = local.cloudflare_enabled ? 1 : 0
+
+  input = "cloudflare-edge"
+
+  lifecycle {
+    precondition {
+      condition     = try(trimspace(var.cloudflare_api_token), "") != ""
+      error_message = "launch_mode or DNS management requires cloudflare_api_token with Zone read, DNS edit, and Zone Settings edit permissions."
     }
   }
 }
@@ -2080,7 +2097,8 @@ resource "google_certificate_manager_dns_authorization" "staging" {
 # DNS-only; proxying validation records prevents Certificate Manager from
 # observing the challenge.
 resource "cloudflare_record" "certificate_authorization" {
-  zone_id = data.cloudflare_zone.meshr.id
+  count   = local.cloudflare_enabled ? 1 : 0
+  zone_id = data.cloudflare_zone.meshr[0].id
   name    = google_certificate_manager_dns_authorization.meshr.dns_resource_record[0].name
   type    = google_certificate_manager_dns_authorization.meshr.dns_resource_record[0].type
   value   = google_certificate_manager_dns_authorization.meshr.dns_resource_record[0].data
@@ -2090,7 +2108,8 @@ resource "cloudflare_record" "certificate_authorization" {
 }
 
 resource "cloudflare_record" "staging_certificate_authorization" {
-  zone_id = data.cloudflare_zone.meshr.id
+  count   = local.cloudflare_enabled ? 1 : 0
+  zone_id = data.cloudflare_zone.meshr[0].id
   name    = google_certificate_manager_dns_authorization.staging.dns_resource_record[0].name
   type    = google_certificate_manager_dns_authorization.staging.dns_resource_record[0].type
   value   = google_certificate_manager_dns_authorization.staging.dns_resource_record[0].data
@@ -2286,12 +2305,13 @@ resource "google_secret_manager_secret_iam_member" "ingest_canary_internal_token
 }
 
 data "cloudflare_zone" "meshr" {
-  name = var.zone_name
+  count = local.cloudflare_enabled ? 1 : 0
+  name  = var.zone_name
 }
 
 resource "cloudflare_zone_settings_override" "tls" {
   count   = (var.manage_production_dns_records || var.manage_staging_dns_records) ? 1 : 0
-  zone_id = data.cloudflare_zone.meshr.id
+  zone_id = data.cloudflare_zone.meshr[0].id
   settings {
     ssl              = "strict"
     always_use_https = "on"
@@ -2301,7 +2321,7 @@ resource "cloudflare_zone_settings_override" "tls" {
 
 resource "cloudflare_record" "root" {
   count   = var.manage_production_dns_records ? 1 : 0
-  zone_id = data.cloudflare_zone.meshr.id
+  zone_id = data.cloudflare_zone.meshr[0].id
   name    = "@"
   type    = "A"
   value   = google_compute_global_address.gateway.address
@@ -2313,7 +2333,7 @@ resource "cloudflare_record" "root" {
 
 resource "cloudflare_record" "staging" {
   count   = var.manage_staging_dns_records ? 1 : 0
-  zone_id = data.cloudflare_zone.meshr.id
+  zone_id = data.cloudflare_zone.meshr[0].id
   name    = "staging"
   type    = "A"
   value   = google_compute_global_address.staging_gateway.address

@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meshr.social/schemas/meshr/v1/agent-profile.schema.json",
+  "$ref": "./contracts.schema.json#/$defs/agentProfile"
+}

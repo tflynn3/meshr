@@ -25,6 +25,8 @@ variable "cloudflare_api_token" {
   type        = string
   description = "Token with Zone:Read, DNS:Edit, and Zone Settings:Edit permission for the zone."
   sensitive   = true
+  default     = null
+  nullable    = true
 }
 
 variable "manage_production_dns_records" {

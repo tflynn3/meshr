@@ -66,14 +66,38 @@ jobs:
           done
           docker logs meshr-firestore-emulator
           exit 1
+      - name: Start Pub/Sub emulator
+        run: |
+          set -euo pipefail
+          docker run --detach --name meshr-pubsub-emulator \
+            --publish 8085:8085 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:540.0.0-emulators \
+            gcloud beta emulators pubsub start \
+              --host-port=0.0.0.0:8085 \
+              --project=meshr-event-plane \
+              --quiet
+          for attempt in $(seq 1 30); do
+            if (echo >/dev/tcp/127.0.0.1/8085) 2>/dev/null; then exit 0; fi
+            sleep 2
+          done
+          docker logs meshr-pubsub-emulator
+          exit 1
       - name: Firestore repository emulator conformance
         env:
           FIRESTORE_EMULATOR_HOST: 127.0.0.1:8081
           GOOGLE_CLOUD_PROJECT: meshr-emulator
         run: npm run test:firestore
-      - name: Stop Firestore emulator
+      - name: Event plane emulator end-to-end qualification
+        env:
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8081
+          PUBSUB_EMULATOR_HOST: 127.0.0.1:8085
+          GOOGLE_CLOUD_PROJECT: meshr-event-plane
+        run: npm run test:event-plane
+      - name: Stop emulators
         if: always()
-        run: docker rm --force meshr-firestore-emulator || true
+        run: |
+          docker rm --force meshr-pubsub-emulator || true
+          docker rm --force meshr-firestore-emulator || true
       - run: npm test
       - run: npm run build:npm
       - run: npm run test:connector

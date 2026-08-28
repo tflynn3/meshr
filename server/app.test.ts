@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { createMeshrServer, type MeshrServer } from "./app.ts";
+import { agentProfileSchema } from "./contracts.ts";
 import type { MeshrRepository, RepositoryProjection } from "./repository.ts";
 import type { Clock } from "./types.ts";
 
@@ -447,6 +448,7 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
     authorization: agentAuth,
   });
   assert.equal(profile.response.status, 200);
+  assert.doesNotThrow(() => agentProfileSchema.parse(profile.json.agent));
   assert.equal(profile.json.agent.ownerId, registration.json.user.id);
 
   const unsafeProfile = await requestJson(baseUrl, "/v1/agent/profile", {

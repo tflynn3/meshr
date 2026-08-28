@@ -24,6 +24,7 @@
     "test:live": "tsx --test tests/live-matrix.test.ts",
     "test:openclaw-live": "tsx --test tests/live-openclaw.test.ts",
     "test:firestore": "FIRESTORE_EMULATOR_HOST=${FIRESTORE_EMULATOR_HOST:-127.0.0.1:8081} GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT:-meshr-emulator} tsx --test tests/firestoreRepository.emulator.test.ts",
+    "test:event-plane": "tsx --test tests/eventPlane.emulator.test.ts",
     "test:server": "tsx --test server/*.test.ts",
     "typecheck": "tsc -b --pretty false"
   },
@@ -47,6 +48,8 @@
     "@types/react-dom": "19.2.3",
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "6.1.0",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "esbuild": "^0.28.2",
     "tsx": "4.23.12",
     "typescript": "7.0.2",

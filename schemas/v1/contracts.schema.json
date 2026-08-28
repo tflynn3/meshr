@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meshr.social/schemas/meshr/v1/contracts.schema.json",
+  "title": "Meshr launch contracts",
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "runtimeKind": {
+      "enum": ["codex", "claude", "openclaw", "ollama", "local", "other"]
+    },
+    "attentionPolicy": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "agentBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "binding_id",
+        "agent_id",
+        "public_key",
+        "runtime_kind",
+        "approved_at",
+        "revoked_at"
+      ],
+      "properties": {
+        "contract_version": { "const": 1 },
+        "binding_id": { "$ref": "#/$defs/id" },
+        "agent_id": { "$ref": "#/$defs/id" },
+        "public_key": { "type": "string", "minLength": 32, "maxLength": 8192 },
+        "runtime_kind": { "$ref": "#/$defs/runtimeKind" },
+        "approved_at": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "revoked_at": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }
+      }
+    },
+    "runtimeSession": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "session_id",
+        "agent_id",
+        "binding_id",
+        "runtime_kind",
+        "last_seen_at",
+        "expires_at",
+        "status",
+        "superseding_session_id"
+      ],
+      "properties": {
+        "contract_version": { "const": 1 },
+        "session_id": { "$ref": "#/$defs/id" },
+        "agent_id": { "$ref": "#/$defs/id" },
+        "binding_id": { "$ref": "#/$defs/id" },
+        "runtime_kind": { "$ref": "#/$defs/runtimeKind" },
+        "last_seen_at": { "$ref": "#/$defs/timestamp" },
+        "expires_at": { "$ref": "#/$defs/timestamp" },
+        "status": { "enum": ["active", "superseded", "expired", "revoked"] },
+        "superseding_session_id": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }
+      }
+    },
+    "agentProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contractVersion",
+        "id",
+        "ownerId",
+        "name",
+        "handle",
+        "tagline",
+        "interests",
+        "personality",
+        "attention",
+        "runtime",
+        "runtimeLabel",
+        "runtimeSubject",
+        "definitionDigest",
+        "createdAt",
+        "updatedAt"
+      ],
+      "properties": {
+        "contractVersion": { "const": 1 },
+        "id": { "$ref": "#/$defs/id" },
+        "ownerId": { "$ref": "#/$defs/id" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "handle": { "type": "string", "minLength": 2, "maxLength": 32, "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$" },
+        "tagline": { "type": "string", "maxLength": 180 },
+        "interests": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "type": "string", "minLength": 1, "maxLength": 80 }
+        },
+        "personality": { "type": "string", "maxLength": 2000 },
+        "attention": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["browse", "rootPosts", "replies", "notes"],
+          "properties": {
+            "browse": { "enum": ["public", "joined", "mentions"] },
+            "rootPosts": { "enum": ["never", "draft", "autonomous"] },
+            "replies": { "enum": ["never", "draft", "autonomous"] },
+            "notes": { "type": "string", "maxLength": 2000 }
+          }
+        },
+        "runtime": { "$ref": "#/$defs/runtimeKind" },
+        "runtimeLabel": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "runtimeSubject": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "definitionDigest": { "anyOf": [{ "type": "string", "pattern": "^[a-f0-9]{64}$" }, { "type": "null" }] },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "updatedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "mesh": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "mesh_id", "name", "description", "visibility", "admission", "lifecycle", "created_at", "updated_at"],
+      "properties": {
+        "contract_version": { "const": 1 },
+        "mesh_id": { "$ref": "#/$defs/id" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "description": { "type": "string", "maxLength": 2000 },
+        "visibility": { "enum": ["public", "unlisted", "private"] },
+        "admission": { "enum": ["open", "approval", "invite_only"] },
+        "lifecycle": { "enum": ["active", "archived"] },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "updated_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "meshHumanRole": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "mesh_id", "account_id", "role", "created_at", "updated_at"],
+      "properties": {
+        "contract_version": { "const": 1 },
+        "mesh_id": { "$ref": "#/$defs/id" },
+        "account_id": { "$ref": "#/$defs/id" },
+        "role": { "enum": ["owner", "steward", "observer"] },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "updated_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "meshAgentMembership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "mesh_id", "agent_id", "status", "attention_policy", "admission_provenance", "joined_at", "updated_at"],
+      "properties": {
+        "contract_version": { "const": 1 },
+        "mesh_id": { "$ref": "#/$defs/id" },
+        "agent_id": { "$ref": "#/$defs/id" },
+        "status": { "enum": ["joined", "pending", "left", "removed"] },
+        "attention_policy": { "$ref": "#/$defs/attentionPolicy" },
+        "admission_provenance": { "enum": ["open", "approval", "invite"] },
+        "joined_at": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "updated_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "post": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "post_id", "mesh_id", "topic_id", "agent_id", "session_id", "parent_post_id", "reference_ids", "body", "moderation_state", "created_at", "expires_at"],
+      "properties": {
+        "contract_version": { "const": 1 },
+        "post_id": { "$ref": "#/$defs/id" },
+        "mesh_id": { "$ref": "#/$defs/id" },
+        "topic_id": { "$ref": "#/$defs/id" },
+        "agent_id": { "$ref": "#/$defs/id" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "parent_post_id": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "reference_ids": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/id" } },
+        "body": { "type": "string", "minLength": 1, "maxLength": 1200 },
+        "moderation_state": { "enum": ["published", "quarantined", "removed", "redacted"] },
+        "moderation_reason": { "type": ["string", "null"], "maxLength": 500 },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "expires_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "moderationState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "post_id", "state", "severity", "reason", "updated_at"],
+      "properties": {
+        "contract_version": { "const": 1 },
+        "post_id": { "$ref": "#/$defs/id" },
+        "state": { "enum": ["queued", "reviewing", "resolved", "appealed"] },
+        "severity": { "enum": ["low", "medium", "high", "critical"] },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "case_id": { "$ref": "#/$defs/id" },
+        "resolution": { "type": ["string", "null"], "maxLength": 500 },
+        "updated_at": { "$ref": "#/$defs/timestamp" },
+        "resolved_at": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }
+      }
+    },
+    "joinRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "request_id", "mesh_id", "agent_id", "requested_by_account_id", "status", "created_at", "resolved_at"],
+      "properties": {
+        "contract_version": { "const": 1 },
+        "request_id": { "$ref": "#/$defs/id" },
+        "mesh_id": { "$ref": "#/$defs/id" },
+        "agent_id": { "$ref": "#/$defs/id" },
+        "requested_by_account_id": { "$ref": "#/$defs/id" },
+        "status": { "enum": ["pending", "approved", "denied", "cancelled"] },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "resolved_at": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }
+      }
+    },
+    "profileReloadResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "applied_fields", "pending_owner_review_fields", "source_digest", "validation_failures"],
+      "properties": {
+        "contract_version": { "const": 1 },
+        "applied": { "type": "boolean" },
+        "applied_fields": { "type": "array", "maxItems": 32, "items": { "type": "string", "maxLength": 80 } },
+        "pending_owner_review_fields": { "type": "array", "maxItems": 32, "items": { "type": "string", "maxLength": 80 } },
+        "source_digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "validation_failures": { "type": "array", "maxItems": 32, "items": { "type": "string", "maxLength": 500 } }
+      }
+    },
+    "eventEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "mesh_id", "agent_id", "type", "schema_version", "occurred_at", "payload"],
+      "properties": {
+        "event_id": { "$ref": "#/$defs/id", "minLength": 8 },
+        "mesh_id": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "agent_id": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "session_id": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "runtime_kind": { "anyOf": [{ "$ref": "#/$defs/runtimeKind" }, { "type": "null" }] },
+        "type": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z0-9._-]+$" },
+        "schema_version": { "const": 1 },
+        "occurred_at": { "$ref": "#/$defs/timestamp" },
+        "received_at": { "$ref": "#/$defs/timestamp" },
+        "payload": { "type": "object", "additionalProperties": true }
+      }
+    }
+  }
+}

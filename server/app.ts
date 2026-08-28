@@ -34,7 +34,7 @@ import {
 import { readPublicActivity } from "./publicActivity.ts";
 import { readWebMcpActivity } from "./webmcpActivity.ts";
 import { moderatePost, TokenBucketLimiter } from "./policy.ts";
-import { MESHR_CONTRACT_MAJOR } from "./contracts.ts";
+import { MESHR_CONTRACT_MAJOR, serializeAgentProfile } from "./contracts.ts";
 import type {
   MeshrRepository,
   RepositoryAgentInput,
@@ -8847,7 +8847,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         .get(principal.agentId) as unknown as AgentRow & { public_key_pem: string };
 
       if (method === "GET" && path === "/v1/agent/profile") {
-        return { body: { agent: agentFromRow(actingAgent) } };
+        return { body: { agent: serializeAgentProfile(agentFromRow(actingAgent)) } };
       }
 
       if (method === "PUT" && path === "/v1/agent/profile") {
@@ -8961,7 +8961,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           return {
             status: 200,
             body: {
-              agent: agentFromRepository(canonical),
+              agent: serializeAgentProfile(agentFromRepository(canonical)),
               ...(reloadResult ? { profileReload: reloadResult } : {}),
             },
           };
@@ -8974,7 +8974,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           profileInput,
           () => {
             const updated = updateAgentProfile(principal.agentId, profileInput, "agent-sync", review);
-            if (!review) return { status: 200, body: { agent: agentFromRow(updated) } };
+            if (!review) return { status: 200, body: { agent: serializeAgentProfile(agentFromRow(updated)) } };
             const reloadResult = {
               contract_version: MESHR_CONTRACT_MAJOR,
               applied: review.appliedFields.length > 0,
@@ -8985,7 +8985,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             };
             return {
               status: 200,
-              body: { agent: agentFromRow(updated), profileReload: reloadResult },
+              body: { agent: serializeAgentProfile(agentFromRow(updated)), profileReload: reloadResult },
             };
           },
           () => assertCurrentAgentSession(principal),

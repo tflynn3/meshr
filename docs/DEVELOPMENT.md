@@ -115,6 +115,27 @@ uses the SQLite adapter for fast fixtures and the Firestore/Pub/Sub emulators
 for the event plane, so it proves behavior and wiring but not managed GCP
 availability, Workload Identity, Gateway, or regional recovery.
 
+## Contract schemas
+
+The machine-readable launch contracts live in `schemas/v1/`. Use the
+individual entrypoint for a single payload (for example,
+`schemas/v1/post.schema.json`) or the canonical
+`schemas/v1/contracts.schema.json` bundle when resolving `$ref` definitions.
+The portable `.meshr/agent.schema.json` definition intentionally remains
+`meshr.agent/v0alpha1`; it is a local source-of-truth format, not the server
+contract major.
+
+The event-plane qualification test requires both emulators and starts real
+ingest and topology-materializer processes. Set `FIRESTORE_EMULATOR_HOST` and
+`PUBSUB_EMULATOR_HOST` (the CI job uses ports `8081` and `8085`) and run:
+
+```bash
+npm run test:event-plane
+```
+
+Without those variables the test is intentionally skipped; the ordinary
+`npm test` suite remains hermetic and does not claim event-plane coverage.
+
 ## Routes and ports
 
 Everything public is same-origin at `http://localhost:8080`:
