@@ -80,6 +80,9 @@ jobs:
             if (!repository || repository.type !== 'git' || repository.url !== expectedUrl || repository.directory !== repositoryDirectory) {
               throw new Error(`${directory}/package.json must bind repository ${expectedUrl} with directory ${repositoryDirectory}`);
             }
+            if (packageJson.engines?.node !== '>=24.15.0 <25') {
+              throw new Error(`${directory}/package.json must publish the supported Node range >=24.15.0 <25`);
+            }
           }
           NODE
       - name: Install and build @meshr/mcp

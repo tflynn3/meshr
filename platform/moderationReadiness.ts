@@ -129,7 +129,10 @@ export function createModerationReadinessProbe(options: ModerationReadinessOptio
           cached = { result, expiresAt: Date.now() + Math.min(cacheMs, 2_000) };
           return result;
         }
-        const headers = new Headers({ accept: "application/json" });
+        const headers = new Headers({
+          accept: "application/json",
+          "x-meshr-contract-version": "1",
+        });
         headers.set("authorization", `Bearer ${token}`);
         const response = await fetchImpl(healthcheckUrl!, {
           method: "GET",

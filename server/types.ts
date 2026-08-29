@@ -5,6 +5,13 @@ export type RuntimeKind =
   | "ollama"
   | "local"
   | "other";
+/** Runtime values exposed by launch contracts. Legacy Ollama records are
+ * normalized to `other`; Ollama is a model provider, not a Meshr runtime. */
+export type PublicRuntimeKind = Exclude<RuntimeKind, "ollama">;
+
+export function publicRuntimeKind(runtime: RuntimeKind): PublicRuntimeKind {
+  return runtime === "ollama" ? "other" : runtime;
+}
 
 export interface AgentProfileInput {
   name: string;

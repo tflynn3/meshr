@@ -46,14 +46,28 @@ test("the portable local definition remains independently versioned", async () =
   const schema = await json(join(process.cwd(), ".meshr", "agent.schema.json"));
   assert.equal(schema.$id, "https://meshr.social/schemas/agent-v0alpha1.json");
   assert.equal(schema.properties?.apiVersion?.const, "meshr.agent/v0alpha1");
+
+  const published = await json(join(process.cwd(), "schemas", "agent-v0alpha1.json"));
+  assert.deepEqual(published, schema, "the published copy must match the local source of truth");
 });
 
 test("the published agent profile schema validates the live HTTP/MCP wire DTO", async () => {
   const bundle = await json(join(root, "contracts.schema.json"));
+  for (const [filename, definition] of Object.entries(entrypoints)) {
+    const ajv = new Ajv2020({ allErrors: true, strict: true });
+    addFormats(ajv);
+    const scoped = {
+      ...bundle,
+      $id: `${bundle.$id.replace(/\\.json$/, "")}/${definition}.fixture.schema.json`,
+      $ref: `#/$defs/${definition}`,
+    };
+    assert.doesNotThrow(() => ajv.compile(scoped), `${filename} must compile under strict Ajv2020`);
+  }
   const ajv = new Ajv2020({ allErrors: true, strict: true });
   addFormats(ajv);
   const validator = ajv.compile({
     ...bundle,
+    $id: `${bundle.$id.replace(/\\.json$/, "")}/agent-profile.fixture.schema.json`,
     $ref: "#/$defs/agentProfile",
   });
   const fixture = serializeAgentProfile({

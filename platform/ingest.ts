@@ -22,6 +22,7 @@ if (!internalToken) throw new Error("MESHR_INTERNAL_TOKEN is required.");
 const config = eventPlaneConfig();
 const firestore = createFirestore(config.projectId, config.databaseId);
 const pubsub = createPubSub(config.projectId);
+const MESHR_CONTRACT_MAJOR = "1";
 const topic = pubsub.topic(config.topicName, { messageOrdering: true });
 const PUBLISH_LEASE_SECONDS = 30;
 const MAX_PUBLISH_BATCH = 200;
@@ -43,7 +44,11 @@ function readyDiscoveryShard(eventId: string): number {
 }
 
 function json(response: ServerResponse, status: number, body: unknown): void {
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+  response.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "x-meshr-contract-version": MESHR_CONTRACT_MAJOR,
+  });
   response.end(JSON.stringify(body));
 }
 
@@ -450,6 +455,18 @@ const server = createServer(async (request, response) => {
     const path = basePath && url.pathname.startsWith(basePath)
       ? url.pathname.slice(basePath.length) || "/"
       : url.pathname;
+    const suppliedContractVersion = request.headers["x-meshr-contract-version"];
+    if (suppliedContractVersion !== undefined &&
+        (typeof suppliedContractVersion !== "string" ||
+          suppliedContractVersion.trim() !== MESHR_CONTRACT_MAJOR)) {
+      json(response, 426, {
+        error: {
+          code: "incompatible_contract",
+          message: `This Meshr ingest service requires contract major ${MESHR_CONTRACT_MAJOR}; upgrade the client integration.`,
+        },
+      });
+      return;
+    }
     if (request.method === "GET" && path === "/healthz") {
       json(response, 200, { ok: true, service: "ingest" });
       return;

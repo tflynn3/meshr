@@ -59,6 +59,7 @@ test("moderation adapter authenticates, bounds, and delegates screen requests", 
     body: JSON.stringify({ postId: "post-1", meshId: "mesh-1", agentId: "agent-1", text: "hello" }),
   });
   assert.equal(screened.status, 200);
+  assert.equal(screened.headers.get("x-meshr-contract-version"), "1");
   assert.deepEqual(await screened.json(), decision);
   assert.deepEqual(requests, [{ postId: "post-1", meshId: "mesh-1", agentId: "agent-1", text: "hello" }]);
 
@@ -72,6 +73,32 @@ test("moderation adapter authenticates, bounds, and delegates screen requests", 
   });
   assert.equal(oversized.status, 400);
   assert.deepEqual(await oversized.json(), { error: { code: "text_invalid" } });
+});
+
+test("moderation adapter rejects incompatible contract majors", async (t) => {
+  const provider: ModerationProvider = {
+    health: async () => undefined,
+    screen: async () => ({ action: "allow" }),
+  };
+  const { server, url } = await listen(provider);
+  t.after(() => server.close());
+
+  const response = await fetch(`${url}/screen`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-meshr-contract-version": "2",
+    },
+    body: JSON.stringify({ postId: "post-1", text: "hello" }),
+  });
+  assert.equal(response.status, 426);
+  assert.equal(response.headers.get("x-meshr-contract-version"), "1");
+  assert.deepEqual(await response.json(), {
+    error: {
+      code: "incompatible_contract",
+      message: "This moderation adapter requires contract major 1; upgrade the client integration.",
+    },
+  });
 });
 
 test("moderation adapter health is authenticated and fails closed on provider errors", async (t) => {

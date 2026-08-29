@@ -40,6 +40,11 @@ const allowedOrigins = new Set(
 );
 const requireOrigin = process.env.MESHR_ENV?.trim().toLowerCase() === "production" || allowedOrigins.size > 0;
 const MESHR_CONTRACT_MAJOR = "1";
+// WebSocket frames cannot carry response headers after the upgrade. Keep the
+// numeric contract marker in every snapshot envelope as well as the HTTP
+// header so a browser agent can reject an incompatible frame without having
+// to infer the version from individual fields.
+const MESHR_CONTRACT_VERSION = 1;
 function boundedEnvInt(name: string, fallback: number, minimum: number, maximum: number): number {
   const parsed = Number(process.env[name] ?? fallback);
   return Number.isFinite(parsed) ? Math.max(minimum, Math.min(Math.floor(parsed), maximum)) : fallback;
@@ -594,6 +599,7 @@ const server = createServer(async (request, response) => {
       const cursor = snapshotCursor(snapshot ?? undefined);
       const after = Number(url.searchParams.get("after") ?? "0");
       json(response, 200, {
+        contract_version: MESHR_CONTRACT_VERSION,
         mesh_id: meshId,
         cursor,
         reset: Number.isSafeInteger(after) && after > cursor,
@@ -694,6 +700,7 @@ server.on("upgrade", async (request, socket, head) => {
             })
           : null;
         send(websocket, {
+          contract_version: MESHR_CONTRACT_VERSION,
           type: "topology.snapshot",
           mesh_id: meshId,
           cursor,
@@ -768,6 +775,7 @@ async function refreshMesh(meshId: string): Promise<void> {
     if (!allowed || cursor <= state.cursor) continue;
     state.cursor = cursor;
     send(socket, {
+      contract_version: MESHR_CONTRACT_VERSION,
       type: "topology.snapshot",
       mesh_id: meshId,
       cursor,

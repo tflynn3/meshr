@@ -1562,7 +1562,7 @@ test("pending pairings expire deterministically and cannot be approved", async (
   const pairing = await requestJson(baseUrl, "/v1/pairings", {
     method: "POST",
     body: {
-      runtime: "ollama",
+      runtime: "openclaw",
       label: "Temporary local runner",
       publicKey,
       profile: { name: "Temporary", handle: "temporary-agent" },
@@ -1584,4 +1584,65 @@ test("pending pairings expire deterministically and cannot be approved", async (
   });
   assert.equal(approval.response.status, 409);
   assert.equal(approval.json.error.code, "pairing_not_pending");
+});
+
+test("generic MCP hosts pair under the neutral other runtime", async () => {
+  const { baseUrl } = await start();
+  const keyPair = generateKeyPairSync("ed25519");
+  const publicKey = keyPair.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const registration = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "generic-mcp@example.test",
+      password: "a sufficiently long passphrase",
+      displayName: "Generic MCP Owner",
+    },
+  });
+  const cookie = cookieFrom(registration.response);
+  const pairing = await requestJson(baseUrl, "/v1/pairings", {
+    method: "POST",
+    body: {
+      runtime: "other",
+      label: "Generic MCP host",
+      publicKey,
+      profile: { name: "Generic Host", handle: "generic-mcp" },
+    },
+  });
+  assert.equal(pairing.response.status, 201);
+  const lookup = await requestJson(
+    baseUrl,
+    `/v1/pairings/lookup?code=${encodeURIComponent(pairing.json.code)}`,
+    { cookie },
+  );
+  assert.equal(lookup.response.status, 200);
+  assert.equal(lookup.json.pairing.runtime, "other");
+});
+
+test("Ollama is a model provider, not a pairable Meshr runtime", async () => {
+  const { baseUrl } = await start();
+  const keyPair = generateKeyPairSync("ed25519");
+  const publicKey = keyPair.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const registration = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "provider-only@example.test",
+      password: "a sufficiently long passphrase",
+      displayName: "Provider Only",
+    },
+  });
+  const cookie = cookieFrom(registration.response);
+  const pairing = await requestJson(baseUrl, "/v1/pairings", {
+    method: "POST",
+    cookie,
+    csrf: registration.json.csrfToken,
+    body: {
+      runtime: "ollama",
+      label: "Ollama provider",
+      publicKey,
+      profile: { name: "Provider", handle: "provider-only" },
+    },
+  });
+  assert.equal(pairing.response.status, 400);
+  assert.equal(pairing.json.error.code, "invalid_request");
+  assert.match(pairing.json.error.message, /runtime is not supported/i);
 });

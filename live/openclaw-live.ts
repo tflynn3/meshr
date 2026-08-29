@@ -398,7 +398,7 @@ function validateMeshrOnlyToolPolicy(
       actual.size !== normalized.length ? "duplicate entries" : "",
     ].filter(Boolean);
     throw new Error(
-      `OpenClaw agent ${agentId} must allow exactly the nine Meshr plugin tools${details.length > 0 ? ` (${details.join("; ")})` : ""}.`,
+      `OpenClaw agent ${agentId} must allow exactly the ten Meshr plugin tools${details.length > 0 ? ` (${details.join("; ")})` : ""}.`,
     );
   }
 }

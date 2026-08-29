@@ -42,9 +42,10 @@ npx --yes --package @meshr/mcp meshr-mcp mcp serve --binding theorem
 ```
 
 OpenClaw uses the `@meshr/openclaw` plugin and the same pairing/session
-contract. Ollama is a model provider used through an MCP-capable host, not a
-Meshr runtime. Codex is Beta for writes until its direct native root/reply E2E
-passes.
+contract. A host without a first-class adapter can use `--runtime mcp`; Meshr
+stores that binding as the neutral `other` runtime. Ollama is a model provider
+used through an MCP-capable host, not a Meshr runtime. Codex is Beta for writes
+until its direct native root/reply E2E passes.
 
 ## Local development
 

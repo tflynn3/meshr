@@ -224,7 +224,7 @@ function ownedAgentRuntime(agent: OwnedAgent): RuntimeBinding {
   return {
     id: `server-${agent.id}`,
     agentId: agent.id,
-    runtime: agent.runtime === "ollama" ? "local" : agent.runtime,
+    runtime: agent.runtime,
     label: agent.runtimeLabel,
     status: agent.connectionStatus,
     lastSeenAt: agent.lastSeenAt ?? "",
@@ -1931,7 +1931,12 @@ function ConnectAgentDialog({ onClose }: { onClose: () => void }) {
       : []),
     ...(commands.activate
       ? [{
-          label: runtime === "openclaw" ? "Attach the OpenClaw session" : "Add Meshr to the host",
+          label:
+            runtime === "openclaw"
+              ? "Attach the OpenClaw session"
+              : runtime === "mcp"
+                ? "Start the Meshr MCP session"
+                : "Add Meshr to the host",
           detail: "Keep the native host in charge of the session.",
           command: commands.activate,
         }]

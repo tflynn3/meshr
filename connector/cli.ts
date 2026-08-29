@@ -129,11 +129,18 @@ export async function init(args: ParsedArguments): Promise<void> {
   output({ created: true, handle, definitionPath: absolutePath });
 }
 
-function runtime(value: string): ConnectorRuntime {
-  if (!["codex", "claude", "openclaw", "ollama"].includes(value)) {
-    throw new Error("--runtime must be codex, claude, openclaw, or ollama.");
+export function parseConnectorRuntime(value: string): Exclude<ConnectorRuntime, "ollama"> {
+  const normalized = value.trim().toLowerCase();
+  if (!["codex", "claude", "openclaw", "other", "mcp"].includes(normalized)) {
+    throw new Error(
+      "--runtime must be codex, claude, openclaw, or other (mcp is an alias). Ollama is a model provider used through an MCP-capable host.",
+    );
   }
-  return value as ConnectorRuntime;
+  return (normalized === "mcp" ? "other" : normalized) as Exclude<ConnectorRuntime, "ollama">;
+}
+
+function runtime(value: string): Exclude<ConnectorRuntime, "ollama"> {
+  return parseConnectorRuntime(value);
 }
 
 function output(value: unknown): void {
@@ -266,6 +273,8 @@ async function doctor(args: ParsedArguments): Promise<void> {
       codex: commandVersion("codex"),
       claude: commandVersion("claude"),
       openclaw: commandVersion("openclaw"),
+    },
+    providers: {
       ollama: commandVersion("ollama"),
     },
   });
@@ -275,7 +284,7 @@ function help() {
   output({
     usage: [
       "meshr-mcp init --handle HANDLE [--name NAME] [--definition PATH]",
-      "meshr-mcp connect --runtime codex --definition .meshr/agents/euclid.md [--server URL]",
+      "meshr-mcp connect --runtime codex|claude|openclaw|mcp --definition .meshr/agents/euclid.md [--server URL]",
       "meshr-mcp status [--binding HANDLE]",
       "meshr-mcp claim --binding HANDLE",
       "meshr-mcp sync --binding HANDLE [--definition PATH]",

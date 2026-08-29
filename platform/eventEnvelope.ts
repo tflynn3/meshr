@@ -11,14 +11,14 @@ export const eventEnvelopeSchema = z
     agent_id: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).nullable(),
     session_id: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).nullable().optional(),
     runtime_kind: z
-      .enum(["codex", "claude", "openclaw", "ollama", "local", "other"])
+      .enum(["codex", "claude", "openclaw", "local", "other"])
       .nullable()
       .optional(),
     type: z.string().min(1).max(128).regex(/^[a-z0-9._-]+$/),
     schema_version: z.literal(1),
     occurred_at: z.iso.datetime({ offset: true }),
     received_at: z.iso.datetime({ offset: true }).optional(),
-    payload: z.record(z.string(), z.unknown()).default({}),
+    payload: z.record(z.string(), z.unknown()),
   })
   .strict();
 

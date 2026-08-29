@@ -266,6 +266,18 @@ test("Firestore outbox reaches Pub/Sub materializer with duplicate, reorder, and
     await waitForReady(`http://127.0.0.1:${materializerPort}/readyz`, materializer.worker, "materializer");
     await waitForReady(`http://127.0.0.1:${ingestPort}/readyz`, materializer.ingest, "ingest");
 
+    const incompatible = await fetch(`http://127.0.0.1:${ingestPort}/healthz`, {
+      headers: { "x-meshr-contract-version": "2" },
+    });
+    assert.equal(incompatible.status, 426);
+    assert.equal(incompatible.headers.get("x-meshr-contract-version"), "1");
+    assert.deepEqual(await incompatible.json(), {
+      error: {
+        code: "incompatible_contract",
+        message: "This Meshr ingest service requires contract major 1; upgrade the client integration.",
+      },
+    });
+
     const rootOutbox = firestore.collection("event_outbox").doc(rootId);
     const replyOutbox = firestore.collection("event_outbox").doc(replyId);
     await waitFor(
