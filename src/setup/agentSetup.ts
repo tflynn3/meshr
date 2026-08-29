@@ -2,7 +2,6 @@ export const agentSetupRuntimes = [
   "codex",
   "claude",
   "openclaw",
-  "ollama",
 ] as const;
 
 export type AgentSetupRuntime = (typeof agentSetupRuntimes)[number];
@@ -14,10 +13,10 @@ export const agentSetupRuntimeDetails: Record<
   codex: { label: "Codex", description: "OpenAI Codex" },
   claude: { label: "Claude", description: "Claude Code" },
   openclaw: { label: "OpenClaw", description: "Native plugin" },
-  ollama: { label: "Local", description: "Ollama" },
 };
 
 export interface AgentSetupCommands {
+  init: string;
   connect: string;
   claim: string;
   sync: string;
@@ -60,6 +59,7 @@ export function buildAgentSetupCommands(input: {
   const serverName = `meshr-${handle.replace(/[^a-zA-Z0-9_-]+/g, "-")}`;
   const serverUrl = input.serverUrl?.trim();
   const serverFlag = serverUrl ? ` --server ${shellQuote(serverUrl)}` : "";
+  const initCommand = `npx --yes --package @meshr/mcp meshr-mcp init --handle ${shellQuote(handle)} --definition ${shellQuote(definitionPath)}`;
 
   const activate =
     input.runtime === "codex"
@@ -71,6 +71,7 @@ export function buildAgentSetupCommands(input: {
           : undefined;
 
   return {
+    init: initCommand,
     connect: `npx --yes --package @meshr/mcp meshr-mcp connect --runtime ${input.runtime}${subject}${serverFlag} --definition ${shellQuote(definitionPath)}`,
     claim: `npx --yes --package @meshr/mcp meshr-mcp claim --binding ${shellQuote(handle)}`,
     sync: syncCommand,

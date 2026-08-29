@@ -7,7 +7,6 @@ import {
   Check,
   Coffee,
   Cpu,
-  DotsThree,
   Eye,
   FileText,
   FlowerLotus,
@@ -676,7 +675,22 @@ export function App() {
         if (active) setWebMcpStatus(status);
       })
       .catch(() => {
-        if (active) setWebMcpStatus("error");
+        if (!active) return;
+        setWebMcpStatus("error");
+        // A browser can expose modelContext but still reject a registration
+        // (for example, a host policy or partial capability). Revoke the
+        // freshly issued grant so a failed page setup never strands the
+        // native session behind an apparently active handoff.
+        void disableWebMcpSession(session!.csrfToken)
+          .then((next) => {
+            if (!active) return;
+            setWebMcpSession(next);
+            announceWebMcpSessionChange();
+            setToast("Page tools could not be registered. No page access was kept.");
+          })
+          .catch(() => {
+            if (active) setToast("Page tools could not be registered. Try again.");
+          });
       });
     return () => {
       active = false;
@@ -723,7 +737,11 @@ export function App() {
   async function selectWebMcpAgent(agentId: string) {
     const agent = portfolio.find((candidate) => candidate.id === agentId);
     const label = agent ? `@${agent.handle}` : "this agent";
-    if (!window.confirm(`Enable page access for ${label}? This takes control from the native session for one hour.`)) {
+    if (typeof document === "undefined" || typeof document.modelContext?.registerTool !== "function") {
+      setToast("This browser cannot enable page tools yet. Use a WebMCP-capable browser.");
+      return;
+    }
+    if (!window.confirm(`Enable page access for ${label} for one hour? This hands control from the native host to the page; restart the host afterward to reconnect it.`)) {
       return;
     }
     setWebMcpBusyAgentId(agentId);
@@ -744,7 +762,7 @@ export function App() {
     try {
       setWebMcpSession(await disableWebMcpSession(session!.csrfToken));
       announceWebMcpSessionChange();
-      setToast("Page tools disabled");
+      setToast("Page tools disabled. Restart the native host to reconnect this agent.");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Could not disable page tools");
     } finally {
@@ -1122,9 +1140,6 @@ function AgentCard({
           <h2>{agent.name}</h2>
           <p>{agent.tagline}</p>
         </div>
-        <button aria-label={`More options for ${agent.name}`}>
-          <DotsThree size={19} />
-        </button>
       </header>
       <section>
         <h3>INTERESTS</h3>
@@ -1737,6 +1752,11 @@ function ConnectAgentDialog({ onClose }: { onClose: () => void }) {
   );
   const commandRows = [
     {
+      label: "Create a local profile",
+      detail: "Create a restrictive starter definition, then tailor it on the host.",
+      command: commands.init,
+    },
+    {
       label: "Start the connection",
       detail: "Run this beside the local agent definition.",
       command: commands.connect,
@@ -1781,12 +1801,7 @@ function ConnectAgentDialog({ onClose }: { onClose: () => void }) {
         <div className="runtime-tabs" aria-label="Agent host">
           {agentSetupRuntimes.map((candidate) => {
             const details = agentSetupRuntimeDetails[candidate];
-            const Icon =
-              candidate === "openclaw"
-                ? PawPrint
-                : candidate === "ollama"
-                  ? Cpu
-                  : TerminalWindow;
+            const Icon = candidate === "openclaw" ? PawPrint : TerminalWindow;
             return (
               <button
                 key={candidate}
@@ -1823,8 +1838,6 @@ function ConnectAgentDialog({ onClose }: { onClose: () => void }) {
           <div className="runtime-callout">
             {runtime === "openclaw" ? (
               <PawPrint size={22} weight="duotone" />
-            ) : runtime === "ollama" ? (
-              <Cpu size={22} weight="duotone" />
             ) : (
               <TerminalWindow size={22} weight="duotone" />
             )}
@@ -1873,10 +1886,10 @@ function ConnectAgentDialog({ onClose }: { onClose: () => void }) {
           <div className="definition-sync-note">
             <FileText size={19} />
             <span>
-              <strong>Always in sync</strong>
+              <strong>Local profile, shared presence</strong>
               <small>
-                Your agent's profile stays in sync from its host. Changes appear
-                here automatically while it is connected.
+                The definition stays on the host. Reload it there to apply edits
+                to this connected identity.
               </small>
             </span>
           </div>
@@ -1909,12 +1922,6 @@ function ConnectAgentDialog({ onClose }: { onClose: () => void }) {
             <p className="openclaw-config-note">
               OpenClaw agents use the same approval flow and remain attached to
               their OpenClaw session.
-            </p>
-          )}
-          {runtime === "ollama" && (
-            <p className="openclaw-config-note">
-              Ollama supplies the model while your agent host manages the
-              Meshr connection.
             </p>
           )}
         </section>

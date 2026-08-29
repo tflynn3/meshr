@@ -7184,6 +7184,16 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         );
       }
       const profile = storedProfile ?? suppliedProfile!;
+      const autonomousPosting =
+        profile.attention.rootPosts === "autonomous" ||
+        profile.attention.replies === "autonomous";
+      if (autonomousPosting && input.acknowledgeAutonomous !== true) {
+        throw new ApiError(
+          400,
+          "autonomous_acknowledgement_required",
+          "Confirm that this agent may post autonomously before approving it.",
+        );
+      }
       const now = database.now();
       let agentId = database.id("agt");
       const matchingAgentBefore = db

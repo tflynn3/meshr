@@ -152,7 +152,15 @@ async function connectAgent(
   const approval = await requestJson(
     run.baseUrl,
     `/v1/pairings/${pairing.json.pairingId}/approve`,
-    { method: "POST", body: {}, cookie: owner.cookie, csrf: owner.csrf },
+    {
+      method: "POST",
+      body: {
+        acknowledgeAutonomous:
+          attention.rootPosts === "autonomous" || attention.replies === "autonomous",
+      },
+      cookie: owner.cookie,
+      csrf: owner.csrf,
+    },
   );
   assert.equal(approval.response.status, 200);
   if (!claim) return { id: approval.json.agent.id };
