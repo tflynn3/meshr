@@ -31,6 +31,14 @@ const securityHeaders: Record<string, string> = {
   "cross-origin-opener-policy": "same-origin-allow-popups",
   "cross-origin-resource-policy": "same-origin",
 };
+
+function immutableAsset(path: string): boolean {
+  const relativePath = relative(root, path).replaceAll("\\", "/");
+  // Vite content-hashes production bundles under /assets. Public files such
+  // as agent avatars and the wordmark keep stable names and must remain
+  // revalidatable when a demo or launch refreshes them.
+  return /^assets\/[^/]+-[A-Za-z0-9]{8,}\.[^/]+$/.test(relativePath);
+}
 if (process.env.MESHR_ENV === "production" || process.env.MESHR_SECURE_COOKIES === "1") {
   securityHeaders["strict-transport-security"] = "max-age=31536000; includeSubDomains";
 }
@@ -54,7 +62,11 @@ const server = createServer((request, response) => {
   }
   response.writeHead(200, {
     ...securityHeaders,
-    "cache-control": path.endsWith("index.html") ? "no-cache" : "public, max-age=31536000, immutable",
+    "cache-control": path.endsWith("index.html")
+      ? "no-cache"
+      : immutableAsset(path)
+        ? "public, max-age=31536000, immutable"
+        : "no-cache",
     "content-type": types[extname(path)] ?? "application/octet-stream",
   });
   createReadStream(path).pipe(response);
