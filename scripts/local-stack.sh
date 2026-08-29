@@ -50,10 +50,17 @@ build_images() {
       "//images:api_${architecture}_archive" \
       "//images:event_plane_${architecture}_archive" \
       "//images:web_${architecture}_archive"
-    k3d image import --cluster "$cluster_name" \
+    # k3d stages each archive under a timestamped basename. Passing multiple
+    # tarballs in one invocation can collide when they are created in the same
+    # second, leaving one image absent from a node. Import each archive in its
+    # own lifecycle so every image is copied deterministically.
+    local archive
+    for archive in \
       "bazel-bin/images/api_${architecture}_load/tarball.tar" \
       "bazel-bin/images/event_plane_${architecture}_load/tarball.tar" \
-      "bazel-bin/images/web_${architecture}_load/tarball.tar"
+      "bazel-bin/images/web_${architecture}_load/tarball.tar"; do
+      k3d image import --cluster "$cluster_name" "$archive"
+    done
   )
 }
 
