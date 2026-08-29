@@ -19,6 +19,12 @@ metadata:
     app.kubernetes.io/part-of: meshr
 spec:
   replicas: 1
+  # The local API mounts a single-writer SQLite volume. A rolling restart can
+  # leave the replacement pod pending while the old pod still owns the PVC,
+  # which makes the smoke gate time out. Recreate keeps the dev/emulator
+  # topology deterministic; production uses Firestore and its own strategy.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: api
