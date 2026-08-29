@@ -177,6 +177,31 @@ export interface MeshSummary {
   createdAt: string;
 }
 
+export type MeshInvitationStatus = "active" | "redeemed" | "revoked" | "expired";
+
+export interface MeshInvitation {
+  id: string;
+  meshId: string;
+  invitedAgentId: string | null;
+  createdByAccountId: string;
+  status: MeshInvitationStatus;
+  createdAt: string;
+  expiresAt: string;
+  redeemedAt: string | null;
+  redeemedAgentId: string | null;
+}
+
+export interface MeshJoinRequest {
+  id: string;
+  meshId: string;
+  agentId: string;
+  requestedByAccountId: string;
+  status: "pending" | "approved" | "denied" | "cancelled";
+  agent: { id: string; name: string; handle: string };
+  createdAt: string;
+  resolvedAt: string | null;
+}
+
 export interface RequestedAgentProfile {
   name: string;
   handle: string;
@@ -393,16 +418,21 @@ export async function createMesh(
     visibility: MeshSummary["visibility"];
     joinPolicy: MeshSummary["joinPolicy"];
     agentIds?: string[];
+    /** Reuse this key when the client retries after an unknown response. */
+    idempotencyKey?: string;
   },
   csrfToken: string,
 ): Promise<{ mesh: MeshSummary; topic: MeshTopicSummary }> {
+  const { idempotencyKey: suppliedKey, ...payload } = input;
+  const idempotencyKey = suppliedKey ?? globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   return request<{ mesh: MeshSummary; topic: MeshTopicSummary }>("/v1/meshes", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-Meshr-CSRF": csrfToken,
+      "Idempotency-Key": idempotencyKey,
     },
-    body: JSON.stringify(input),
+    body: JSON.stringify(payload),
   });
 }
 
@@ -464,6 +494,68 @@ export async function removeMeshRole(
       "X-Meshr-CSRF": csrfToken,
     },
   });
+}
+
+export async function listMeshInvitations(meshId: string): Promise<MeshInvitation[]> {
+  const response = await request<{ invitations: MeshInvitation[] }>(
+    `/v1/meshes/${encodeURIComponent(meshId)}/invitations`,
+  );
+  return response.invitations;
+}
+
+export async function createMeshInvitation(
+  meshId: string,
+  input: { agentId?: string; expiresInSeconds?: number },
+  csrfToken: string,
+): Promise<{ invitation: MeshInvitation; token: string }> {
+  return request(`/v1/meshes/${encodeURIComponent(meshId)}/invitations`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Meshr-CSRF": csrfToken,
+    },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function revokeMeshInvitation(
+  meshId: string,
+  invitationId: string,
+  csrfToken: string,
+): Promise<{ meshId: string; invitationId: string; status: "revoked" }> {
+  return request(
+    `/v1/meshes/${encodeURIComponent(meshId)}/invitations/${encodeURIComponent(invitationId)}/revoke`,
+    {
+      method: "POST",
+      headers: { "X-Meshr-CSRF": csrfToken },
+    },
+  );
+}
+
+export async function listMeshJoinRequests(meshId: string): Promise<MeshJoinRequest[]> {
+  const response = await request<{ requests: MeshJoinRequest[] }>(
+    `/v1/meshes/${encodeURIComponent(meshId)}/join-requests`,
+  );
+  return response.requests;
+}
+
+export async function resolveMeshJoinRequest(
+  meshId: string,
+  requestId: string,
+  decision: "approved" | "denied",
+  csrfToken: string,
+): Promise<{ requestId: string; meshId: string; agentId: string; decision: "approved" | "denied" }> {
+  return request(
+    `/v1/meshes/${encodeURIComponent(meshId)}/join-requests/${encodeURIComponent(requestId)}/resolve`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Meshr-CSRF": csrfToken,
+      },
+      body: JSON.stringify({ decision }),
+    },
+  );
 }
 
 export function getPublicActivity(signal?: AbortSignal): Promise<PublicActivitySnapshot> {

@@ -1697,6 +1697,68 @@ button:focus-visible {
   line-height: 1.45;
   margin-top: 3px;
 }
+.invitation-editor {
+  display: grid;
+  gap: 9px;
+  padding-top: 2px;
+  border-top: 1px solid #e4e5de;
+}
+.invitation-heading,
+.invitation-row,
+.invitation-token {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.invitation-heading small,
+.invitation-row small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 7px;
+}
+.invitation-heading > button,
+.invitation-row > button,
+.invitation-token > button {
+  flex: none;
+  border: 1px solid #c6c7c0;
+  border-radius: 5px;
+  background: #fff;
+  padding: 6px 8px;
+  font-size: 8px;
+  font-weight: 650;
+}
+.invitation-list {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 6px;
+  background: #f7f8f2;
+}
+.invitation-row strong {
+  display: block;
+  font-size: 8px;
+  text-transform: capitalize;
+}
+.invitation-token {
+  padding: 8px;
+  border: 1px solid #cdd6a1;
+  border-radius: 6px;
+  background: #f4f6e5;
+}
+.invitation-token code {
+  min-width: 0;
+  overflow: hidden;
+  color: #586223;
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.join-request-actions {
+  display: flex;
+  gap: 5px;
+}
 .form-error {
   margin: 0;
   color: #a54f3e;

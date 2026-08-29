@@ -215,6 +215,23 @@
         "resolved_at": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }
       }
     },
+    "meshInvitation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "invitation_id", "mesh_id", "invited_agent_id", "created_by_account_id", "status", "created_at", "expires_at", "redeemed_at", "redeemed_agent_id"],
+      "properties": {
+        "contract_version": { "const": 1 },
+        "invitation_id": { "$ref": "#/$defs/id" },
+        "mesh_id": { "$ref": "#/$defs/id" },
+        "invited_agent_id": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "created_by_account_id": { "$ref": "#/$defs/id" },
+        "status": { "enum": ["active", "redeemed", "revoked", "expired"] },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "expires_at": { "$ref": "#/$defs/timestamp" },
+        "redeemed_at": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "redeemed_agent_id": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }
+      }
+    },
     "profileReloadResult": {
       "type": "object",
       "additionalProperties": false,

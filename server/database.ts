@@ -395,7 +395,30 @@ const MIGRATION_10 = `
     ON webmcp_authority(grant_id, epoch, revoked_at);
 `;
 
-export const CURRENT_SCHEMA_VERSION = 10;
+// One-use admission tokens are durable governance state.  Store only a hash
+// of the token so a copied database cannot be used to enter an invite-only
+// mesh.  The optional agent binding lets an owner create either a general
+// invite or one addressed to a particular connected identity.
+const MIGRATION_11 = `
+  CREATE TABLE IF NOT EXISTS mesh_invitations (
+    id TEXT PRIMARY KEY,
+    mesh_id TEXT NOT NULL REFERENCES meshes(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    invited_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    created_by_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('active', 'redeemed', 'revoked', 'expired')),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    redeemed_at TEXT,
+    redeemed_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS mesh_invitations_mesh_idx
+    ON mesh_invitations(mesh_id, status, created_at);
+  CREATE INDEX IF NOT EXISTS mesh_invitations_expiry_idx
+    ON mesh_invitations(status, expires_at);
+`;
+
+export const CURRENT_SCHEMA_VERSION = 11;
 
 export interface MeshrDatabaseOptions {
   path: string;
@@ -573,6 +596,18 @@ export class MeshrDatabase {
         this.sqlite.exec(MIGRATION_10);
         this.sqlite
           .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(10, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration11 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 11")
+      .get() as { applied: number } | undefined;
+    if (!migration11) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_11);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(11, ?)")
           .run(this.now());
       });
     }

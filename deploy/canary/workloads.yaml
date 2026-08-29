@@ -26,19 +26,16 @@ spec:
             - {name: MESHR_IDENTITY_API_KEY_FILE, value: /var/run/secrets/meshr/identity-api-key}
             - {name: MESHR_INTERNAL_TOKEN_FILE, value: /var/run/secrets/meshr/internal-token}
             - {name: MESHR_RENEWAL_RECOVERY_SECRET_FILE, value: /var/run/secrets/meshr/renewal-recovery}
-            - {name: MESHR_PROJECTION_DB_PATH, value: /tmp/meshr-projection.db}
             - name: MESHR_COST_PROTECTION_MODE
               value: ${MESHR_COST_PROTECTION_MODE}
           ports: [{name: http, containerPort: 8787}]
           readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 5, failureThreshold: 3}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15, periodSeconds: 20}
           volumeMounts:
-            - {name: projection, mountPath: /tmp}
             - {name: meshr-api-secrets, mountPath: /var/run/secrets/meshr, readOnly: true}
           securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
           resources: {requests: {cpu: 250m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
       volumes:
-        - {name: projection, emptyDir: {sizeLimit: 2Gi}}
         - name: meshr-api-secrets
           csi:
             driver: secrets-store-gke.csi.k8s.io

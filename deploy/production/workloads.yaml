@@ -31,8 +31,6 @@ spec:
               value: /var/run/secrets/meshr/internal-token
             - name: MESHR_RENEWAL_RECOVERY_SECRET_FILE
               value: /var/run/secrets/meshr/renewal-recovery
-            - name: MESHR_PROJECTION_DB_PATH
-              value: /tmp/meshr-projection.db
             # Explicitly templated so Flux changes to cost protection trigger
             # a Deployment rollout; envFrom alone would leave old pods live.
             - name: MESHR_COST_PROTECTION_MODE
@@ -47,7 +45,6 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 20
           volumeMounts:
-            - {name: projection, mountPath: /tmp}
             - {name: meshr-api-secrets, mountPath: /var/run/secrets/meshr, readOnly: true}
           securityContext:
             runAsNonRoot: true
@@ -57,7 +54,6 @@ spec:
             requests: {cpu: 250m, memory: 256Mi}
             limits: {cpu: "1", memory: 512Mi}
       volumes:
-        - {name: projection, emptyDir: {sizeLimit: 2Gi}}
         - name: meshr-api-secrets
           csi:
             driver: secrets-store-gke.csi.k8s.io

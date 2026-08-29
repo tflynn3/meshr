@@ -392,7 +392,7 @@ test("Firestore repository preserves the launch authority and outbox contract", 
     const names = [
       "system", "meshes", "topics", "accounts", "provider_identities", "human_sessions",
       "pairings", "agents", "agent_handles", "agent_bindings", "mesh_agent_memberships",
-      "agent_authority", "runtime_sessions", "posts", "idempotency", "quota_counters",
+      "agent_authority", "runtime_sessions", "posts", "mesh_invitations", "idempotency", "quota_counters",
       "event_outbox", "event_outbox_ready", "moderation_cases", "live_access_epochs",
       "audit_events", "governance_events", "event_audit", "topology_activity_totals",
       "topology_activity_buckets", "topology_activity_recent", "topology_activity_snapshots",

@@ -35,20 +35,58 @@ const topologyFirestore = firestore && settings.identityProjectId
 const repository = firestore
   ? new FirestoreMeshrRepository({ firestore, topologyFirestore })
   : undefined;
+if (settings.environment === "production") {
+  // The repository port keeps optional methods so SQLite fixtures and small
+  // unit doubles can stay focused. Production must never silently fall back
+  // to its disposable projection when one authoritative capability is
+  // missing, so fail before opening the listener instead.
+  const requiredProductionMethods = [
+    "ensureEmptyProduction", "checkReady", "createPairing", "approvePairing",
+    "updatePairing", "findPairing", "findPairingByCode", "createPairingChallenge",
+    "findPairingChallenge", "consumePairingChallenge", "upsertAgent",
+    "updateAgentProfileFromSession", "revokeAgent", "upsertMesh", "createMeshWithOwner",
+    "upsertTopic", "upsertMeshHumanRole", "deleteMeshHumanRole",
+    "upsertMeshAgentMembership", "joinMeshForAgent", "createMeshInvitation",
+    "listMeshInvitations", "revokeMeshInvitation", "upsertJoinRequest", "findJoinRequest",
+    "listJoinRequests", "resolveJoinRequest", "upsertFollow", "listProfileReviewProposals",
+    "resolveProfileReviewProposal", "listHumanActivityPreferences", "upsertHumanActivityPreference",
+    "revokeHumanSession", "revokeWebMcpGrants", "appendEvent", "appendAuditEvent",
+    "listAgentEvents", "upsertModerationCase", "findModerationCase", "listModerationCases",
+    "updatePostModeration", "findPostById", "listPublishedPostsByTopic", "findAgentById",
+    "listAgentsForAccount", "listRuntimeSessionsForAgents", "findMeshById", "findTopicById",
+    "listTopicsForAgent", "listPublicMeshes", "listPublicTopics", "listMeshDirectoryForAccount",
+    "findMeshHumanRole", "findMeshAgentMembership", "listMeshesForAgent", "listJoinedMeshIdsForAgent",
+    "loadProjection", "findRuntimeSessionByTokenHash", "findRuntimeSessionById",
+    "findActiveRuntimeSessionForAgent", "purgeExpired", "findWebMcpGrant", "findAccountByProvider",
+    "findAccountById", "createSocialAccount", "linkProvider", "listProviderIdentities",
+    "createHumanSession", "findHumanSession", "touchHumanSession", "startRuntimeSession",
+    "heartbeatRuntimeSession", "transferPageAuthority", "createPostWithOutbox",
+  ] as const;
+  const missing = requiredProductionMethods.filter(
+    (name) => typeof (repository as unknown as Record<string, unknown> | undefined)?.[name] !== "function",
+  );
+  if (!repository || missing.length > 0) {
+    throw new Error(`Production Firestore repository is incomplete: ${missing.join(", ") || "not configured"}`);
+  }
+}
 if (firestore) {
   // Production starts empty apart from the public commons and system
   // taxonomy. No local prototype identities or content are imported.
   await repository!.ensureEmptyProduction();
 }
 
-// SQLite is an ephemeral projection in production, never an authority. A
-// writable path is still required by the HTTP process for cursors and local
-// cache reads; the deployment mounts it on an emptyDir rather than a PVC.
+// SQLite is an ephemeral projection in production, never an authority. Keep
+// the production cache in memory so a restart cannot preserve stale identity,
+// membership, post, or topology state and no filesystem volume can be
+// mistaken for durable authority. Firestore is hydrated on demand for every
+// authoritative path. Local development keeps its file-backed fixture DB.
 const projectionDbPath =
   settings.environment === "production"
-    ? resolve(process.env.MESHR_PROJECTION_DB_PATH ?? "/tmp/meshr-projection.db")
+    ? ":memory:"
     : dbPath;
-mkdirSync(dirname(projectionDbPath), { recursive: true });
+if (projectionDbPath !== ":memory:") {
+  mkdirSync(dirname(projectionDbPath), { recursive: true });
+}
 const app = createMeshrServer({
   dbPath: projectionDbPath,
   secureCookies: settings.secureCookies,
