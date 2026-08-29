@@ -489,6 +489,25 @@ async function signedSessionStart(
   return { token, expiresAt, sessionId: renewedSessionId };
 }
 
+/** Start a new host-owned session and atomically supersede any old session. */
+async function startOpenClawSession(binding: BoundConnector, agentId: string): Promise<void> {
+  const started = await signedSessionStart(binding);
+  Object.assign(binding, {
+    token: started.token,
+    agentTokenExpiresAt: started.expiresAt,
+    sessionId: started.sessionId,
+    sessionSuperseded: false,
+    supersededToken: undefined,
+    sessionValidated: true,
+  });
+  await persistBindingState(binding, agentId, {
+    agentToken: started.token,
+    agentTokenExpiresAt: started.expiresAt,
+    sessionId: started.sessionId,
+    status: "connected",
+  });
+}
+
 async function renewOpenClawSession(binding: BoundConnector, agentId: string): Promise<void> {
   if (!binding.pairingId || !binding.pairingSecret || !binding.privateKeyPem) return;
   let renewed: { token: string; expiresAt: string; sessionId: string };
@@ -834,31 +853,21 @@ async function ensureRuntimeSession(binding: BoundConnector, agentId: string): P
   if (binding.token && binding.sessionId) {
     const canRenew = Boolean(binding.pairingId && binding.pairingSecret && binding.privateKeyPem);
     if (canRenew && !binding.sessionValidated) {
-      try {
-        // Validate a persisted session once when this process first uses it.
-        // This catches a handoff that happened while the host was offline and
-        // lets a clean restart reclaim only after the server confirms the old
-        // session is no longer authoritative.
-        await renewOpenClawSession(binding, agentId);
-      } catch (error) {
-        const status = typeof error === "object" && error !== null && "status" in error
-          ? Number((error as { status?: unknown }).status)
-          : 0;
-        if (status === 429) {
-          // The session is valid but not yet within the renewal window.
-          binding.sessionValidated = true;
-        } else if (isSessionSupersededError(error) || [401, 403, 404].includes(status)) {
-          binding.token = "";
-          binding.sessionId = undefined;
-          binding.agentTokenExpiresAt = undefined;
-          binding.sessionValidated = false;
-          await ensureRuntimeSession(binding, agentId);
-          return;
-        } else {
-          // A transient network failure must not prevent an otherwise valid
-          // bearer from being used. Heartbeats will retry the validation.
-          binding.sessionValidated = true;
-        }
+      // A new OpenClaw host process must own a new runtime session even when
+      // its state file contains an unexpired bearer. This prevents two host
+      // processes from sharing write authority. The shared start-work map
+      // below keeps multiple tool factories in one process from racing.
+      const timerKey = binding.cacheKey ?? bindingCacheKey(binding);
+      const existing = sessionStartWork.get(timerKey);
+      if (existing) {
+        await existing;
+      } else {
+        const work = startOpenClawSession(binding, agentId);
+        const tracked = work.finally(() => {
+          if (sessionStartWork.get(timerKey) === tracked) sessionStartWork.delete(timerKey);
+        });
+        sessionStartWork.set(timerKey, tracked);
+        await tracked;
       }
     }
     keepRuntimeSessionAlive(binding, agentId);

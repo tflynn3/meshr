@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { createMeshrServer, type MeshrServer } from "./app.ts";
+import { CURRENT_SCHEMA_VERSION } from "./database.ts";
 import { agentProfileSchema } from "./contracts.ts";
 import type { MeshrRepository, RepositoryProjection } from "./repository.ts";
 import type { Clock } from "./types.ts";
@@ -86,7 +87,7 @@ test("health and public discovery expose a durable seeded commons", async () => 
 
   const health = await requestJson(baseUrl, "/healthz");
   assert.equal(health.response.status, 200);
-  assert.deepEqual(health.json, { status: "ok", database: "ok", schemaVersion: 10 });
+  assert.deepEqual(health.json, { status: "ok", database: "ok", schemaVersion: CURRENT_SCHEMA_VERSION });
   const journal = app.database.sqlite.prepare("PRAGMA journal_mode").get() as {
     journal_mode: string;
   };
@@ -447,6 +448,71 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
   assert.equal(ownedAgents.json.agents[0].connectionStatus, "connected");
   assert.ok(ownedAgents.json.agents[0].lastSeenAt);
 
+  const privateMesh = await requestJson(baseUrl, "/v1/meshes", {
+    method: "POST",
+    cookie,
+    csrf,
+    idempotencyKey: "mesh-invitation-e2e-001",
+    body: {
+      name: "Private garden",
+      description: "A small invited conversation.",
+      visibility: "private",
+      joinPolicy: "invite_only",
+      agentIds: [],
+    },
+  });
+  assert.equal(privateMesh.response.status, 201);
+  const privateMeshId = privateMesh.json.mesh.id as string;
+  const invitation = await requestJson(baseUrl, `/v1/meshes/${privateMeshId}/invitations`, {
+    method: "POST",
+    cookie,
+    csrf,
+    body: {},
+  });
+  assert.equal(invitation.response.status, 201);
+  assert.equal(typeof invitation.json.token, "string");
+  const invitationList = await requestJson(baseUrl, `/v1/meshes/${privateMeshId}/invitations`, { cookie });
+  assert.equal(invitationList.response.status, 200);
+  assert.equal(invitationList.json.invitations[0].status, "active");
+  assert.equal("token" in invitationList.json.invitations[0], false);
+  const joinWithoutInvitation = await requestJson(
+    baseUrl,
+    `/v1/agent/meshes/${privateMeshId}/join`,
+    { method: "POST", authorization: agentAuth, idempotencyKey: "mesh-join-invite-missing-001" },
+  );
+  assert.equal(joinWithoutInvitation.response.status, 403);
+  assert.equal(joinWithoutInvitation.json.error.code, "invite_required");
+  const invitedJoin = await requestJson(
+    baseUrl,
+    `/v1/agent/meshes/${privateMeshId}/join`,
+    {
+      method: "POST",
+      authorization: agentAuth,
+      idempotencyKey: "mesh-join-invite-001",
+      body: { invitationToken: invitation.json.token },
+    },
+  );
+  assert.equal(invitedJoin.response.status, 201);
+  assert.equal(invitedJoin.json.meshId, privateMeshId);
+  assert.equal(invitedJoin.json.invitationId, invitation.json.invitation.id);
+  const redeemedInvitations = await requestJson(
+    baseUrl,
+    `/v1/meshes/${privateMeshId}/invitations`,
+    { cookie },
+  );
+  assert.equal(redeemedInvitations.json.invitations[0].status, "redeemed");
+  const invitedJoinRetry = await requestJson(
+    baseUrl,
+    `/v1/agent/meshes/${privateMeshId}/join`,
+    {
+      method: "POST",
+      authorization: agentAuth,
+      idempotencyKey: "mesh-join-invite-001",
+      body: { invitationToken: invitation.json.token },
+    },
+  );
+  assert.deepEqual(invitedJoinRetry.json, invitedJoin.json);
+
   const replay = await requestJson(baseUrl, "/v1/agent-sessions", {
     method: "POST",
     authorization: pairingAuth,
@@ -546,8 +612,9 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
     authorization: agentAuth,
   });
   assert.equal(meshes.response.status, 200);
-  assert.equal(meshes.json.meshes[0].id, "mesh-public");
-  assert.equal(meshes.json.meshes[0].joined, true);
+  const publicMesh = meshes.json.meshes.find((mesh: any) => mesh.id === "mesh-public");
+  assert.ok(publicMesh);
+  assert.equal(publicMesh.joined, true);
 
   const topics = await requestJson(baseUrl, "/v1/agent/meshes/mesh-public/topics", {
     authorization: agentAuth,

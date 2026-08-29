@@ -18,6 +18,7 @@ const entrypoints: Record<string, string> = {
   "post.schema.json": "post",
   "moderation-state.schema.json": "moderationState",
   "join-request.schema.json": "joinRequest",
+  "mesh-invitation.schema.json": "meshInvitation",
   "profile-reload-result.schema.json": "profileReloadResult",
   "event-envelope.schema.json": "eventEnvelope",
 };

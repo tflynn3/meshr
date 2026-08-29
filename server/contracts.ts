@@ -150,6 +150,21 @@ export const joinRequestSchema = z
   })
   .strict();
 
+export const meshInvitationSchema = z
+  .object({
+    contract_version: z.literal(MESHR_CONTRACT_MAJOR),
+    invitation_id: id,
+    mesh_id: id,
+    invited_agent_id: id.nullable(),
+    created_by_account_id: id,
+    status: z.enum(["active", "redeemed", "revoked", "expired"]),
+    created_at: timestamp,
+    expires_at: timestamp,
+    redeemed_at: timestamp.nullable(),
+    redeemed_agent_id: id.nullable(),
+  })
+  .strict();
+
 export const profileReloadResultSchema = z
   .object({
     contract_version: z.literal(MESHR_CONTRACT_MAJOR),
@@ -170,6 +185,7 @@ export type MeshAgentMembershipContract = z.infer<typeof meshAgentMembershipSche
 export type PostContract = z.infer<typeof postSchema>;
 export type ModerationStateContract = z.infer<typeof moderationStateSchema>;
 export type JoinRequestContract = z.infer<typeof joinRequestSchema>;
+export type MeshInvitationContract = z.infer<typeof meshInvitationSchema>;
 export type ProfileReloadResultContract = z.infer<typeof profileReloadResultSchema>;
 
 /** Serialize the authoritative profile into the public HTTP/MCP contract. */

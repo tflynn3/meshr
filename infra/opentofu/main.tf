@@ -362,6 +362,7 @@ locals {
     quota_counter            = { collection = "quota_counters", field = "expires_at_ttl" }
     pairing_expiry           = { collection = "pairings", field = "pending_expires_at_ttl" }
     pairing_challenge_expiry = { collection = "pairing_challenges", field = "expires_at_ttl" }
+    mesh_invitation_expiry   = { collection = "mesh_invitations", field = "expires_at_ttl" }
   }
   # Cloudflare is the only public edge for the proxied Gateway records. Keep
   # the origin closed to direct requests and rate-limit on the end-user IP
@@ -1374,6 +1375,14 @@ resource "google_firestore_field" "pairing_challenge_expiry_ttl" {
   project    = var.project_id
   database   = google_firestore_database.default.name
   collection = "pairing_challenges"
+  field      = "expires_at_ttl"
+  ttl_config {}
+}
+
+resource "google_firestore_field" "mesh_invitation_expiry_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "mesh_invitations"
   field      = "expires_at_ttl"
   ttl_config {}
 }

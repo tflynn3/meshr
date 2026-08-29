@@ -333,11 +333,33 @@ export async function serveBindingFromState(input: {
       agentId: renewed.agent.id,
     });
   };
-  // OpenClaw persists an approved binding without a bearer after a local
-  // session observes supersession. Start a fresh signed session before the
-  // first profile sync so a deliberate host restart has a usable binding.
-  if (!binding.agentToken || binding.status !== "connected") {
-    await renewStoredSession();
+  // A native host process owns one runtime session. Even when the state file
+  // contains an unexpired bearer, start a fresh signed session once at process
+  // boot so a second host cannot silently share the first host's write
+  // authority. The server's authority fence supersedes the old session
+  // atomically; subsequent lifecycle ticks use fenced renewal only.
+  if (!binding.privateKeyPem || !binding.pairingSecret || !binding.pairingId) {
+    if (!binding.agentToken) throw new Error("Binding is missing signed session credentials.");
+  } else {
+    const challenge = await api.createChallenge(binding);
+    const signature = sign(
+      null,
+      Buffer.from(challenge.message, "utf8"),
+      binding.privateKeyPem,
+    ).toString("base64url");
+    const started = await api.createAgentSession({
+      binding,
+      challengeId: challenge.challengeId,
+      signature,
+    });
+    binding = await store.patch(input.selector, {
+      status: "connected",
+      agentToken: started.token,
+      agentTokenExpiresAt: started.expiresAt,
+      sessionId: started.sessionId,
+      bindingId: started.bindingId ?? binding.bindingId,
+      agentId: started.agent.id,
+    });
   }
   let initialSync;
   try {

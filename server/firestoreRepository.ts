@@ -32,6 +32,7 @@ import type {
   RepositoryMutationArtifacts,
   RepositoryModerationCase,
   RepositoryJoinRequest,
+  RepositoryMeshInvitation,
   RepositoryHumanActivityPreference,
 } from "./repository.ts";
 import type { Clock, RuntimeKind, SocialProvider } from "./types.ts";
@@ -2493,15 +2494,42 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     mesh: RepositoryMeshInput;
     topic: RepositoryTopicInput;
     agentIds: string[];
-  } & RepositoryMutationArtifacts): Promise<void> {
+    idempotencyKey?: string;
+    requestHash?: string;
+  } & RepositoryMutationArtifacts): Promise<{ duplicate: boolean }> {
     const { mesh, topic } = input;
     const agentIds = [...new Set(input.agentIds)];
-    await this.firestore.runTransaction(async (transaction) => {
+    const result = await this.firestore.runTransaction(async (transaction) => {
       const meshRef = this.doc("meshes", mesh.meshId);
       const topicRef = this.doc("topics", topic.topicId);
       const roleRef = this.doc("mesh_human_roles", `${mesh.meshId}:${mesh.ownerAccountId}`);
       const existingMesh = await transaction.get(meshRef);
-      if (existingMesh.exists) throw new Error("mesh_already_exists");
+      const existingTopic = existingMesh.exists ? await transaction.get(topicRef) : null;
+      const existingMemberships = existingMesh.exists
+        ? await transaction.get(
+            this.firestore
+              .collection(this.collection("mesh_agent_memberships"))
+              .where("mesh_id", "==", mesh.meshId)
+              .where("status", "==", "joined")
+              .limit(101),
+          )
+        : null;
+      if (existingMesh.exists) {
+        const existingAgentIds = existingMemberships?.docs
+          .map((document) => String(document.get("agent_id")))
+          .sort() ?? [];
+        const requestedAgentIds = [...agentIds].sort();
+        const matches = input.idempotencyKey && existingTopic?.exists &&
+          String(existingMesh.get("owner_account_id")) === mesh.ownerAccountId &&
+          String(existingMesh.get("name")) === mesh.name &&
+          String(existingMesh.get("description")) === mesh.description &&
+          String(existingMesh.get("visibility")) === mesh.visibility &&
+          String(existingMesh.get("admission")) === mesh.admission &&
+          existingAgentIds.length === requestedAgentIds.length &&
+          existingAgentIds.every((agentId, index) => agentId === requestedAgentIds[index]);
+        if (matches) return { duplicate: true };
+        throw new Error(input.idempotencyKey ? "idempotency_conflict" : "mesh_already_exists");
+      }
       if (!mesh.ownerAccountId) throw new Error("owner_required");
       await this.assertHumanSession(
         transaction,
@@ -2582,7 +2610,9 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         });
       }
       this.writeMutationArtifacts(transaction, input);
+      return { duplicate: false };
     });
+    return result;
   }
 
   async upsertTopic(input: RepositoryTopicInput): Promise<void> {
@@ -2800,9 +2830,13 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     requestId: string;
     requestedAt: string;
     attentionPolicy: Record<string, unknown>;
+    invitationTokenHash?: string;
   }): Promise<{ status: "joined" | "pending"; requestId?: string; duplicate: boolean }> {
     const requestHash = createHash("sha256")
-      .update(JSON.stringify({ meshId: input.meshId }))
+      .update(JSON.stringify({
+        meshId: input.meshId,
+        invitationTokenHash: input.invitationTokenHash ?? null,
+      }))
       .digest("hex");
     const idempotencyRef = this.doc(
       "idempotency",
@@ -2814,13 +2848,19 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       `${input.meshId}:${input.agentId}`,
     );
     const requestRef = this.doc("mesh_join_requests", input.requestId);
+    const invitationQuery = input.invitationTokenHash
+      ? this.firestore
+        .collection(this.collection("mesh_invitations"))
+        .where("token_hash", "==", input.invitationTokenHash)
+        .limit(1)
+      : null;
     const authorityRef = this.authorityRef(input.agentId);
     const sessionRef = this.doc("runtime_sessions", input.sessionId);
     const now = input.requestedAt;
     if (!Number.isFinite(Date.parse(now))) throw new Error("invalid_request_timestamp");
 
     return this.firestore.runTransaction(async (transaction) => {
-    const [existingIdempotency, authority, session, mesh, agent, membership, pendingRequests] =
+    const [existingIdempotency, authority, session, mesh, agent, membership, pendingRequests, invitationCandidates] =
         await Promise.all([
           transaction.get(idempotencyRef),
           transaction.get(authorityRef),
@@ -2836,6 +2876,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
               .where("status", "==", "pending")
               .limit(1),
           ),
+          invitationQuery ? transaction.get(invitationQuery) : Promise.resolve(null),
         ]);
 
       if (
@@ -2909,7 +2950,25 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       }
 
       const admission = String(mesh.get("admission") ?? "invite_only");
-      if (admission === "invite_only") throw new Error("invite_required");
+      let invitation: DocumentSnapshot | null = invitationCandidates?.docs[0] ?? null;
+      if (admission === "invite_only") {
+        if (!input.invitationTokenHash) throw new Error("invite_required");
+        if (!invitation || String(invitation.get("mesh_id")) !== input.meshId) {
+          throw new Error("invitation_invalid");
+        }
+        if (String(invitation.get("status")) !== "active") {
+          throw new Error(`invitation_${String(invitation.get("status"))}`);
+        }
+        if (Date.parse(String(invitation.get("expires_at") ?? "")) <= Date.parse(now)) {
+          throw new Error("invitation_expired");
+        }
+        const invitedAgentId = invitation.get("invited_agent_id");
+        if (invitedAgentId != null && String(invitedAgentId) !== input.agentId) {
+          throw new Error("invitation_invalid");
+        }
+      } else {
+        invitation = null;
+      }
 
       if (admission === "approval") {
         const pendingRequest = pendingRequests.docs[0];
@@ -2996,13 +3055,24 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         agent_id: input.agentId,
         status: "joined",
         attention_policy: input.attentionPolicy,
-        admission_provenance: "open",
+        admission_provenance: invitation ? "invite" : "open",
         joined_at: membership.exists && membership.get("joined_at") != null
           ? membership.get("joined_at")
           : now,
         updated_at: now,
       }, { merge: true });
-      const body = { meshId: input.meshId, status: "joined" as const };
+      if (invitation) {
+        transaction.update(invitation.ref, {
+          status: "redeemed",
+          redeemed_at: now,
+          redeemed_agent_id: input.agentId,
+        });
+      }
+      const body = {
+        meshId: input.meshId,
+        status: "joined" as const,
+        ...(invitation ? { invitationId: invitation.id } : {}),
+      };
       const eventId = `evt_${createHash("sha256")
         .update(`mesh.agent.joined:${input.meshId}:${input.agentId}:${input.idempotencyKey}`)
         .digest("hex")
@@ -3016,7 +3086,11 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         runtime_kind: input.runtimeKind,
         type: "mesh.agent.joined",
         occurred_at: now,
-        payload: { meshId: input.meshId, agentId: input.agentId },
+        payload: {
+          meshId: input.meshId,
+          agentId: input.agentId,
+          ...(invitation ? { invitationId: invitation.id } : {}),
+        },
       };
       transaction.create(this.doc("event_outbox", eventId), {
         contract_version: MESHR_CONTRACT_MAJOR,
@@ -3041,6 +3115,129 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         ),
       });
       return { status: "joined", duplicate: false };
+    });
+  }
+
+  private meshInvitationFromSnapshot(
+    snapshot: DocumentSnapshot,
+    now = this.now(),
+  ): RepositoryMeshInvitation {
+    const status = String(snapshot.get("status") ?? "active") as RepositoryMeshInvitation["status"];
+    const expiresAt = String(snapshot.get("expires_at") ?? now);
+    return {
+      invitationId: String(snapshot.get("invitation_id") ?? snapshot.id),
+      meshId: String(snapshot.get("mesh_id")),
+      invitedAgentId: snapshot.get("invited_agent_id") == null
+        ? null
+        : String(snapshot.get("invited_agent_id")),
+      createdByAccountId: String(snapshot.get("created_by_account_id")),
+      status: status === "active" && Date.parse(expiresAt) <= Date.parse(now) ? "expired" : status,
+      createdAt: String(snapshot.get("created_at") ?? now),
+      expiresAt,
+      redeemedAt: snapshot.get("redeemed_at") == null ? null : String(snapshot.get("redeemed_at")),
+      redeemedAgentId: snapshot.get("redeemed_agent_id") == null
+        ? null
+        : String(snapshot.get("redeemed_agent_id")),
+    };
+  }
+
+  async createMeshInvitation(input: {
+    invitationId: string;
+    meshId: string;
+    tokenHash: string;
+    invitedAgentId: string | null;
+    createdByAccountId: string;
+    createdAt: string;
+    expiresAt: string;
+    actingAccountId: string;
+    humanSessionHash: string;
+  } & RepositoryMutationArtifacts): Promise<RepositoryMeshInvitation> {
+    const invitationRef = this.doc("mesh_invitations", input.invitationId);
+    return this.firestore.runTransaction(async (transaction) => {
+      const [mesh, existing, agent] = await Promise.all([
+        transaction.get(this.doc("meshes", input.meshId)),
+        transaction.get(invitationRef),
+        input.invitedAgentId
+          ? transaction.get(this.doc("agents", input.invitedAgentId))
+          : Promise.resolve(null),
+      ]);
+      if (!mesh.exists) throw new Error("mesh_not_found");
+      await this.assertHumanRole(
+        transaction,
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner", "steward"],
+        input.createdAt,
+      );
+      if (input.invitedAgentId && (!agent || !agent.exists)) throw new Error("agent_not_found");
+      if (existing.exists) {
+        throw new Error("invitation_already_exists");
+      }
+      transaction.create(invitationRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        invitation_id: input.invitationId,
+        mesh_id: input.meshId,
+        token_hash: input.tokenHash,
+        invited_agent_id: input.invitedAgentId,
+        created_by_account_id: input.createdByAccountId,
+        status: "active",
+        created_at: input.createdAt,
+        expires_at: input.expiresAt,
+        redeemed_at: null,
+        redeemed_agent_id: null,
+        expires_at_ttl: ttlTimestamp(input.expiresAt),
+      });
+      this.writeMutationArtifacts(transaction, input);
+      return {
+        invitationId: input.invitationId,
+        meshId: input.meshId,
+        invitedAgentId: input.invitedAgentId,
+        createdByAccountId: input.createdByAccountId,
+        status: "active",
+        createdAt: input.createdAt,
+        expiresAt: input.expiresAt,
+        redeemedAt: null,
+        redeemedAgentId: null,
+      } satisfies RepositoryMeshInvitation;
+    });
+  }
+
+  async listMeshInvitations(meshId: string): Promise<RepositoryMeshInvitation[]> {
+    const snapshot = await this.firestore
+      .collection(this.collection("mesh_invitations"))
+      .where("mesh_id", "==", meshId)
+      .limit(500)
+      .get();
+    return snapshot.docs
+      .map((document) => this.meshInvitationFromSnapshot(document))
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || left.invitationId.localeCompare(right.invitationId));
+  }
+
+  async revokeMeshInvitation(input: {
+    invitationId: string;
+    meshId: string;
+    revokedAt: string;
+    actingAccountId: string;
+    humanSessionHash: string;
+  } & RepositoryMutationArtifacts): Promise<void> {
+    const invitationRef = this.doc("mesh_invitations", input.invitationId);
+    await this.firestore.runTransaction(async (transaction) => {
+      const invitation = await transaction.get(invitationRef);
+      await this.assertHumanRole(
+        transaction,
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner", "steward"],
+        input.revokedAt,
+      );
+      if (!invitation.exists || String(invitation.get("mesh_id")) !== input.meshId) {
+        throw new Error("invitation_not_found");
+      }
+      if (String(invitation.get("status")) !== "active") throw new Error("invitation_not_active");
+      transaction.update(invitationRef, { status: "revoked", revoked_at: input.revokedAt });
+      this.writeMutationArtifacts(transaction, input);
     });
   }
 
@@ -4514,6 +4711,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         "mesh_human_roles",
         "mesh_agent_memberships",
         "mesh_join_requests",
+        "mesh_invitations",
         "posts",
         "follows",
         "human_activity_preferences",
@@ -4882,6 +5080,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     challengeUsedAt?: string;
     expectedSessionId?: string;
     expectedAuthorityEpoch?: number;
+    allowExpiredPredecessorRecovery?: boolean;
     claimPairing?: boolean;
     event?: RepositoryEventInput;
     audit?: RepositoryAuditInput;
@@ -4944,7 +5143,8 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           predecessor.get("status") !== "active" ||
           predecessor.get("agent_id") !== input.agentId ||
           predecessor.get("authority_epoch") !== input.expectedAuthorityEpoch ||
-          Date.parse(String(predecessor.get("expires_at") ?? "")) <= Date.parse(now)
+          (Date.parse(String(predecessor.get("expires_at") ?? "")) <= Date.parse(now) &&
+            !input.allowExpiredPredecessorRecovery)
         ) {
           throw new Error("session_invalid");
         }

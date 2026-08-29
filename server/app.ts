@@ -47,6 +47,7 @@ import type {
   RepositoryModerationCase,
   RepositoryPostRecord,
   RepositoryJoinRequest,
+  RepositoryMeshInvitation,
   RepositoryProjection,
   RepositoryHumanActivityPreference,
   RepositoryEventInput,
@@ -652,6 +653,27 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       }
       if (error instanceof Error && error.message === "invite_required") {
         throw new ApiError(403, "invite_required", "This mesh requires an invitation.");
+      }
+      if (error instanceof Error && error.message === "invitation_invalid") {
+        throw new ApiError(403, "invitation_invalid", "That invitation is not valid for this agent or mesh.");
+      }
+      if (error instanceof Error && error.message === "invitation_expired") {
+        throw new ApiError(410, "invitation_expired", "That invitation has expired.");
+      }
+      if (error instanceof Error && error.message === "invitation_redeemed") {
+        throw new ApiError(410, "invitation_redeemed", "That invitation has already been used.");
+      }
+      if (error instanceof Error && error.message === "invitation_revoked") {
+        throw new ApiError(410, "invitation_revoked", "That invitation has been revoked.");
+      }
+      if (error instanceof Error && error.message === "invitation_not_active") {
+        throw new ApiError(409, "invitation_not_active", "That invitation is no longer active.");
+      }
+      if (error instanceof Error && error.message === "invitation_not_found") {
+        throw new ApiError(404, "invitation_not_found", "Invitation not found.");
+      }
+      if (error instanceof Error && error.message === "invitation_already_exists") {
+        throw new ApiError(409, "invitation_already_exists", "That invitation already exists.");
       }
       if (error instanceof Error && error.message === "mesh_unavailable") {
         throw new ApiError(409, "mesh_unavailable", "This mesh is not accepting new activity.");
@@ -1643,13 +1665,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
   const hydrateDurableAgentSession = async (
     tokenHash: string,
     now: string,
+    options: { allowExpired?: boolean } = {},
   ): Promise<boolean> => {
     if (!repository?.findRuntimeSessionByTokenHash || !repository.findAgentById) return false;
     const durableSession = await repository.findRuntimeSessionByTokenHash(tokenHash);
     if (
       !durableSession ||
       durableSession.status !== "active" ||
-      Date.parse(durableSession.expiresAt) <= Date.parse(now)
+      (!options.allowExpired && Date.parse(durableSession.expiresAt) <= Date.parse(now))
     ) {
       return false;
     }
@@ -3413,6 +3436,51 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }));
   };
 
+  const meshInvitationRepresentation = (invitation: RepositoryMeshInvitation) => ({
+    id: invitation.invitationId,
+    meshId: invitation.meshId,
+    invitedAgentId: invitation.invitedAgentId,
+    createdByAccountId: invitation.createdByAccountId,
+    status: invitation.status,
+    createdAt: invitation.createdAt,
+    expiresAt: invitation.expiresAt,
+    redeemedAt: invitation.redeemedAt,
+    redeemedAgentId: invitation.redeemedAgentId,
+  });
+
+  const listMeshInvitationsForRoute = async (meshId: string): Promise<RepositoryMeshInvitation[]> => {
+    if (repository?.listMeshInvitations) {
+      try {
+        return await repository.listMeshInvitations(meshId);
+      } catch (error) {
+        throw new ApiError(
+          503,
+          "governance_store_unavailable",
+          error instanceof Error ? error.message : "The invitation store is unavailable.",
+        );
+      }
+    }
+    const now = Date.parse(database.now());
+    return (db.prepare(
+      `SELECT id, mesh_id, invited_agent_id, created_by_account_id, status,
+              created_at, expires_at, redeemed_at, redeemed_agent_id
+       FROM mesh_invitations WHERE mesh_id = ? ORDER BY created_at DESC, id ASC`,
+    ).all(meshId) as Array<Record<string, string | null>>).map((row) => {
+      const status = String(row.status) as RepositoryMeshInvitation["status"];
+      return {
+        invitationId: String(row.id),
+        meshId: String(row.mesh_id),
+        invitedAgentId: row.invited_agent_id == null ? null : String(row.invited_agent_id),
+        createdByAccountId: String(row.created_by_account_id),
+        status: status === "active" && Date.parse(String(row.expires_at)) <= now ? "expired" : status,
+        createdAt: String(row.created_at),
+        expiresAt: String(row.expires_at),
+        redeemedAt: row.redeemed_at == null ? null : String(row.redeemed_at),
+        redeemedAgentId: row.redeemed_agent_id == null ? null : String(row.redeemed_agent_id),
+      } satisfies RepositoryMeshInvitation;
+    });
+  };
+
   const findJoinRequestForRoute = async (requestId: string): Promise<RepositoryJoinRequest | null> => {
     if (repository?.findJoinRequest) {
       try {
@@ -3487,6 +3555,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     requestId: string;
     requestedAt: string;
     attentionPolicy: Record<string, unknown>;
+    invitationTokenHash?: string;
   }): Promise<{ status: "joined" | "pending"; requestId?: string; duplicate: boolean } | null> => {
     if (!repository?.joinMeshForAgent) return null;
     try {
@@ -3494,6 +3563,18 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     } catch (error) {
       if (error instanceof Error && error.message === "invite_required") {
         throw new ApiError(403, "invite_required", "This mesh requires an invitation.");
+      }
+      if (error instanceof Error && error.message === "invitation_invalid") {
+        throw new ApiError(403, "invitation_invalid", "That invitation is not valid for this agent or mesh.");
+      }
+      if (error instanceof Error && error.message === "invitation_expired") {
+        throw new ApiError(410, "invitation_expired", "That invitation has expired.");
+      }
+      if (error instanceof Error && error.message === "invitation_redeemed") {
+        throw new ApiError(410, "invitation_redeemed", "That invitation has already been used.");
+      }
+      if (error instanceof Error && error.message === "invitation_revoked") {
+        throw new ApiError(410, "invitation_revoked", "That invitation has been revoked.");
       }
       if (error instanceof Error && error.message === "mesh_unavailable") {
         throw new ApiError(409, "mesh_unavailable", "This mesh is not accepting new activity.");
@@ -5714,6 +5795,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       const principal = await requireHuman(request, true);
       requireCsrf(request, principal);
       assertCostProtectionAllows("mesh");
+      const idempotencyKey = requireIdempotencyKey(request);
       const input = asObject(await readJson(request));
       for (const key of Object.keys(input)) {
         if (!["name", "description", "visibility", "joinPolicy", "agentIds"].includes(key)) {
@@ -5731,6 +5813,26 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (joinPolicy !== "open" && joinPolicy !== "approval" && joinPolicy !== "invite_only") {
         throw new ApiError(400, "invalid_mesh", "joinPolicy is invalid.");
       }
+      // The production API keeps only an in-memory projection. Resolve the
+      // account's agents and owned-mesh count from Firestore before validating
+      // the request so a fresh replica can still create a mesh with the
+      // correct connected identities and quota.
+      let durableOwnedAgents: RepositoryAgentInput[] | undefined;
+      let durableOwnedMeshes: RepositoryMeshDirectoryEntry[] | undefined;
+      if (repository?.listAgentsForAccount) {
+        try {
+          durableOwnedAgents = await repository.listAgentsForAccount(principal.accountId);
+          if (repository.listMeshDirectoryForAccount) {
+            durableOwnedMeshes = await repository.listMeshDirectoryForAccount(principal.accountId);
+          }
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "mesh_store_unavailable",
+            error instanceof Error ? error.message : "The mesh store is unavailable.",
+          );
+        }
+      }
       const agentIds = input.agentIds === undefined
         ? []
         : (() => {
@@ -5743,27 +5845,50 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
               }
               return value.trim();
             }))];
-            const owned = db
-              .prepare("SELECT id FROM agents WHERE owner_account_id = ?")
-              .all(principal.accountId)
-              .map((raw) => (raw as { id: string }).id);
+            const owned = durableOwnedAgents
+              ? durableOwnedAgents.map((agent) => agent.agentId)
+              : db
+                  .prepare("SELECT id FROM agents WHERE owner_account_id = ?")
+                  .all(principal.accountId)
+                  .map((raw) => (raw as { id: string }).id);
             const ownedSet = new Set(owned);
             if (unique.some((agentId) => !ownedSet.has(agentId))) {
               throw new ApiError(403, "agent_access_denied", "Only your connected agents can join a new mesh.");
             }
             return unique;
           })();
-      const ownedCount = db
-        .prepare("SELECT COUNT(*) AS count FROM meshes WHERE owner_account_id = ?")
-        .get(principal.accountId) as { count: number };
-      if (Number(ownedCount.count) >= MAX_OWNED_MESHES_PER_ACCOUNT) {
+      const now = database.now();
+      const requestHash = sha256(JSON.stringify({ name, description, visibility, joinPolicy, agentIds }));
+      const meshSeed = sha256(`mesh:create:${principal.accountId}:${idempotencyKey}`);
+      const meshId = `mesh_${meshSeed.slice(0, 40)}`;
+      const topicId = `topic_${sha256(`${meshSeed}:topic`).slice(0, 40)}`;
+      const meshEventId = `evt_${sha256(`${meshSeed}:event`).slice(0, 40)}`;
+      const meshAuditId = `audit_${sha256(`${meshSeed}:audit`).slice(0, 40)}`;
+      const durableMeshForIdempotency = durableOwnedMeshes?.find(
+        (entry) => entry.mesh.meshId === meshId,
+      );
+      const existingMeshForIdempotency: { ownerAccountId: string | null } | undefined =
+        durableMeshForIdempotency
+          ? { ownerAccountId: durableMeshForIdempotency.mesh.ownerAccountId }
+          : (() => {
+              const row = db.prepare(
+                "SELECT owner_account_id FROM meshes WHERE id = ?",
+              ).get(meshId) as { owner_account_id: string | null } | undefined;
+              return row ? { ownerAccountId: row.owner_account_id } : undefined;
+            })();
+      const ownedMeshCount = durableOwnedMeshes
+        ? durableOwnedMeshes.filter((entry) => entry.role === "owner").length
+        : Number((db
+            .prepare("SELECT COUNT(*) AS count FROM meshes WHERE owner_account_id = ?")
+            .get(principal.accountId) as { count: number }).count);
+      // A retry must reach the durable idempotency check even when the account
+      // has since reached its ten-mesh quota. New keys still fail fast here.
+      if (
+        ownedMeshCount >= MAX_OWNED_MESHES_PER_ACCOUNT &&
+        existingMeshForIdempotency?.ownerAccountId !== principal.accountId
+      ) {
         throw new ApiError(429, "mesh_limit_reached", "This account has reached its mesh limit.");
       }
-      const now = database.now();
-      const meshId = database.id("mesh");
-      const topicId = database.id("topic");
-      const meshEventId = database.id("evt");
-      const meshAuditId = database.id("audit");
       const meshEvent: RepositoryEventInput = {
         eventId: meshEventId,
         type: "mesh.created",
@@ -5786,6 +5911,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         data: { visibility, joinPolicy },
         createdAt: now,
       };
+      let durableMeshDuplicate = false;
       await durableWrite("mesh create", async () => {
         const meshInput: RepositoryMeshInput = {
           meshId,
@@ -5810,13 +5936,20 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           createdAt: now,
         };
         if (repository?.createMeshWithOwner) {
-          await repository.createMeshWithOwner({
+          const result = await repository.createMeshWithOwner({
             mesh: meshInput,
             topic: topicInput,
             agentIds,
+            idempotencyKey,
+            requestHash,
             event: meshEvent,
             audit: meshAudit,
           });
+          durableMeshDuplicate = result.duplicate;
+          // The SQLite conformance adapter writes directly into the same
+          // database used by this handler. Firestore has a separate durable
+          // store and therefore needs the local projection step below.
+          if (!repository.loadProjection) durableMeshDuplicate = true;
         } else {
           await repository?.upsertMesh?.(meshInput);
           await repository?.upsertTopic?.(topicInput);
@@ -5844,7 +5977,40 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           }
         }
       });
+      if (!repository) {
+        const existing = db.prepare(
+          `SELECT owner_account_id, name, description, visibility, join_policy
+           FROM meshes WHERE id = ?`,
+        ).get(meshId) as {
+          owner_account_id: string | null;
+          name: string;
+          description: string;
+          visibility: string;
+          join_policy: string;
+        } | undefined;
+        const topicExists = db.prepare(
+          "SELECT 1 FROM topics WHERE id = ? AND mesh_id = ?",
+        ).get(topicId, meshId);
+        const existingAgentIds = db
+          .prepare("SELECT agent_id FROM mesh_members WHERE mesh_id = ? ORDER BY agent_id")
+          .all(meshId)
+          .map((row) => (row as { agent_id: string }).agent_id);
+        const requestedAgentIds = [...agentIds].sort();
+        if (existing) {
+          const matches = topicExists && existing.owner_account_id === principal.accountId &&
+            existing.name === name && existing.description === description &&
+            existing.visibility === visibility && existing.join_policy === joinPolicy &&
+            existingAgentIds.length === requestedAgentIds.length &&
+            existingAgentIds.every((agentId, index) => agentId === requestedAgentIds[index]);
+          if (!matches) throw new ApiError(409, "idempotency_conflict", "This idempotency key was already used for a different mesh.");
+          durableMeshDuplicate = true;
+        }
+      }
+      if (durableMeshDuplicate && repository?.loadProjection) {
+        await refreshHumanProjection(principal.accountId);
+      }
       const mesh = database.transaction(() => {
+        if (durableMeshDuplicate) return { id: meshId, topicId };
         db.prepare(
           `INSERT INTO meshes(
              id, owner_account_id, name, description, visibility, join_policy, created_at
@@ -5882,11 +6048,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         });
         return { id: meshId, topicId };
       });
+      const summary = meshSummary(readMesh(mesh.id), principal.accountId);
       return {
-        status: 201,
+        status: durableMeshDuplicate ? 200 : 201,
         body: {
-          mesh: meshSummary(readMesh(mesh.id), principal.accountId),
-          topic: meshSummary(readMesh(mesh.id), principal.accountId).topics.find(
+          mesh: summary,
+          topic: summary.topics.find(
             (topic) => topic.id === mesh.topicId,
           ),
         },
@@ -6044,6 +6211,308 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       return { body: { mesh: meshSummary(readMesh(meshId), principal.accountId) } };
     }
 
+    const meshInvitationListMatch = matchingPath(path, /^\/v1\/meshes\/([^/]+)\/invitations$/);
+    if (meshInvitationListMatch && (method === "GET" || method === "POST")) {
+      const principal = await requireHuman(request, true);
+      const meshId = decodeURIComponent(meshInvitationListMatch[1]);
+      await requireMeshRole(principal.accountId, meshId, ["owner", "steward"]);
+      if (method === "GET") {
+        const invitations = await listMeshInvitationsForRoute(meshId);
+        return { body: { invitations: invitations.map(meshInvitationRepresentation) } };
+      }
+      requireCsrf(request, principal);
+      const input = asObject(await readJson(request));
+      for (const key of Object.keys(input)) {
+        if (!["agentId", "expiresInSeconds"].includes(key)) {
+          throw new ApiError(400, "invalid_request", `${key} is not allowed.`);
+        }
+      }
+      const invitedAgentId = input.agentId === undefined
+        ? null
+        : requiredString(input, "agentId", { max: 128 });
+      if (invitedAgentId && repository?.findAgentById) {
+        let invitedAgent: RepositoryAgentInput | null;
+        try {
+          invitedAgent = await repository.findAgentById(invitedAgentId);
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "governance_store_unavailable",
+            error instanceof Error ? error.message : "The agent store is unavailable.",
+          );
+        }
+        if (!invitedAgent) throw new ApiError(404, "agent_not_found", "Agent not found.");
+      } else if (invitedAgentId && !db.prepare("SELECT 1 FROM agents WHERE id = ?").get(invitedAgentId)) {
+        throw new ApiError(404, "agent_not_found", "Agent not found.");
+      }
+      const rawExpiry = input.expiresInSeconds;
+      const expiresInSeconds = rawExpiry === undefined ? 7 * 24 * 60 * 60 : rawExpiry;
+      if (
+        typeof expiresInSeconds !== "number" ||
+        !Number.isSafeInteger(expiresInSeconds) ||
+        expiresInSeconds < 60 ||
+        expiresInSeconds > 30 * 24 * 60 * 60
+      ) {
+        throw new ApiError(400, "invalid_request", "expiresInSeconds must be between 60 seconds and 30 days.");
+      }
+      const nowDate = database.clock.now();
+      const now = nowDate.toISOString();
+      const expiresAt = addSeconds(nowDate, expiresInSeconds);
+      const invitationId = database.id("invite");
+      const token = randomToken(32);
+      const tokenHash = sha256(token);
+      const eventId = database.id("evt");
+      const auditId = database.id("audit");
+      const payload = { invitationId, meshId, invitedAgentId, expiresAt };
+      const event: RepositoryEventInput = {
+        eventId,
+        type: "mesh.invitation.created",
+        meshId,
+        topicId: null,
+        agentId: invitedAgentId,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload,
+        occurredAt: now,
+      };
+      const audit: RepositoryAuditInput = {
+        auditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: "mesh.invitation.created",
+        resourceType: "mesh_invitation",
+        resourceId: invitationId,
+        data: payload,
+        createdAt: now,
+      };
+      if (repository?.createMeshInvitation) {
+        try {
+          await repository.createMeshInvitation({
+            invitationId,
+            meshId,
+            tokenHash,
+            invitedAgentId,
+            createdByAccountId: principal.accountId,
+            createdAt: now,
+            expiresAt,
+            actingAccountId: principal.accountId,
+            humanSessionHash: principal.sessionHash,
+            event,
+            audit,
+          });
+        } catch (error) {
+          if (error instanceof Error && error.message === "mesh_governance_denied") {
+            throw new ApiError(403, "mesh_governance_denied", "You do not have the required mesh role.");
+          }
+          if (error instanceof Error && error.message === "mesh_not_found") {
+            throw new ApiError(404, "mesh_not_found", "Mesh not found.");
+          }
+          if (error instanceof Error && error.message === "agent_not_found") {
+            throw new ApiError(404, "agent_not_found", "Agent not found.");
+          }
+          throw new ApiError(
+            503,
+            "governance_store_unavailable",
+            error instanceof Error ? error.message : "The invitation store is unavailable.",
+          );
+        }
+        // Firestore owns the invitation and its event/audit records. A fresh
+        // API replica may not have the mesh row in its disposable SQLite
+        // projection yet, so only mirror when this repository explicitly does
+        // not provide a durable list (the local compatibility case).
+        if (!repository.listMeshInvitations) {
+          const localMesh = db.prepare("SELECT 1 FROM meshes WHERE id = ?").get(meshId);
+          if (localMesh) {
+            database.transaction(() => {
+              db.prepare(
+                `INSERT INTO mesh_invitations(
+                   id, mesh_id, token_hash, invited_agent_id, created_by_account_id,
+                   status, created_at, expires_at, redeemed_at, redeemed_agent_id
+                 ) VALUES(?, ?, ?, ?, ?, 'active', ?, ?, NULL, NULL)`,
+              ).run(invitationId, meshId, tokenHash, invitedAgentId, principal.accountId, now, expiresAt);
+              emitAudit({
+                auditId,
+                createdAt: now,
+                actorType: "human",
+                actorId: principal.accountId,
+                sessionId: principal.sessionHash,
+                action: "mesh.invitation.created",
+                resourceType: "mesh_invitation",
+                resourceId: invitationId,
+                data: payload,
+                durable: true,
+              });
+              emitEvent("mesh.invitation.created", invitedAgentId, meshId, null, payload, {
+                eventId,
+                occurredAt: now,
+                sessionId: principal.sessionHash,
+                durable: true,
+              });
+            });
+          }
+        }
+      } else {
+        database.transaction(() => {
+          db.prepare(
+            `INSERT INTO mesh_invitations(
+               id, mesh_id, token_hash, invited_agent_id, created_by_account_id,
+               status, created_at, expires_at, redeemed_at, redeemed_agent_id
+             ) VALUES(?, ?, ?, ?, ?, 'active', ?, ?, NULL, NULL)`,
+          ).run(invitationId, meshId, tokenHash, invitedAgentId, principal.accountId, now, expiresAt);
+          emitAudit({
+            auditId,
+            createdAt: now,
+            actorType: "human",
+            actorId: principal.accountId,
+            sessionId: principal.sessionHash,
+            action: "mesh.invitation.created",
+            resourceType: "mesh_invitation",
+            resourceId: invitationId,
+            data: payload,
+          });
+          emitEvent("mesh.invitation.created", invitedAgentId, meshId, null, payload, {
+            eventId,
+            occurredAt: now,
+            sessionId: principal.sessionHash,
+          });
+        });
+      }
+      return {
+        status: 201,
+        body: {
+          invitation: {
+            id: invitationId,
+            meshId,
+            invitedAgentId,
+            createdByAccountId: principal.accountId,
+            status: "active",
+            createdAt: now,
+            expiresAt,
+            redeemedAt: null,
+            redeemedAgentId: null,
+          },
+          token,
+        },
+      };
+    }
+
+    const meshInvitationRevokeMatch = matchingPath(
+      path,
+      /^\/v1\/meshes\/([^/]+)\/invitations\/([^/]+)\/revoke$/,
+    );
+    if (method === "POST" && meshInvitationRevokeMatch) {
+      const principal = await requireHuman(request, true);
+      requireCsrf(request, principal);
+      const meshId = decodeURIComponent(meshInvitationRevokeMatch[1]);
+      const invitationId = decodeURIComponent(meshInvitationRevokeMatch[2]);
+      await requireMeshRole(principal.accountId, meshId, ["owner", "steward"]);
+      const now = database.now();
+      const eventId = database.id("evt");
+      const auditId = database.id("audit");
+      const payload = { invitationId, meshId };
+      const event: RepositoryEventInput = {
+        eventId,
+        type: "mesh.invitation.revoked",
+        meshId,
+        topicId: null,
+        agentId: null,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload,
+        occurredAt: now,
+      };
+      const audit: RepositoryAuditInput = {
+        auditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: "mesh.invitation.revoked",
+        resourceType: "mesh_invitation",
+        resourceId: invitationId,
+        data: payload,
+        createdAt: now,
+      };
+      if (repository?.revokeMeshInvitation) {
+        try {
+          await repository.revokeMeshInvitation({
+            invitationId,
+            meshId,
+            revokedAt: now,
+            actingAccountId: principal.accountId,
+            humanSessionHash: principal.sessionHash,
+            event,
+            audit,
+          });
+        } catch (error) {
+          if (error instanceof Error && error.message === "invitation_not_found") {
+            throw new ApiError(404, "invitation_not_found", "Invitation not found.");
+          }
+          if (error instanceof Error && error.message === "invitation_not_active") {
+            throw new ApiError(409, "invitation_not_active", "That invitation is no longer active.");
+          }
+          if (error instanceof Error && error.message === "mesh_governance_denied") {
+            throw new ApiError(403, "mesh_governance_denied", "You do not have the required mesh role.");
+          }
+          throw new ApiError(
+            503,
+            "governance_store_unavailable",
+            error instanceof Error ? error.message : "The invitation store is unavailable.",
+          );
+        }
+        // Firestore replicas do not need a local invitation row: the durable
+        // transaction already contains the authoritative state and event.
+        if (!repository.listMeshInvitations) {
+          db.prepare(
+            "UPDATE mesh_invitations SET status = 'revoked' WHERE id = ? AND mesh_id = ? AND status = 'active'",
+          ).run(invitationId, meshId);
+          emitAudit({
+            auditId,
+            createdAt: now,
+            actorType: "human",
+            actorId: principal.accountId,
+            sessionId: principal.sessionHash,
+            action: "mesh.invitation.revoked",
+            resourceType: "mesh_invitation",
+            resourceId: invitationId,
+            data: payload,
+            durable: true,
+          });
+          emitEvent("mesh.invitation.revoked", null, meshId, null, payload, {
+            eventId,
+            occurredAt: now,
+            sessionId: principal.sessionHash,
+            durable: true,
+          });
+        }
+      } else {
+        const result = database.transaction(() => {
+          const outcome = db.prepare(
+            "UPDATE mesh_invitations SET status = 'revoked' WHERE id = ? AND mesh_id = ? AND status = 'active'",
+          ).run(invitationId, meshId);
+          if (outcome.changes !== 1) throw new ApiError(404, "invitation_not_found", "Invitation not found or already inactive.");
+          emitAudit({
+            auditId,
+            createdAt: now,
+            actorType: "human",
+            actorId: principal.accountId,
+            sessionId: principal.sessionHash,
+            action: "mesh.invitation.revoked",
+            resourceType: "mesh_invitation",
+            resourceId: invitationId,
+            data: payload,
+          });
+          emitEvent("mesh.invitation.revoked", null, meshId, null, payload, {
+            eventId,
+            occurredAt: now,
+            sessionId: principal.sessionHash,
+          });
+        });
+        void result;
+      }
+      return { body: { invitationId, meshId, status: "revoked" } };
+    }
+
     const meshRoleMatch = matchingPath(path, /^\/v1\/meshes\/([^/]+)\/roles\/([^/]+)$/);
     if ((method === "PUT" || method === "DELETE") && meshRoleMatch) {
       const principal = await requireHuman(request, true);
@@ -6052,9 +6521,19 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       const accountId = decodeURIComponent(meshRoleMatch[2]);
       await requireMeshRole(principal.accountId, meshId, ["owner"]);
       readMesh(meshId);
-      if (!db.prepare("SELECT 1 FROM accounts WHERE id = ?").get(accountId)) {
-        throw new ApiError(404, "account_not_found", "Account not found.");
+      let targetAccountExists = Boolean(db.prepare("SELECT 1 FROM accounts WHERE id = ?").get(accountId));
+      if (!targetAccountExists && repository?.findAccountById) {
+        try {
+          targetAccountExists = Boolean(await repository.findAccountById(accountId));
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "governance_store_unavailable",
+            error instanceof Error ? error.message : "The account store is unavailable.",
+          );
+        }
       }
+      if (!targetAccountExists) throw new ApiError(404, "account_not_found", "Account not found.");
       if (method === "DELETE") {
         const current = await meshRoleForAuthoritatively(accountId, meshId);
         if (!current) return { body: { meshId, accountId, removed: false } };
@@ -6181,6 +6660,22 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         });
       });
       database.transaction(() => {
+        if (role === "owner") {
+          // Firestore promotes one canonical owner and demotes its previous
+          // owner atomically. Mirror that transfer in the local read
+          // projection so the next response cannot briefly expose two owners.
+          const previousOwner = db.prepare(
+            `SELECT account_id FROM mesh_human_roles
+             WHERE mesh_id = ? AND role = 'owner' AND account_id <> ?
+             ORDER BY created_at, account_id LIMIT 1`,
+          ).get(meshId, accountId) as { account_id: string } | undefined;
+          if (previousOwner) {
+            db.prepare(
+              `UPDATE mesh_human_roles SET role = 'steward', updated_at = ?
+               WHERE mesh_id = ? AND account_id = ? AND role = 'owner'`,
+            ).run(now, meshId, previousOwner.account_id);
+          }
+        }
         db.prepare(
           `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
            VALUES(?, ?, ?, ?, ?)
@@ -7475,6 +7970,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         // successor must still report `session_superseded` rather than
         // treating the old native session as reclaimable.
         let durableRequestedSessionSuperseded = false;
+        let expiredPredecessorRecovery = false;
         let active = db
           .prepare(
             `SELECT expires_at FROM agent_sessions
@@ -7508,10 +8004,19 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
               }
             }
             durableRequestedSessionSuperseded = durableSession?.status === "superseded";
-            active =
+            const durableSessionBelongsToPairing = Boolean(
               durableSession &&
               durableSession.bindingId === pairing.id &&
-              durableSession.status === "active" &&
+              durableSession.agentId === pairing.agent_id,
+            );
+            expiredPredecessorRecovery = Boolean(
+              durableSessionBelongsToPairing &&
+              durableSession?.status === "active" &&
+              Date.parse(durableSession?.expiresAt ?? "") <= Date.parse(database.now()),
+            );
+            active =
+              durableSessionBelongsToPairing &&
+              durableSession?.status === "active" &&
               Date.parse(durableSession.expiresAt) > Date.parse(database.now())
               ? { active: 1 }
                 : undefined;
@@ -7531,7 +8036,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           // A lost renewal response may leave the predecessor superseded while
           // its deterministic successor is already active. Permit one more
           // signed challenge so the host can recover that credential.
-        } else if (!active) {
+        } else if (!active && !expiredPredecessorRecovery) {
           if (durableRequestedSessionSuperseded) {
             throw new ApiError(
               401,
@@ -7562,7 +8067,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         if (recoverySuccessorId) {
           // Recovery challenge; the renewal endpoint will return the existing
           // deterministic successor after verifying the signature.
-        } else if (!active) {
+        } else if (!active && !expiredPredecessorRecovery) {
           const localStatus = db
             .prepare(
               `SELECT status FROM agent_sessions
@@ -7578,7 +8083,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           }
           throw new ApiError(401, "session_invalid", "The requested runtime session is not active.");
         }
-        if (!recoverySuccessorId && active && activeExpiresAtMs !== undefined) {
+        if (!recoverySuccessorId && !expiredPredecessorRecovery && active && activeExpiresAtMs !== undefined) {
           const remainingSeconds = Math.ceil(
             (activeExpiresAtMs - database.clock.now().getTime()) / 1_000,
           );
@@ -8001,11 +8506,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             durableCurrent.supersedingSessionId === replacementSessionId,
           );
           durableRecovery = recoverable;
+          const expiredPredecessorRecovery = Boolean(
+            durableCurrent?.status === "active" &&
+            Date.parse(durableCurrent.expiresAt) <= Date.parse(now),
+          );
           if (
             !durableCurrent ||
             durableCurrent.bindingId !== pairing.id ||
             durableCurrent.agentId !== pairing.agent_id ||
-            (!recoverable && (
+            (!recoverable && !expiredPredecessorRecovery && (
               durableCurrent.status !== "active" ||
               Date.parse(durableCurrent.expiresAt) <= Date.parse(now)
             ))
@@ -8019,7 +8528,9 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             );
           }
           if (!recoverable && (!currentBefore || currentBefore.authority_epoch !== durableCurrent.authorityEpoch)) {
-            await hydrateDurableAgentSession(durableCurrent.tokenHash, now);
+            await hydrateDurableAgentSession(durableCurrent.tokenHash, now, {
+              allowExpired: expiredPredecessorRecovery,
+            });
           }
         } catch (error) {
           if (error instanceof ApiError) throw error;
@@ -8201,6 +8712,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             challengeUsedAt: now,
             expectedSessionId: sessionId,
             expectedAuthorityEpoch: currentBeforeRow.authority_epoch,
+            // A signed renewal may recover an expired predecessor only while
+            // Firestore's authority fence still names it. A newer native
+            // session, revoke, or page handoff fails the CAS in the
+            // repository and cannot be reclaimed by this host.
+            allowExpiredPredecessorRecovery: true,
             event: renewalEvent,
             audit: renewalAudit,
           });
@@ -9290,6 +9806,19 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (method === "POST" && agentJoinMatch) {
         const meshId = decodeURIComponent(agentJoinMatch[1]);
         const key = requireIdempotencyKey(request);
+        let invitationTokenHash: string | undefined;
+        const contentLengthHeader = request.headers["content-length"];
+        const contentLength = typeof contentLengthHeader === "string" ? Number(contentLengthHeader) : 0;
+        if (Number.isFinite(contentLength) && contentLength > 0) {
+          const input = asObject(await readJson(request));
+          for (const field of Object.keys(input)) {
+            if (field !== "invitationToken") {
+              throw new ApiError(400, "invalid_request", `${field} is not allowed.`);
+            }
+          }
+          const invitationToken = requiredString(input, "invitationToken", { min: 16, max: 512 });
+          invitationTokenHash = sha256(invitationToken);
+        }
         if (repository?.joinMeshForAgent) {
           // Firestore is the authority for admission. The local projection is
           // refreshed before the command for a responsive profile, but the
@@ -9312,6 +9841,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             requestId,
             requestedAt: database.now(),
             attentionPolicy: attentionFor(actingAgent) as Record<string, unknown>,
+            ...(invitationTokenHash ? { invitationTokenHash } : {}),
           });
           if (!durableResult) {
             throw new ApiError(503, "authorization_store_unavailable", "The mesh authorization store is unavailable.");
@@ -9331,7 +9861,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           principal,
           "mesh.join",
           key,
-          { meshId },
+          { meshId, invitationTokenHash: invitationTokenHash ?? null },
           () => {
             const currentCount = db
               .prepare("SELECT COUNT(*) AS count FROM mesh_members WHERE agent_id = ?")
@@ -9344,8 +9874,39 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
               .get(meshId, principal.agentId);
             if (existing) return { status: 200, body: { meshId, status: "joined" } };
             const now = database.now();
+            let invitationId: string | null = null;
             if (mesh.join_policy === "invite_only") {
-              throw new ApiError(403, "invite_required", "This mesh requires an invitation.");
+              if (!invitationTokenHash) {
+                throw new ApiError(403, "invite_required", "This mesh requires an invitation.");
+              }
+              const invitation = db.prepare(
+                `SELECT id, invited_agent_id, status, expires_at
+                 FROM mesh_invitations WHERE token_hash = ? LIMIT 1`,
+              ).get(invitationTokenHash) as {
+                id: string;
+                invited_agent_id: string | null;
+                status: RepositoryMeshInvitation["status"];
+                expires_at: string;
+              } | undefined;
+              if (!invitation || invitation.status !== "active") {
+                if (invitation?.status === "redeemed") {
+                  throw new ApiError(410, "invitation_redeemed", "That invitation has already been used.");
+                }
+                if (invitation?.status === "revoked") {
+                  throw new ApiError(410, "invitation_revoked", "That invitation has been revoked.");
+                }
+                throw new ApiError(403, "invitation_invalid", "That invitation is not valid for this mesh.");
+              }
+              if (Date.parse(invitation.expires_at) <= Date.parse(now)) {
+                db.prepare(
+                  "UPDATE mesh_invitations SET status = 'expired' WHERE id = ? AND status = 'active'",
+                ).run(invitation.id);
+                throw new ApiError(410, "invitation_expired", "That invitation has expired.");
+              }
+              if (invitation.invited_agent_id && invitation.invited_agent_id !== principal.agentId) {
+                throw new ApiError(403, "invitation_invalid", "That invitation is not addressed to this agent.");
+              }
+              invitationId = invitation.id;
             }
             if (mesh.join_policy === "approval") {
               const requestId = database.id("join");
@@ -9364,11 +9925,22 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             db.prepare(
               "INSERT INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)",
             ).run(meshId, principal.agentId, now);
+            if (invitationId) {
+              const redeemed = db.prepare(
+                `UPDATE mesh_invitations
+                 SET status = 'redeemed', redeemed_at = ?, redeemed_agent_id = ?
+                 WHERE id = ? AND status = 'active'`,
+              ).run(now, principal.agentId, invitationId);
+              if (redeemed.changes !== 1) {
+                throw new ApiError(410, "invitation_redeemed", "That invitation has already been used.");
+              }
+            }
             emitEvent("mesh.agent.joined", principal.agentId, meshId, null, {
               meshId,
               agentId: principal.agentId,
+              ...(invitationId ? { invitationId } : {}),
             }, { sessionId: principal.sessionId, runtimeKind: principal.runtime });
-            return { status: 201, body: { meshId, status: "joined" } };
+            return { status: 201, body: { meshId, status: "joined", ...(invitationId ? { invitationId } : {}) } };
           },
         () => {
             assertCurrentAgentSession(principal);
@@ -9402,7 +9974,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
               agentId: principal.agentId,
               status: "joined",
               attentionPolicy: attentionFor(actingAgent) as Record<string, unknown>,
-              admissionProvenance: "open",
+              admissionProvenance: typeof resultBody.invitationId === "string" ? "invite" : "open",
               joinedAt: database.now(),
               updatedAt: database.now(),
             });

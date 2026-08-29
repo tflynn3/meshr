@@ -346,6 +346,21 @@ export interface RepositoryJoinRequest {
   resolvedAt: string | null;
 }
 
+export type RepositoryMeshInvitationStatus = "active" | "redeemed" | "revoked" | "expired";
+
+/** A one-use, expiring admission token for an invite-only mesh. */
+export interface RepositoryMeshInvitation {
+  invitationId: string;
+  meshId: string;
+  invitedAgentId: string | null;
+  createdByAccountId: string;
+  status: RepositoryMeshInvitationStatus;
+  createdAt: string;
+  expiresAt: string;
+  redeemedAt: string | null;
+  redeemedAgentId: string | null;
+}
+
 export type RepositoryActivityPreferenceKind = "topic" | "link";
 
 export interface RepositoryHumanActivityPreference {
@@ -430,7 +445,10 @@ export interface MeshrRepository {
     mesh: RepositoryMeshInput;
     topic: RepositoryTopicInput;
     agentIds: string[];
-  } & RepositoryMutationArtifacts): Promise<void>;
+    /** Stable client key used to make retries return the original mesh. */
+    idempotencyKey?: string;
+    requestHash?: string;
+  } & RepositoryMutationArtifacts): Promise<{ duplicate: boolean }>;
   upsertTopic?(input: RepositoryTopicInput): Promise<void>;
   upsertMeshHumanRole?(input: {
     meshId: string;
@@ -477,7 +495,28 @@ export interface MeshrRepository {
     requestId: string;
     requestedAt: string;
     attentionPolicy: Record<string, unknown>;
+    /** SHA-256 of the one-use invitation token, when joining invite-only meshes. */
+    invitationTokenHash?: string;
   }): Promise<{ status: "joined" | "pending"; requestId?: string; duplicate: boolean }>;
+  createMeshInvitation?(input: {
+    invitationId: string;
+    meshId: string;
+    tokenHash: string;
+    invitedAgentId: string | null;
+    createdByAccountId: string;
+    createdAt: string;
+    expiresAt: string;
+    actingAccountId: string;
+    humanSessionHash: string;
+  } & RepositoryMutationArtifacts): Promise<RepositoryMeshInvitation>;
+  listMeshInvitations?(meshId: string): Promise<RepositoryMeshInvitation[]>;
+  revokeMeshInvitation?(input: {
+    invitationId: string;
+    meshId: string;
+    revokedAt: string;
+    actingAccountId: string;
+    humanSessionHash: string;
+  } & RepositoryMutationArtifacts): Promise<void>;
   upsertJoinRequest?(input: {
     requestId: string;
     meshId: string;
@@ -685,6 +724,14 @@ export interface MeshrRepository {
     /** Renewal-only compare-and-swap guard. Fresh starts intentionally omit it. */
     expectedSessionId?: string;
     expectedAuthorityEpoch?: number;
+    /**
+     * Allow a signed renewal to replace an expired predecessor when the
+     * authority fence still points at that exact native session. This is the
+     * bounded recovery path for a host that was offline longer than the
+     * fifteen-minute session TTL; it never bypasses the epoch/kind/session
+     * compare-and-set checks above.
+     */
+    allowExpiredPredecessorRecovery?: boolean;
     /** Mark the approved binding claimed in the same transaction as the session. */
     claimPairing?: boolean;
     /** Immutable session lifecycle records committed with the authority change. */

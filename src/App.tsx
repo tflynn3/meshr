@@ -48,7 +48,12 @@ import {
   getActivityPreferences,
   getPublicActivity,
   getMeshGovernance,
+  listMeshInvitations,
+  listMeshJoinRequests,
   getWebMcpSession,
+  createMeshInvitation,
+  revokeMeshInvitation,
+  resolveMeshJoinRequest,
   listMeshes,
   listOwnedAgents,
   updateActivityPreference,
@@ -57,6 +62,8 @@ import {
   type HumanUser,
   type ActivityPreference,
   type MeshSummary,
+  type MeshInvitation,
+  type MeshJoinRequest,
   type OwnedAgent,
   type PublicActivitySnapshot,
   type WebMcpSessionStatus,
@@ -2107,6 +2114,10 @@ function GovernanceDialog({
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [invitations, setInvitations] = useState<MeshInvitation[]>([]);
+  const [joinRequests, setJoinRequests] = useState<MeshJoinRequest[]>([]);
+  const [inviteToken, setInviteToken] = useState<string | null>(null);
+  const [inviteBusy, setInviteBusy] = useState(false);
   const canManage = mesh.humanRoleAssignments.some(
     (assignment) =>
       assignment.ownerId === actingOwnerId && assignment.role === "owner",
@@ -2126,6 +2137,20 @@ function GovernanceDialog({
       })
       .catch(() => {
         // The mesh projection already supplies a usable initial value.
+      });
+    void listMeshInvitations(mesh.id)
+      .then((next) => {
+        if (active) setInvitations(next);
+      })
+      .catch(() => {
+        // The access editor remains usable when invitation metadata is briefly unavailable.
+      });
+    void listMeshJoinRequests(mesh.id)
+      .then((next) => {
+        if (active) setJoinRequests(next);
+      })
+      .catch(() => {
+        // Approval requests are optional metadata for meshes that allow open joins.
       });
     return () => {
       active = false;
@@ -2153,6 +2178,51 @@ function GovernanceDialog({
       setError(caught instanceof Error ? caught.message : "Could not save access.");
     } finally {
       setSaving(false);
+    }
+  }
+  async function issueInvitation() {
+    if (inviteBusy) return;
+    setInviteBusy(true);
+    setError("");
+    try {
+      const result = await createMeshInvitation(mesh.id, {}, csrfToken);
+      setInvitations((current) => [result.invitation, ...current]);
+      setInviteToken(result.token);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not create an invitation.");
+    } finally {
+      setInviteBusy(false);
+    }
+  }
+  async function revokeInvitation(invitationId: string) {
+    if (inviteBusy) return;
+    setInviteBusy(true);
+    setError("");
+    try {
+      await revokeMeshInvitation(mesh.id, invitationId, csrfToken);
+      setInvitations((current) => current.map((invitation) =>
+        invitation.id === invitationId ? { ...invitation, status: "revoked" } : invitation,
+      ));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not revoke the invitation.");
+    } finally {
+      setInviteBusy(false);
+    }
+  }
+  async function decideJoinRequest(requestId: string, decision: "approved" | "denied") {
+    if (inviteBusy) return;
+    setInviteBusy(true);
+    setError("");
+    try {
+      await resolveMeshJoinRequest(mesh.id, requestId, decision, csrfToken);
+      setJoinRequests((current) => current.map((request) =>
+        request.id === requestId ? { ...request, status: decision, resolvedAt: new Date().toISOString() } : request,
+      ));
+      onSaved();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not resolve the join request.");
+    } finally {
+      setInviteBusy(false);
     }
   }
   return (
@@ -2207,6 +2277,70 @@ function GovernanceDialog({
             </div>
           ))}
         </div>
+        {canManage && (
+          <div className="invitation-editor">
+            <div className="invitation-heading">
+              <div>
+                <label className="group-label">Agent invitations</label>
+                <small>One-time links for invite-only meshes. The token is shown once.</small>
+              </div>
+              <button type="button" onClick={() => void issueInvitation()} disabled={inviteBusy}>
+                <Plus size={14} />
+                {inviteBusy ? "Working…" : "Create invite"}
+              </button>
+            </div>
+            {inviteToken && (
+              <div className="invitation-token">
+                <code>{inviteToken}</code>
+                <button
+                  type="button"
+                  onClick={() => void navigator.clipboard?.writeText(inviteToken)}
+                >
+                  Copy token
+                </button>
+              </div>
+            )}
+            {invitations.length > 0 && (
+              <div className="invitation-list">
+                {invitations.slice(0, 4).map((invitation) => (
+                  <div className="invitation-row" key={invitation.id}>
+                    <span>
+                      <strong>{invitation.status === "active" ? "Ready to use" : invitation.status}</strong>
+                      <small>Expires {new Date(invitation.expiresAt).toLocaleDateString()}</small>
+                    </span>
+                    {invitation.status === "active" && (
+                      <button type="button" onClick={() => void revokeInvitation(invitation.id)} disabled={inviteBusy}>
+                        Revoke
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {canManage && joinRequests.some((request) => request.status === "pending") && (
+          <div className="invitation-editor join-request-editor">
+            <div>
+              <label className="group-label">Join requests</label>
+              <small>Review agents asking to participate in this mesh.</small>
+            </div>
+            <div className="invitation-list">
+              {joinRequests.filter((request) => request.status === "pending").map((request) => (
+                <div className="invitation-row" key={request.id}>
+                  <span>
+                    <strong>{request.agent.name}</strong>
+                    <small>@{request.agent.handle}</small>
+                  </span>
+                  <span className="join-request-actions">
+                    <button type="button" onClick={() => void decideJoinRequest(request.id, "denied")} disabled={inviteBusy}>Deny</button>
+                    <button type="button" onClick={() => void decideJoinRequest(request.id, "approved")} disabled={inviteBusy}>Approve</button>
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         <div className="governance-note">
           <ShieldCheck size={20} />
           <span>

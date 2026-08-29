@@ -19,6 +19,7 @@ import type {
   RepositoryPostRecord,
   RepositoryTopicPostsPage,
   RepositoryJoinRequest,
+  RepositoryMeshInvitation,
   RepositoryHumanActivityPreference,
   RepositoryMutationArtifacts,
   RepositoryEventInput,
@@ -843,7 +844,7 @@ export class SqliteMeshrRepository implements MeshrRepository {
     actingAccountId?: string,
     humanSessionHash?: string,
   ): Promise<void> {
-    this.database.transaction(() => {
+    return this.database.transaction(() => {
       if (actingAccountId || humanSessionHash) {
         this.assertHumanSession(actingAccountId, humanSessionHash, revokedAt);
         const agent = this.db
@@ -890,12 +891,47 @@ export class SqliteMeshrRepository implements MeshrRepository {
     mesh: RepositoryMeshInput;
     topic: RepositoryTopicInput;
     agentIds: string[];
-  } & RepositoryMutationArtifacts): Promise<void> {
+    idempotencyKey?: string;
+    requestHash?: string;
+  } & RepositoryMutationArtifacts): Promise<{ duplicate: boolean }> {
     const { mesh, topic } = input;
     const agentIds = [...new Set(input.agentIds)];
-    this.database.transaction(() => {
+    return this.database.transaction(() => {
       const existing = this.db.prepare("SELECT 1 FROM meshes WHERE id = ?").get(mesh.meshId);
-      if (existing) throw new Error("mesh_already_exists");
+      if (existing) {
+        const current = this.db.prepare(
+          `SELECT owner_account_id, name, description, visibility, join_policy
+           FROM meshes WHERE id = ?`,
+        ).get(mesh.meshId) as {
+          owner_account_id: string | null;
+          name: string;
+          description: string;
+          visibility: RepositoryMeshInput["visibility"];
+          join_policy: RepositoryMeshInput["admission"];
+        } | undefined;
+        const topicExists = this.db.prepare(
+          "SELECT 1 FROM topics WHERE id = ? AND mesh_id = ?",
+        ).get(topic.topicId, mesh.meshId);
+        const existingAgentIds = this.db
+          .prepare(
+            `SELECT agent_id FROM mesh_members
+             WHERE mesh_id = ? ORDER BY agent_id`,
+          )
+          .all(mesh.meshId)
+          .map((row) => (row as { agent_id: string }).agent_id);
+        const requestedAgentIds = [...agentIds].sort();
+        if (
+          input.idempotencyKey && current && topicExists &&
+          current.owner_account_id === mesh.ownerAccountId &&
+          current.name === mesh.name && current.description === mesh.description &&
+          current.visibility === mesh.visibility && current.join_policy === mesh.admission &&
+          existingAgentIds.length === requestedAgentIds.length &&
+          existingAgentIds.every((agentId, index) => agentId === requestedAgentIds[index])
+        ) {
+          return { duplicate: true };
+        }
+        throw new Error(input.idempotencyKey ? "idempotency_conflict" : "mesh_already_exists");
+      }
       if (!mesh.ownerAccountId) throw new Error("owner_required");
       this.assertHumanSession(mesh.actingAccountId, mesh.humanSessionHash, mesh.updatedAt);
       if (mesh.actingAccountId !== mesh.ownerAccountId) throw new Error("mesh_governance_denied");
@@ -951,6 +987,8 @@ export class SqliteMeshrRepository implements MeshrRepository {
         "INSERT INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)",
       );
       for (const agentId of agentIds) insertMembership.run(mesh.meshId, agentId, mesh.createdAt);
+      this.writeMutationArtifacts(input);
+      return { duplicate: false };
     });
   }
 
@@ -1231,10 +1269,14 @@ export class SqliteMeshrRepository implements MeshrRepository {
     requestId: string;
     requestedAt: string;
     attentionPolicy: Record<string, unknown>;
+    invitationTokenHash?: string;
   }): Promise<{ status: "joined" | "pending"; requestId?: string; duplicate: boolean }> {
     return this.database.transaction(() => {
       const requestHash = createHash("sha256")
-        .update(JSON.stringify({ meshId: input.meshId }))
+        .update(JSON.stringify({
+          meshId: input.meshId,
+          invitationTokenHash: input.invitationTokenHash ?? null,
+        }))
         .digest("hex");
       const existingIdempotency = this.db.prepare(
         `SELECT request_hash, response_status, response_json
@@ -1295,7 +1337,36 @@ export class SqliteMeshrRepository implements MeshrRepository {
         ).run(input.agentId, input.idempotencyKey, requestHash, JSON.stringify(body), input.requestedAt);
         return { status: "joined", duplicate: false };
       }
-      if (mesh.join_policy === "invite_only") throw new Error("invite_required");
+      let invitationId: string | null = null;
+      if (mesh.join_policy === "invite_only") {
+        if (!input.invitationTokenHash) throw new Error("invite_required");
+        const invitation = this.db.prepare(
+          `SELECT id, invited_agent_id, status, expires_at
+           FROM mesh_invitations WHERE token_hash = ? LIMIT 1`,
+        ).get(input.invitationTokenHash) as {
+          id: string;
+          invited_agent_id: string | null;
+          status: RepositoryMeshInvitation["status"];
+          expires_at: string;
+        } | undefined;
+        if (!invitation) throw new Error("invitation_invalid");
+        if (invitation.status !== "active") {
+          if (invitation.status === "redeemed") throw new Error("invitation_redeemed");
+          if (invitation.status === "revoked") throw new Error("invitation_revoked");
+          if (invitation.status === "expired") throw new Error("invitation_expired");
+          throw new Error("invitation_invalid");
+        }
+        if (Date.parse(invitation.expires_at) <= Date.parse(input.requestedAt)) {
+          this.db.prepare(
+            "UPDATE mesh_invitations SET status = 'expired' WHERE id = ? AND status = 'active'",
+          ).run(invitation.id);
+          throw new Error("invitation_expired");
+        }
+        if (invitation.invited_agent_id && invitation.invited_agent_id !== input.agentId) {
+          throw new Error("invitation_invalid");
+        }
+        invitationId = invitation.id;
+      }
       let responseStatus: 201 | 202;
       let body: Record<string, unknown>;
       if (mesh.join_policy === "approval") {
@@ -1347,8 +1418,16 @@ export class SqliteMeshrRepository implements MeshrRepository {
         this.db.prepare(
           "INSERT INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)",
         ).run(input.meshId, input.agentId, input.requestedAt);
+        if (invitationId) {
+          const redeemed = this.db.prepare(
+            `UPDATE mesh_invitations
+             SET status = 'redeemed', redeemed_at = ?, redeemed_agent_id = ?
+             WHERE id = ? AND status = 'active'`,
+          ).run(input.requestedAt, input.agentId, invitationId);
+          if (redeemed.changes !== 1) throw new Error("invitation_invalid");
+        }
         responseStatus = 201;
-        body = { meshId: input.meshId, status: "joined" };
+        body = { meshId: input.meshId, status: "joined", ...(invitationId ? { invitationId } : {}) };
         const eventId = `evt_${createHash("sha256")
           .update(`mesh.agent.joined:${input.meshId}:${input.agentId}:${input.idempotencyKey}`)
           .digest("hex")
@@ -1383,6 +1462,107 @@ export class SqliteMeshrRepository implements MeshrRepository {
         ...(responseStatus === 202 ? { requestId: input.requestId } : {}),
         duplicate: false,
       };
+    });
+  }
+
+  async createMeshInvitation(input: {
+    invitationId: string;
+    meshId: string;
+    tokenHash: string;
+    invitedAgentId: string | null;
+    createdByAccountId: string;
+    createdAt: string;
+    expiresAt: string;
+    actingAccountId: string;
+    humanSessionHash: string;
+  } & RepositoryMutationArtifacts): Promise<RepositoryMeshInvitation> {
+    return this.database.transaction(() => {
+      this.assertHumanGovernance(
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner", "steward"],
+        input.createdAt,
+      );
+      const mesh = this.db.prepare("SELECT 1 FROM meshes WHERE id = ?").get(input.meshId);
+      if (!mesh) throw new Error("mesh_not_found");
+      if (input.invitedAgentId) {
+        const agent = this.db.prepare("SELECT 1 FROM agents WHERE id = ?").get(input.invitedAgentId);
+        if (!agent) throw new Error("agent_not_found");
+      }
+      this.db.prepare(
+        `INSERT INTO mesh_invitations(
+           id, mesh_id, token_hash, invited_agent_id, created_by_account_id,
+           status, created_at, expires_at, redeemed_at, redeemed_agent_id
+         ) VALUES(?, ?, ?, ?, ?, 'active', ?, ?, NULL, NULL)`,
+      ).run(
+        input.invitationId,
+        input.meshId,
+        input.tokenHash,
+        input.invitedAgentId,
+        input.createdByAccountId,
+        input.createdAt,
+        input.expiresAt,
+      );
+      this.writeMutationArtifacts(input);
+      return {
+        invitationId: input.invitationId,
+        meshId: input.meshId,
+        invitedAgentId: input.invitedAgentId,
+        createdByAccountId: input.createdByAccountId,
+        status: "active",
+        createdAt: input.createdAt,
+        expiresAt: input.expiresAt,
+        redeemedAt: null,
+        redeemedAgentId: null,
+      } satisfies RepositoryMeshInvitation;
+    });
+  }
+
+  async listMeshInvitations(meshId: string): Promise<RepositoryMeshInvitation[]> {
+    const now = Date.parse(this.now());
+    const rows = this.db.prepare(
+      `SELECT id, mesh_id, invited_agent_id, created_by_account_id, status,
+              created_at, expires_at, redeemed_at, redeemed_agent_id
+       FROM mesh_invitations WHERE mesh_id = ? ORDER BY created_at DESC, id ASC`,
+    ).all(meshId) as Array<Record<string, string | null>>;
+    return rows.map((row) => {
+      const status = String(row.status) as RepositoryMeshInvitation["status"];
+      return {
+        invitationId: String(row.id),
+        meshId: String(row.mesh_id),
+        invitedAgentId: row.invited_agent_id == null ? null : String(row.invited_agent_id),
+        createdByAccountId: String(row.created_by_account_id),
+        status: status === "active" && Date.parse(String(row.expires_at)) <= now ? "expired" : status,
+        createdAt: String(row.created_at),
+        expiresAt: String(row.expires_at),
+        redeemedAt: row.redeemed_at == null ? null : String(row.redeemed_at),
+        redeemedAgentId: row.redeemed_agent_id == null ? null : String(row.redeemed_agent_id),
+      } satisfies RepositoryMeshInvitation;
+    });
+  }
+
+  async revokeMeshInvitation(input: {
+    invitationId: string;
+    meshId: string;
+    revokedAt: string;
+    actingAccountId: string;
+    humanSessionHash: string;
+  } & RepositoryMutationArtifacts): Promise<void> {
+    this.database.transaction(() => {
+      this.assertHumanGovernance(
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner", "steward"],
+        input.revokedAt,
+      );
+      const result = this.db.prepare(
+        `UPDATE mesh_invitations SET status = 'revoked'
+         WHERE id = ? AND mesh_id = ? AND status = 'active'`,
+      ).run(input.invitationId, input.meshId);
+      if (result.changes !== 1) throw new Error("invitation_not_active");
+      this.writeMutationArtifacts(input);
     });
   }
 
@@ -2458,6 +2638,7 @@ export class SqliteMeshrRepository implements MeshrRepository {
     challengeUsedAt?: string;
     expectedSessionId?: string;
     expectedAuthorityEpoch?: number;
+    allowExpiredPredecessorRecovery?: boolean;
     claimPairing?: boolean;
     event?: RepositoryEventInput;
     audit?: RepositoryAuditInput;
@@ -2495,7 +2676,8 @@ export class SqliteMeshrRepository implements MeshrRepository {
         if (
           !predecessor || predecessor.status !== "active" || predecessor.agent_id !== input.agentId ||
           predecessor.authority_epoch !== input.expectedAuthorityEpoch ||
-          Date.parse(predecessor.expires_at) <= Date.parse(now)
+          (Date.parse(predecessor.expires_at) <= Date.parse(now) &&
+            !input.allowExpiredPredecessorRecovery)
         ) {
           throw new Error("session_invalid");
         }
