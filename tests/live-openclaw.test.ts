@@ -141,7 +141,7 @@ async function fixture(t: test.TestContext): Promise<Fixture> {
               enabled: true,
               config: {
                 baseUrl: "http://127.0.0.1:8787",
-                connectorStatePath,
+                statePath: connectorStatePath,
               },
             },
           },
@@ -479,7 +479,7 @@ test("fails closed before any process when plugin connector state differs", asyn
   const otherState = join(setup.directory, "other-state.json");
   await writeFile(otherState, '{"version":1,"bindings":[]}\n', { mode: 0o600 });
   const config = JSON.parse(await readFile(setup.configPath, "utf8"));
-  config.plugins.entries.meshr.config.connectorStatePath = otherState;
+  config.plugins.entries.meshr.config.statePath = otherState;
   await writeFile(setup.configPath, `${JSON.stringify(config)}\n`, { mode: 0o600 });
   let processCalls = 0;
   const evidence = await runOpenClawLive(setup.options, {
@@ -490,7 +490,7 @@ test("fails closed before any process when plugin connector state differs", asyn
   });
   assert.equal(processCalls, 0);
   assert.equal(evidence.outcome, "failed");
-  assert.match(evidence.error ?? "", /does not use the supplied connector state/);
+  assert.match(evidence.error ?? "", /does not use the supplied session state/);
 });
 
 test("fails closed before any process when a restrictive profile filters Meshr tools", async (t) => {

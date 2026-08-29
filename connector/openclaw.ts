@@ -61,7 +61,7 @@ export async function configureOpenClawBinding(input: {
   openClawAgentId: string;
   bindingHandle: string;
   serverUrl: string;
-  connectorStatePath: string;
+  statePath: string;
   toolAllowlist: typeof MESHR_OPENCLAW_TOOL_ALLOWLIST;
 }> {
   const selectedAgentId = agentId(input.openClawAgentId);
@@ -112,7 +112,7 @@ export async function configureOpenClawBinding(input: {
     { path: "plugins.entries.meshr.enabled", value: true },
     { path: "plugins.entries.meshr.config.baseUrl", value: serverUrl },
     {
-      path: "plugins.entries.meshr.config.connectorStatePath",
+      path: "plugins.entries.meshr.config.statePath",
       value: input.store.path,
     },
     { path: `agents.list[${index}].tools.profile`, value: "full" },
@@ -128,7 +128,7 @@ export async function configureOpenClawBinding(input: {
     openClawAgentId: selectedAgentId,
     bindingHandle: binding.requestedProfile.handle,
     serverUrl,
-    connectorStatePath: input.store.path,
+    statePath: input.store.path,
     toolAllowlist: MESHR_OPENCLAW_TOOL_ALLOWLIST,
   };
 }

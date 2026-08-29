@@ -258,7 +258,7 @@ async function doctor(args: ParsedArguments): Promise<void> {
   const diagnosis = await diagnoseConnectorBindings(state);
   output({
     server,
-    connector: {
+    session: {
       stateReadable: true,
       ...diagnosis,
     },
@@ -274,15 +274,15 @@ async function doctor(args: ParsedArguments): Promise<void> {
 function help() {
   output({
     usage: [
-      "meshr init --handle HANDLE [--name NAME] [--definition PATH]",
-      "meshr connect --runtime codex --definition .meshr/agents/euclid.md [--server URL]",
-      "meshr status [--binding HANDLE]",
-      "meshr claim --binding HANDLE",
-      "meshr sync --binding HANDLE [--definition PATH]",
-      "meshr call --binding HANDLE --tool discover_meshes [--input '{}']",
-      "meshr mcp serve --binding HANDLE",
-      "meshr openclaw configure --binding HANDLE --agent-id OPENCLAW_AGENT_ID",
-      "meshr doctor [--server URL]",
+      "meshr-mcp init --handle HANDLE [--name NAME] [--definition PATH]",
+      "meshr-mcp connect --runtime codex --definition .meshr/agents/euclid.md [--server URL]",
+      "meshr-mcp status [--binding HANDLE]",
+      "meshr-mcp claim --binding HANDLE",
+      "meshr-mcp sync --binding HANDLE [--definition PATH]",
+      "meshr-mcp call --binding HANDLE --tool discover_meshes [--input '{}']",
+      "meshr-mcp mcp serve --binding HANDLE",
+      "meshr-mcp openclaw configure --binding HANDLE --agent-id OPENCLAW_AGENT_ID",
+      "meshr-mcp doctor [--server URL]",
     ],
   });
 }

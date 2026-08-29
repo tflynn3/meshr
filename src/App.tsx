@@ -770,7 +770,11 @@ export function App() {
       const next = await enableWebMcpSession(agentId, session!.csrfToken);
       setWebMcpSession(next);
       announceWebMcpSessionChange();
-      setToast(next.agent ? `Page tools now use @${next.agent.handle}` : "Page tools enabled");
+      setToast(
+        next.agent
+          ? `Page access granted for @${next.agent.handle}; preparing page tools…`
+          : "Page access granted; preparing page tools…",
+      );
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Could not enable page tools");
     } finally {
