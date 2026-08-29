@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import type { RepositoryActivityProjection, RepositoryProjection } from "./repository.ts";
 
 const WINDOW_MINUTES = 15;
 
@@ -97,6 +98,41 @@ function median(values: number[]): number {
     : Math.round(((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2);
 }
 
+/**
+ * Firestore topology snapshots retain delay histograms rather than every
+ * reply timestamp. Keep the WebMCP contract stable by returning the midpoint
+ * of the bucket containing the median observation.
+ */
+function medianFromBuckets(buckets: number[], total: number): number {
+  if (!total || !buckets.length) return 0;
+  const boundaries = [
+    0,
+    1_000,
+    5_000,
+    30_000,
+    120_000,
+    600_000,
+    3_600_000,
+    21_600_000,
+    86_400_000,
+    259_200_000,
+    604_800_000,
+    2_592_000_000,
+  ];
+  const midpoint = (index: number): number => {
+    const lower = boundaries[index] ?? boundaries.at(-1) ?? 0;
+    const upper = boundaries[index + 1] ?? Math.max(lower, lower * 2);
+    return Math.round((lower + upper) / 2);
+  };
+  const target = Math.ceil(total / 2);
+  let seen = 0;
+  for (let index = 0; index < buckets.length; index += 1) {
+    seen += Number(buckets[index] ?? 0);
+    if (seen >= target) return midpoint(index);
+  }
+  return midpoint(buckets.length - 1);
+}
+
 function accessibleMeshes(
   db: DatabaseSync,
   agentId: string,
@@ -122,6 +158,140 @@ function accessibleMeshes(
     : rows;
 }
 
+/**
+ * Build the WebMCP activity contract from the shared Firestore projection.
+ * This path deliberately does not inspect SQLite posts or events: every API
+ * replica sees the same bounded topology snapshot and cannot return a
+ * replica-local view after a load balancer hop.
+ */
+function readWebMcpActivityFromProjection(
+  input: {
+    agentId: string;
+    browse: BrowseMode;
+    generatedAt: string;
+    meshId?: string;
+    authorizedMeshIds?: ReadonlySet<string>;
+  },
+  projection: RepositoryProjection,
+): WebMcpActivity {
+  const activity: RepositoryActivityProjection = projection.activity ?? {
+    meshes: [],
+    topics: [],
+    agents: [],
+    links: [],
+  };
+  const joinedMeshIds = new Set(
+    projection.memberships
+      .filter((membership) => membership.agentId === input.agentId && membership.status === "joined")
+      .map((membership) => membership.meshId),
+  );
+  const visibleMeshes = projection.meshes
+    .filter((mesh) => {
+      const joined = joinedMeshIds.has(mesh.meshId);
+      const visible = input.browse === "joined"
+        ? joined
+        : mesh.visibility === "public" || joined;
+      return visible && (!input.meshId || mesh.meshId === input.meshId) &&
+        (!input.authorizedMeshIds || input.authorizedMeshIds.has(mesh.meshId));
+    })
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.meshId.localeCompare(right.meshId));
+  const activityByMesh = new Map(activity.meshes.map((mesh) => [mesh.meshId, mesh]));
+  const activityTopics = new Map(activity.topics.map((topic) => [topic.topicId, topic]));
+  const activityAgentsByMesh = new Map<string, string[]>();
+  for (const agent of activity.agents) {
+    const values = activityAgentsByMesh.get(agent.meshId) ?? [];
+    values.push(agent.agentId);
+    activityAgentsByMesh.set(agent.meshId, values);
+  }
+  const activityLinksByMesh = new Map<string, RepositoryActivityProjection["links"]>();
+  for (const link of activity.links) {
+    const values = activityLinksByMesh.get(link.meshId) ?? [];
+    values.push(link);
+    activityLinksByMesh.set(link.meshId, values);
+  }
+  const nowMs = Date.parse(input.generatedAt);
+  const revision = Number.isFinite(nowMs) ? Math.floor(nowMs / 1_000) : 0;
+  const meshes = visibleMeshes.map((mesh) => {
+    const summary = activityByMesh.get(mesh.meshId);
+    const topics = projection.topics
+      .filter((topic) => topic.meshId === mesh.meshId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.topicId.localeCompare(right.topicId));
+    const conversations = topics.map((topic) => {
+      const topicActivity = activityTopics.get(topic.topicId);
+      const rootCount = topicActivity?.rootCount ?? 0;
+      const replyCount = topicActivity?.replyCount ?? 0;
+      return {
+        id: topic.topicId,
+        name: topic.name,
+        title: topic.title,
+        description: topic.description,
+        tags: topic.tags,
+        messageCount: topicActivity?.postCount ?? 0,
+        rootCount,
+        replyCount,
+        recentMessageCount: topicActivity?.recentPostCount ?? 0,
+        participantAgentIds: topicActivity?.participantAgentIds ?? [],
+        velocityBand: velocity(topicActivity?.recentPostCount ?? 0),
+        // Aggregate topology intentionally omits post bodies and per-root
+        // reply state. This bounded lower-bound keeps the field honest until
+        // a conversation is opened through the authoritative post query.
+        unrepliedRootCount: Math.max(0, rootCount - replyCount),
+      };
+    });
+    const memberAgentIds = projection.memberships
+      .filter((membership) => membership.meshId === mesh.meshId && membership.status === "joined")
+      .map((membership) => membership.agentId);
+    const participantAgentIds = [...new Set([
+      ...memberAgentIds,
+      ...(activityAgentsByMesh.get(mesh.meshId) ?? []),
+      ...conversations.flatMap((conversation) => conversation.participantAgentIds),
+    ])].sort();
+    const trafficLinks = (activityLinksByMesh.get(mesh.meshId) ?? [])
+      .filter((link) => link.sourceAgentId && link.targetAgentId)
+      .map((link) => ({
+        id: `traffic:${mesh.meshId}:${link.sourceAgentId}:${link.targetAgentId}`,
+        meshId: mesh.meshId,
+        sourceAgentId: link.sourceAgentId,
+        targetAgentId: link.targetAgentId,
+        conversationIds: link.topicIds,
+        eventCount: link.eventCount,
+        recentEventCount: link.recentEventCount,
+        windowMinutes: WINDOW_MINUTES,
+        messagesPerMinute: Number((link.recentEventCount / WINDOW_MINUTES).toFixed(1)),
+        medianDelayMs: medianFromBuckets(link.delayBuckets, link.delayCount),
+        processor: "reply-path" as const,
+        lastEventAt: link.lastEventAt,
+      }));
+    const recentMessageCount = summary?.recentPostCount ?? conversations.reduce(
+      (total, conversation) => total + conversation.recentMessageCount,
+      0,
+    );
+    const messageCount = summary?.postCount ?? conversations.reduce(
+      (total, conversation) => total + conversation.messageCount,
+      0,
+    );
+    return {
+      id: mesh.meshId,
+      name: mesh.name,
+      description: mesh.description,
+      visibility: mesh.visibility,
+      joinPolicy: mesh.admission,
+      messageCount,
+      recentMessageCount,
+      participantAgentIds,
+      velocityBand: velocity(recentMessageCount),
+      conversations,
+      trafficLinks,
+    };
+  });
+  return {
+    generatedAt: input.generatedAt,
+    revision,
+    velocityWindowMinutes: WINDOW_MINUTES,
+    meshes,
+  };
+}
+
 /** Aggregate durable activity for the meshes allowed by an agent's browse policy. */
 export function readWebMcpActivity(
   db: DatabaseSync,
@@ -131,8 +301,12 @@ export function readWebMcpActivity(
     generatedAt: string;
     meshId?: string;
     authorizedMeshIds?: ReadonlySet<string>;
+    durableProjection?: RepositoryProjection;
   },
 ): WebMcpActivity {
+  if (input.durableProjection) {
+    return readWebMcpActivityFromProjection(input, input.durableProjection);
+  }
   const nowMs = Date.parse(input.generatedAt);
   const cutoff = new Date(nowMs - WINDOW_MINUTES * 60_000).toISOString();
   const revisionRow = db.prepare("SELECT COALESCE(MAX(sequence), 0) AS revision FROM events").get() as {

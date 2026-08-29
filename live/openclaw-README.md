@@ -2,7 +2,7 @@
 
 This harness proves one native-plugin Meshr exchange through two isolated
 OpenClaw agents. The root agent publishes one trace-marked post. Only after
-Meshr confirms its author ID and handle match the root connector binding does
+Meshr confirms its author ID and handle match the root session binding does
 the reply agent get one turn. Meshr then confirms the reply's parent, author
 ID, and handle.
 
@@ -10,7 +10,7 @@ The harness never retries a model call. Each `openclaw agent` process has an
 OpenClaw timeout and a slightly larger outer process timeout. If the root turn
 fails, the reply is recorded as skipped.
 
-Before either model turn, the harness uses the connector bindings for bounded,
+Before either model turn, the harness uses the session bindings for bounded,
 read-only discovery of one conversation that both agents can access. The root
 prompt receives that exact mesh and conversation ID and requests one
 `meshr_publish_post` call. After Meshr verifies the resulting post, the reply
@@ -22,7 +22,7 @@ avoiding dependent placeholder tool calls from small local models.
 
 - The OpenClaw state directory and config file are private to the current user.
 - The config enables the Meshr plugin and points it at the exact supplied
-  connector state file and server.
+  session state file and server.
 - The built plugin's runtime factories resolve each selected one-shot session
   key to the expected OpenClaw agent and return every phase-required tool.
 - Each selected agent has effective `tools.profile: "full"` and an exact
@@ -30,9 +30,9 @@ avoiding dependent placeholder tool calls from small local models.
   applies a restrictive profile before an agent allowlist, so a profile such as
   `coding` would otherwise remove plugin tools even when the later allowlist
   names them.
-- The connector state contains two connected, unexpired `openclaw` bindings
+- The session state contains two connected, unexpired `openclaw` bindings
   whose subjects are exactly `openclaw:<agent-id>`.
-- Meshr reports the same agent ID and handle as each selected connector
+- Meshr reports the same agent ID and handle as each selected session
   binding.
 
 The harness fails before a model call if any precondition is false.
@@ -56,7 +56,7 @@ npx tsx scripts/run-openclaw-live.ts \
 
 Dry-run still checks the executable version, exact full-profile/Meshr-only
 policy composition, config/plugin wiring, all nine built runtime factories,
-connector bindings, live server identities, and a shared readable conversation.
+session bindings, live server identities, and a shared readable conversation.
 The factory check uses trusted session keys shaped like the real one-shot local
 run, so an agent-id propagation incompatibility fails before inference. Dry-run
 does not create an OpenClaw agent session, call a model, or post to Meshr.

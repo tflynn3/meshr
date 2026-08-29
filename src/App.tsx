@@ -773,6 +773,7 @@ export function App() {
           state={activityState}
           loading={ownedAgents === null}
           webMcpSession={webMcpSession}
+          webMcpStatus={webMcpStatus}
           webMcpBusyAgentId={webMcpBusyAgentId}
           onSelectWebMcp={(agentId) => void selectWebMcpAgent(agentId)}
           onClearWebMcp={() => void clearWebMcpAgent()}
@@ -974,6 +975,7 @@ function AgentPortfolio({
   state,
   loading,
   webMcpSession,
+  webMcpStatus,
   webMcpBusyAgentId,
   onSelectWebMcp,
   onClearWebMcp,
@@ -983,11 +985,13 @@ function AgentPortfolio({
   state: ReturnType<typeof meshStore.getSnapshot>;
   loading: boolean;
   webMcpSession: WebMcpSessionStatus | null;
+  webMcpStatus: WebMcpRegistrationStatus | "disabled" | "registering" | "error";
   webMcpBusyAgentId: string | null;
   onSelectWebMcp: (agentId: string) => void;
   onClearWebMcp: () => void;
   onAdd: () => void;
 }) {
+  const webMcpReady = webMcpStatus === "ready" && Boolean(webMcpSession?.enabled && webMcpSession.agent);
   return (
     <main className="portfolio-view">
       <header className="portfolio-header">
@@ -1000,7 +1004,13 @@ function AgentPortfolio({
           {webMcpSession?.enabled && webMcpSession.agent && (
             <span className="portfolio-webmcp-status">
               <ShieldCheck size={16} weight="fill" />
-              Page tools use @{webMcpSession.agent.handle}
+              {webMcpReady
+                ? `Page tools use @${webMcpSession.agent.handle}`
+                : webMcpStatus === "unsupported"
+                  ? "Page tools need a compatible browser"
+                  : webMcpStatus === "error"
+                    ? "Page tools need attention"
+                    : "Preparing page tools"}
             </span>
           )}
           <button className="primary" onClick={onAdd}>
@@ -1009,7 +1019,7 @@ function AgentPortfolio({
         </div>
       </header>
       <section
-        className={`webmcp-story ${webMcpSession?.enabled ? "active" : ""}`}
+        className={`webmcp-story ${webMcpReady ? "active" : ""}`}
         aria-labelledby="webmcp-story-title"
       >
         <div className="webmcp-story-copy">
@@ -1030,9 +1040,15 @@ function AgentPortfolio({
         <div className="webmcp-story-state">
           <span className="webmcp-story-indicator" />
           <span>
-            {webMcpSession?.enabled && webMcpSession.agent
+            {webMcpReady && webMcpSession?.agent
               ? `Following as @${webMcpSession.agent.handle}`
-              : agents.length
+              : webMcpSession?.enabled && webMcpStatus === "unsupported"
+                ? "Use a browser with page tools enabled"
+                : webMcpSession?.enabled && webMcpStatus === "error"
+                  ? "Page tools need attention"
+                  : webMcpStatus === "registering"
+                    ? "Preparing page tools"
+                    : agents.length
                 ? "Choose a connected agent to begin"
                 : "Connect an agent to begin"}
           </span>
@@ -1055,6 +1071,7 @@ function AgentPortfolio({
             agent={agent}
             state={state}
             webMcpEnabled={webMcpSession?.agent?.id === agent.id}
+            webMcpStatus={webMcpStatus}
             webMcpBusy={webMcpBusyAgentId !== null}
             onSelectWebMcp={() => onSelectWebMcp(agent.id)}
             onClearWebMcp={onClearWebMcp}
@@ -1070,6 +1087,7 @@ function AgentCard({
   agent,
   state,
   webMcpEnabled,
+  webMcpStatus,
   webMcpBusy,
   onSelectWebMcp,
   onClearWebMcp,
@@ -1077,6 +1095,7 @@ function AgentCard({
   agent: Agent;
   state: ReturnType<typeof meshStore.getSnapshot>;
   webMcpEnabled: boolean;
+  webMcpStatus: WebMcpRegistrationStatus | "disabled" | "registering" | "error";
   webMcpBusy: boolean;
   onSelectWebMcp: () => void;
   onClearWebMcp: () => void;
@@ -1147,7 +1166,13 @@ function AgentCard({
               <strong>Page WebMCP</strong>
               <small>
                 {webMcpEnabled
-                  ? `Tools are bound to @${agent.handle}`
+                  ? webMcpStatus === "ready"
+                    ? `Tools are bound to @${agent.handle}`
+                    : webMcpStatus === "unsupported"
+                      ? "Page grant active; browser tools unavailable"
+                      : webMcpStatus === "error"
+                        ? "Page grant active; tools need attention"
+                        : "Preparing page tools"
                   : "Select this identity for page tools"}
               </small>
             </span>

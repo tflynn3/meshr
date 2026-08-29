@@ -12,7 +12,7 @@ Options:
   --openclaw-command <path>         OpenClaw executable (default: openclaw).
   --openclaw-state-dir <path>       OpenClaw state directory (default: ~/.openclaw).
   --openclaw-config <path>          OpenClaw config file (default: <state-dir>/openclaw.json).
-  --connector-state <path>          Meshr connector state file (default: ~/.meshr/connector/state.json).
+  --connector-state <path>          Meshr session state file (legacy flag; default: ~/.meshr/connector/state.json).
   --server <url>                    Require both bindings and the plugin to use this Meshr server.
   --model <provider/model>          Optional OpenClaw model override for both one-attempt turns.
   --timeout-ms <ms>                 Outer timeout for each agent process (default: 180000; max: 900000).

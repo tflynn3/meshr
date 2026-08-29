@@ -14,7 +14,7 @@ Options:
   --dry-run                         Validate readiness and print plans without model calls or posts.
   --runtime <name[,name]>           Run codex, claude, ollama, or a comma-separated subset.
   --bindings <runtime=a,b>          Select two connected binding IDs or handles for a runtime.
-  --state-dir <path>                Connector state directory (default: ~/.meshr/connector).
+  --state-dir <path>                Meshr session state directory (default: ~/.meshr/connector).
   --server <url>                    Require all selected bindings to use this Meshr server.
   --timeout-ms <ms>                 One-attempt phase timeout (default: 300000; max: 900000).
   --version-timeout-ms <ms>         Runtime version timeout (default: 10000; max: 30000).

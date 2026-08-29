@@ -8500,6 +8500,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         const rawMeshId = url.searchParams.get("meshId");
         let meshId: string | undefined;
         let authorizedMeshIds: ReadonlySet<string> | undefined;
+        let durableProjection: RepositoryProjection | undefined;
         if (rawMeshId !== null) {
           meshId = rawMeshId.trim();
           if (!meshId || meshId.length > 128) {
@@ -8522,6 +8523,25 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             );
           }
         }
+        if (repository?.loadProjection) {
+          try {
+            // WebMCP topology is a cross-replica read. Hydrate only the
+            // bounded metadata and aggregate activity projection; never fall
+            // back to this process's disposable SQLite post/event rows.
+            await hydrateProjection(
+              { agentId: principal.agentId },
+              true,
+              { includePosts: false, includeActivity: true },
+            );
+            durableProjection = cachedProjection({ agentId: principal.agentId });
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "projection_unavailable",
+              error instanceof Error ? error.message : "The durable topology projection is unavailable.",
+            );
+          }
+        }
         return {
           body: readWebMcpActivity(db, {
             agentId: principal.agentId,
@@ -8529,6 +8549,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             generatedAt: database.now(),
             meshId,
             authorizedMeshIds,
+            durableProjection,
           }),
         };
       }
@@ -8821,11 +8842,32 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         const linkId = decodeURIComponent(webMcpTrafficMatch[2]);
         const browse = requireBrowsePolicy(principal.agent);
         await ensureAttentionMeshAccessAuthoritatively(principal.agent, principal.agentId, meshId);
+        let durableProjection: RepositoryProjection | undefined;
+        if (repository?.loadProjection) {
+          try {
+            // Keep link inspection on the same shared aggregate used by the
+            // activity catalog. This prevents a second API replica from
+            // reporting a different conversation path for the same link.
+            await hydrateProjection(
+              { agentId: principal.agentId },
+              true,
+              { includePosts: false, includeActivity: true },
+            );
+            durableProjection = cachedProjection({ agentId: principal.agentId });
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "projection_unavailable",
+              error instanceof Error ? error.message : "The durable topology projection is unavailable.",
+            );
+          }
+        }
         const activity = readWebMcpActivity(db, {
           agentId: principal.agentId,
           browse,
           generatedAt: database.now(),
           meshId,
+          durableProjection,
         });
         const link = activity.meshes
           .flatMap((mesh) => mesh.trafficLinks)
@@ -8837,13 +8879,48 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             "Traffic link is not available to this session.",
           );
         }
+        const durableAgents = new Map(
+          (durableProjection?.agents ?? []).map((agent) => [agent.agentId, agent]),
+        );
+        if (repository?.findAgentById) {
+          try {
+            const missingAgentIds = [link.sourceAgentId, link.targetAgentId]
+              .filter((agentId) => !durableAgents.has(agentId));
+            const resolvedAgents = await Promise.all(
+              missingAgentIds.map((agentId) => repository.findAgentById!(agentId)),
+            );
+            for (const agent of resolvedAgents) {
+              if (agent) durableAgents.set(agent.agentId, agent);
+            }
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "agent_store_unavailable",
+              error instanceof Error ? error.message : "The durable agent store is unavailable.",
+            );
+          }
+        }
         const readAgent = (agentId: string) => {
+          const durable = durableAgents.get(agentId);
+          if (durable) {
+            return { id: durable.agentId, name: durable.name, handle: durable.handle };
+          }
           const row = db
             .prepare("SELECT id, name, handle FROM agents WHERE id = ?")
             .get(agentId) as { id: string; name: string; handle: string } | undefined;
           return row ?? null;
         };
         const conversations = link.conversationIds.map((topicId) => {
+          const durableTopic = durableProjection?.topics.find(
+            (topic) => topic.topicId === topicId && topic.meshId === meshId,
+          );
+          if (durableTopic) {
+            return {
+              id: durableTopic.topicId,
+              title: durableTopic.title,
+              tags: durableTopic.tags,
+            };
+          }
           const row = db
             .prepare("SELECT id, title, tags_json FROM topics WHERE id = ? AND mesh_id = ?")
             .get(topicId, meshId) as

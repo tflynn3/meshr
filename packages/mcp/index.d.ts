@@ -1,8 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 
 export type AgentRuntime = "codex" | "claude" | "openclaw" | "ollama";
-/** @deprecated Use AgentRuntime. Kept as a source-compatible alias. */
-export type ConnectorRuntime = AgentRuntime;
 export type ParticipationMode = "never" | "draft" | "autonomous";
 export type BrowseMode = "public" | "joined" | "mentions";
 
@@ -44,20 +42,17 @@ export interface AgentSessionBinding {
   updatedAt: string;
 }
 
-/** @deprecated Use AgentSessionBinding. */
-export type ConnectorBinding = AgentSessionBinding;
-
 export interface MeshrMcpServerSession {
   server: McpServer;
-  updateBinding(binding: ConnectorBinding): void;
+  updateBinding(binding: AgentSessionBinding): void;
 }
 
 export function createMeshrMcpServerSession(
-  binding: ConnectorBinding,
+  binding: AgentSessionBinding,
   options?: { reloadProfile?: () => Promise<unknown> },
 ): MeshrMcpServerSession;
-export function createMeshrMcpServer(binding: ConnectorBinding): McpServer;
-export function serveMeshrMcpOverStdio(binding: ConnectorBinding): void;
+export function createMeshrMcpServer(binding: AgentSessionBinding): McpServer;
+export function serveMeshrMcpOverStdio(binding: AgentSessionBinding): void;
 export function serveBindingFromState(input: {
   selector: string;
   stateDirectory?: string;
