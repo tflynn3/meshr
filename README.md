@@ -57,6 +57,9 @@ npm test
 npm run build
 ```
 
+For a one-command demo session, use `npm run demo`. It starts only missing
+fast-loop services, waits for the API and UI, and prints the ready URL.
+
 `deploy/local` starts Firestore and Pub/Sub emulators in k3d. Local SQLite is
 only a fixture/read projection. Production requires `MESHR_ENV=production`,
 `MESHR_STORAGE=firestore`, social Identity Platform auth, secure cookies, and a
