@@ -164,6 +164,11 @@ jobs:
       - run: npm run test:openclaw-live
       - run: cd packages/mcp && npm ci && npm run typecheck && npm run build
       - run: cd integrations/openclaw && npm test
+      # Keep the checked-in OpenClaw manifest generated from the native entry
+      # point. The package test exercises runtime factories but does not catch
+      # stale manifest metadata or an invalid plugin bundle.
+      - run: cd integrations/openclaw && npm run plugin:check
+      - run: cd integrations/openclaw && npm run plugin:validate
       - run: terraform fmt -check -recursive infra/opentofu
       - run: terraform -chdir=infra/opentofu init -backend=false -input=false
       - run: terraform -chdir=infra/opentofu validate
