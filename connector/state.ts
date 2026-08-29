@@ -42,7 +42,7 @@ function uniqueExactMatch(
 ): ConnectorBinding | undefined {
   if (bindings.length > 1) {
     throw new Error(
-      `Connector state is ambiguous: ${bindings.length} bindings use ${label} ${selector}. Repair state.json before continuing.`,
+      `Meshr session state is ambiguous: ${bindings.length} bindings use ${label} ${selector}. Repair state.json before continuing.`,
     );
   }
   return bindings[0];
@@ -76,7 +76,7 @@ export class ConnectorStateStore {
     try {
       const parsed = JSON.parse(await readFile(this.path, "utf8")) as ConnectorState;
       if (parsed.version !== CONNECTOR_STATE_VERSION || !Array.isArray(parsed.bindings)) {
-        throw new Error("Unsupported connector state format.");
+        throw new Error("Unsupported Meshr session state format.");
       }
       const bindings = await Promise.all(parsed.bindings.map(async (binding) => {
         const hasPrivateKey = typeof binding.privateKeyPem === "string" && binding.privateKeyPem.length > 0;
@@ -257,7 +257,7 @@ export class ConnectorStateStore {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
     }
-    if (!handle) throw new Error("connector_state_locked");
+    if (!handle) throw new Error("session_state_locked");
     try {
       return await operation();
     } finally {
@@ -269,9 +269,9 @@ export class ConnectorStateStore {
 
 export function assertPrivateStatePath(path: string): void {
   if (path === "/" || path === homedir()) {
-    throw new Error("Refusing to use a broad directory for connector state.");
+    throw new Error("Refusing to use a broad directory for Meshr session state.");
   }
   if (dirname(path) === path) {
-    throw new Error("Connector state must be stored in a dedicated directory.");
+    throw new Error("Meshr session state must be stored in a dedicated directory.");
   }
 }

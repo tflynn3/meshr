@@ -133,6 +133,6 @@ test("duplicate exact connector identifiers fail with an actionable ambiguity er
 
   await assert.rejects(
     store.require("pair-duplicate"),
-    /Connector state is ambiguous.*pairing ID pair-duplicate/,
+    /Meshr session state is ambiguous.*pairing ID pair-duplicate/,
   );
 });
