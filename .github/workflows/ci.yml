@@ -197,6 +197,7 @@ jobs:
           curl --fail --silent --show-error --location --retry 3 "$k3d_url" --output "$RUNNER_TEMP/meshr-bin/k3d"
           echo "$k3d_sha256  $RUNNER_TEMP/meshr-bin/k3d" | sha256sum --check --strict
           chmod 0755 "$RUNNER_TEMP/meshr-bin/k3d"
+          export PATH="$RUNNER_TEMP/meshr-bin:$PATH"
           echo "$RUNNER_TEMP/meshr-bin" >> "$GITHUB_PATH"
           bazelisk version
           k3d version
