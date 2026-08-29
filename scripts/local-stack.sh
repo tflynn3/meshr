@@ -57,10 +57,22 @@ build_images() {
   )
 }
 
+dump_diagnostics() {
+  echo "local stack failed; collecting Kubernetes diagnostics" >&2
+  kubectl -n "$namespace" get pods,rs,pvc,pv -o wide >&2 || true
+  kubectl -n "$namespace" get events --sort-by=.lastTimestamp >&2 || true
+  kubectl -n "$namespace" describe deployment/api >&2 || true
+  kubectl -n "$namespace" describe pvc/api-sqlite >&2 || true
+  kubectl -n "$namespace" logs deployment/api --all-containers=true --tail=200 >&2 || true
+}
+
 up() {
   require_command k3d
   select_runtime
+  trap dump_diagnostics ERR
+  local cluster_created=0
   if ! k3d cluster list --no-headers 2>/dev/null | awk '{print $1}' | grep -qx "$cluster_name"; then
+    cluster_created=1
     k3d cluster create --config "$repo_root/deploy/local/k3d.yaml"
   else
     k3d cluster start "$cluster_name"
@@ -69,9 +81,15 @@ up() {
   select_cluster
   build_images
   kubectl apply -k "$repo_root/deploy/local"
-  kubectl -n "$namespace" rollout restart \
-    deployment/api deployment/web deployment/ingest \
-    deployment/topology-materializer deployment/live-gateway
+  # A fresh cluster already starts pods from the just-built images. Restarting
+  # before that first rollout is ready races the Recreate API strategy and can
+  # strand its single-writer PVC at zero updated replicas. Existing clusters
+  # still need an explicit restart to pick up newly imported images.
+  if (( cluster_created == 0 )); then
+    kubectl -n "$namespace" rollout restart \
+      deployment/api deployment/web deployment/ingest \
+      deployment/topology-materializer deployment/live-gateway
+  fi
   kubectl -n "$namespace" rollout status deployment/firestore --timeout=5m
   kubectl -n "$namespace" rollout status deployment/pubsub --timeout=5m
   kubectl -n "$namespace" rollout status deployment/api --timeout=5m
@@ -79,6 +97,7 @@ up() {
   kubectl -n "$namespace" rollout status deployment/ingest --timeout=5m
   kubectl -n "$namespace" rollout status deployment/topology-materializer --timeout=5m
   kubectl -n "$namespace" rollout status deployment/live-gateway --timeout=5m
+  trap - ERR
   echo "Meshr local stack is ready at http://localhost:8080/"
 }
 
@@ -113,6 +132,19 @@ smoke() {
       sleep 1
     done
   }
+  wait_json() {
+    local url="$1"
+    local attempts=0
+    local response
+    until response="$(curl --fail --silent --show-error "$url" 2>/dev/null)" && [[ "$response" == \{* ]]; do
+      attempts=$((attempts + 1))
+      if (( attempts >= 60 )); then
+        echo "timed out waiting for JSON response from $url after rollout" >&2
+        return 1
+      fi
+      sleep 1
+    done
+  }
   (
     cd "$repo_root"
     bazelisk build //:smoke
@@ -131,6 +163,7 @@ smoke() {
   # a transient 504 is not mistaken for event-plane loss.
   wait_http http://localhost:8080/healthz
   wait_http http://localhost:8080/
+  wait_json "${MESHR_LOCAL_URL:-http://localhost:8080}/v1/live/snapshots/mesh-public"
   (
     cd "$repo_root"
     MESHR_LOCAL_SMOKE_REPLAY_FILE="$event_file" node bazel-bin/smoke.mjs
