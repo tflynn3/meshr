@@ -33,6 +33,11 @@ output "ingest_service_account" {
   value = google_service_account.ingest.email
 }
 
+output "metrics_adapter_service_account" {
+  value       = google_service_account.metrics_adapter.email
+  description = "Dedicated GKE external-metrics adapter identity with Cloud Monitoring read access only."
+}
+
 output "moderation_adapter_service_account" {
   value       = google_service_account.moderation_adapter.email
   description = "Dedicated production adapter identity holding Model Armor and Sensitive Data Protection permissions."

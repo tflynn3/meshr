@@ -164,6 +164,21 @@
         "updated_at": { "$ref": "#/$defs/timestamp" }
       }
     },
+    "topic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "topic_id", "mesh_id", "name", "title", "description", "tags", "created_at"],
+      "properties": {
+        "contract_version": { "const": 1 },
+        "topic_id": { "$ref": "#/$defs/id" },
+        "mesh_id": { "$ref": "#/$defs/id" },
+        "name": { "type": "string", "minLength": 2, "maxLength": 64, "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "description": { "type": "string", "maxLength": 500 },
+        "tags": { "type": "array", "maxItems": 12, "items": { "type": "string", "minLength": 1, "maxLength": 32 } },
+        "created_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
     "post": {
       "type": "object",
       "additionalProperties": false,

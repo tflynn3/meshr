@@ -52,16 +52,30 @@ import {
   listMeshJoinRequests,
   getWebMcpSession,
   createMeshInvitation,
+  createMeshTopic,
+  deleteMeshTopic,
+  addMeshMemberByEmail,
+  acceptRoleInvitation,
+  listRoleInvitations,
+  listMeshRoleInvitations,
+  listMeshTopics,
   revokeMeshInvitation,
+  revokeRoleInvitation,
+  removeMeshRole,
+  removeMeshAgentFromMesh,
   resolveMeshJoinRequest,
   listMeshes,
   listOwnedAgents,
   updateActivityPreference,
   updateMeshGovernance,
+  updateMeshTopic,
   updateMeshRole,
   type HumanUser,
   type ActivityPreference,
   type MeshSummary,
+  type MeshRoleSummary,
+  type MeshRoleInvitation,
+  type MeshTopicSummary,
   type MeshInvitation,
   type MeshJoinRequest,
   type OwnedAgent,
@@ -802,8 +816,10 @@ export function App() {
           webMcpSession={webMcpSession}
           webMcpStatus={webMcpStatus}
           webMcpBusyAgentId={webMcpBusyAgentId}
+          csrfToken={session!.csrfToken}
           onSelectWebMcp={(agentId) => void selectWebMcpAgent(agentId)}
           onClearWebMcp={() => void clearWebMcpAgent()}
+          onInvitationAccepted={() => void refreshMeshes().catch(() => setToast("Role accepted; refresh failed"))}
           onAdd={() => setCreateAgentOpen(true)}
         />
       ) : (
@@ -852,6 +868,10 @@ export function App() {
       {governanceOpen && selectedMesh && (
         <GovernanceDialog
           mesh={selectedMesh}
+          initialTopics={activityState.topics.filter((topic) => topic.meshId === selectedMesh.id)}
+          memberAgents={selectedMesh.memberAgentIds
+            .map((agentId) => activityState.agents.find((agent) => agent.id === agentId))
+            .filter(Boolean) as Agent[]}
           owners={activityState.owners}
           actingOwnerId={accountId}
           csrfToken={session!.csrfToken}
@@ -1004,8 +1024,10 @@ function AgentPortfolio({
   webMcpSession,
   webMcpStatus,
   webMcpBusyAgentId,
+  csrfToken,
   onSelectWebMcp,
   onClearWebMcp,
+  onInvitationAccepted,
   onAdd,
 }: {
   agents: Agent[];
@@ -1014,8 +1036,10 @@ function AgentPortfolio({
   webMcpSession: WebMcpSessionStatus | null;
   webMcpStatus: WebMcpRegistrationStatus | "disabled" | "registering" | "error";
   webMcpBusyAgentId: string | null;
+  csrfToken: string;
   onSelectWebMcp: (agentId: string) => void;
   onClearWebMcp: () => void;
+  onInvitationAccepted: () => void;
   onAdd: () => void;
 }) {
   const webMcpReady = webMcpStatus === "ready" && Boolean(webMcpSession?.enabled && webMcpSession.agent);
@@ -1081,6 +1105,7 @@ function AgentPortfolio({
           </span>
         </div>
       </section>
+      <RoleInvitationInbox csrfToken={csrfToken} onAccepted={onInvitationAccepted} />
       <section className="agent-grid">
         {!loading && agents.length === 0 && (
           <div className="agent-empty-state">
@@ -1217,6 +1242,126 @@ function AgentCard({
         </div>
       </footer>
     </article>
+  );
+}
+
+function RoleInvitationInbox({
+  csrfToken,
+  onAccepted,
+}: {
+  csrfToken: string;
+  onAccepted: () => void;
+}) {
+  const [invitations, setInvitations] = useState<MeshRoleInvitation[]>([]);
+  const [selectedId, setSelectedId] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    const fragment = window.location.hash.startsWith("#")
+      ? window.location.hash.slice(1)
+      : window.location.hash;
+    return new URLSearchParams(fragment).get("roleInvitation") ?? "";
+  });
+  const [token, setToken] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    const fragment = window.location.hash.startsWith("#")
+      ? window.location.hash.slice(1)
+      : window.location.hash;
+    return new URLSearchParams(fragment).get("token") ?? "";
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    // Invite tokens are bearer capabilities. Read the fragment once, then
+    // scrub it immediately so it is not sent in HTTP request lines or left in
+    // the visible address bar/history. The token remains only in component
+    // memory until the one-use acceptance call completes.
+    if (typeof window !== "undefined" && window.location.hash) {
+      const url = new URL(window.location.href);
+      url.hash = "";
+      url.searchParams.delete("roleInvitation");
+      url.searchParams.delete("token");
+      window.history.replaceState({}, "", url);
+    }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void listRoleInvitations()
+      .then((next) => {
+        if (!active) return;
+        setInvitations(next.filter((invitation) => invitation.status === "active"));
+        if (!selectedId && next[0]) setSelectedId(next[0].id);
+      })
+      .catch(() => {
+        // A missing inbox should not block the rest of the agent portfolio.
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedId]);
+
+  const selected = invitations.find((invitation) => invitation.id === selectedId);
+  if (!selected && !token) return null;
+
+  async function accept() {
+    if (busy || !selectedId || !token.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      await acceptRoleInvitation(selectedId, token.trim(), csrfToken);
+      setInvitations((current) => current.filter((invitation) => invitation.id !== selectedId));
+      setToken("");
+      if (typeof window !== "undefined") {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("roleInvitation");
+        url.searchParams.delete("token");
+        url.hash = "";
+        window.history.replaceState({}, "", url);
+      }
+      onAccepted();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not accept this role invitation.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="role-invitation-inbox" aria-labelledby="role-invitation-title">
+      <div>
+        <p className="eyebrow">PENDING ACCESS</p>
+        <h2 id="role-invitation-title">Role invitations</h2>
+        <p>Accept an invitation to join a mesh as an observer, steward, or new owner.</p>
+      </div>
+      <div className="role-invitation-inbox-form">
+        {invitations.length > 0 && (
+          <label>
+            Invitation
+            <select value={selectedId} onChange={(event) => setSelectedId(event.target.value)}>
+              {invitations.map((invitation) => (
+                <option key={invitation.id} value={invitation.id}>
+                  {invitation.role} · {invitation.meshId}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+        <label>
+          One-time token
+          <input
+            type="password"
+            value={token}
+            onChange={(event) => setToken(event.target.value)}
+            placeholder="Paste the token shared by the mesh owner"
+            autoComplete="one-time-code"
+          />
+        </label>
+        <button className="primary" type="button" onClick={() => void accept()} disabled={busy || !selectedId || !token.trim()}>
+          {busy ? "Accepting…" : "Accept invitation"}
+        </button>
+      </div>
+      {error && <p className="form-error">{error}</p>}
+    </section>
   );
 }
 
@@ -2087,6 +2232,8 @@ function CreateMeshDialog({
 
 function GovernanceDialog({
   mesh,
+  initialTopics,
+  memberAgents,
   owners,
   actingOwnerId,
   csrfToken,
@@ -2094,6 +2241,8 @@ function GovernanceDialog({
   onClose,
 }: {
   mesh: Mesh;
+  initialTopics: Topic[];
+  memberAgents: Agent[];
   owners: Owner[];
   actingOwnerId: string;
   csrfToken: string;
@@ -2111,17 +2260,64 @@ function GovernanceDialog({
         ]),
       ) as Record<string, MeshHumanRole>,
   );
+  const [members, setMembers] = useState<MeshRoleSummary[]>(() =>
+    mesh.humanRoleAssignments.map((assignment) => {
+      const owner = owners.find((candidate) => candidate.id === assignment.ownerId);
+      return {
+        accountId: assignment.ownerId,
+        role: assignment.role,
+        displayName: owner?.name ?? "Mesh member",
+        createdAt: "",
+        updatedAt: "",
+      };
+    }),
+  );
+  const [memberEmail, setMemberEmail] = useState("");
+  const [memberRole, setMemberRole] = useState<MeshHumanRole>("observer");
+  const [memberBusy, setMemberBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [invitations, setInvitations] = useState<MeshInvitation[]>([]);
   const [joinRequests, setJoinRequests] = useState<MeshJoinRequest[]>([]);
   const [inviteToken, setInviteToken] = useState<string | null>(null);
+  const [roleInviteToken, setRoleInviteToken] = useState<string | null>(null);
+  const [roleInviteId, setRoleInviteId] = useState<string | null>(null);
+  const [roleInvitations, setRoleInvitations] = useState<MeshRoleInvitation[]>([]);
   const [inviteBusy, setInviteBusy] = useState(false);
+  const [topics, setTopics] = useState<MeshTopicSummary[]>(() =>
+    initialTopics.map((topic) => ({
+      id: topic.id,
+      meshId: topic.meshId,
+      name: topic.name,
+      title: topic.title,
+      description: topic.description,
+      tags: topic.tags,
+      activityCount: topic.activityCount,
+      recentActivityCount: topic.recentActivityCount,
+      participantAgentIds: topic.participantAgentIds,
+      lastActivityAt: topic.lastActivityAt,
+      createdAt: new Date().toISOString(),
+    })),
+  );
+  const [topicName, setTopicName] = useState("");
+  const [topicTitle, setTopicTitle] = useState("");
+  const [topicDescription, setTopicDescription] = useState("");
+  const [topicTags, setTopicTags] = useState("");
+  const [editingTopicId, setEditingTopicId] = useState<string | null>(null);
+  const [topicBusy, setTopicBusy] = useState(false);
   const canManage = mesh.humanRoleAssignments.some(
     (assignment) =>
       assignment.ownerId === actingOwnerId && assignment.role === "owner",
   );
+  const canManageTopics = mesh.humanRoleAssignments.some(
+    (assignment) =>
+      assignment.ownerId === actingOwnerId &&
+      (assignment.role === "owner" || assignment.role === "steward"),
+  );
+  const roleInviteLink = roleInviteId && roleInviteToken && typeof window !== "undefined"
+    ? `${window.location.origin}/#roleInvitation=${encodeURIComponent(roleInviteId)}&token=${encodeURIComponent(roleInviteToken)}`
+    : null;
   useEffect(() => {
     let active = true;
     void getMeshGovernance(mesh.id)
@@ -2134,6 +2330,7 @@ function GovernanceDialog({
             result.roles.map((assignment) => [assignment.accountId, assignment.role]),
           ) as Record<string, MeshHumanRole>,
         );
+        setMembers(result.roles);
       })
       .catch(() => {
         // The mesh projection already supplies a usable initial value.
@@ -2152,6 +2349,23 @@ function GovernanceDialog({
       .catch(() => {
         // Approval requests are optional metadata for meshes that allow open joins.
       });
+    void listMeshTopics(mesh.id)
+      .then((next) => {
+        if (active) setTopics(next);
+      })
+      .catch(() => {
+        // The mesh projection already supplies a usable initial topic list.
+      });
+    if (canManage) {
+      void listMeshRoleInvitations(mesh.id)
+        .then((next) => {
+          if (active) setRoleInvitations(next);
+        })
+        .catch(() => {
+          // Role invitations are optional metadata; the editor remains usable
+          // when the invitation index is briefly unavailable.
+        });
+    }
     return () => {
       active = false;
     };
@@ -2194,6 +2408,68 @@ function GovernanceDialog({
       setInviteBusy(false);
     }
   }
+  async function addMember(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (memberBusy || !canManage || !memberEmail.trim()) return;
+    if (memberRole === "owner" && !window.confirm(
+      "Ownership transfer will move mesh ownership to the invited account after they accept and demote you to steward. Continue?",
+    )) return;
+    setMemberBusy(true);
+    setError("");
+    try {
+      const result = await addMeshMemberByEmail(
+        mesh.id,
+        { email: memberEmail.trim(), role: memberRole },
+        csrfToken,
+      );
+      // Human role changes require target consent. Keep the token visible only
+      // to the owner who created it so it can be delivered through a trusted
+      // channel; the recipient accepts it after signing in.
+      setRoleInvitations((current) => [result.invitation, ...current]);
+      setRoleInviteToken(result.token);
+      setRoleInviteId(result.invitation.id);
+      setMemberEmail("");
+      setMemberRole("observer");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not add that collaborator.");
+    } finally {
+      setMemberBusy(false);
+    }
+  }
+  async function removeMember(member: MeshRoleSummary) {
+    if (memberBusy || !canManage || member.accountId === actingOwnerId) return;
+    if (!window.confirm(`Remove ${member.displayName} from this mesh?`)) return;
+    setMemberBusy(true);
+    setError("");
+    try {
+      await removeMeshRole(mesh.id, member.accountId, csrfToken);
+      setMembers((current) => current.filter((candidate) => candidate.accountId !== member.accountId));
+      setRoles((current) => {
+        const next = { ...current };
+        delete next[member.accountId];
+        return next;
+      });
+      onSaved();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not remove that collaborator.");
+    } finally {
+      setMemberBusy(false);
+    }
+  }
+  async function removeAgent(agent: Agent) {
+    if (inviteBusy || !canManageTopics) return;
+    if (!window.confirm(`Remove ${agent.name} from this mesh? Its native session will no longer be able to post here.`)) return;
+    setInviteBusy(true);
+    setError("");
+    try {
+      await removeMeshAgentFromMesh(mesh.id, agent.id, csrfToken);
+      onSaved();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not remove that agent.");
+    } finally {
+      setInviteBusy(false);
+    }
+  }
   async function revokeInvitation(invitationId: string) {
     if (inviteBusy) return;
     setInviteBusy(true);
@@ -2205,6 +2481,21 @@ function GovernanceDialog({
       ));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not revoke the invitation.");
+    } finally {
+      setInviteBusy(false);
+    }
+  }
+  async function revokeRoleInvite(invitationId: string) {
+    if (inviteBusy) return;
+    setInviteBusy(true);
+    setError("");
+    try {
+      await revokeRoleInvitation(mesh.id, invitationId, csrfToken);
+      setRoleInvitations((current) => current.map((invitation) =>
+        invitation.id === invitationId ? { ...invitation, status: "revoked" } : invitation,
+      ));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not revoke the role invitation.");
     } finally {
       setInviteBusy(false);
     }
@@ -2223,6 +2514,73 @@ function GovernanceDialog({
       setError(caught instanceof Error ? caught.message : "Could not resolve the join request.");
     } finally {
       setInviteBusy(false);
+    }
+  }
+  function resetTopicDraft() {
+    setEditingTopicId(null);
+    setTopicName("");
+    setTopicTitle("");
+    setTopicDescription("");
+    setTopicTags("");
+  }
+  function editTopic(topic: MeshTopicSummary) {
+    setEditingTopicId(topic.id);
+    setTopicName(topic.name);
+    setTopicTitle(topic.title);
+    setTopicDescription(topic.description);
+    setTopicTags(topic.tags.join(", "));
+  }
+  async function saveTopic(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (topicBusy || !canManageTopics) return;
+    setTopicBusy(true);
+    setError("");
+    const tags = topicTags
+      .split(",")
+      .map((tag) => tag.trim().toLowerCase())
+      .filter(Boolean);
+    try {
+      if (editingTopicId) {
+        const result = await updateMeshTopic(
+          mesh.id,
+          editingTopicId,
+          { name: topicName, title: topicTitle, description: topicDescription, tags },
+          csrfToken,
+        );
+        setTopics((current) => current.map((topic) =>
+          topic.id === editingTopicId ? result.topic : topic,
+        ));
+      } else {
+        const result = await createMeshTopic(
+          mesh.id,
+          { name: topicName, title: topicTitle, description: topicDescription, tags },
+          csrfToken,
+        );
+        setTopics((current) => [...current, result.topic].sort((left, right) =>
+          left.title.localeCompare(right.title) || left.id.localeCompare(right.id)));
+      }
+      resetTopicDraft();
+      onSaved();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not save the topic.");
+    } finally {
+      setTopicBusy(false);
+    }
+  }
+  async function removeTopic(topic: MeshTopicSummary) {
+    if (topicBusy || !canManageTopics) return;
+    if (!window.confirm(`Delete “${topic.title}”? Topics with retained posts cannot be deleted.`)) return;
+    setTopicBusy(true);
+    setError("");
+    try {
+      await deleteMeshTopic(mesh.id, topic.id, csrfToken);
+      setTopics((current) => current.filter((candidate) => candidate.id !== topic.id));
+      if (editingTopicId === topic.id) resetTopicDraft();
+      onSaved();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not delete the topic.");
+    } finally {
+      setTopicBusy(false);
     }
   }
   return (
@@ -2251,33 +2609,209 @@ function GovernanceDialog({
         </label>
         <div className="role-editor">
           <label className="group-label">Human roles</label>
-          {owners.map((owner) => (
-            <div className="role-row" key={owner.id}>
-              <span>{owner.name.slice(0, 2).toUpperCase()}</span>
+          {members.map((member) => (
+            <div className="role-row" key={member.accountId}>
+              <span>{member.displayName.slice(0, 2).toUpperCase()}</span>
               <div>
-                <strong>{owner.name}</strong>
+                <strong>{member.displayName}</strong>
                 <small>
-                  {owner.id === actingOwnerId ? "You" : "Human member"}
+                  {member.accountId === actingOwnerId ? "You" : member.email ?? "Meshr account"}
                 </small>
               </div>
-              <select
-                value={roles[owner.id] ?? "observer"}
-                onChange={(event) =>
-                  setRoles((items) => ({
-                    ...items,
-                    [owner.id]: event.target.value as MeshHumanRole,
-                  }))
-                }
-                disabled={!canManage || owner.id === actingOwnerId}
-              >
-                <option value="owner">Owner</option>
-                <option value="steward">Steward</option>
-                <option value="observer">Observer</option>
-              </select>
+              <div className="role-actions">
+                <select
+                  value={roles[member.accountId] ?? member.role}
+                  onChange={(event) =>
+                    setRoles((items) => ({
+                      ...items,
+                      [member.accountId]: event.target.value as MeshHumanRole,
+                    }))
+                  }
+                  disabled={!canManage || member.accountId === actingOwnerId}
+                >
+                  {member.role === "owner" && <option value="owner">Owner</option>}
+                  <option value="steward">Steward</option>
+                  <option value="observer">Observer</option>
+                </select>
+                {canManage && member.accountId !== actingOwnerId && (
+                  <button type="button" onClick={() => void removeMember(member)} disabled={memberBusy}>
+                    Remove
+                  </button>
+                )}
+              </div>
             </div>
           ))}
+          {canManage && (
+            <form className="role-add-form" onSubmit={(event) => void addMember(event)}>
+              <div className="two-fields">
+                <label>
+                  Invite collaborator
+                  <input
+                    type="email"
+                    value={memberEmail}
+                    onChange={(event) => setMemberEmail(event.target.value)}
+                    placeholder="person@example.com"
+                    maxLength={254}
+                    required
+                  />
+                </label>
+                <label>
+                  Role
+                  <select
+                    value={memberRole}
+                    onChange={(event) => setMemberRole(event.target.value as MeshHumanRole)}
+                  >
+                    <option value="observer">Observer</option>
+                    <option value="steward">Steward</option>
+                    <option value="owner">Owner (transfer)</option>
+                  </select>
+                </label>
+              </div>
+              <small className="field-hint">They must sign in and accept the one-time invitation before the role is added. Owner invitations transfer ownership on acceptance.</small>
+              <button type="submit" disabled={memberBusy || !memberEmail.trim()}>
+                <Plus size={14} />
+                {memberBusy ? "Creating invite…" : "Create role invite"}
+              </button>
+            </form>
+          )}
+          {roleInviteToken && (
+            <div className="invitation-token">
+              <span>
+                <strong>Share this role invite once</strong>
+                <small>The recipient must be signed in to the invited email.</small>
+              </span>
+              {roleInviteLink ? <code>{roleInviteLink}</code> : <code>{roleInviteToken}</code>}
+              <button
+                type="button"
+                onClick={() => void navigator.clipboard?.writeText(roleInviteLink ?? roleInviteToken)}
+              >
+                Copy invite link
+              </button>
+            </div>
+          )}
+          {roleInvitations.length > 0 && (
+            <div className="invitation-list role-invitation-list">
+              {[...
+                roleInvitations.filter((invitation) => invitation.status === "active"),
+                ...roleInvitations.filter((invitation) => invitation.status !== "active").slice(0, 4),
+              ].map((invitation) => (
+                <div className="invitation-row" key={invitation.id}>
+                  <span>
+                    <strong>{invitation.role[0].toUpperCase() + invitation.role.slice(1)} · {invitation.status}</strong>
+                    <small>Expires {new Date(invitation.expiresAt).toLocaleDateString()}</small>
+                  </span>
+                  {invitation.status === "active" && (
+                    <button type="button" onClick={() => void revokeRoleInvite(invitation.id)} disabled={inviteBusy}>
+                      Revoke
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
-        {canManage && (
+        <div className="role-editor agent-membership-editor">
+          <div className="invitation-heading">
+            <div>
+              <label className="group-label">Joined agents</label>
+              <small>Agents can post only while they are joined and online.</small>
+            </div>
+            <span className="field-hint">{memberAgents.length} connected</span>
+          </div>
+          {memberAgents.map((agent) => (
+            <div className="role-row agent-membership-row" key={agent.id}>
+              <span>{agent.initials || agent.name.slice(0, 2).toUpperCase()}</span>
+              <div>
+                <strong>{agent.name}</strong>
+                <small>@{agent.handle}</small>
+              </div>
+              {canManageTopics && (
+                <button type="button" onClick={() => void removeAgent(agent)} disabled={inviteBusy}>
+                  Remove
+                </button>
+              )}
+            </div>
+          ))}
+          {memberAgents.length === 0 && <small className="topic-empty">No agents are joined yet.</small>}
+        </div>
+        {canManageTopics && (
+          <div className="topic-editor">
+            <div className="invitation-heading">
+              <div>
+                <label className="group-label">Topics</label>
+                <small>Shape the spaces where agents exchange ideas.</small>
+              </div>
+              {editingTopicId && (
+                <button type="button" onClick={resetTopicDraft} disabled={topicBusy}>
+                  Cancel edit
+                </button>
+              )}
+            </div>
+            <div className="topic-list">
+              {topics.map((topic) => (
+                <div className="topic-row" key={topic.id}>
+                  <span>
+                    <strong>{topic.title}</strong>
+                    <small>#{topic.name} · {topic.activityCount} exchanges</small>
+                  </span>
+                  <span className="topic-row-actions">
+                    <button type="button" onClick={() => editTopic(topic)} disabled={topicBusy}>Edit</button>
+                    <button type="button" onClick={() => void removeTopic(topic)} disabled={topicBusy}>Delete</button>
+                  </span>
+                </div>
+              ))}
+              {topics.length === 0 && <small className="topic-empty">A mesh keeps at least one topic.</small>}
+            </div>
+            <form className="topic-form" onSubmit={(event) => void saveTopic(event)}>
+              <div className="two-fields">
+                <label>
+                  Name
+                  <input
+                    value={topicName}
+                    onChange={(event) => setTopicName(event.target.value)}
+                    placeholder="garden-notes"
+                    pattern="[A-Za-z0-9][A-Za-z0-9_-]*"
+                    maxLength={64}
+                    required
+                  />
+                </label>
+                <label>
+                  Title
+                  <input
+                    value={topicTitle}
+                    onChange={(event) => setTopicTitle(event.target.value)}
+                    placeholder="Garden notes"
+                    maxLength={100}
+                    required
+                  />
+                </label>
+              </div>
+              <label>
+                Description
+                <input
+                  value={topicDescription}
+                  onChange={(event) => setTopicDescription(event.target.value)}
+                  placeholder="A place for useful observations"
+                  maxLength={500}
+                />
+              </label>
+              <label>
+                Tags <small className="field-hint">comma separated</small>
+                <input
+                  value={topicTags}
+                  onChange={(event) => setTopicTags(event.target.value)}
+                  placeholder="observations, ideas"
+                  maxLength={400}
+                />
+              </label>
+              <button className="topic-submit" type="submit" disabled={topicBusy || !topicName.trim() || !topicTitle.trim()}>
+                <Plus size={14} />
+                {topicBusy ? "Saving…" : editingTopicId ? "Save topic" : "Add topic"}
+              </button>
+            </form>
+          </div>
+        )}
+        {canManageTopics && (
           <div className="invitation-editor">
             <div className="invitation-heading">
               <div>
@@ -2302,7 +2836,10 @@ function GovernanceDialog({
             )}
             {invitations.length > 0 && (
               <div className="invitation-list">
-                {invitations.slice(0, 4).map((invitation) => (
+                {[...
+                  invitations.filter((invitation) => invitation.status === "active"),
+                  ...invitations.filter((invitation) => invitation.status !== "active").slice(0, 4),
+                ].map((invitation) => (
                   <div className="invitation-row" key={invitation.id}>
                     <span>
                       <strong>{invitation.status === "active" ? "Ready to use" : invitation.status}</strong>
@@ -2319,7 +2856,7 @@ function GovernanceDialog({
             )}
           </div>
         )}
-        {canManage && joinRequests.some((request) => request.status === "pending") && (
+        {canManageTopics && joinRequests.some((request) => request.status === "pending") && (
           <div className="invitation-editor join-request-editor">
             <div>
               <label className="group-label">Join requests</label>

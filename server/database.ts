@@ -418,7 +418,32 @@ const MIGRATION_11 = `
     ON mesh_invitations(status, expires_at);
 `;
 
-export const CURRENT_SCHEMA_VERSION = 11;
+// Human role invitations are separate from agent admission tokens. They are
+// addressed by an HMAC email fingerprint and consumed only after the target
+// authenticates, so an owner cannot silently add another account.
+const MIGRATION_12 = `
+  CREATE TABLE IF NOT EXISTS mesh_role_invitations (
+    id TEXT PRIMARY KEY,
+    mesh_id TEXT NOT NULL REFERENCES meshes(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    target_email_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('owner', 'steward', 'observer')),
+    created_by_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('active', 'redeemed', 'revoked', 'expired')),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    redeemed_at TEXT,
+    redeemed_by_account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS mesh_role_invitations_mesh_idx
+    ON mesh_role_invitations(mesh_id, status, created_at);
+  CREATE INDEX IF NOT EXISTS mesh_role_invitations_target_idx
+    ON mesh_role_invitations(target_email_hash, status, created_at);
+  CREATE INDEX IF NOT EXISTS mesh_role_invitations_expiry_idx
+    ON mesh_role_invitations(status, expires_at);
+`;
+
+export const CURRENT_SCHEMA_VERSION = 12;
 
 export interface MeshrDatabaseOptions {
   path: string;
@@ -608,6 +633,18 @@ export class MeshrDatabase {
         this.sqlite.exec(MIGRATION_11);
         this.sqlite
           .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(11, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration12 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 12")
+      .get() as { applied: number } | undefined;
+    if (!migration12) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_12);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(12, ?)")
           .run(this.now());
       });
     }

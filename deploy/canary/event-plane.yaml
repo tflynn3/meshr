@@ -111,6 +111,10 @@ spec:
               value: id_token
             - name: MESHR_MODERATION_AUDIENCE
               value: ${MESHR_MODERATION_AUDIENCE}
+            - name: MESHR_MODERATION_CONCURRENCY
+              value: "8"
+            - name: MESHR_MODERATION_SWEEP_FALLBACK
+              value: "0"
           ports: [{name: http, containerPort: 8080}]
           readinessProbe:
             httpGet: {path: /readyz, port: http}
@@ -120,6 +124,84 @@ spec:
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
           securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
           resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+---
+# Intake only acknowledges the source event after the durable moderation inbox
+# and screening-job publish both succeed. Provider work is handled by the
+# dedicated screening deployment below.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moderation-screening-worker-canary
+  labels: {app.kubernetes.io/name: moderation-screening-worker-canary, app.kubernetes.io/part-of: meshr}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: moderation-screening-worker-canary}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: moderation-screening-worker-canary, app.kubernetes.io/part-of: meshr}}
+    spec:
+      serviceAccountName: meshr-moderation-worker-canary
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: moderation-screening-worker
+          image: ${EVENT_PLANE_IMAGE}
+          args: ["materializer", "moderation-screening"]
+          envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
+          env:
+            - name: MESHR_MODERATION_ENDPOINT
+              value: ${MESHR_MODERATION_ENDPOINT}
+            - name: MESHR_MODERATION_HEALTHCHECK_URL
+              value: ${MESHR_MODERATION_HEALTHCHECK_URL}
+            - name: MESHR_MODERATION_AUTH
+              value: adc
+            - name: MESHR_MODERATION_TOKEN_TYPE
+              value: id_token
+            - name: MESHR_MODERATION_AUDIENCE
+              value: ${MESHR_MODERATION_AUDIENCE}
+            - name: MESHR_MODERATION_CONCURRENCY
+              value: "8"
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            timeoutSeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
+          securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: moderation-screening-worker-canary}
+spec:
+  minReplicas: 1
+  maxReplicas: 3
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: moderation-screening-worker-canary}
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 65}}
+    # Scale on the dedicated provider-work queue rather than the intake
+    # subscription, which is acknowledged after inbox persistence.
+    - type: External
+      external:
+        metric:
+          name: pubsub.googleapis.com|subscription|num_undelivered_messages
+          selector:
+            matchLabels:
+              resource.labels.subscription_id: moderation-screening-worker-canary
+        target: {type: AverageValue, averageValue: "20"}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: moderation-worker-canary}
+spec:
+  minReplicas: 1
+  maxReplicas: 3
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: moderation-worker-canary}
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 65}}
 ---
 apiVersion: apps/v1
 kind: Deployment

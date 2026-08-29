@@ -100,13 +100,17 @@ test("moderation worker readiness and provider decisions are durable and replaya
   const projectId = `meshr-moderation-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
   const topicName = "mesh-events";
   const subscriptionName = "moderation-worker";
+  const screeningTopicName = "moderation-screening";
+  const screeningSubscriptionName = "moderation-screening-worker";
   const firestore = new Firestore({ projectId, databaseId: "(default)" });
   const pubsub = new PubSub({ projectId });
   const providerPort = await freePort();
   const workerPort = await freePort();
+  const screeningWorkerPort = await freePort();
   const ingestPort = await freePort();
   let provider: Server | undefined;
   let moderation: Worker | undefined;
+  let screening: Worker | undefined;
   let ingest: Worker | undefined;
   let screenCalls = 0;
   let healthCalls = 0;
@@ -125,6 +129,11 @@ test("moderation worker readiness and provider decisions are durable and replaya
   try {
     await pubsub.createTopic(topicName);
     await pubsub.topic(topicName).createSubscription(subscriptionName, {
+      enableMessageOrdering: true,
+      ackDeadlineSeconds: 30,
+    });
+    await pubsub.createTopic(screeningTopicName);
+    await pubsub.topic(screeningTopicName).createSubscription(screeningSubscriptionName, {
       enableMessageOrdering: true,
       ackDeadlineSeconds: 30,
     });
@@ -216,6 +225,8 @@ test("moderation worker readiness and provider decisions are durable and replaya
       MESHR_TOPOLOGY_FIRESTORE_DATABASE: "(default)",
       MESHR_EVENTS_TOPIC: topicName,
       MESHR_MODERATION_SUBSCRIPTION: subscriptionName,
+      MESHR_MODERATION_SCREENING_TOPIC: screeningTopicName,
+      MESHR_MODERATION_SCREENING_SUBSCRIPTION: screeningSubscriptionName,
       MESHR_HOST: "127.0.0.1",
     };
     moderation = startWorker("platform/materializer.ts", {
@@ -228,9 +239,27 @@ test("moderation worker readiness and provider decisions are durable and replaya
       MESHR_MODERATION_TOKEN: "provider-token",
       MESHR_MODERATION_ENDPOINT: `http://127.0.0.1:${providerPort}/screen`,
       MESHR_MODERATION_HEALTHCHECK_URL: `http://127.0.0.1:${providerPort}/healthz`,
+      MESHR_MODERATION_SWEEP_FALLBACK: "0",
     });
     await waitForReady(`http://127.0.0.1:${workerPort}/readyz`, moderation, "moderation worker");
     assert.ok(healthCalls >= 1);
+
+    screening = startWorker("platform/materializer.ts", {
+      ...commonEnv,
+      MESHR_CONSUMER: "moderation-screening",
+      MESHR_PORT: String(screeningWorkerPort),
+      MESHR_ENV: "local",
+      MESHR_MODERATION_REQUIRED: "1",
+      MESHR_MODERATION_AUTH: "static",
+      MESHR_MODERATION_TOKEN: "provider-token",
+      MESHR_MODERATION_ENDPOINT: `http://127.0.0.1:${providerPort}/screen`,
+      MESHR_MODERATION_HEALTHCHECK_URL: `http://127.0.0.1:${providerPort}/healthz`,
+    });
+    await waitForReady(
+      `http://127.0.0.1:${screeningWorkerPort}/readyz`,
+      screening,
+      "moderation screening worker",
+    );
 
     ingest = startWorker("platform/ingest.ts", {
       ...commonEnv,
@@ -275,9 +304,10 @@ test("moderation worker readiness and provider decisions are durable and replaya
     assert.equal(screenedEvents.size, 1);
     assert.equal(screenedEvents.docs[0]?.get("observation_scope"), "public");
   } catch (error) {
-    throw new Error(`${error instanceof Error ? error.message : String(error)}\nmoderation output:\n${moderation?.output() ?? ""}\ningest output:\n${ingest?.output() ?? ""}`);
+    throw new Error(`${error instanceof Error ? error.message : String(error)}\nmoderation output:\n${moderation?.output() ?? ""}\nscreening output:\n${screening?.output() ?? ""}\ningest output:\n${ingest?.output() ?? ""}`);
   } finally {
     await stopWorker(ingest);
+    await stopWorker(screening);
     await stopWorker(moderation);
     await new Promise<void>((resolve) => provider?.close(() => resolve()) ?? resolve());
     await Promise.all([pubsub.close(), firestore.terminate()]);

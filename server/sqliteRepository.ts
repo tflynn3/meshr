@@ -2,31 +2,40 @@ import type { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import { CURRENT_SCHEMA_VERSION, MeshrDatabase } from "./database.ts";
 import { MESHR_CONTRACT_MAJOR } from "./contracts.ts";
+import { MAX_TOPICS_PER_MESH } from "./repository.ts";
 import type {
   MeshrRepository,
   RepositoryAgentInput,
   RepositoryProfileReloadResult,
   RepositoryProfileReviewProposal,
   RepositoryMeshInput,
+  RepositoryMeshGovernancePatch,
   RepositoryPairingInput,
   RepositoryPairingChallenge,
   RepositoryTopicInput,
+  RepositoryTopicCreateInput,
+  RepositoryTopicUpdateInput,
+  RepositoryTopicDeleteInput,
   RepositoryAgentTopic,
   RepositoryMeshDirectoryEntry,
   RepositoryRuntimeSession,
   RepositoryWebMcpGrant,
   RepositoryModerationCase,
+  RepositoryModerationCasesPage,
   RepositoryPostRecord,
   RepositoryTopicPostsPage,
   RepositoryJoinRequest,
   RepositoryMeshInvitation,
+  RepositoryMeshRoleInvitation,
   RepositoryHumanActivityPreference,
+  RepositoryHumanActivityPreferencePatch,
   RepositoryMutationArtifacts,
   RepositoryEventInput,
   RepositoryAuditInput,
 } from "./repository.ts";
 import type { Clock, RuntimeKind, SocialProvider } from "./types.ts";
 import { systemClock } from "./types.ts";
+import { hmacSha256 } from "./security.ts";
 
 const HUMAN_IDLE_SECONDS = 12 * 60 * 60;
 const NEW_IDENTITY_REVIEW_POSTS = 5;
@@ -41,11 +50,14 @@ export class SqliteMeshrRepository implements MeshrRepository {
   readonly database: MeshrDatabase;
   readonly db: DatabaseSync;
   readonly clock: Clock;
+  private readonly invitationPepper: string;
 
   constructor(database: MeshrDatabase, clock: Clock = systemClock) {
     this.database = database;
     this.db = database.sqlite;
     this.clock = clock;
+    this.invitationPepper = process.env.MESHR_INVITATION_PEPPER?.trim() ||
+      "meshr-local-invitation-pepper";
   }
 
   private now(): string {
@@ -887,6 +899,57 @@ export class SqliteMeshrRepository implements MeshrRepository {
     );
   }
 
+  async updateMeshGovernance(
+    input: RepositoryMeshGovernancePatch,
+  ): Promise<RepositoryMeshInput> {
+    return this.database.transaction(() => {
+      const current = this.db.prepare(
+        `SELECT id, owner_account_id, name, description, visibility, join_policy,
+                created_at
+         FROM meshes WHERE id = ?`,
+      ).get(input.meshId) as {
+        id: string;
+        owner_account_id: string | null;
+        name: string;
+        description: string;
+        visibility: RepositoryMeshInput["visibility"];
+        join_policy: RepositoryMeshInput["admission"];
+        created_at: string;
+      } | undefined;
+      if (!current) throw new Error("mesh_not_found");
+      this.assertHumanGovernance(
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner"],
+        input.updatedAt,
+      );
+      const next: RepositoryMeshInput = {
+        meshId: current.id,
+        ownerAccountId: current.owner_account_id,
+        name: input.name ?? current.name,
+        description: input.description ?? current.description,
+        visibility: input.visibility ?? current.visibility,
+        admission: input.admission ?? current.join_policy,
+        lifecycle: "active",
+        createdAt: current.created_at,
+        updatedAt: input.updatedAt,
+      };
+      this.db.prepare(
+        `UPDATE meshes SET name = ?, description = ?, visibility = ?,
+                          join_policy = ? WHERE id = ?`,
+      ).run(
+        next.name,
+        next.description,
+        next.visibility,
+        next.admission,
+        input.meshId,
+      );
+      this.writeMutationArtifacts(input);
+      return next;
+    });
+  }
+
   async createMeshWithOwner(input: {
     mesh: RepositoryMeshInput;
     topic: RepositoryTopicInput;
@@ -997,6 +1060,106 @@ export class SqliteMeshrRepository implements MeshrRepository {
       `UPDATE topics SET mesh_id = ?, name = ?, title = ?, description = ?, tags_json = ?
        WHERE id = ?`,
     ).run(input.meshId, input.name, input.title, input.description, JSON.stringify(input.tags), input.topicId);
+  }
+
+  async createTopic(input: RepositoryTopicCreateInput & RepositoryMutationArtifacts): Promise<void> {
+    this.database.transaction(() => {
+      this.assertHumanGovernance(
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner", "steward"],
+        input.createdAt,
+      );
+      if (!this.db.prepare("SELECT 1 FROM meshes WHERE id = ?").get(input.meshId)) {
+        throw new Error("mesh_not_found");
+      }
+      if (this.db.prepare("SELECT 1 FROM topics WHERE id = ?").get(input.topicId)) {
+        throw new Error("topic_already_exists");
+      }
+      const topicCount = this.db
+        .prepare("SELECT COUNT(*) AS count FROM topics WHERE mesh_id = ?")
+        .get(input.meshId) as { count: number };
+      if (Number(topicCount.count) >= MAX_TOPICS_PER_MESH) {
+        throw new Error("topic_limit_reached");
+      }
+      if (this.db.prepare("SELECT 1 FROM topics WHERE mesh_id = ? AND name = ?").get(input.meshId, input.name)) {
+        throw new Error("topic_name_taken");
+      }
+      this.db.prepare(
+        `INSERT INTO topics(id, mesh_id, name, title, description, tags_json, created_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        input.topicId,
+        input.meshId,
+        input.name,
+        input.title,
+        input.description,
+        JSON.stringify(input.tags),
+        input.createdAt,
+      );
+      this.writeMutationArtifacts(input);
+    });
+  }
+
+  async updateTopic(input: RepositoryTopicUpdateInput & RepositoryMutationArtifacts): Promise<void> {
+    this.database.transaction(() => {
+      this.assertHumanGovernance(
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner", "steward"],
+        input.updatedAt,
+      );
+      const existing = this.db.prepare(
+        "SELECT mesh_id FROM topics WHERE id = ?",
+      ).get(input.topicId) as { mesh_id: string } | undefined;
+      if (!existing || existing.mesh_id !== input.meshId) throw new Error("topic_not_found");
+      const sameName = this.db.prepare(
+        "SELECT id FROM topics WHERE mesh_id = ? AND name = ? AND id <> ?",
+      ).get(input.meshId, input.name, input.topicId) as { id: string } | undefined;
+      if (sameName) throw new Error("topic_name_taken");
+      this.db.prepare(
+        `UPDATE topics SET name = ?, title = ?, description = ?, tags_json = ?
+         WHERE id = ? AND mesh_id = ?`,
+      ).run(
+        input.name,
+        input.title,
+        input.description,
+        JSON.stringify(input.tags),
+        input.topicId,
+        input.meshId,
+      );
+      this.writeMutationArtifacts(input);
+    });
+  }
+
+  async deleteTopic(input: RepositoryTopicDeleteInput & RepositoryMutationArtifacts): Promise<void> {
+    this.database.transaction(() => {
+      this.assertHumanGovernance(
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner", "steward"],
+        input.deletedAt,
+      );
+      const existing = this.db.prepare(
+        "SELECT mesh_id FROM topics WHERE id = ?",
+      ).get(input.topicId) as { mesh_id: string } | undefined;
+      if (!existing || existing.mesh_id !== input.meshId) throw new Error("topic_not_found");
+      const topicCount = this.db
+        .prepare("SELECT COUNT(*) AS count FROM topics WHERE mesh_id = ?")
+        .get(input.meshId) as { count: number };
+      if (Number(topicCount.count) <= 1) throw new Error("last_topic");
+      if (this.db.prepare("SELECT 1 FROM posts WHERE topic_id = ? LIMIT 1").get(input.topicId)) {
+        throw new Error("topic_not_empty");
+      }
+      // Follows are derived intent and the local schema cascades them when a
+      // topic is removed. Unlike retained posts, they never block deletion.
+      this.db.prepare("DELETE FROM follows WHERE topic_id = ?").run(input.topicId);
+      this.db.prepare("DELETE FROM topics WHERE id = ? AND mesh_id = ?").run(input.topicId, input.meshId);
+      this.writeMutationArtifacts(input);
+    });
   }
 
   async findTopicById(topicId: string): Promise<RepositoryTopicInput | null> {
@@ -1141,10 +1304,17 @@ export class SqliteMeshrRepository implements MeshrRepository {
       const existing = this.db
         .prepare("SELECT role FROM mesh_human_roles WHERE mesh_id = ? AND account_id = ?")
         .get(input.meshId, input.accountId) as { role: string } | undefined;
+      // Keep the local compatibility adapter aligned with Firestore: a
+      // human-authorized update cannot create a new membership without a
+      // recipient-accepted role invitation.
+      if (input.actingAccountId && !existing) {
+        throw new Error("role_invitation_required");
+      }
       const mesh = this.db
         .prepare("SELECT owner_account_id FROM meshes WHERE id = ?")
         .get(input.meshId) as { owner_account_id: string | null } | undefined;
       if (input.role === "owner" && existing?.role !== "owner") {
+        if (!existing) throw new Error("owner_transfer_requires_member");
         const owned = this.db
           .prepare(
             "SELECT COUNT(*) AS count FROM mesh_human_roles WHERE account_id = ? AND role = 'owner'",
@@ -1486,6 +1656,10 @@ export class SqliteMeshrRepository implements MeshrRepository {
       );
       const mesh = this.db.prepare("SELECT 1 FROM meshes WHERE id = ?").get(input.meshId);
       if (!mesh) throw new Error("mesh_not_found");
+      const active = this.db.prepare(
+        "SELECT COUNT(*) AS count FROM mesh_invitations WHERE mesh_id = ? AND status = 'active' AND expires_at > ?",
+      ).get(input.meshId, input.createdAt) as { count: number };
+      if (Number(active.count) >= 50) throw new Error("invitation_limit_reached");
       if (input.invitedAgentId) {
         const agent = this.db.prepare("SELECT 1 FROM agents WHERE id = ?").get(input.invitedAgentId);
         if (!agent) throw new Error("agent_not_found");
@@ -1563,6 +1737,246 @@ export class SqliteMeshrRepository implements MeshrRepository {
       ).run(input.invitationId, input.meshId);
       if (result.changes !== 1) throw new Error("invitation_not_active");
       this.writeMutationArtifacts(input);
+    });
+  }
+
+  private roleInvitationFromRow(
+    row: Record<string, string | null>,
+    now = this.now(),
+  ): RepositoryMeshRoleInvitation {
+    const status = String(row.status) as RepositoryMeshRoleInvitation["status"];
+    const expiresAt = String(row.expires_at);
+    return {
+      invitationId: String(row.id),
+      meshId: String(row.mesh_id),
+      role: String(row.role) as RepositoryMeshRoleInvitation["role"],
+      createdByAccountId: String(row.created_by_account_id),
+      status: status === "active" && Date.parse(expiresAt) <= Date.parse(now) ? "expired" : status,
+      createdAt: String(row.created_at),
+      expiresAt,
+      redeemedAt: row.redeemed_at == null ? null : String(row.redeemed_at),
+      redeemedByAccountId: row.redeemed_by_account_id == null ? null : String(row.redeemed_by_account_id),
+    };
+  }
+
+  async createMeshRoleInvitation(input: {
+    invitationId: string;
+    meshId: string;
+    tokenHash: string;
+    targetEmailHash: string;
+    role: "owner" | "steward" | "observer";
+    createdByAccountId: string;
+    createdAt: string;
+    expiresAt: string;
+    actingAccountId: string;
+    humanSessionHash: string;
+  } & RepositoryMutationArtifacts): Promise<RepositoryMeshRoleInvitation> {
+    return this.database.transaction(() => {
+      this.assertHumanGovernance(
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner"],
+        input.createdAt,
+      );
+      // The SQLite compatibility schema predates the Firestore lifecycle
+      // field; an existing local mesh is active by definition. Production
+      // Firestore performs the explicit lifecycle check above.
+      const mesh = this.db.prepare("SELECT id FROM meshes WHERE id = ?").get(input.meshId) as
+        | { id: string }
+        | undefined;
+      if (!mesh) throw new Error("mesh_not_found");
+      const active = this.db.prepare(
+        "SELECT COUNT(*) AS count FROM mesh_role_invitations WHERE mesh_id = ? AND status = 'active' AND expires_at > ?",
+      ).get(input.meshId, input.createdAt) as { count: number };
+      if (Number(active.count) >= 50) throw new Error("role_invitation_limit_reached");
+      if (this.db.prepare("SELECT 1 FROM mesh_role_invitations WHERE id = ?").get(input.invitationId)) {
+        throw new Error("role_invitation_already_exists");
+      }
+      this.db.prepare(
+        `INSERT INTO mesh_role_invitations(
+           id, mesh_id, token_hash, target_email_hash, role, created_by_account_id,
+           status, created_at, expires_at, redeemed_at, redeemed_by_account_id
+         ) VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL, NULL)`,
+      ).run(
+        input.invitationId,
+        input.meshId,
+        input.tokenHash,
+        input.targetEmailHash,
+        input.role,
+        input.createdByAccountId,
+        input.createdAt,
+        input.expiresAt,
+      );
+      this.writeMutationArtifacts(input);
+      return {
+        invitationId: input.invitationId,
+        meshId: input.meshId,
+        role: input.role,
+        createdByAccountId: input.createdByAccountId,
+        status: "active",
+        createdAt: input.createdAt,
+        expiresAt: input.expiresAt,
+        redeemedAt: null,
+        redeemedByAccountId: null,
+      } satisfies RepositoryMeshRoleInvitation;
+    });
+  }
+
+  async listMeshRoleInvitationsForEmail(
+    targetEmailHash: string,
+  ): Promise<RepositoryMeshRoleInvitation[]> {
+    const rows = this.db.prepare(
+      `SELECT id, mesh_id, role, created_by_account_id, status, created_at,
+              expires_at, redeemed_at, redeemed_by_account_id
+       FROM mesh_role_invitations WHERE target_email_hash = ? ORDER BY created_at DESC, id ASC
+       LIMIT 100`,
+    ).all(targetEmailHash) as Array<Record<string, string | null>>;
+    return rows.map((row) => this.roleInvitationFromRow(row));
+  }
+
+  async findMeshRoleInvitation(input: {
+    invitationId: string;
+    targetEmailHash: string;
+  }): Promise<RepositoryMeshRoleInvitation | null> {
+    const row = this.db.prepare(
+      `SELECT id, mesh_id, role, created_by_account_id, status, created_at,
+              expires_at, redeemed_at, redeemed_by_account_id
+       FROM mesh_role_invitations
+       WHERE id = ? AND target_email_hash = ?
+       LIMIT 1`,
+    ).get(input.invitationId, input.targetEmailHash) as Record<string, string | null> | undefined;
+    return row ? this.roleInvitationFromRow(row) : null;
+  }
+
+  async listMeshRoleInvitations(meshId: string): Promise<RepositoryMeshRoleInvitation[]> {
+    const rows = this.db.prepare(
+      `SELECT id, mesh_id, role, created_by_account_id, status, created_at,
+              expires_at, redeemed_at, redeemed_by_account_id
+       FROM mesh_role_invitations WHERE mesh_id = ? ORDER BY created_at DESC, id ASC
+       LIMIT 100`,
+    ).all(meshId) as Array<Record<string, string | null>>;
+    return rows.map((row) => this.roleInvitationFromRow(row));
+  }
+
+  async revokeMeshRoleInvitation(input: {
+    invitationId: string;
+    meshId: string;
+    revokedAt: string;
+    actingAccountId: string;
+    humanSessionHash: string;
+  } & RepositoryMutationArtifacts): Promise<void> {
+    this.database.transaction(() => {
+      this.assertHumanGovernance(
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner"],
+        input.revokedAt,
+      );
+      const result = this.db.prepare(
+        `UPDATE mesh_role_invitations SET status = 'revoked'
+         WHERE id = ? AND mesh_id = ? AND status = 'active'`,
+      ).run(input.invitationId, input.meshId);
+      if (result.changes !== 1) throw new Error("role_invitation_not_active");
+      this.writeMutationArtifacts(input);
+    });
+  }
+
+  async acceptMeshRoleInvitation(input: {
+    invitationId: string;
+    tokenHash: string;
+    targetEmailHash?: string;
+    accountId: string;
+    humanSessionHash: string;
+    acceptedAt: string;
+    idempotencyKey?: string;
+    requestHash?: string;
+  } & RepositoryMutationArtifacts): Promise<{
+    invitation: RepositoryMeshRoleInvitation;
+    role: "owner" | "steward" | "observer";
+    duplicate: boolean;
+  }> {
+    return this.database.transaction(() => {
+      this.assertHumanSession(input.accountId, input.humanSessionHash, input.acceptedAt);
+      const row = this.db.prepare(
+        `SELECT id, mesh_id, token_hash, target_email_hash, role, created_by_account_id,
+                status, created_at, expires_at, redeemed_at, redeemed_by_account_id
+         FROM mesh_role_invitations WHERE id = ?`,
+      ).get(input.invitationId) as Record<string, string | null> | undefined;
+      if (!row) throw new Error("role_invitation_not_found");
+      if (String(row.token_hash) !== input.tokenHash) throw new Error("role_invitation_invalid");
+      const account = this.db.prepare("SELECT email FROM accounts WHERE id = ?").get(input.accountId) as
+        | { email: string }
+        | undefined;
+      if (!account) throw new Error("account_not_found");
+      const expectedTargetEmailHash = input.targetEmailHash ??
+        hmacSha256(account.email.trim().toLowerCase(), this.invitationPepper);
+      if (expectedTargetEmailHash !== String(row.target_email_hash)) {
+        throw new Error("role_invitation_target_mismatch");
+      }
+      const existingInvitation = this.roleInvitationFromRow(row, input.acceptedAt);
+      if (existingInvitation.status === "redeemed") {
+        if (existingInvitation.redeemedByAccountId === input.accountId) {
+          return { invitation: existingInvitation, role: existingInvitation.role, duplicate: true };
+        }
+        throw new Error("role_invitation_redeemed");
+      }
+      if (existingInvitation.status === "revoked") throw new Error("role_invitation_revoked");
+      if (existingInvitation.status === "expired" || Date.parse(existingInvitation.expiresAt) <= Date.parse(input.acceptedAt)) {
+        throw new Error("role_invitation_expired");
+      }
+      const meshId = String(row.mesh_id);
+      const mesh = this.db.prepare("SELECT owner_account_id FROM meshes WHERE id = ?").get(meshId) as
+        | { owner_account_id: string | null }
+        | undefined;
+      if (!mesh) throw new Error("mesh_not_found");
+      const role = String(row.role) as "owner" | "steward" | "observer";
+      const transferringOwnerId = String(row.created_by_account_id);
+      const currentOwner = this.db.prepare(
+        "SELECT role FROM mesh_human_roles WHERE mesh_id = ? AND account_id = ?",
+      ).get(meshId, transferringOwnerId) as { role: string } | undefined;
+      if (mesh.owner_account_id !== transferringOwnerId || currentOwner?.role !== "owner") {
+        throw new Error("role_invitation_inviter_not_owner");
+      }
+      const targetRole = this.db.prepare(
+        "SELECT role, created_at FROM mesh_human_roles WHERE mesh_id = ? AND account_id = ?",
+      ).get(meshId, input.accountId) as { role: string; created_at: string } | undefined;
+      if (targetRole?.role === "owner" && role !== "owner") throw new Error("owner_role_protected");
+      if (role === "owner") {
+        if (input.accountId !== transferringOwnerId && targetRole?.role !== "owner") {
+          const owned = this.db.prepare(
+            "SELECT COUNT(*) AS count FROM mesh_human_roles WHERE account_id = ? AND role = 'owner'",
+          ).get(input.accountId) as { count: number };
+          if (Number(owned.count) >= 10) throw new Error("mesh_limit_reached");
+          this.db.prepare(
+            "UPDATE mesh_human_roles SET role = 'steward', updated_at = ? WHERE mesh_id = ? AND account_id = ?",
+          ).run(input.acceptedAt, meshId, transferringOwnerId);
+          this.db.prepare("UPDATE meshes SET owner_account_id = ? WHERE id = ?")
+            .run(input.accountId, meshId);
+        }
+      }
+      this.db.prepare(
+        `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
+         VALUES(?, ?, ?, ?, ?)
+         ON CONFLICT(mesh_id, account_id) DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at`,
+      ).run(meshId, input.accountId, role, targetRole?.created_at ?? input.acceptedAt, input.acceptedAt);
+      this.db.prepare(
+        `UPDATE mesh_role_invitations
+         SET status = 'redeemed', redeemed_at = ?, redeemed_by_account_id = ?
+         WHERE id = ? AND status = 'active'`,
+      ).run(input.acceptedAt, input.accountId, input.invitationId);
+      this.writeMutationArtifacts(input);
+      return {
+        invitation: {
+          ...existingInvitation,
+          status: "redeemed",
+          redeemedAt: input.acceptedAt,
+          redeemedByAccountId: input.accountId,
+        },
+        role,
+        duplicate: false,
+      };
     });
   }
 
@@ -1725,23 +2139,59 @@ export class SqliteMeshrRepository implements MeshrRepository {
     }));
   }
 
-  async upsertHumanActivityPreference(input: RepositoryHumanActivityPreference): Promise<void> {
-    this.db.prepare(
-      `INSERT INTO human_activity_preferences(
-         account_id, kind, resource_id, watching, muted, updated_at
-       ) VALUES(?, ?, ?, ?, ?, ?)
-       ON CONFLICT(account_id, kind, resource_id) DO UPDATE SET
-         watching = excluded.watching,
-         muted = excluded.muted,
-         updated_at = excluded.updated_at`,
-    ).run(
-      input.accountId,
-      input.kind,
-      input.resourceId,
-      input.watching ? 1 : 0,
-      input.muted ? 1 : 0,
-      input.updatedAt,
-    );
+  async upsertHumanActivityPreference(
+    input: RepositoryHumanActivityPreferencePatch,
+  ): Promise<RepositoryHumanActivityPreference> {
+    return this.database.transaction(() => {
+      this.assertHumanSession(input.accountId, input.humanSessionHash, input.updatedAt);
+      const mesh = this.db.prepare(
+        "SELECT visibility, lifecycle FROM meshes WHERE id = ?",
+      ).get(input.meshId) as { visibility: RepositoryMeshInput["visibility"]; lifecycle: string } | undefined;
+      if (!mesh || mesh.lifecycle !== "active") throw new Error("mesh_not_found");
+      if (input.kind === "topic") {
+        const topic = this.db.prepare(
+          "SELECT mesh_id FROM topics WHERE id = ?",
+        ).get(input.resourceId) as { mesh_id: string } | undefined;
+        if (!topic || topic.mesh_id !== input.meshId) throw new Error("topic_not_found");
+      }
+      if (mesh.visibility !== "public") {
+        const role = this.db.prepare(
+          "SELECT 1 AS present FROM mesh_human_roles WHERE mesh_id = ? AND account_id = ?",
+        ).get(input.meshId, input.accountId);
+        if (!role) throw new Error("mesh_access_denied");
+      }
+      const existing = this.db.prepare(
+        `SELECT watching, muted FROM human_activity_preferences
+         WHERE account_id = ? AND kind = ? AND resource_id = ?`,
+      ).get(input.accountId, input.kind, input.resourceId) as
+        | { watching: number; muted: number }
+        | undefined;
+      const preference: RepositoryHumanActivityPreference = {
+        accountId: input.accountId,
+        kind: input.kind,
+        resourceId: input.resourceId,
+        watching: input.watching ?? (existing?.watching === 1),
+        muted: input.muted ?? (existing?.muted === 1),
+        updatedAt: input.updatedAt,
+      };
+      this.db.prepare(
+        `INSERT INTO human_activity_preferences(
+           account_id, kind, resource_id, watching, muted, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?)
+         ON CONFLICT(account_id, kind, resource_id) DO UPDATE SET
+           watching = excluded.watching,
+           muted = excluded.muted,
+           updated_at = excluded.updated_at`,
+      ).run(
+        preference.accountId,
+        preference.kind,
+        preference.resourceId,
+        preference.watching ? 1 : 0,
+        preference.muted ? 1 : 0,
+        preference.updatedAt,
+      );
+      return preference;
+    });
   }
 
   async revokeHumanSession(tokenHash: string, _revokedAt?: string): Promise<void> {
@@ -1921,11 +2371,32 @@ export class SqliteMeshrRepository implements MeshrRepository {
   }
 
   async listModerationCases(meshId: string): Promise<RepositoryModerationCase[]> {
+    return (await this.listModerationCasesPage({ meshId, limit: 500 })).cases;
+  }
+
+  async listModerationCasesPage(input: {
+    meshId: string;
+    state?: RepositoryModerationCase["state"];
+    after?: { updatedAt: string; caseId: string };
+    limit: number;
+  }): Promise<RepositoryModerationCasesPage> {
+    const limit = Math.min(Math.max(Math.floor(input.limit), 1), 500);
+    const where = ["mesh_id = ?"];
+    const params: Array<string | number> = [input.meshId];
+    if (input.state) {
+      where.push("state = ?");
+      params.push(input.state);
+    }
+    if (input.after) {
+      where.push("(updated_at < ? OR (updated_at = ? AND id < ?))");
+      params.push(input.after.updatedAt, input.after.updatedAt, input.after.caseId);
+    }
     const rows = this.db.prepare(
       `SELECT id, post_id, mesh_id, reason, state, severity, created_at,
               updated_at, resolved_at, resolution
-       FROM moderation_cases WHERE mesh_id = ? ORDER BY updated_at DESC, id ASC`,
-    ).all(meshId) as Array<{
+       FROM moderation_cases WHERE ${where.join(" AND ")}
+       ORDER BY updated_at DESC, id DESC LIMIT ?`,
+    ).all(...params, limit + 1) as Array<{
       id: string;
       post_id: string;
       mesh_id: string;
@@ -1937,7 +2408,10 @@ export class SqliteMeshrRepository implements MeshrRepository {
       resolved_at: string | null;
       resolution: string | null;
     }>;
-    return rows.map((row) => ({
+    const pageRows = rows.slice(0, limit);
+    const last = pageRows.at(-1);
+    return {
+      cases: pageRows.map((row) => ({
       caseId: row.id,
       postId: row.post_id,
       meshId: row.mesh_id,
@@ -1948,7 +2422,11 @@ export class SqliteMeshrRepository implements MeshrRepository {
       updatedAt: row.updated_at,
       resolvedAt: row.resolved_at,
       resolution: row.resolution,
-    }));
+      })),
+      nextAfter: rows.length > limit && last
+        ? { updatedAt: last.updated_at, caseId: last.id }
+        : null,
+    };
   }
 
   async updatePostModeration(input: {
@@ -2429,6 +2907,22 @@ export class SqliteMeshrRepository implements MeshrRepository {
     const row = this.db
       .prepare("SELECT id, email, display_name, created_at FROM accounts WHERE id = ?")
       .get(accountId) as
+      | { id: string; email: string; display_name: string; created_at: string }
+      | undefined;
+    return row
+      ? {
+          accountId: row.id,
+          email: row.email,
+          displayName: row.display_name,
+          createdAt: row.created_at,
+        }
+      : null;
+  }
+
+  async findAccountByEmail(email: string) {
+    const row = this.db
+      .prepare("SELECT id, email, display_name, created_at FROM accounts WHERE email = ? COLLATE NOCASE")
+      .get(email.trim().toLowerCase()) as
       | { id: string; email: string; display_name: string; created_at: string }
       | undefined;
     return row

@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meshr-metrics-adapter-values
+  namespace: flux-system
+data:
+  # Bootstrap automation replaces this placeholder with the OpenTofu output.
+  # It is intentionally not a project ID or a credential.
+  METRICS_ADAPTER_GSA: meshr-metrics-adapter@PROJECT_ID.iam.gserviceaccount.com

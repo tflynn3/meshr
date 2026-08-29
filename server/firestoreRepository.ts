@@ -8,15 +8,21 @@ import {
 } from "@google-cloud/firestore";
 import { createHash, randomUUID } from "node:crypto";
 import { MESHR_CONTRACT_MAJOR } from "./contracts.ts";
+import { MAX_TOPICS_PER_MESH } from "./repository.ts";
+import { hmacSha256 } from "./security.ts";
 import type {
   MeshrRepository,
   RepositoryAgentInput,
   RepositoryProfileReloadResult,
   RepositoryProfileReviewProposal,
   RepositoryMeshInput,
+  RepositoryMeshGovernancePatch,
   RepositoryPairingInput,
   RepositoryPairingChallenge,
   RepositoryTopicInput,
+  RepositoryTopicCreateInput,
+  RepositoryTopicUpdateInput,
+  RepositoryTopicDeleteInput,
   RepositoryAgentTopic,
   RepositoryMeshDirectoryEntry,
   RepositoryRuntimeSession,
@@ -31,9 +37,13 @@ import type {
   RepositoryAuditInput,
   RepositoryMutationArtifacts,
   RepositoryModerationCase,
+  RepositoryModerationCasesPage,
   RepositoryJoinRequest,
   RepositoryMeshInvitation,
+  RepositoryMeshRoleInvitation,
+  RepositoryMeshRoleInvitationStatus,
   RepositoryHumanActivityPreference,
+  RepositoryHumanActivityPreferencePatch,
 } from "./repository.ts";
 import type { Clock, RuntimeKind, SocialProvider } from "./types.ts";
 import { systemClock } from "./types.ts";
@@ -44,6 +54,10 @@ export interface FirestoreRepositoryOptions {
   topologyFirestore?: Firestore;
   clock?: Clock;
   collectionPrefix?: string;
+  /** Secret Manager pepper used for non-enumerable role-invitation lookup. */
+  invitationPepper?: string;
+  /** Immediately previous pepper retained for direct repository callers during rotation. */
+  invitationPepperPrevious?: string;
 }
 
 export interface RepositoryAccount {
@@ -216,6 +230,8 @@ export class FirestoreMeshrRepository implements MeshrRepository {
   readonly topologyFirestore: Firestore;
   readonly clock: Clock;
   private readonly prefix: string;
+  private readonly invitationPepper: string;
+  private readonly invitationPepperPrevious?: string;
   // Public topology is identical for every authenticated viewer. Posts keep a
   // short process-local cache, but the public-mesh snapshot is intentionally
   // uncached: a visibility change on another API replica must take effect
@@ -244,6 +260,11 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     this.topologyFirestore = options.topologyFirestore ?? options.firestore;
     this.clock = options.clock ?? systemClock;
     this.prefix = options.collectionPrefix?.replace(/[^A-Za-z0-9_-]/g, "") || "";
+    this.invitationPepper = options.invitationPepper ||
+      process.env.MESHR_INVITATION_PEPPER?.trim() ||
+      "meshr-local-invitation-pepper";
+    this.invitationPepperPrevious = options.invitationPepperPrevious?.trim() ||
+      process.env.MESHR_INVITATION_PEPPER_PREVIOUS?.trim();
   }
 
   async checkReady(): Promise<void> {
@@ -2099,14 +2120,37 @@ export class FirestoreMeshrRepository implements MeshrRepository {
   }
 
   async listModerationCases(meshId: string): Promise<RepositoryModerationCase[]> {
-    const snapshot = await this.firestore
+    const page = await this.listModerationCasesPage({ meshId, limit: 500 });
+    return page.cases;
+  }
+
+  async listModerationCasesPage(input: {
+    meshId: string;
+    state?: RepositoryModerationCase["state"];
+    after?: { updatedAt: string; caseId: string };
+    limit: number;
+  }): Promise<RepositoryModerationCasesPage> {
+    const limit = Math.min(Math.max(Math.floor(input.limit), 1), 500);
+    let query: Query = this.firestore
       .collection(this.collection("moderation_cases"))
-      .where("mesh_id", "==", meshId)
-      .limit(500)
-      .get();
-    return snapshot.docs
-      .map((document) => this.moderationCaseFromSnapshot(document))
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.caseId.localeCompare(right.caseId));
+      .where("mesh_id", "==", input.meshId);
+    if (input.state) query = query.where("state", "==", input.state);
+    query = query
+      .orderBy("updated_at", "desc")
+      .orderBy(FieldPath.documentId(), "desc");
+    if (input.after) query = query.startAfter(input.after.updatedAt, input.after.caseId);
+    const snapshot = await query.limit(limit + 1).get();
+    const documents = snapshot.docs.slice(0, limit);
+    const last = documents.at(-1);
+    return {
+      cases: documents.map((document) => this.moderationCaseFromSnapshot(document)),
+      nextAfter: snapshot.docs.length > limit && last
+        ? {
+            updatedAt: String(last.get("updated_at") ?? last.get("created_at") ?? this.now()),
+            caseId: last.id,
+          }
+        : null,
+    };
   }
 
   async updatePostModeration(input: {
@@ -2490,6 +2534,59 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     });
   }
 
+  async updateMeshGovernance(
+    input: RepositoryMeshGovernancePatch,
+  ): Promise<RepositoryMeshInput> {
+    const meshRef = this.doc("meshes", input.meshId);
+    return this.firestore.runTransaction(async (transaction) => {
+      const existing = await transaction.get(meshRef);
+      if (!existing.exists) throw new Error("mesh_not_found");
+      await this.assertHumanRole(
+        transaction,
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner"],
+        input.updatedAt,
+      );
+      const current: RepositoryMeshInput = {
+        meshId: input.meshId,
+        ownerAccountId: existing.get("owner_account_id") == null
+          ? null
+          : String(existing.get("owner_account_id")),
+        name: String(existing.get("name") ?? ""),
+        description: String(existing.get("description") ?? ""),
+        visibility: String(existing.get("visibility") ?? "private") as RepositoryMeshInput["visibility"],
+        admission: String(existing.get("admission") ?? "invite_only") as RepositoryMeshInput["admission"],
+        lifecycle: String(existing.get("lifecycle") ?? "active") as RepositoryMeshInput["lifecycle"],
+        createdAt: String(existing.get("created_at") ?? input.updatedAt),
+        updatedAt: input.updatedAt,
+      };
+      const next: RepositoryMeshInput = {
+        ...current,
+        name: input.name ?? current.name,
+        description: input.description ?? current.description,
+        visibility: input.visibility ?? current.visibility,
+        admission: input.admission ?? current.admission,
+        updatedAt: input.updatedAt,
+      };
+      transaction.set(meshRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        mesh_id: next.meshId,
+        owner_account_id: next.ownerAccountId,
+        name: next.name,
+        description: next.description,
+        visibility: next.visibility,
+        admission: next.admission,
+        lifecycle: next.lifecycle,
+        created_at: current.createdAt,
+        updated_at: next.updatedAt,
+      }, { merge: true });
+      this.writeMutationArtifacts(transaction, input);
+      return next;
+    });
+  }
+
   async createMeshWithOwner(input: {
     mesh: RepositoryMeshInput;
     topic: RepositoryTopicInput;
@@ -2631,6 +2728,192 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     );
   }
 
+  async consumeGovernanceRateLimit(input: {
+    accountId: string;
+    bucket: string;
+    now: string;
+    capacity: number;
+    refillPerSecond: number;
+  }): Promise<{ allowed: boolean; retryAfterSeconds: number }> {
+    if (!input.accountId || !input.bucket || input.capacity <= 0 || input.refillPerSecond <= 0) {
+      throw new Error("invalid_governance_rate_limit");
+    }
+    const nowMs = Date.parse(input.now);
+    if (!Number.isFinite(nowMs)) throw new Error("invalid_governance_rate_limit");
+    const ref = this.doc("quota_counters", `governance:${input.bucket}:${input.accountId}`);
+    return this.firestore.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(ref);
+      const previousTokens = snapshot.exists
+        ? Number(snapshot.get("tokens") ?? input.capacity)
+        : input.capacity;
+      const previousRefillMs = snapshot.exists
+        ? Number(snapshot.get("last_refill_ms") ?? nowMs)
+        : nowMs;
+      const elapsedSeconds = Math.max(0, (nowMs - previousRefillMs) / 1_000);
+      const available = Math.min(
+        input.capacity,
+        (Number.isFinite(previousTokens) ? previousTokens : input.capacity) +
+          elapsedSeconds * input.refillPerSecond,
+      );
+      if (available < 1) {
+        return {
+          allowed: false,
+          retryAfterSeconds: Math.max(1, Math.ceil((1 - available) / input.refillPerSecond)),
+        };
+      }
+      transaction.set(
+        ref,
+        {
+          contract_version: MESHR_CONTRACT_MAJOR,
+          bucket: `governance:${input.bucket}:${input.accountId}`,
+          tokens: available - 1,
+          last_refill_ms: nowMs,
+          updated_at: input.now,
+          expires_at_ttl: quotaExpiryTimestamp(input.now),
+        },
+        { merge: true },
+      );
+      return { allowed: true, retryAfterSeconds: 0 };
+    });
+  }
+
+  async createTopic(input: RepositoryTopicCreateInput & RepositoryMutationArtifacts): Promise<void> {
+    await this.firestore.runTransaction(async (transaction) => {
+      const meshRef = this.doc("meshes", input.meshId);
+      const topicRef = this.doc("topics", input.topicId);
+      const mesh = await transaction.get(meshRef);
+      if (!mesh.exists || mesh.get("lifecycle") !== "active") throw new Error("mesh_not_found");
+      await this.assertHumanRole(
+        transaction,
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner", "steward"],
+        input.createdAt,
+      );
+      const [existingTopic, sameName] = await Promise.all([
+        transaction.get(topicRef),
+        transaction.get(
+          this.firestore
+            .collection(this.collection("topics"))
+            .where("mesh_id", "==", input.meshId)
+            .where("name", "==", input.name)
+            .limit(1),
+        ),
+      ]);
+      if (existingTopic.exists) throw new Error("topic_already_exists");
+      const topicCount = await transaction.get(
+        this.firestore
+          .collection(this.collection("topics"))
+          .where("mesh_id", "==", input.meshId)
+          .limit(MAX_TOPICS_PER_MESH + 1),
+      );
+      if (topicCount.size >= MAX_TOPICS_PER_MESH) {
+        throw new Error("topic_limit_reached");
+      }
+      if (sameName.docs.some((document) => document.id !== input.topicId)) {
+        throw new Error("topic_name_taken");
+      }
+      transaction.create(topicRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        topic_id: input.topicId,
+        mesh_id: input.meshId,
+        name: input.name,
+        title: input.title,
+        description: input.description,
+        tags: input.tags,
+        created_at: input.createdAt,
+        updated_at: input.createdAt,
+      });
+      this.writeMutationArtifacts(transaction, input);
+    });
+  }
+
+  async updateTopic(input: RepositoryTopicUpdateInput & RepositoryMutationArtifacts): Promise<void> {
+    await this.firestore.runTransaction(async (transaction) => {
+      const meshRef = this.doc("meshes", input.meshId);
+      const topicRef = this.doc("topics", input.topicId);
+      const mesh = await transaction.get(meshRef);
+      if (!mesh.exists || mesh.get("lifecycle") !== "active") throw new Error("mesh_not_found");
+      await this.assertHumanRole(
+        transaction,
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner", "steward"],
+        input.updatedAt,
+      );
+      const existingTopic = await transaction.get(topicRef);
+      if (!existingTopic.exists || String(existingTopic.get("mesh_id")) !== input.meshId) {
+        throw new Error("topic_not_found");
+      }
+      const sameName = await transaction.get(
+        this.firestore
+          .collection(this.collection("topics"))
+          .where("mesh_id", "==", input.meshId)
+          .where("name", "==", input.name)
+          .limit(2),
+      );
+      if (sameName.docs.some((document) => document.id !== input.topicId)) {
+        throw new Error("topic_name_taken");
+      }
+      transaction.update(topicRef, {
+        name: input.name,
+        title: input.title,
+        description: input.description,
+        tags: input.tags,
+        updated_at: input.updatedAt,
+      });
+      this.writeMutationArtifacts(transaction, input);
+    });
+  }
+
+  async deleteTopic(input: RepositoryTopicDeleteInput & RepositoryMutationArtifacts): Promise<void> {
+    await this.firestore.runTransaction(async (transaction) => {
+      const meshRef = this.doc("meshes", input.meshId);
+      const topicRef = this.doc("topics", input.topicId);
+      const mesh = await transaction.get(meshRef);
+      if (!mesh.exists || mesh.get("lifecycle") !== "active") throw new Error("mesh_not_found");
+      await this.assertHumanRole(
+        transaction,
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner", "steward"],
+        input.deletedAt,
+      );
+      const existingTopic = await transaction.get(topicRef);
+      if (!existingTopic.exists || String(existingTopic.get("mesh_id")) !== input.meshId) {
+        throw new Error("topic_not_found");
+      }
+      const posts = await transaction.get(
+        this.firestore
+          .collection(this.collection("posts"))
+          .where("topic_id", "==", input.topicId)
+          .limit(1),
+      );
+      const remainingTopics = await transaction.get(
+        this.firestore
+          .collection(this.collection("topics"))
+          .where("mesh_id", "==", input.meshId)
+          .limit(2),
+      );
+      if (remainingTopics.size <= 1) throw new Error("last_topic");
+      // Retained posts are immutable social history. Do not permit a topic
+      // delete to orphan or silently erase them; archive/remove the topic in
+      // a future lifecycle command instead.
+      if (!posts.empty) throw new Error("topic_not_empty");
+      // Follow documents are derived intent, not retained social history. Do
+      // not read or delete them in this transaction: a popular topic may have
+      // thousands of followers and Firestore transactions are capped at 500
+      // writes. The follow mutation accepts an explicit unsubscribe for a
+      // deleted topic, allowing stale records to be cleaned without exposing
+      // the topic again; the retention worker can also sweep orphan follows.
+      transaction.delete(topicRef);
+      this.writeMutationArtifacts(transaction, input);
+    });
+  }
+
   async upsertMeshHumanRole(input: {
     meshId: string;
     accountId: string;
@@ -2656,6 +2939,12 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           input.updatedAt,
         );
       }
+      // A human-authorized role mutation may update an existing assignment,
+      // but it may not create a membership. Creation requires the separate
+      // one-use invitation and recipient acceptance flow.
+      if (input.actingAccountId && !existing.exists) {
+        throw new Error("role_invitation_required");
+      }
       if (existing.exists && existing.get("role") === "owner" && input.role !== "owner") {
         const owners = await transaction.get(
           this.firestore
@@ -2673,6 +2962,10 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           transaction.update(meshRef, { owner_account_id: replacement, updated_at: input.updatedAt });
         }
       } else if (input.role === "owner") {
+        // Ownership transfer is only valid for an existing mesh member. The
+        // email-based collaborator endpoint deliberately cannot mint a new
+        // owner role for an unrelated account.
+        if (!existing.exists) throw new Error("owner_transfer_requires_member");
         if (!existing.exists || existing.get("role") !== "owner") {
           const ownedMeshes = await transaction.get(
             this.firestore
@@ -3154,14 +3447,22 @@ export class FirestoreMeshrRepository implements MeshrRepository {
   } & RepositoryMutationArtifacts): Promise<RepositoryMeshInvitation> {
     const invitationRef = this.doc("mesh_invitations", input.invitationId);
     return this.firestore.runTransaction(async (transaction) => {
-      const [mesh, existing, agent] = await Promise.all([
+      const [mesh, existing, agent, activeInvitations] = await Promise.all([
         transaction.get(this.doc("meshes", input.meshId)),
         transaction.get(invitationRef),
         input.invitedAgentId
           ? transaction.get(this.doc("agents", input.invitedAgentId))
           : Promise.resolve(null),
+        transaction.get(
+          this.firestore
+            .collection(this.collection("mesh_invitations"))
+            .where("mesh_id", "==", input.meshId)
+            .where("status", "==", "active")
+            .where("expires_at", ">", input.createdAt)
+            .limit(51),
+        ),
       ]);
-      if (!mesh.exists) throw new Error("mesh_not_found");
+      if (!mesh.exists || mesh.get("lifecycle") !== "active") throw new Error("mesh_not_found");
       await this.assertHumanRole(
         transaction,
         input.meshId,
@@ -3171,6 +3472,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         input.createdAt,
       );
       if (input.invitedAgentId && (!agent || !agent.exists)) throw new Error("agent_not_found");
+      if (activeInvitations.size >= 50) throw new Error("invitation_limit_reached");
       if (existing.exists) {
         throw new Error("invitation_already_exists");
       }
@@ -3238,6 +3540,306 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       if (String(invitation.get("status")) !== "active") throw new Error("invitation_not_active");
       transaction.update(invitationRef, { status: "revoked", revoked_at: input.revokedAt });
       this.writeMutationArtifacts(transaction, input);
+    });
+  }
+
+  private meshRoleInvitationFromSnapshot(
+    snapshot: DocumentSnapshot,
+    now = this.now(),
+  ): RepositoryMeshRoleInvitation {
+    const status = String(snapshot.get("status") ?? "active") as RepositoryMeshRoleInvitationStatus;
+    const expiresAt = String(snapshot.get("expires_at") ?? now);
+    return {
+      invitationId: String(snapshot.get("invitation_id") ?? snapshot.id),
+      meshId: String(snapshot.get("mesh_id")),
+      role: String(snapshot.get("role") ?? "observer") as RepositoryMeshRoleInvitation["role"],
+      createdByAccountId: String(snapshot.get("created_by_account_id")),
+      status: status === "active" && Date.parse(expiresAt) <= Date.parse(now) ? "expired" : status,
+      createdAt: String(snapshot.get("created_at") ?? now),
+      expiresAt,
+      redeemedAt: snapshot.get("redeemed_at") == null ? null : String(snapshot.get("redeemed_at")),
+      redeemedByAccountId: snapshot.get("redeemed_by_account_id") == null
+        ? null
+        : String(snapshot.get("redeemed_by_account_id")),
+    };
+  }
+
+  async createMeshRoleInvitation(input: {
+    invitationId: string;
+    meshId: string;
+    tokenHash: string;
+    targetEmailHash: string;
+    role: "owner" | "steward" | "observer";
+    createdByAccountId: string;
+    createdAt: string;
+    expiresAt: string;
+    actingAccountId: string;
+    humanSessionHash: string;
+  } & RepositoryMutationArtifacts): Promise<RepositoryMeshRoleInvitation> {
+    const invitationRef = this.doc("mesh_role_invitations", input.invitationId);
+    return this.firestore.runTransaction(async (transaction) => {
+      const [mesh, existing, activeInvitations] = await Promise.all([
+        transaction.get(this.doc("meshes", input.meshId)),
+        transaction.get(invitationRef),
+        transaction.get(
+          this.firestore
+            .collection(this.collection("mesh_role_invitations"))
+            .where("mesh_id", "==", input.meshId)
+            .where("status", "==", "active")
+            .where("expires_at", ">", input.createdAt)
+            .limit(51),
+        ),
+      ]);
+      if (!mesh.exists || mesh.get("lifecycle") !== "active") throw new Error("mesh_not_found");
+      await this.assertHumanRole(
+        transaction,
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner"],
+        input.createdAt,
+      );
+      if (existing.exists) throw new Error("role_invitation_already_exists");
+      if (activeInvitations.size >= 50) throw new Error("role_invitation_limit_reached");
+      // Only the current owner can create an ownership-transfer invitation.
+      // Steward/observer invitations may be created by the same route, but a
+      // future acceptance still rechecks the target's canonical email.
+      transaction.create(invitationRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        invitation_id: input.invitationId,
+        mesh_id: input.meshId,
+        token_hash: input.tokenHash,
+        target_email_hash: input.targetEmailHash,
+        role: input.role,
+        created_by_account_id: input.createdByAccountId,
+        status: "active",
+        created_at: input.createdAt,
+        expires_at: input.expiresAt,
+        redeemed_at: null,
+        redeemed_by_account_id: null,
+        expires_at_ttl: ttlTimestamp(input.expiresAt),
+      });
+      this.writeMutationArtifacts(transaction, input);
+      return {
+        invitationId: input.invitationId,
+        meshId: input.meshId,
+        role: input.role,
+        createdByAccountId: input.createdByAccountId,
+        status: "active",
+        createdAt: input.createdAt,
+        expiresAt: input.expiresAt,
+        redeemedAt: null,
+        redeemedByAccountId: null,
+      } satisfies RepositoryMeshRoleInvitation;
+    });
+  }
+
+  async listMeshRoleInvitationsForEmail(
+    targetEmailHash: string,
+  ): Promise<RepositoryMeshRoleInvitation[]> {
+    const snapshot = await this.firestore
+      .collection(this.collection("mesh_role_invitations"))
+      .where("target_email_hash", "==", targetEmailHash)
+      .limit(100)
+      .get();
+    return snapshot.docs
+      .map((document) => this.meshRoleInvitationFromSnapshot(document))
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || left.invitationId.localeCompare(right.invitationId));
+  }
+
+  async findMeshRoleInvitation(input: {
+    invitationId: string;
+    targetEmailHash: string;
+  }): Promise<RepositoryMeshRoleInvitation | null> {
+    const snapshot = await this.doc("mesh_role_invitations", input.invitationId).get();
+    if (!snapshot.exists || String(snapshot.get("target_email_hash") ?? "") !== input.targetEmailHash) {
+      return null;
+    }
+    return this.meshRoleInvitationFromSnapshot(snapshot);
+  }
+
+  async listMeshRoleInvitations(meshId: string): Promise<RepositoryMeshRoleInvitation[]> {
+    const snapshot = await this.firestore
+      .collection(this.collection("mesh_role_invitations"))
+      .where("mesh_id", "==", meshId)
+      .limit(100)
+      .get();
+    return snapshot.docs
+      .map((document) => this.meshRoleInvitationFromSnapshot(document))
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || left.invitationId.localeCompare(right.invitationId));
+  }
+
+  async revokeMeshRoleInvitation(input: {
+    invitationId: string;
+    meshId: string;
+    revokedAt: string;
+    actingAccountId: string;
+    humanSessionHash: string;
+  } & RepositoryMutationArtifacts): Promise<void> {
+    const invitationRef = this.doc("mesh_role_invitations", input.invitationId);
+    await this.firestore.runTransaction(async (transaction) => {
+      const invitation = await transaction.get(invitationRef);
+      await this.assertHumanRole(
+        transaction,
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner"],
+        input.revokedAt,
+      );
+      if (!invitation.exists || String(invitation.get("mesh_id")) !== input.meshId) {
+        throw new Error("role_invitation_not_found");
+      }
+      if (String(invitation.get("status")) !== "active") throw new Error("role_invitation_not_active");
+      transaction.update(invitationRef, { status: "revoked", revoked_at: input.revokedAt });
+      this.writeMutationArtifacts(transaction, input);
+    });
+  }
+
+  async acceptMeshRoleInvitation(input: {
+    invitationId: string;
+    tokenHash: string;
+    targetEmailHash?: string;
+    accountId: string;
+    humanSessionHash: string;
+    acceptedAt: string;
+    idempotencyKey?: string;
+    requestHash?: string;
+  } & RepositoryMutationArtifacts): Promise<{
+    invitation: RepositoryMeshRoleInvitation;
+    role: "owner" | "steward" | "observer";
+    duplicate: boolean;
+  }> {
+    const invitationRef = this.doc("mesh_role_invitations", input.invitationId);
+    const idempotencyRef = input.idempotencyKey
+      ? this.doc("idempotency", `${input.accountId}:mesh.role.invitation:${input.idempotencyKey}`)
+      : undefined;
+    const requestHash = input.requestHash ?? createHash("sha256")
+      .update(JSON.stringify({ invitationId: input.invitationId, tokenHash: input.tokenHash }))
+      .digest("hex");
+    return this.firestore.runTransaction(async (transaction) => {
+      const [invitation, account, existingIdempotency] = await Promise.all([
+        transaction.get(invitationRef),
+        transaction.get(this.doc("accounts", input.accountId)),
+        idempotencyRef ? transaction.get(idempotencyRef) : Promise.resolve(undefined),
+      ]);
+      if (existingIdempotency?.exists) {
+        if (existingIdempotency.get("request_hash") !== requestHash) throw new Error("idempotency_conflict");
+        if (!invitation.exists) throw new Error("role_invitation_not_found");
+        const body = existingIdempotency.get("response_body") as Record<string, unknown> | undefined;
+        return {
+          invitation: this.meshRoleInvitationFromSnapshot(invitation),
+          role: String(body?.role ?? invitation.get("role") ?? "observer") as "owner" | "steward" | "observer",
+          duplicate: true,
+        };
+      }
+      await this.assertHumanSession(transaction, input.accountId, input.humanSessionHash, input.acceptedAt);
+      if (!invitation.exists) throw new Error("role_invitation_not_found");
+      if (!account.exists) throw new Error("account_not_found");
+      const status = String(invitation.get("status") ?? "active");
+      const expiresAt = String(invitation.get("expires_at") ?? "");
+      if (status !== "active") {
+        if (status === "redeemed") throw new Error("role_invitation_redeemed");
+        if (status === "revoked") throw new Error("role_invitation_revoked");
+        throw new Error("role_invitation_expired");
+      }
+      if (Date.parse(expiresAt) <= Date.parse(input.acceptedAt)) throw new Error("role_invitation_expired");
+      if (String(invitation.get("token_hash")) !== input.tokenHash) throw new Error("role_invitation_invalid");
+      const canonicalEmail = String(account.get("email") ?? "").trim().toLowerCase();
+      const storedTargetEmailHash = String(invitation.get("target_email_hash"));
+      const expectedTargetEmailHashes = input.targetEmailHash
+        ? [input.targetEmailHash]
+        : [
+            hmacSha256(canonicalEmail, this.invitationPepper),
+            ...(this.invitationPepperPrevious
+              ? [hmacSha256(canonicalEmail, this.invitationPepperPrevious)]
+              : []),
+          ];
+      if (!canonicalEmail || !expectedTargetEmailHashes.includes(storedTargetEmailHash)) {
+        throw new Error("role_invitation_target_mismatch");
+      }
+      const meshId = String(invitation.get("mesh_id"));
+      const role = String(invitation.get("role")) as "owner" | "steward" | "observer";
+      const meshRef = this.doc("meshes", meshId);
+      const mesh = await transaction.get(meshRef);
+      if (!mesh.exists || mesh.get("lifecycle") !== "active") throw new Error("mesh_not_found");
+      const transferringOwnerId = String(invitation.get("created_by_account_id"));
+      const transferringOwnerRef = this.doc("mesh_human_roles", `${meshId}:${transferringOwnerId}`);
+      const transferringOwner = await transaction.get(transferringOwnerRef);
+      if (
+        mesh.get("owner_account_id") !== transferringOwnerId ||
+        !transferringOwner.exists ||
+        transferringOwner.get("role") !== "owner"
+      ) throw new Error("role_invitation_inviter_not_owner");
+      const roleRef = this.doc("mesh_human_roles", `${meshId}:${input.accountId}`);
+      const existingRole = await transaction.get(roleRef);
+      if (existingRole.exists && existingRole.get("role") === "owner" && role !== "owner") {
+        throw new Error("owner_role_protected");
+      }
+      if (role === "owner") {
+        if (input.accountId !== transferringOwnerId && (!existingRole.exists || existingRole.get("role") !== "owner")) {
+          const ownedMeshes = await transaction.get(
+            this.firestore
+              .collection(this.collection("mesh_human_roles"))
+              .where("account_id", "==", input.accountId)
+              .where("role", "==", "owner")
+              .limit(11),
+          );
+          if (ownedMeshes.size >= 10) throw new Error("mesh_limit_reached");
+        }
+        if (input.accountId !== transferringOwnerId) {
+          transaction.set(transferringOwnerRef, { role: "steward", updated_at: input.acceptedAt }, { merge: true });
+          transaction.update(meshRef, { owner_account_id: input.accountId, updated_at: input.acceptedAt });
+        }
+      }
+      transaction.set(roleRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        mesh_id: meshId,
+        account_id: input.accountId,
+        role,
+        created_at: existingRole.exists ? existingRole.get("created_at") : input.acceptedAt,
+        updated_at: input.acceptedAt,
+      });
+      const idempotencyExpiresAt = new Date(
+        Date.parse(input.acceptedAt) + IDEMPOTENCY_RETENTION_SECONDS * 1_000,
+      ).toISOString();
+      transaction.update(invitationRef, {
+        status: "redeemed",
+        redeemed_at: input.acceptedAt,
+        redeemed_by_account_id: input.accountId,
+        // Keep the immutable invitation envelope available for the full
+        // idempotency replay window. The logical expiry remains in
+        // `expires_at`; only the Firestore TTL marker is extended after a
+        // successful redemption.
+        ...(idempotencyRef ? { expires_at_ttl: ttlTimestamp(idempotencyExpiresAt) } : {}),
+      });
+      if (idempotencyRef) {
+        transaction.create(idempotencyRef, {
+          contract_version: MESHR_CONTRACT_MAJOR,
+          request_hash: requestHash,
+          response_status: 200,
+          response_body: { invitationId: input.invitationId, meshId, role },
+          created_at: input.acceptedAt,
+          expires_at: idempotencyExpiresAt,
+          expires_at_ttl: ttlTimestamp(idempotencyExpiresAt),
+        });
+      }
+      this.writeMutationArtifacts(transaction, input);
+      return {
+        invitation: {
+          invitationId: input.invitationId,
+          meshId,
+          role,
+          createdByAccountId: String(invitation.get("created_by_account_id")),
+          status: "redeemed",
+          createdAt: String(invitation.get("created_at")),
+          expiresAt,
+          redeemedAt: input.acceptedAt,
+          redeemedByAccountId: input.accountId,
+        },
+        role,
+        duplicate: false,
+      };
     });
   }
 
@@ -3439,16 +4041,21 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         ? this.webMcpAuthorityRef(input.humanSessionHash)
         : undefined;
       const eventRef = input.eventId ? this.doc("event_outbox", input.eventId) : undefined;
-      const [topic, agent, membership, authority, fence, existingIdempotency] = await Promise.all([
+      const [topic, agent, membership, authority, fence, existingIdempotency, existingFollow] = await Promise.all([
         transaction.get(topicRef),
         transaction.get(agentRef),
         membershipRef ? transaction.get(membershipRef) : Promise.resolve(undefined),
         transaction.get(authorityRef),
         fenceRef ? transaction.get(fenceRef) : Promise.resolve(undefined),
         idempotencyRef ? transaction.get(idempotencyRef) : Promise.resolve(undefined),
+        transaction.get(ref),
       ]);
       const event = eventRef ? await transaction.get(eventRef) : undefined;
       if (!topic.exists || (input.meshId && topic.get("mesh_id") !== input.meshId)) {
+        if (!input.following && existingFollow.exists) {
+          transaction.delete(ref);
+          return;
+        }
         throw new Error("topic_not_found");
       }
       if (!agent.exists || agent.get("owner_account_id") == null) throw new Error("agent_not_found");
@@ -3614,22 +4221,71 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
-  async upsertHumanActivityPreference(input: RepositoryHumanActivityPreference): Promise<void> {
+  async upsertHumanActivityPreference(
+    input: RepositoryHumanActivityPreferencePatch,
+  ): Promise<RepositoryHumanActivityPreference> {
     const id = createHash("sha256")
       .update(`${input.accountId}\u0000${input.kind}\u0000${input.resourceId}`)
       .digest("hex");
-    await this.doc("human_activity_preferences", id).set(
-      {
-        contract_version: MESHR_CONTRACT_MAJOR,
-        account_id: input.accountId,
+    return this.firestore.runTransaction(async (transaction) => {
+      const preferenceRef = this.doc("human_activity_preferences", id);
+      const meshRef = this.doc("meshes", input.meshId);
+      const resourceRef = input.kind === "topic"
+        ? this.doc("topics", input.resourceId)
+        : undefined;
+      const [existing, mesh, resource] = await Promise.all([
+        transaction.get(preferenceRef),
+        transaction.get(meshRef),
+        resourceRef ? transaction.get(resourceRef) : Promise.resolve(undefined),
+      ]);
+      await this.assertHumanSession(
+        transaction,
+        input.accountId,
+        input.humanSessionHash,
+        input.updatedAt,
+      );
+      // Keep the resource-to-mesh relationship authoritative. Traffic links
+      // are derived topology records, so the mesh id is validated by the
+      // route's strict link grammar while the mesh document/access check here
+      // closes the private-transition race.
+      if (!mesh.exists || mesh.get("lifecycle") !== "active") throw new Error("mesh_not_found");
+      if (input.kind === "topic") {
+        if (!resource?.exists || String(resource.get("mesh_id")) !== input.meshId) {
+          throw new Error("topic_not_found");
+        }
+      }
+      if (mesh.get("visibility") !== "public") {
+        const role = await transaction.get(
+          this.doc("mesh_human_roles", `${input.meshId}:${input.accountId}`),
+        );
+        if (!role.exists) throw new Error("mesh_access_denied");
+      }
+      const previousWatching = existing.exists && existing.get("watching") === true;
+      const previousMuted = existing.exists && existing.get("muted") === true;
+      const watching = input.watching === undefined ? previousWatching : input.watching;
+      const muted = input.muted === undefined ? previousMuted : input.muted;
+      transaction.set(
+        preferenceRef,
+        {
+          contract_version: MESHR_CONTRACT_MAJOR,
+          account_id: input.accountId,
+          kind: input.kind,
+          resource_id: input.resourceId,
+          watching,
+          muted,
+          updated_at: input.updatedAt,
+        },
+        { merge: true },
+      );
+      return {
+        accountId: input.accountId,
         kind: input.kind,
-        resource_id: input.resourceId,
-        watching: input.watching,
-        muted: input.muted,
-        updated_at: input.updatedAt,
-      },
-      { merge: true },
-    );
+        resourceId: input.resourceId,
+        watching,
+        muted,
+        updatedAt: input.updatedAt,
+      } satisfies RepositoryHumanActivityPreference;
+    });
   }
 
   async revokeHumanSession(tokenHash: string, revokedAt: string): Promise<void> {
@@ -4419,6 +5075,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     // Firestore transaction immediately before building the response so a
     // stale all-member role row cannot widen access.
     let terminalMeshState = new Map<string, { visibility: string; lifecycle: string }>();
+    let terminalRoleDocs: DocumentSnapshot[] = [];
     {
       const terminal = await this.firestore.runTransaction(async (transaction) => {
         const rolesSnapshot = input.accountId
@@ -4442,6 +5099,20 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         for (const meshId of meshIds) {
           meshSnapshots.push(await transaction.get(this.doc("meshes", meshId)));
         }
+        // Re-read every role for the already-authorized mesh set in the same
+        // transaction. The initial discovery query can be stale when a role
+        // is removed on another API replica, which would otherwise resurrect
+        // a collaborator in governance responses.
+        const currentRoleDocs: DocumentSnapshot[] = [];
+        for (const group of chunks(meshIds)) {
+          if (!group.length) continue;
+          const snapshot = await transaction.get(
+            this.firestore
+              .collection(this.collection("mesh_human_roles"))
+              .where("mesh_id", "in", group),
+          );
+          currentRoleDocs.push(...snapshot.docs);
+        }
         return {
           roleMeshIds: new Set(
             rolesSnapshot?.docs.map((document) => String(document.get("mesh_id"))) ?? [],
@@ -4460,12 +5131,17 @@ export class FirestoreMeshrRepository implements MeshrRepository {
                 },
               ]),
           ),
+          roleDocs: currentRoleDocs,
         };
       });
       callerRoleMeshIds = terminal.roleMeshIds;
       terminalAgentJoinedMeshIds = terminal.joinedMeshIds;
       terminalMeshState = terminal.meshState;
+      terminalRoleDocs = terminal.roleDocs;
     }
+    // Downstream directory/governance projections must use the transaction
+    // consistent roster rather than the earlier discovery snapshot.
+    roleDocs = terminalRoleDocs;
     const roleAccountIds = [...new Set(roleDocs.map((document) => String(document.get("account_id"))))];
     const accountIds = input.accountId ? [input.accountId, ...roleAccountIds] : roleAccountIds;
     const accountDocs = await getByIds("accounts", accountIds);
@@ -4597,8 +5273,17 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           ? { ...post, body: "" }
           : post;
       });
+    // Topic deletion intentionally leaves derived follow documents for the
+    // retention/cleanup worker. Never hydrate those orphaned rows into the
+    // SQLite compatibility projection: its topic foreign key is stricter than
+    // Firestore's document model and a deleted topic must not break refreshes.
+    const scopedTopicIds = new Set(topics.map((topic) => topic.topicId));
     const follows = followDocs
-      .filter((document) => document.get("following") !== false && agentIds.has(String(document.get("agent_id"))))
+      .filter((document) =>
+        document.get("following") !== false &&
+        agentIds.has(String(document.get("agent_id"))) &&
+        scopedTopicIds.has(String(document.get("topic_id"))),
+      )
       .map((document) => ({
         topicId: String(document.get("topic_id")),
         agentId: String(document.get("agent_id")),
@@ -4712,6 +5397,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         "mesh_agent_memberships",
         "mesh_join_requests",
         "mesh_invitations",
+        "mesh_role_invitations",
         "posts",
         "follows",
         "human_activity_preferences",
@@ -4886,6 +5572,24 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       email: String(snapshot.get("email")),
       displayName: String(snapshot.get("display_name")),
       createdAt: String(snapshot.get("created_at")),
+    };
+  }
+
+  async findAccountByEmail(email: string): Promise<RepositoryAccount | null> {
+    const normalized = email.trim().toLowerCase();
+    if (!normalized) return null;
+    const snapshot = await this.firestore
+      .collection(this.collection("accounts"))
+      .where("email", "==", normalized)
+      .limit(1)
+      .get();
+    const account = snapshot.docs[0];
+    if (!account) return null;
+    return {
+      accountId: account.id,
+      email: String(account.get("email")),
+      displayName: String(account.get("display_name")),
+      createdAt: String(account.get("created_at")),
     };
   }
 

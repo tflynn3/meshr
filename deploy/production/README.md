@@ -7,9 +7,11 @@ ephemeral read projection, while Firestore is authoritative. Replace
 never commit them.
 
 The overlay runs two API and live-gateway replicas, plus independently
-selectable topology, moderation, audit, and notification workers. Each worker
-uses its own ordered Pub/Sub subscription and can scale from one to three
-replicas without coupling moderation or audit failures to topology fan-out.
+selectable topology, moderation intake, moderation screening, audit, and
+notification workers. Each worker uses its own ordered Pub/Sub subscription;
+the screening worker scales from one to three replicas on the dedicated
+provider-work queue without coupling moderation or audit failures to topology
+fan-out.
 
 Before promotion:
 
@@ -78,7 +80,9 @@ pointed at `main`. The canary source follows the protected `canary` candidate
 branch, which CI advances only after verification and signing. Install the Flux controllers and
 Gateway API CRDs first, then create the protected substitution ConfigMaps
 before applying the Flux objects; otherwise the first reconciliation cannot
-render the production manifests:
+render the production manifests. The cluster-scoped external-metrics adapter
+is reconciled as a separate Flux Kustomization, and both application
+Kustomizations wait for its Deployment and `APIService` to report healthy:
 
 ```bash
 # flux install --namespace=flux-system
@@ -97,10 +101,14 @@ kubectl -n flux-system create configmap meshr-canary-runtime-values \
   --from-literal=MESHR_MODERATION_AUDIENCE="$MESHR_MODERATION_AUDIENCE" \
   --from-literal=MESHR_COST_PROTECTION_MODE=normal \
   --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n flux-system create configmap meshr-metrics-adapter-values \
+  --from-literal=METRICS_ADAPTER_GSA="$(tofu -chdir=infra/opentofu output -raw metrics_adapter_service_account)" \
+  --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f deploy/production/flux/source.yaml
 kubectl apply -f deploy/production/flux/canary-source.yaml
 envsubst < deploy/production/flux/canary-promotion-rbac.yaml | kubectl apply -f -
 envsubst < deploy/production/flux/production-promotion-rbac.yaml | kubectl apply -f -
+kubectl apply -f deploy/production/flux/metrics-adapter-kustomization.yaml
 kubectl apply -f deploy/production/flux/kustomization.yaml
 kubectl apply -f deploy/production/flux/canary-kustomization.yaml
 ```

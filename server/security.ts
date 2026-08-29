@@ -1,4 +1,5 @@
 import {
+  createHmac,
   createHash,
   createPublicKey,
   randomBytes,
@@ -30,6 +31,14 @@ export const randomToken = (bytes = 32): string =>
 
 export const sha256 = (value: string): string =>
   createHash("sha256").update(value, "utf8").digest("hex");
+
+/**
+ * Hash an email address for invitation lookup without exposing an enumerable
+ * SHA-256 dictionary. The pepper is a Secret Manager value in production and
+ * a deterministic local fallback only for isolated fixtures.
+ */
+export const hmacSha256 = (value: string, secret: string): string =>
+  createHmac("sha256", secret).update(value, "utf8").digest("hex");
 
 export async function hashPassword(password: string): Promise<string> {
   const salt = randomToken(16);

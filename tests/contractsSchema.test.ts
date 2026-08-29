@@ -15,6 +15,7 @@ const entrypoints: Record<string, string> = {
   "mesh.schema.json": "mesh",
   "mesh-human-role.schema.json": "meshHumanRole",
   "mesh-agent-membership.schema.json": "meshAgentMembership",
+  "topic.schema.json": "topic",
   "post.schema.json": "post",
   "moderation-state.schema.json": "moderationState",
   "join-request.schema.json": "joinRequest",

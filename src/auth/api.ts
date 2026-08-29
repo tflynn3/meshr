@@ -191,6 +191,20 @@ export interface MeshInvitation {
   redeemedAgentId: string | null;
 }
 
+export type MeshRoleInvitationStatus = "active" | "redeemed" | "revoked" | "expired";
+
+export interface MeshRoleInvitation {
+  id: string;
+  meshId: string;
+  role: MeshRoleSummary["role"];
+  createdByAccountId: string;
+  status: MeshRoleInvitationStatus;
+  createdAt: string;
+  expiresAt: string;
+  redeemedAt: string | null;
+  redeemedByAccountId: string | null;
+}
+
 export interface MeshJoinRequest {
   id: string;
   meshId: string;
@@ -467,6 +481,61 @@ export async function updateMeshGovernance(
   );
 }
 
+export async function listMeshTopics(meshId: string): Promise<MeshTopicSummary[]> {
+  const response = await request<{ topics: MeshTopicSummary[] }>(
+    `/v1/meshes/${encodeURIComponent(meshId)}/topics`,
+  );
+  return response.topics;
+}
+
+export async function createMeshTopic(
+  meshId: string,
+  input: { name: string; title: string; description?: string; tags?: string[] },
+  csrfToken: string,
+): Promise<{ topic: MeshTopicSummary }> {
+  return request(`/v1/meshes/${encodeURIComponent(meshId)}/topics`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Meshr-CSRF": csrfToken,
+    },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function updateMeshTopic(
+  meshId: string,
+  topicId: string,
+  input: { name?: string; title?: string; description?: string; tags?: string[] },
+  csrfToken: string,
+): Promise<{ topic: MeshTopicSummary }> {
+  return request(
+    `/v1/meshes/${encodeURIComponent(meshId)}/topics/${encodeURIComponent(topicId)}`,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Meshr-CSRF": csrfToken,
+      },
+      body: JSON.stringify(input),
+    },
+  );
+}
+
+export async function deleteMeshTopic(
+  meshId: string,
+  topicId: string,
+  csrfToken: string,
+): Promise<{ meshId: string; topicId: string; deleted: boolean }> {
+  return request(
+    `/v1/meshes/${encodeURIComponent(meshId)}/topics/${encodeURIComponent(topicId)}`,
+    {
+      method: "DELETE",
+      headers: { "X-Meshr-CSRF": csrfToken },
+    },
+  );
+}
+
 export async function updateMeshRole(
   meshId: string,
   accountId: string,
@@ -483,6 +552,69 @@ export async function updateMeshRole(
   });
 }
 
+export async function addMeshMemberByEmail(
+  meshId: string,
+  input: { email: string; role: MeshRoleSummary["role"] },
+  csrfToken: string,
+): Promise<{
+  invitation: MeshRoleInvitation;
+  token: string;
+}> {
+  return request(`/v1/meshes/${encodeURIComponent(meshId)}/role-invitations`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Meshr-CSRF": csrfToken,
+    },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function listRoleInvitations(): Promise<MeshRoleInvitation[]> {
+  const response = await request<{ invitations: MeshRoleInvitation[] }>(
+    "/v1/account/role-invitations",
+  );
+  return response.invitations;
+}
+
+export async function listMeshRoleInvitations(meshId: string): Promise<MeshRoleInvitation[]> {
+  const response = await request<{ invitations: MeshRoleInvitation[] }>(
+    `/v1/meshes/${encodeURIComponent(meshId)}/role-invitations`,
+  );
+  return response.invitations;
+}
+
+export async function acceptRoleInvitation(
+  invitationId: string,
+  token: string,
+  csrfToken: string,
+  idempotencyKey = `role-accept-${invitationId}`,
+): Promise<{ invitation: MeshRoleInvitation; role: MeshRoleSummary["role"]; duplicate: boolean }> {
+  return request(`/v1/account/role-invitations/${encodeURIComponent(invitationId)}/accept`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Meshr-CSRF": csrfToken,
+      "Idempotency-Key": idempotencyKey,
+    },
+    body: JSON.stringify({ token }),
+  });
+}
+
+export async function revokeRoleInvitation(
+  meshId: string,
+  invitationId: string,
+  csrfToken: string,
+): Promise<{ meshId: string; invitationId: string; status: "revoked" }> {
+  return request(
+    `/v1/meshes/${encodeURIComponent(meshId)}/role-invitations/${encodeURIComponent(invitationId)}/revoke`,
+    {
+      method: "POST",
+      headers: { "X-Meshr-CSRF": csrfToken },
+    },
+  );
+}
+
 export async function removeMeshRole(
   meshId: string,
   accountId: string,
@@ -494,6 +626,22 @@ export async function removeMeshRole(
       "X-Meshr-CSRF": csrfToken,
     },
   });
+}
+
+/** Remove an already-joined agent from a mesh. Humans can govern membership,
+ * but the server still requires a current owner/steward role and CSRF proof. */
+export async function removeMeshAgentFromMesh(
+  meshId: string,
+  agentId: string,
+  csrfToken: string,
+): Promise<{ meshId: string; agentId: string; status: "removed" }> {
+  return request(
+    `/v1/meshes/${encodeURIComponent(meshId)}/agents/${encodeURIComponent(agentId)}`,
+    {
+      method: "DELETE",
+      headers: { "X-Meshr-CSRF": csrfToken },
+    },
+  );
 }
 
 export async function listMeshInvitations(meshId: string): Promise<MeshInvitation[]> {

@@ -6,6 +6,9 @@ claim, or projected steady-state infrastructure cost above the approved
 target.
 
 - [ ] Clean-environment OpenTofu apply in `us-central1`.
+- [ ] Pinned GKE external-metrics adapter is installed through the cluster
+      bootstrap Flux Kustomization, its `APIService` is Available, and both
+      moderation HPAs resolve the Pub/Sub backlog selector.
 - [ ] Cloudflare delegation, `meshr.social`, and reserved
       `staging.meshr.social` verified with Full (strict) TLS.
 - [ ] GitHub `main`, `canary`, and `production` refs reject ordinary,

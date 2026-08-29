@@ -109,6 +109,163 @@ test("health and public discovery expose a durable seeded commons", async () => 
   );
 });
 
+test("expired native renewal recovers deterministically and fences stale retries", async () => {
+  const { app, baseUrl } = await start();
+  const keyPair = generateKeyPairSync("ed25519");
+  const publicKey = keyPair.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const registration = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "renewal-owner@example.test",
+      password: "correct horse battery staple",
+      displayName: "Renewal Owner",
+    },
+  });
+  assert.equal(registration.response.status, 201);
+  const cookie = cookieFrom(registration.response);
+  const csrf = registration.json.csrfToken as string;
+  const pairing = await requestJson(baseUrl, "/v1/pairings", {
+    method: "POST",
+    body: {
+      runtime: "openclaw",
+      label: "Renewal fixture",
+      externalSubject: "openclaw:renewal-fixture",
+      publicKey,
+      profile: {
+        name: "Renewal Fixture",
+        handle: "renewal-fixture",
+        attention: { browse: "public", rootPosts: "draft", replies: "never" },
+      },
+    },
+  });
+  assert.equal(pairing.response.status, 201);
+  const pairingId = pairing.json.pairingId as string;
+  const pairingAuth = `Pairing ${pairing.json.pairingSecret as string}`;
+  const approval = await requestJson(baseUrl, `/v1/pairings/${pairingId}/approve`, {
+    method: "POST",
+    cookie,
+    csrf,
+    body: {},
+  });
+  assert.equal(approval.response.status, 200);
+
+  const claimChallenge = await requestJson(baseUrl, `/v1/pairings/${pairingId}/challenges`, {
+    method: "POST",
+    authorization: pairingAuth,
+    body: {},
+  });
+  const claimSignature = sign(
+    null,
+    Buffer.from(claimChallenge.json.message as string, "utf8"),
+    keyPair.privateKey,
+  ).toString("base64url");
+  const claim = await requestJson(baseUrl, "/v1/agent-sessions", {
+    method: "POST",
+    authorization: pairingAuth,
+    body: {
+      pairingId,
+      challengeId: claimChallenge.json.challengeId,
+      signature: claimSignature,
+    },
+  });
+  assert.equal(claim.response.status, 201);
+  const agentId = claim.json.agent.id as string;
+  const predecessorSessionId = claim.json.sessionId as string;
+  app.database.sqlite
+    .prepare("UPDATE agent_sessions SET expires_at = ? WHERE session_id = ? AND agent_id = ?")
+    .run("2026-08-27T17:59:00.000Z", predecessorSessionId, agentId);
+
+  const recoveryChallenge = await requestJson(baseUrl, `/v1/pairings/${pairingId}/challenges`, {
+    method: "POST",
+    authorization: pairingAuth,
+    body: { sessionId: predecessorSessionId },
+  });
+  assert.equal(recoveryChallenge.response.status, 201);
+  assert.match(recoveryChallenge.json.message as string, /:renew:/);
+  const recoverySignature = sign(
+    null,
+    Buffer.from(recoveryChallenge.json.message as string, "utf8"),
+    keyPair.privateKey,
+  ).toString("base64url");
+  const renewed = await requestJson(baseUrl, "/v1/agent-sessions/renew", {
+    method: "POST",
+    authorization: pairingAuth,
+    body: {
+      pairingId,
+      challengeId: recoveryChallenge.json.challengeId,
+      sessionId: predecessorSessionId,
+      signature: recoverySignature,
+    },
+  });
+  assert.equal(renewed.response.status, 201);
+  const successorSessionId = renewed.json.sessionId as string;
+  assert.notEqual(successorSessionId, predecessorSessionId);
+  assert.ok(renewed.json.token);
+  const predecessor = app.database.sqlite
+    .prepare("SELECT status, superseded_by FROM agent_sessions WHERE session_id = ?")
+    .get(predecessorSessionId) as { status: string; superseded_by: string | null };
+  assert.equal(predecessor.status, "superseded");
+  assert.equal(predecessor.superseded_by, successorSessionId);
+
+  // If the first response was lost, the host can repeat the signed challenge
+  // and receive the same deterministic successor without a second authority
+  // mutation. The old session remains fenced after recovery.
+  const retryChallenge = await requestJson(baseUrl, `/v1/pairings/${pairingId}/challenges`, {
+    method: "POST",
+    authorization: pairingAuth,
+    body: { sessionId: predecessorSessionId },
+  });
+  assert.equal(retryChallenge.response.status, 201);
+  const retrySignature = sign(
+    null,
+    Buffer.from(retryChallenge.json.message as string, "utf8"),
+    keyPair.privateKey,
+  ).toString("base64url");
+  const retry = await requestJson(baseUrl, "/v1/agent-sessions/renew", {
+    method: "POST",
+    authorization: pairingAuth,
+    body: {
+      pairingId,
+      challengeId: retryChallenge.json.challengeId,
+      sessionId: predecessorSessionId,
+      signature: retrySignature,
+    },
+  });
+  assert.equal(retry.response.status, 200);
+  assert.equal(retry.json.sessionId, successorSessionId);
+  assert.equal(retry.json.token, renewed.json.token);
+
+  const staleChallenge = await requestJson(baseUrl, `/v1/pairings/${pairingId}/challenges`, {
+    method: "POST",
+    authorization: pairingAuth,
+    body: { sessionId: predecessorSessionId },
+  });
+  assert.equal(staleChallenge.response.status, 201);
+  const staleSignature = sign(
+    null,
+    Buffer.from(staleChallenge.json.message as string, "utf8"),
+    keyPair.privateKey,
+  ).toString("base64url");
+  // The deterministic successor is still recoverable, but a challenge bound
+  // to a different stale predecessor can never mint a second active session.
+  const staleRetry = await requestJson(baseUrl, "/v1/agent-sessions/renew", {
+    method: "POST",
+    authorization: pairingAuth,
+    body: {
+      pairingId,
+      challengeId: staleChallenge.json.challengeId,
+      sessionId: predecessorSessionId,
+      signature: staleSignature,
+    },
+  });
+  assert.equal(staleRetry.response.status, 200);
+  assert.equal(staleRetry.json.sessionId, successorSessionId);
+  assert.equal(
+    (app.database.sqlite.prepare("SELECT COUNT(*) AS count FROM agent_sessions WHERE agent_id = ? AND status = 'active'").get(agentId) as { count: number }).count,
+    1,
+  );
+});
+
 test("durable projection refresh updates an existing moderation state", async () => {
   const directory = mkdtempSync(join(tmpdir(), "meshr-projection-test-"));
   const clock = new TestClock();
@@ -463,6 +620,144 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
   });
   assert.equal(privateMesh.response.status, 201);
   const privateMeshId = privateMesh.json.mesh.id as string;
+  const collaboratorRegistration = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "steward@example.test",
+      password: "another correct horse battery staple",
+      displayName: "Mesh Steward",
+    },
+  });
+  assert.equal(collaboratorRegistration.response.status, 201);
+  const collaboratorCookie = cookieFrom(collaboratorRegistration.response);
+  const collaboratorCsrf = collaboratorRegistration.json.csrfToken as string;
+  const collaboratorId = collaboratorRegistration.json.user.id as string;
+  const roleInvite = await requestJson(baseUrl, `/v1/meshes/${privateMeshId}/role-invitations`, {
+    method: "POST",
+    cookie,
+    csrf,
+    body: { email: "STEWARD@example.test", role: "steward" },
+  });
+  assert.equal(roleInvite.response.status, 201);
+  assert.equal(roleInvite.json.invitation.role, "steward");
+  assert.equal(typeof roleInvite.json.token, "string");
+  const bypassRoleInvite = await requestJson(
+    baseUrl,
+    `/v1/meshes/${privateMeshId}/roles/${collaboratorId}`,
+    {
+      method: "PUT",
+      cookie,
+      csrf,
+      body: { role: "observer" },
+    },
+  );
+  assert.equal(bypassRoleInvite.response.status, 409);
+  assert.equal(bypassRoleInvite.json.error.code, "role_invitation_required");
+  const pendingGovernance = await requestJson(baseUrl, `/v1/meshes/${privateMeshId}/governance`, { cookie });
+  assert.equal(
+    pendingGovernance.json.roles.some((role: any) => role.accountId === collaboratorId),
+    false,
+  );
+  const acceptedRoleInvite = await requestJson(
+    baseUrl,
+    `/v1/account/role-invitations/${roleInvite.json.invitation.id}/accept`,
+    {
+      method: "POST",
+      cookie: collaboratorCookie,
+      csrf: collaboratorCsrf,
+      idempotencyKey: "role-accept-e2e-001",
+      body: { token: roleInvite.json.token },
+    },
+  );
+  assert.equal(acceptedRoleInvite.response.status, 201);
+  assert.equal(acceptedRoleInvite.json.role, "steward");
+  const duplicateRoleInvite = await requestJson(
+    baseUrl,
+    `/v1/account/role-invitations/${roleInvite.json.invitation.id}/accept`,
+    {
+      method: "POST",
+      cookie: collaboratorCookie,
+      csrf: collaboratorCsrf,
+      idempotencyKey: "role-accept-e2e-001",
+      body: { token: roleInvite.json.token },
+    },
+  );
+  assert.equal(duplicateRoleInvite.response.status, 200);
+  assert.equal(duplicateRoleInvite.json.duplicate, true);
+  const unknownCollaborator = await requestJson(baseUrl, `/v1/meshes/${privateMeshId}/role-invitations`, {
+    method: "POST",
+    cookie,
+    csrf,
+    body: { email: "missing@example.test", role: "observer" },
+  });
+  assert.equal(unknownCollaborator.response.status, 201);
+  const retiredRoleEndpoint = await requestJson(baseUrl, `/v1/meshes/${privateMeshId}/roles`, {
+    method: "POST",
+    cookie,
+    csrf,
+    body: { email: "missing@example.test", role: "observer" },
+  });
+  assert.equal(retiredRoleEndpoint.response.status, 410);
+  assert.equal(retiredRoleEndpoint.json.error.code, "role_invitation_required");
+  const stewardCannotInvite = await requestJson(baseUrl, `/v1/meshes/${privateMeshId}/role-invitations`, {
+    method: "POST",
+    cookie: collaboratorCookie,
+    csrf: collaboratorCsrf,
+    body: { email: "missing@example.test", role: "observer" },
+  });
+  assert.equal(stewardCannotInvite.response.status, 403);
+  assert.equal(stewardCannotInvite.json.error.code, "mesh_governance_denied");
+  const initialTopics = await requestJson(baseUrl, `/v1/meshes/${privateMeshId}/topics`, { cookie });
+  assert.equal(initialTopics.response.status, 200);
+  assert.equal(initialTopics.json.topics.some((topic: any) => topic.name === "general"), true);
+  const generalTopicId = initialTopics.json.topics.find((topic: any) => topic.name === "general").id as string;
+  const createdTopic = await requestJson(baseUrl, `/v1/meshes/${privateMeshId}/topics`, {
+    method: "POST",
+    cookie,
+    csrf,
+    body: {
+      name: "field-notes",
+      title: "Field notes",
+      description: "Small observations worth connecting.",
+      tags: ["observations", "ideas"],
+    },
+  });
+  assert.equal(createdTopic.response.status, 201);
+  assert.equal(createdTopic.json.topic.name, "field-notes");
+  const duplicateTopic = await requestJson(baseUrl, `/v1/meshes/${privateMeshId}/topics`, {
+    method: "POST",
+    cookie,
+    csrf,
+    body: { name: "field-notes", title: "Another title" },
+  });
+  assert.equal(duplicateTopic.response.status, 409);
+  assert.equal(duplicateTopic.json.error.code, "topic_name_taken");
+  const updatedTopic = await requestJson(
+    baseUrl,
+    `/v1/meshes/${privateMeshId}/topics/${createdTopic.json.topic.id}`,
+    {
+      method: "PUT",
+      cookie,
+      csrf,
+      body: { title: "Connected field notes", tags: ["connections"] },
+    },
+  );
+  assert.equal(updatedTopic.response.status, 200);
+  assert.equal(updatedTopic.json.topic.title, "Connected field notes");
+  const deletedTopic = await requestJson(
+    baseUrl,
+    `/v1/meshes/${privateMeshId}/topics/${createdTopic.json.topic.id}`,
+    { method: "DELETE", cookie, csrf },
+  );
+  assert.equal(deletedTopic.response.status, 200);
+  assert.equal(deletedTopic.json.deleted, true);
+  const lastTopic = await requestJson(baseUrl, `/v1/meshes/${privateMeshId}/topics/${generalTopicId}`, {
+    method: "DELETE",
+    cookie,
+    csrf,
+  });
+  assert.equal(lastTopic.response.status, 409);
+  assert.equal(lastTopic.json.error.code, "last_topic");
   const invitation = await requestJson(baseUrl, `/v1/meshes/${privateMeshId}/invitations`, {
     method: "POST",
     cookie,
@@ -993,6 +1288,162 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
   });
   assert.equal(login.response.status, 200);
   assert.match(cookieFrom(login.response), /^meshr_session=/);
+});
+
+test("owner transfer requires target acceptance and preserves the last-owner invariant", async () => {
+  const { baseUrl } = await start();
+  const owner = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "transfer-owner@example.test",
+      password: "a sufficiently long owner passphrase",
+      displayName: "Transfer Owner",
+    },
+  });
+  const ownerCookie = cookieFrom(owner.response);
+  const ownerCsrf = owner.json.csrfToken as string;
+  const target = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "transfer-target@example.test",
+      password: "a sufficiently long target passphrase",
+      displayName: "Transfer Target",
+    },
+  });
+  const targetCookie = cookieFrom(target.response);
+  const targetCsrf = target.json.csrfToken as string;
+  const mesh = await requestJson(baseUrl, "/v1/meshes", {
+    method: "POST",
+    cookie: ownerCookie,
+    csrf: ownerCsrf,
+    idempotencyKey: "owner-transfer-mesh-001",
+    body: {
+      name: "Transfer test mesh",
+      description: "Target acceptance fixture",
+      visibility: "private",
+      joinPolicy: "open",
+      agentIds: [],
+    },
+  });
+  assert.equal(mesh.response.status, 201);
+  const meshId = mesh.json.mesh.id as string;
+  const invitation = await requestJson(baseUrl, `/v1/meshes/${meshId}/role-invitations`, {
+    method: "POST",
+    cookie: ownerCookie,
+    csrf: ownerCsrf,
+    body: { email: "transfer-target@example.test", role: "owner" },
+  });
+  assert.equal(invitation.response.status, 201);
+  const before = await requestJson(baseUrl, `/v1/meshes/${meshId}/governance`, { cookie: ownerCookie });
+  assert.equal(before.json.mesh.ownerId, owner.json.user.id);
+  assert.equal(before.json.roles.some((role: any) => role.accountId === target.json.user.id), false);
+  const accepted = await requestJson(
+    baseUrl,
+    `/v1/account/role-invitations/${invitation.json.invitation.id}/accept`,
+    {
+      method: "POST",
+      cookie: targetCookie,
+      csrf: targetCsrf,
+      idempotencyKey: "owner-transfer-accept-001",
+      body: { token: invitation.json.token },
+    },
+  );
+  assert.equal(accepted.response.status, 201);
+  assert.equal(accepted.json.role, "owner");
+  const after = await requestJson(baseUrl, `/v1/meshes/${meshId}/governance`, { cookie: targetCookie });
+  assert.equal(after.json.mesh.ownerId, target.json.user.id);
+  assert.equal(after.json.roles.find((role: any) => role.accountId === owner.json.user.id)?.role, "steward");
+  assert.equal(after.json.roles.find((role: any) => role.accountId === target.json.user.id)?.role, "owner");
+});
+
+test("governance invitation and role endpoints enforce per-account budgets", async () => {
+  const { app, baseUrl } = await start();
+  const owner = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "governance-rate-owner@example.test",
+      password: "a sufficiently long owner passphrase",
+      displayName: "Governance Rate Owner",
+    },
+  });
+  assert.equal(owner.response.status, 201);
+  const ownerCookie = cookieFrom(owner.response);
+  const ownerCsrf = owner.json.csrfToken as string;
+  const target = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "governance-rate-target@example.test",
+      password: "a sufficiently long target passphrase",
+      displayName: "Governance Rate Target",
+    },
+  });
+  assert.equal(target.response.status, 201);
+  const targetId = target.json.user.id as string;
+  const mesh = await requestJson(baseUrl, "/v1/meshes", {
+    method: "POST",
+    cookie: ownerCookie,
+    csrf: ownerCsrf,
+    idempotencyKey: "governance-rate-mesh-001",
+    body: {
+      name: "Governance rate mesh",
+      description: "Per-account governance budget fixture",
+      visibility: "private",
+      joinPolicy: "open",
+      agentIds: [],
+    },
+  });
+  assert.equal(mesh.response.status, 201);
+  const meshId = mesh.json.mesh.id as string;
+  // Seed an already-consented member so the legacy update endpoint exercises
+  // the mutation limiter instead of the invitation-required guard.
+  app.database.sqlite
+    .prepare(
+      `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
+       VALUES(?, ?, 'steward', ?, ?)`,
+    )
+    .run(meshId, targetId, "2026-08-27T18:00:00.000Z", "2026-08-27T18:00:00.000Z");
+
+  const inboxResponses = [];
+  for (let index = 0; index < 11; index += 1) {
+    inboxResponses.push(await requestJson(baseUrl, "/v1/account/role-invitations", { cookie: ownerCookie }));
+  }
+  const inboxLimited = inboxResponses.at(-1)!;
+  assert.equal(inboxLimited.response.status, 429);
+  assert.equal(inboxLimited.json.error.code, "role_invitation_rate_limited");
+  assert.ok(Number(inboxLimited.response.headers.get("retry-after")) >= 1);
+
+  const acceptResponses = [];
+  for (let index = 0; index < 6; index += 1) {
+    acceptResponses.push(
+      await requestJson(baseUrl, "/v1/account/role-invitations/missing-rate-invite/accept", {
+        method: "POST",
+        cookie: ownerCookie,
+        csrf: ownerCsrf,
+        idempotencyKey: `governance-rate-accept-${index}`,
+        body: { token: "a-token-that-is-long-enough" },
+      }),
+    );
+  }
+  const acceptLimited = acceptResponses.at(-1)!;
+  assert.equal(acceptLimited.response.status, 429);
+  assert.equal(acceptLimited.json.error.code, "role_invitation_rate_limited");
+  assert.ok(Number(acceptLimited.response.headers.get("retry-after")) >= 1);
+
+  const roleResponses = [];
+  for (let index = 0; index < 11; index += 1) {
+    roleResponses.push(
+      await requestJson(baseUrl, `/v1/meshes/${meshId}/roles/${targetId}`, {
+        method: "PUT",
+        cookie: ownerCookie,
+        csrf: ownerCsrf,
+        body: { role: "observer" },
+      }),
+    );
+  }
+  const roleLimited = roleResponses.at(-1)!;
+  assert.equal(roleLimited.response.status, 429);
+  assert.equal(roleLimited.json.error.code, "mesh_role_rate_limited");
+  assert.ok(Number(roleLimited.response.headers.get("retry-after")) >= 1);
 });
 
 test("durable event polling rechecks native session authority after a raced query", async () => {

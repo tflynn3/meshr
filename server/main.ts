@@ -33,7 +33,12 @@ const topologyFirestore = firestore && settings.identityProjectId
     )
   : undefined;
 const repository = firestore
-  ? new FirestoreMeshrRepository({ firestore, topologyFirestore })
+  ? new FirestoreMeshrRepository({
+      firestore,
+      topologyFirestore,
+      invitationPepper: settings.invitationPepper,
+      invitationPepperPrevious: settings.invitationPepperPrevious,
+    })
   : undefined;
 if (settings.environment === "production") {
   // The repository port keeps optional methods so SQLite fixtures and small
@@ -44,21 +49,23 @@ if (settings.environment === "production") {
     "ensureEmptyProduction", "checkReady", "createPairing", "approvePairing",
     "updatePairing", "findPairing", "findPairingByCode", "createPairingChallenge",
     "findPairingChallenge", "consumePairingChallenge", "upsertAgent",
-    "updateAgentProfileFromSession", "revokeAgent", "upsertMesh", "createMeshWithOwner",
-    "upsertTopic", "upsertMeshHumanRole", "deleteMeshHumanRole",
-    "upsertMeshAgentMembership", "joinMeshForAgent", "createMeshInvitation",
+    "updateAgentProfileFromSession", "revokeAgent", "upsertMesh", "updateMeshGovernance", "createMeshWithOwner",
+    "upsertTopic", "consumeGovernanceRateLimit", "createTopic", "updateTopic", "deleteTopic", "upsertMeshHumanRole", "deleteMeshHumanRole",
+    "upsertMeshAgentMembership", "joinMeshForAgent", "createMeshInvitation", "createMeshRoleInvitation",
+    "findMeshRoleInvitation", "listMeshRoleInvitations", "listMeshRoleInvitationsForEmail", "revokeMeshRoleInvitation", "acceptMeshRoleInvitation",
     "listMeshInvitations", "revokeMeshInvitation", "upsertJoinRequest", "findJoinRequest",
     "listJoinRequests", "resolveJoinRequest", "upsertFollow", "listProfileReviewProposals",
     "resolveProfileReviewProposal", "listHumanActivityPreferences", "upsertHumanActivityPreference",
     "revokeHumanSession", "revokeWebMcpGrants", "appendEvent", "appendAuditEvent",
     "listAgentEvents", "upsertModerationCase", "findModerationCase", "listModerationCases",
     "updatePostModeration", "findPostById", "listPublishedPostsByTopic", "findAgentById",
+    "listModerationCasesPage",
     "listAgentsForAccount", "listRuntimeSessionsForAgents", "findMeshById", "findTopicById",
     "listTopicsForAgent", "listPublicMeshes", "listPublicTopics", "listMeshDirectoryForAccount",
     "findMeshHumanRole", "findMeshAgentMembership", "listMeshesForAgent", "listJoinedMeshIdsForAgent",
     "loadProjection", "findRuntimeSessionByTokenHash", "findRuntimeSessionById",
     "findActiveRuntimeSessionForAgent", "purgeExpired", "findWebMcpGrant", "findAccountByProvider",
-    "findAccountById", "createSocialAccount", "linkProvider", "listProviderIdentities",
+    "findAccountByEmail", "findAccountById", "createSocialAccount", "linkProvider", "listProviderIdentities",
     "createHumanSession", "findHumanSession", "touchHumanSession", "startRuntimeSession",
     "heartbeatRuntimeSession", "transferPageAuthority", "createPostWithOutbox",
   ] as const;
@@ -101,6 +108,8 @@ const app = createMeshrServer({
       ? createIdentityPlatformVerifier(identityProjectId)
       : undefined,
   webMcpTransfersSession: settings.webMcpTransfersSession,
+  invitationPepper: settings.invitationPepper,
+  invitationPepperPrevious: settings.invitationPepperPrevious,
   repository,
 });
 

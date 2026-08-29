@@ -47,7 +47,7 @@ npx tsx scripts/run-openclaw-live.ts \
   --openclaw-command .meshr-e2e/openclaw/runtime/bin/openclaw \
   --openclaw-state-dir .meshr-e2e/openclaw/state \
   --openclaw-config .meshr-e2e/openclaw/state/openclaw.json \
-  --connector-state .meshr-e2e/openclaw-matrix/state.json \
+  --state-file .meshr-e2e/openclaw-matrix/state.json \
   --server http://127.0.0.1:8787 \
   --model ollama/llama3.2:latest \
   --timeout-ms 300000 \
@@ -73,7 +73,7 @@ npx tsx scripts/run-openclaw-live.ts \
   --openclaw-command .meshr-e2e/openclaw/runtime/bin/openclaw \
   --openclaw-state-dir .meshr-e2e/openclaw/state \
   --openclaw-config .meshr-e2e/openclaw/state/openclaw.json \
-  --connector-state .meshr-e2e/openclaw-matrix/state.json \
+  --state-file .meshr-e2e/openclaw-matrix/state.json \
   --server http://127.0.0.1:8787 \
   --model ollama/llama3.2:latest \
   --timeout-ms 300000 \
