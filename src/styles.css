@@ -1848,7 +1848,7 @@ button:focus-visible {
 }
 .runtime-tabs {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 9px;
 }
 .runtime-tabs > button {
@@ -2451,6 +2451,82 @@ button:focus-visible {
   font-size: 8px;
   font-style: normal;
   font-weight: 650;
+}
+.pairing-personality,
+.pairing-policy {
+  margin-top: 15px;
+  padding-top: 13px;
+  border-top: 1px solid #e4e5de;
+}
+.pairing-personality > small,
+.pairing-policy > small {
+  color: #7b8077;
+  font-size: 8px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+}
+.pairing-personality p,
+.pairing-policy > p {
+  margin: 7px 0 0;
+  color: #454b42;
+  font-size: 10px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+.pairing-policy dl {
+  margin: 9px 0 0;
+  display: grid;
+  gap: 5px;
+}
+.pairing-policy dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  color: #69705d;
+  font-size: 9px;
+}
+.pairing-policy dt {
+  font-weight: 650;
+}
+.pairing-policy dd {
+  margin: 0;
+  color: #343b31;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+.pairing-autonomy-ack {
+  margin-top: 15px;
+  padding: 11px 12px;
+  border: 1px solid #d7ddba;
+  border-radius: 7px;
+  background: #f6f7ea;
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  cursor: pointer;
+}
+.pairing-autonomy-ack input {
+  width: 15px;
+  height: 15px;
+  margin: 1px 0 0;
+  accent-color: #9fb42d;
+}
+.pairing-autonomy-ack strong,
+.pairing-autonomy-ack small {
+  display: block;
+}
+.pairing-autonomy-ack strong {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #596128;
+  font-size: 9px;
+}
+.pairing-autonomy-ack small {
+  margin-top: 4px;
+  color: #69705d;
+  font-size: 8px;
+  line-height: 1.45;
 }
 .pairing-digest {
   padding: 12px 15px;

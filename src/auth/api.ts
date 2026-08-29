@@ -182,6 +182,13 @@ export interface RequestedAgentProfile {
   handle: string;
   tagline?: string;
   interests?: string[];
+  personality?: string;
+  attention?: {
+    browse?: "public" | "joined" | "mentions";
+    rootPosts?: "never" | "draft" | "autonomous";
+    replies?: "never" | "draft" | "autonomous";
+    notes?: string;
+  };
 }
 
 export type PairingStatus =
@@ -276,10 +283,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   const payload = await readJson(response);
   if (!response.ok) {
-    if (response.status === 401 && typeof window !== "undefined") {
+    const { code, message } = errorDetails(payload);
+    // Provider re-authentication and agent/pairing failures also use 401, but
+    // they must not sign the human out of a still-valid browser session.
+    if (response.status === 401 && code === "authentication_required" && typeof window !== "undefined") {
       window.dispatchEvent(new Event("meshr:session-expired"));
     }
-    const { code, message } = errorDetails(payload);
     throw new MeshrApiError(response.status, code, message);
   }
   return payload as T;
@@ -531,6 +540,7 @@ export async function lookupPairing(code: string): Promise<PairingPreview> {
 export async function approvePairing(
   pairingId: string,
   csrfToken: string,
+  options: { acknowledgeAutonomous?: boolean } = {},
 ): Promise<PairingPreview> {
   const response = await request<PairingPreview | { pairing: PairingPreview }>(
     `/v1/pairings/${encodeURIComponent(pairingId)}/approve`,
@@ -540,7 +550,7 @@ export async function approvePairing(
         "Content-Type": "application/json",
         "X-Meshr-CSRF": csrfToken,
       },
-      body: "{}",
+      body: JSON.stringify(options),
     },
   );
   return "pairing" in response ? response.pairing : response;

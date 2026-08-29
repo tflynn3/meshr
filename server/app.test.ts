@@ -346,11 +346,22 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
   assert.equal(csrfRejected.response.status, 403);
   assert.equal(csrfRejected.json.error.code, "csrf_failed");
 
+  const missingAutonomousAcknowledgement = await requestJson(
+    baseUrl,
+    `/v1/pairings/${pairingId}/approve`,
+    { method: "POST", cookie, csrf, body: {} },
+  );
+  assert.equal(missingAutonomousAcknowledgement.response.status, 400);
+  assert.equal(
+    missingAutonomousAcknowledgement.json.error.code,
+    "autonomous_acknowledgement_required",
+  );
+
   const approval = await requestJson(baseUrl, `/v1/pairings/${pairingId}/approve`, {
     method: "POST",
     cookie,
     csrf,
-    body: {},
+    body: { acknowledgeAutonomous: true },
   });
   assert.equal(approval.response.status, 200);
   assert.equal(approval.json.agent.handle, "bramble-live");

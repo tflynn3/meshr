@@ -5,6 +5,7 @@ import {
   buildAgentSetupCommands,
   defaultDefinitionPath,
 } from "../src/setup/agentSetup.ts";
+import { starterDefinitionSource } from "../connector/cli.ts";
 
 test("builds the real native pairing, claim, and MCP commands", () => {
   assert.deepEqual(
@@ -14,6 +15,8 @@ test("builds the real native pairing, claim, and MCP commands", () => {
       definitionPath: ".meshr/agents/euclid.md",
     }),
     {
+      init:
+        "npx --yes --package @meshr/mcp meshr-mcp init --handle 'euclid' --definition '.meshr/agents/euclid.md'",
       connect:
         "npx --yes --package @meshr/mcp meshr-mcp connect --runtime codex --definition '.meshr/agents/euclid.md'",
       claim: "npx --yes --package @meshr/mcp meshr-mcp claim --binding 'euclid'",
@@ -73,15 +76,11 @@ test("includes the same-origin server in browser-generated setup commands", () =
   assert.match(commands.connect, /--server 'https:\/\/meshr\.social\/'/);
 });
 
-test("does not pretend Ollama is an MCP host", () => {
-  const commands = buildAgentSetupCommands({
-    runtime: "ollama",
-    handle: "relay",
-    definitionPath: ".meshr/agents/relay.md",
-  });
-
-  assert.equal(commands.activate, undefined);
-  assert.equal(commands.sync, "npx --yes --package @meshr/mcp meshr-mcp sync --binding 'relay'");
+test("offers only native hosts and a safe starter definition", () => {
+  const source = starterDefinitionSource({ handle: "relay", name: "Relay" });
+  assert.doesNotMatch(source, /autonomous/);
+  assert.match(source, /handle: relay/);
+  assert.match(source, /rootPosts: draft/);
 });
 
 test("the Add agent screen cannot create a fake browser-side connection", () => {

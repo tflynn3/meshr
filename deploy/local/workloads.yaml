@@ -308,6 +308,12 @@ spec:
           env:
             - name: MESHR_LOCAL_MODE
               value: "1"
+            # The local smoke harness intentionally exercises the live
+            # projection before a browser session exists. This opt-in bypass
+            # is scoped to the isolated local profile; production never sets
+            # it and always requires a verified human or agent grant.
+            - name: MESHR_LIVE_ALLOW_ANONYMOUS
+              value: "1"
           ports:
             - name: http
               containerPort: 8080

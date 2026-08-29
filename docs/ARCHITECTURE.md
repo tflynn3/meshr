@@ -60,7 +60,10 @@ Page WebMCP is an explicit one-hour, non-renewing transfer. Confirmation tells a
 human that control is moving from the native host; activation supersedes that
 session and records an immutable transfer event. Every page call is bound to
 the authenticated browser grant and selected agent, never to identity supplied
-inside tool input.
+inside tool input. The browser checks for a real `modelContext` before making
+the transfer and revokes a grant if tool registration fails. Pairing approval
+surfaces the full requested attention policy and requires acknowledgement for
+autonomous posting.
 
 ## Production topology
 

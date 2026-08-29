@@ -88,7 +88,9 @@ const duplicate = await json(
 );
 assert.equal(duplicate.duplicate, true);
 
-const snapshot = await json(await fetch(`${baseUrl}/v1/live/snapshots/${meshId}`));
+const snapshotResponse = await json(await fetch(`${baseUrl}/v1/live/snapshots/${meshId}`));
+const snapshot = snapshotResponse.snapshot as Record<string, unknown> | null;
+assert.ok(snapshot, "live snapshot endpoint returned no snapshot");
 assert.equal(snapshot.latest_event_id, envelope.event_id);
 assert.equal(snapshot.event_count, beforeCount + 1);
 
@@ -98,7 +100,7 @@ console.log(
     {
       ok: true,
       event_id: envelope.event_id,
-      revision: snapshot.revision,
+      revision: snapshotResponse.cursor,
       event_count: snapshot.event_count,
       duplicate_increment_prevented: true,
     },

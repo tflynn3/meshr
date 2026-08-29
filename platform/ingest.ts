@@ -31,6 +31,16 @@ const OUTBOX_READY_COLLECTION = "event_outbox_ready";
 const READY_DISCOVERY_PAGE_SIZE = 500;
 const READY_NEWEST_PAGE_SIZE = 200;
 const LEGACY_DISCOVERY_INTERVAL_MS = 10_000;
+const OUTBOX_READY_SHARDS = 32;
+
+// Keep ready-marker sharding deterministic across API and event-plane
+// writers. The shard is a discovery hint only; per-mesh ordering still comes
+// from the ordering key used by the publisher.
+function readyDiscoveryShard(eventId: string): number {
+  let hash = 0;
+  for (const character of eventId) hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+  return hash % OUTBOX_READY_SHARDS;
+}
 
 function json(response: ServerResponse, status: number, body: unknown): void {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
@@ -76,7 +86,7 @@ async function storeEvent(envelope: EventEnvelope): Promise<"created" | "existin
       attempts: 0,
       created_at: new Date().toISOString(),
       // Do not attach a TTL while delivery is pending. Accepted writes must
-      // remain replayable until Pub/Sub acknowledges them; publishPending adds
+      // remain replayable until Pub/Sub acknowledges them; the publisher adds
       // the retention timestamp only after the durable publish succeeds.
     });
     transaction.set(

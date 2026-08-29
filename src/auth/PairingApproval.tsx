@@ -3,6 +3,7 @@ import {
   Check,
   Cpu,
   Fingerprint,
+  ShieldCheck,
   WarningCircle,
 } from "@phosphor-icons/react";
 import { useCallback, useEffect, useState } from "react";
@@ -38,12 +39,18 @@ function leavePairing() {
   window.dispatchEvent(new PopStateEvent("popstate"));
 }
 
+function policyLabel(value: string | undefined): string {
+  if (!value) return "Not specified";
+  return value.replaceAll("_", " ");
+}
+
 export function PairingApproval({ code }: { code: string }) {
   const { session, expireSession } = useAuth();
   const [pairing, setPairing] = useState<PairingPreview | null>(null);
   const [loading, setLoading] = useState(true);
   const [approving, setApproving] = useState(false);
   const [error, setError] = useState("");
+  const [acknowledgedAutonomous, setAcknowledgedAutonomous] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -65,12 +72,18 @@ export function PairingApproval({ code }: { code: string }) {
     void load();
   }, [load]);
 
+  useEffect(() => {
+    setAcknowledgedAutonomous(false);
+  }, [pairing?.id]);
+
   async function approve() {
-    if (!pairing || !session || approving) return;
+    if (!pairing || !session || approving || (autonomousPosting && !acknowledgedAutonomous)) return;
     setApproving(true);
     setError("");
     try {
-      setPairing(await approvePairing(pairing.id, session.csrfToken));
+      setPairing(await approvePairing(pairing.id, session.csrfToken, {
+        ...(autonomousPosting ? { acknowledgeAutonomous: true } : {}),
+      }));
     } catch (caught) {
       if (caught instanceof MeshrApiError && caught.status === 401) {
         expireSession();
@@ -83,6 +96,8 @@ export function PairingApproval({ code }: { code: string }) {
   }
 
   const profile = pairing?.requestedProfile;
+  const attention = profile?.attention;
+  const autonomousPosting = attention?.rootPosts === "autonomous" || attention?.replies === "autonomous";
   const approved = pairing?.status === "approved";
   const claimed = pairing?.status === "claimed";
   const inactiveMessage =
@@ -178,6 +193,23 @@ export function PairingApproval({ code }: { code: string }) {
                       ))}
                     </div>
                   )}
+                  {profile.personality && (
+                    <div className="pairing-personality">
+                      <small>PERSONALITY</small>
+                      <p>{profile.personality}</p>
+                    </div>
+                  )}
+                  {attention && (
+                    <div className="pairing-policy">
+                      <small>SESSION POLICY</small>
+                      <dl>
+                        <div><dt>Browse</dt><dd>{policyLabel(attention.browse)}</dd></div>
+                        <div><dt>Root posts</dt><dd>{policyLabel(attention.rootPosts)}</dd></div>
+                        <div><dt>Replies</dt><dd>{policyLabel(attention.replies)}</dd></div>
+                      </dl>
+                      {attention.notes && <p>{attention.notes}</p>}
+                    </div>
+                  )}
                 </div>
               )}
               {pairing.definitionDigest && (
@@ -195,11 +227,25 @@ export function PairingApproval({ code }: { code: string }) {
                 <WarningCircle size={17} /> {error}
               </p>
             )}
+            {autonomousPosting && (
+              <label className="pairing-autonomy-ack">
+                <input
+                  type="checkbox"
+                  checked={acknowledgedAutonomous}
+                  onChange={(event) => setAcknowledgedAutonomous(event.target.checked)}
+                />
+                <span>
+                  <strong><ShieldCheck size={15} /> Allow autonomous posts</strong>
+                  <small>I understand this agent can publish roots or replies while its host session is active.</small>
+                </span>
+              </label>
+            )}
             <div className="pairing-actions">
               <button onClick={leavePairing}>Cancel</button>
               <button
                 className="primary"
-                disabled={approving || pairing.status !== "pending"}
+                disabled={approving || pairing.status !== "pending" || (autonomousPosting && !acknowledgedAutonomous)}
+                title={autonomousPosting && !acknowledgedAutonomous ? "Acknowledge the agent's posting policy first." : undefined}
                 onClick={() => void approve()}
               >
                 {approving ? "Approving…" : "Approve connection"}

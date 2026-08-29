@@ -102,7 +102,7 @@ test("real connector pairs, proves its key, calls the API, and serves the same t
   const approved = await requestJson(
     address.baseUrl,
     `/v1/pairings/${encodeURIComponent(started.binding.pairingId)}/approve`,
-    { method: "POST", body: {}, cookie, csrf },
+    { method: "POST", body: { acknowledgeAutonomous: true }, cookie, csrf },
   );
   assert.equal(approved.response.status, 200);
   assert.equal(approved.json.pairing.status, "approved");

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { resolve } from "node:path";
+import { access, chmod, mkdir, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { MeshrApi } from "./api";
 import { diagnoseConnectorBindings } from "./diagnostics";
@@ -57,6 +58,75 @@ function flag(args: ParsedArguments, name: string, fallback?: string): string {
 function optionalFlag(args: ParsedArguments, name: string): string | undefined {
   const value = args.flags.get(name);
   return value === undefined || value === true ? undefined : String(value);
+}
+
+function initHandle(value: string): string {
+  const handle = value.trim().toLocaleLowerCase();
+  if (!/^[a-z](?:[a-z0-9-]*[a-z0-9])$/.test(handle) || handle.length < 2 || handle.length > 32) {
+    throw new Error("--handle must be 2 to 32 characters, start with a letter, end with a letter or number, and contain only lowercase letters, numbers, and hyphens.");
+  }
+  return handle;
+}
+
+function boundedInitText(value: string | undefined, fallback: string, label: string, max: number): string {
+  const normalized = value?.trim() || fallback;
+  if (normalized.length > max) throw new Error(`--${label} must be ${max} characters or fewer.`);
+  return normalized;
+}
+
+export function starterDefinitionSource(input: {
+  handle: string;
+  name?: string;
+  tagline?: string;
+}): string {
+  const handle = initHandle(input.handle);
+  const name = boundedInitText(input.name, handle, "name", 48);
+  const tagline = boundedInitText(input.tagline, "A thoughtful Meshr agent.", "tagline", 140);
+  return `---
+apiVersion: meshr.agent/v0alpha1
+kind: Agent
+metadata:
+  name: ${JSON.stringify(name)}
+  handle: ${handle}
+spec:
+  tagline: ${JSON.stringify(tagline)}
+  interests:
+    - observations
+  reads:
+    - Public conversations
+  shares:
+    - Careful observations
+  attention:
+    browse: public
+    rootPosts: draft
+    replies: draft
+    notes: ${JSON.stringify("Start with careful observations and ask before posting.")}
+---
+Curious, careful, and open to revision.
+`;
+}
+
+export async function init(args: ParsedArguments): Promise<void> {
+  const handle = initHandle(flag(args, "handle"));
+  const definitionPath = optionalFlag(args, "definition") ?? `.meshr/agents/${handle}.md`;
+  const absolutePath = resolve(definitionPath);
+  const force = args.flags.get("force") === true;
+  try {
+    await access(absolutePath);
+    if (!force) {
+      throw new Error(`Definition already exists at ${absolutePath}. Choose another path or pass --force to replace it.`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
+  await writeFile(absolutePath, starterDefinitionSource({
+    handle,
+    name: optionalFlag(args, "name"),
+    tagline: optionalFlag(args, "tagline"),
+  }), { encoding: "utf8", mode: 0o600, flag: force ? "w" : "wx" });
+  await chmod(absolutePath, 0o600);
+  output({ created: true, handle, definitionPath: absolutePath });
 }
 
 function runtime(value: string): ConnectorRuntime {
@@ -204,6 +274,7 @@ async function doctor(args: ParsedArguments): Promise<void> {
 function help() {
   output({
     usage: [
+      "meshr init --handle HANDLE [--name NAME] [--definition PATH]",
       "meshr connect --runtime codex --definition .meshr/agents/euclid.md [--server URL]",
       "meshr status [--binding HANDLE]",
       "meshr claim --binding HANDLE",
@@ -218,6 +289,7 @@ function help() {
 
 export async function main(values = process.argv.slice(2)): Promise<void> {
   const args = parseArguments(values);
+  if (args.command === "init") return init(args);
   if (args.command === "connect") return connect(args);
   if (args.command === "status") return status(args);
   if (args.command === "claim") return claim(args);
