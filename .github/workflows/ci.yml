@@ -167,11 +167,49 @@ jobs:
       - run: terraform fmt -check -recursive infra/opentofu
       - run: terraform -chdir=infra/opentofu init -backend=false -input=false
       - run: terraform -chdir=infra/opentofu validate
+      - run: kubectl kustomize deploy/metrics-adapter >/dev/null
       - run: kubectl kustomize deploy/production >/dev/null
       - run: kubectl kustomize deploy/canary >/dev/null
 
+  # Keep the local GKE-shaped stack as a first-class CI gate. This exercises
+  # the Bazel bundle/image graph, the same k3d manifests used by developers,
+  # the emulator-backed event plane, and a restart-safe topology snapshot.
+  # The job is deliberately ephemeral: the cluster is deleted even when the
+  # smoke check fails.
+  local-stack:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with: {node-version: 24, cache: npm}
+      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4
+      - run: npm ci
+      - name: Install pinned Bazelisk and k3d
+        run: |
+          set -euo pipefail
+          npm install --global --ignore-scripts @bazel/bazelisk@1.28.1
+          k3d_version='v5.9.0'
+          k3d_url="https://github.com/k3d-io/k3d/releases/download/${k3d_version}/k3d-linux-amd64"
+          k3d_sha256='06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0'
+          mkdir -p "$RUNNER_TEMP/meshr-bin"
+          curl --fail --silent --show-error --location --retry 3 "$k3d_url" --output "$RUNNER_TEMP/meshr-bin/k3d"
+          echo "$k3d_sha256  $RUNNER_TEMP/meshr-bin/k3d" | sha256sum --check --strict
+          chmod 0755 "$RUNNER_TEMP/meshr-bin/k3d"
+          echo "$RUNNER_TEMP/meshr-bin" >> "$GITHUB_PATH"
+          bazelisk version
+          k3d version
+      - name: Start the ephemeral k3d stack
+        run: npm run local:up
+      - name: Run the event-plane and restart smoke
+        run: npm run local:smoke
+      - name: Tear down the ephemeral k3d stack
+        if: always()
+        run: npm run local:down
+
   build:
-    needs: [verify, release-preflight]
+    needs: [verify, local-stack, release-preflight]
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -914,8 +952,11 @@ jobs:
           kubectl -n meshr-canary rollout status deployment/ingest-canary --timeout=5m
           kubectl -n meshr-canary rollout status deployment/topology-materializer-canary --timeout=5m
           kubectl -n meshr-canary rollout status deployment/moderation-worker-canary --timeout=5m
+          kubectl -n meshr-canary rollout status deployment/moderation-screening-worker-canary --timeout=5m
           kubectl -n meshr-canary rollout status deployment/audit-worker-canary --timeout=5m
           kubectl -n meshr-canary rollout status deployment/notification-worker-canary --timeout=5m
+          kubectl wait --for=condition=Available=True apiservice/v1beta1.external.metrics.k8s.io --timeout=5m
+          bash scripts/check-gke-metrics-adapter.sh meshr-canary moderation-screening-worker-canary moderation-screening-worker-canary
       - name: Mint fresh canary moderation adapter ID token for post-deploy check
         if: success()
         id: canary-post-adapter-id-token
@@ -1626,8 +1667,11 @@ jobs:
           kubectl -n meshr rollout status deployment/ingest --timeout=5m
           kubectl -n meshr rollout status deployment/topology-materializer --timeout=5m
           kubectl -n meshr rollout status deployment/moderation-worker --timeout=5m
+          kubectl -n meshr rollout status deployment/moderation-screening-worker --timeout=5m
           kubectl -n meshr rollout status deployment/audit-worker --timeout=5m
           kubectl -n meshr rollout status deployment/notification-worker --timeout=5m
+          kubectl wait --for=condition=Available=True apiservice/v1beta1.external.metrics.k8s.io --timeout=5m
+          bash scripts/check-gke-metrics-adapter.sh meshr moderation-screening-worker moderation-screening-worker
       - name: Mint fresh production moderation adapter ID token for post-deploy check
         if: success()
         id: production-post-adapter-id-token

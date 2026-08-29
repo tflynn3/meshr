@@ -6,10 +6,12 @@ export interface EventPlaneConfig {
   databaseId: string;
   topologyDatabaseId: string;
   topicName: string;
+  moderationScreeningTopic: string;
   subscriptionName: string;
   subscriptions: {
     topology: string;
     moderation: string;
+    moderationScreening: string;
     audit: string;
     notifications: string;
   };
@@ -31,10 +33,14 @@ export function eventPlaneConfig(): EventPlaneConfig {
       process.env.MESHR_FIRESTORE_DATABASE?.trim() ||
       "(default)",
     topicName: process.env.MESHR_EVENTS_TOPIC?.trim() || "mesh-events",
+    moderationScreeningTopic:
+      process.env.MESHR_MODERATION_SCREENING_TOPIC?.trim() || "moderation-screening",
     subscriptionName: topology,
     subscriptions: {
       topology,
       moderation: process.env.MESHR_MODERATION_SUBSCRIPTION?.trim() || "moderation-worker",
+      moderationScreening:
+        process.env.MESHR_MODERATION_SCREENING_SUBSCRIPTION?.trim() || "moderation-screening-worker",
       audit: process.env.MESHR_AUDIT_SUBSCRIPTION?.trim() || "audit-worker",
       notifications:
         process.env.MESHR_NOTIFICATIONS_SUBSCRIPTION?.trim() || "notification-worker",

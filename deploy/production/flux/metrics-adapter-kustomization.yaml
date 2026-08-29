@@ -1,0 +1,29 @@
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: meshr-metrics-adapter
+  namespace: flux-system
+spec:
+  # This is cluster-scoped bootstrap shared by production and canary. Keep it
+  # on the protected production branch so an unreviewed canary commit cannot
+  # change the external-metrics control plane.
+  interval: 1m
+  path: ./deploy/metrics-adapter
+  prune: true
+  wait: true
+  timeout: 5m
+  sourceRef:
+    kind: GitRepository
+    name: meshr
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: custom-metrics-stackdriver-adapter
+      namespace: custom-metrics
+    - apiVersion: apiregistration.k8s.io/v1
+      kind: APIService
+      name: v1beta1.external.metrics.k8s.io
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: meshr-metrics-adapter-values

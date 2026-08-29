@@ -6,6 +6,7 @@ import {
   assertEd25519PublicKey,
   constantTimeStringEqual,
   hashPassword,
+  hmacSha256,
   randomToken,
   sha256,
   verifyEd25519Signature,
@@ -35,6 +36,7 @@ import { readPublicActivity } from "./publicActivity.ts";
 import { readWebMcpActivity } from "./webmcpActivity.ts";
 import { moderatePost, TokenBucketLimiter } from "./policy.ts";
 import { MESHR_CONTRACT_MAJOR, serializeAgentProfile } from "./contracts.ts";
+import { MAX_TOPICS_PER_MESH } from "./repository.ts";
 import type {
   MeshrRepository,
   RepositoryAgentInput,
@@ -44,17 +46,25 @@ import type {
   RepositoryPairingInput,
   RepositoryPairingChallenge,
   RepositoryTopicInput,
+  RepositoryTopicCreateInput,
+  RepositoryTopicUpdateInput,
+  RepositoryTopicDeleteInput,
   RepositoryModerationCase,
+  RepositoryModerationCasesPage,
   RepositoryPostRecord,
   RepositoryJoinRequest,
   RepositoryMeshInvitation,
+  RepositoryMeshRoleInvitation,
   RepositoryProjection,
   RepositoryHumanActivityPreference,
+  RepositoryHumanActivityPreferencePatch,
+  RepositoryMeshGovernancePatch,
   RepositoryEventInput,
   RepositoryAuditInput,
   RepositoryWebMcpGrant,
 } from "./repository.ts";
 import type { RepositoryAccount, RepositoryPostInput } from "./firestoreRepository.ts";
+import { SqliteMeshrRepository } from "./sqliteRepository.ts";
 
 const HUMAN_SESSION_SECONDS = 7 * 24 * 60 * 60;
 const HUMAN_IDLE_SECONDS = 12 * 60 * 60;
@@ -70,6 +80,16 @@ const AGENT_OFFLINE_SECONDS = 90;
 const MAX_AGENTS_PER_ACCOUNT = 25;
 const MAX_OWNED_MESHES_PER_ACCOUNT = 10;
 const MAX_JOINED_MESHES_PER_AGENT = 100;
+const TOPIC_ADMIN_BURST = 10;
+const TOPIC_ADMIN_PER_MINUTE = 30;
+const MESH_INVITATION_BURST = 10;
+const MESH_INVITATION_PER_MINUTE = 30;
+const ROLE_INVITATION_READ_BURST = 10;
+const ROLE_INVITATION_READ_PER_MINUTE = 60;
+const ROLE_INVITATION_ACCEPT_BURST = 5;
+const ROLE_INVITATION_ACCEPT_PER_MINUTE = 20;
+const MESH_ROLE_MUTATION_BURST = 10;
+const MESH_ROLE_MUTATION_PER_MINUTE = 30;
 const MAX_POSTS_PER_MINUTE = 60;
 const POST_BURST = 10;
 // Agent hosts normally poll the activity cursor every few seconds. Keep the
@@ -188,6 +208,10 @@ export interface MeshrServerOptions {
   webMcpTransfersSession?: boolean;
   /** Firestore is the authoritative write store in public mode. SQLite is retained as a read cache for local fixtures. */
   repository?: MeshrRepository;
+  /** Secret Manager pepper used to address human role invitations. */
+  invitationPepper?: string;
+  /** Immediately previous invitation pepper retained during rotation. */
+  invitationPepperPrevious?: string;
 }
 
 export interface MeshrServer {
@@ -502,20 +526,29 @@ function pairingFromRepository(input: RepositoryPairingInput): PairingRow {
  * challenge again and recover the already-committed successor without
  * exposing a derivation key to read-only projection workers.
  */
-function renewalMaterial(predecessorSessionId: string): {
+function renewalMaterials(predecessorSessionId: string): Array<{
   token: string;
   sessionId: string;
-} {
-  const recoverySecret = process.env.MESHR_RENEWAL_RECOVERY_SECRET?.trim() ||
-    // Tests and local fixtures do not mount Secret Manager. Production startup
-    // validation requires the real secret, so this fallback is never accepted
-    // by a production process.
-    "meshr-local-renewal-recovery-v1";
-  const digest = sha256(`meshr-agent-renewal:v1:${recoverySecret}:${predecessorSessionId}`);
-  return {
-    token: Buffer.from(digest, "hex").toString("base64url"),
-    sessionId: `sess_${digest.slice(0, 24)}`,
-  };
+}> {
+  const configured = [
+    process.env.MESHR_RENEWAL_RECOVERY_SECRET?.trim(),
+    process.env.MESHR_RENEWAL_RECOVERY_SECRET_PREVIOUS?.trim(),
+  ].filter((value): value is string => Boolean(value));
+  const secrets = configured.length
+    ? [...new Set(configured)]
+    : [
+        // Tests and local fixtures do not mount Secret Manager. Production
+        // startup validation requires the real secret, so this fallback is
+        // never accepted by a production process.
+        "meshr-local-renewal-recovery-v1",
+      ];
+  return secrets.map((recoverySecret) => {
+    const digest = sha256(`meshr-agent-renewal:v1:${recoverySecret}:${predecessorSessionId}`);
+    return {
+      token: Buffer.from(digest, "hex").toString("base64url"),
+      sessionId: `sess_${digest.slice(0, 24)}`,
+    };
+  });
 }
 
 /** Stable page-grant material lets a browser retry a handoff after the
@@ -589,6 +622,19 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
   const socialAuthOnly = options.socialAuthOnly ?? false;
   const webMcpTransfersSession = options.webMcpTransfersSession ?? false;
   const repository = options.repository;
+  const invitationPepper = options.invitationPepper?.trim() ||
+    process.env.MESHR_INVITATION_PEPPER?.trim() ||
+    "meshr-local-invitation-pepper";
+  const invitationPepperPrevious = options.invitationPepperPrevious?.trim() ||
+    process.env.MESHR_INVITATION_PEPPER_PREVIOUS?.trim();
+  // The SQLite adapter remains the isolated/local authority. Production
+  // always injects Firestore and is blocked at startup if its role-invitation
+  // methods are missing.
+  const roleInvitationStore: MeshrRepository = repository ?? new SqliteMeshrRepository(database);
+  const roleInvitationEmailHashes = (email: string): string[] => [
+    hmacSha256(email, invitationPepper),
+    ...(invitationPepperPrevious ? [hmacSha256(email, invitationPepperPrevious)] : []),
+  ].filter((hash, index, values) => values.indexOf(hash) === index);
   // Read the mode per request so tests and explicitly managed runtime
   // environments cannot accidentally keep a stale launch mode in a long-lived
   // server object. The production overlay renders this value into the pod
@@ -617,6 +663,27 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       }
       if (error instanceof Error && error.message === "last_owner") {
         throw new ApiError(409, "last_owner", "A mesh must always retain at least one owner.");
+      }
+      if (error instanceof Error && error.message === "owner_transfer_requires_member") {
+        throw new ApiError(
+          409,
+          "owner_transfer_requires_member",
+          "Add the account as a steward or observer before transferring ownership.",
+        );
+      }
+      if (error instanceof Error && error.message === "owner_transfer_requires_acceptance") {
+        throw new ApiError(
+          409,
+          "owner_transfer_requires_acceptance",
+          "Ownership transfer requires the target account to explicitly accept it.",
+        );
+      }
+      if (error instanceof Error && error.message === "role_invitation_required") {
+        throw new ApiError(
+          409,
+          "role_invitation_required",
+          "Invite this account and wait for it to accept before changing its role.",
+        );
       }
       if (error instanceof Error && error.message === "agent_limit_reached") {
         throw new ApiError(429, "agent_limit_reached", "This account has reached the 25-agent launch limit.");
@@ -710,6 +777,57 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (error instanceof Error && error.message === "topic_not_found") {
         throw new ApiError(404, "topic_not_found", "Topic not found.");
       }
+      if (error instanceof Error && error.message === "topic_already_exists") {
+        throw new ApiError(409, "topic_already_exists", "That topic already exists.");
+      }
+      if (error instanceof Error && error.message === "topic_name_taken") {
+        throw new ApiError(409, "topic_name_taken", "Choose a different topic name.");
+      }
+      if (error instanceof Error && error.message === "topic_limit_reached") {
+        throw new ApiError(429, "topic_limit_reached", "This mesh has reached its topic limit.");
+      }
+      if (error instanceof Error && error.message === "topic_not_empty") {
+        throw new ApiError(409, "topic_not_empty", "Topics with retained posts cannot be deleted.");
+      }
+      if (error instanceof Error && error.message === "topic_in_use") {
+        throw new ApiError(409, "topic_in_use", "Clear the topic's follows before deleting it.");
+      }
+      if (error instanceof Error && error.message === "role_invitation_already_exists") {
+        throw new ApiError(409, "role_invitation_already_exists", "An active invitation already exists for this request.");
+      }
+      if (error instanceof Error && error.message === "role_invitation_limit_reached") {
+        throw new ApiError(429, "role_invitation_limit_reached", "This mesh has reached its active role-invitation limit.");
+      }
+      if (error instanceof Error && error.message === "role_invitation_not_found") {
+        throw new ApiError(404, "role_invitation_not_found", "Role invitation not found.");
+      }
+      if (error instanceof Error && error.message === "role_invitation_not_active") {
+        throw new ApiError(409, "role_invitation_not_active", "That role invitation is no longer active.");
+      }
+      if (error instanceof Error && error.message === "role_invitation_invalid") {
+        throw new ApiError(403, "role_invitation_invalid", "That role invitation token is invalid.");
+      }
+      if (error instanceof Error && error.message === "role_invitation_target_mismatch") {
+        throw new ApiError(403, "role_invitation_target_mismatch", "This invitation is addressed to a different account.");
+      }
+      if (error instanceof Error && error.message === "role_invitation_expired") {
+        throw new ApiError(410, "role_invitation_expired", "That role invitation has expired.");
+      }
+      if (error instanceof Error && error.message === "role_invitation_revoked") {
+        throw new ApiError(410, "role_invitation_revoked", "That role invitation has been revoked.");
+      }
+      if (error instanceof Error && error.message === "role_invitation_redeemed") {
+        throw new ApiError(410, "role_invitation_redeemed", "That role invitation has already been accepted.");
+      }
+      if (error instanceof Error && error.message === "role_invitation_inviter_not_owner") {
+        throw new ApiError(409, "role_invitation_inviter_not_owner", "The transferring owner is no longer the current owner.");
+      }
+      if (error instanceof Error && error.message === "owner_role_protected") {
+        throw new ApiError(409, "owner_role_protected", "An owner must transfer ownership explicitly before accepting a collaborator role.");
+      }
+      if (error instanceof Error && error.message === "last_topic") {
+        throw new ApiError(409, "last_topic", "A mesh must keep at least one topic.");
+      }
       if (error instanceof Error && error.message === "mesh_membership_required") {
         throw new ApiError(403, "mesh_membership_required", "The agent is not currently joined to this mesh.");
       }
@@ -727,6 +845,37 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           : `${label}: durable store unavailable.`,
       );
     }
+  };
+  const mapRoleInvitationError = (error: unknown): never => {
+    if (!(error instanceof Error)) throw error;
+    const mappings: Record<string, [number, string, string]> = {
+      role_invitation_already_exists: [409, "role_invitation_already_exists", "An active invitation already exists for this request."],
+      role_invitation_limit_reached: [429, "role_invitation_limit_reached", "This mesh has reached its active role-invitation limit."],
+      role_invitation_not_found: [404, "role_invitation_not_found", "Role invitation not found."],
+      role_invitation_not_active: [409, "role_invitation_not_active", "That role invitation is no longer active."],
+      role_invitation_invalid: [403, "role_invitation_invalid", "That role invitation token is invalid."],
+      role_invitation_target_mismatch: [403, "role_invitation_target_mismatch", "This invitation is addressed to a different account."],
+      role_invitation_expired: [410, "role_invitation_expired", "That role invitation has expired."],
+      role_invitation_revoked: [410, "role_invitation_revoked", "That role invitation has been revoked."],
+      role_invitation_redeemed: [410, "role_invitation_redeemed", "That role invitation has already been accepted."],
+      role_invitation_inviter_not_owner: [409, "role_invitation_inviter_not_owner", "The transferring owner is no longer the current owner."],
+      owner_role_protected: [409, "owner_role_protected", "An owner must transfer ownership explicitly before accepting a collaborator role."],
+      mesh_limit_reached: [429, "mesh_limit_reached", "This account has reached its mesh limit."],
+      mesh_not_found: [404, "mesh_not_found", "Mesh not found."],
+      account_not_found: [401, "authentication_required", "Sign in is required."],
+      mesh_governance_denied: [403, "mesh_governance_denied", "You do not have the required mesh role."],
+      idempotency_conflict: [409, "idempotency_conflict", "This idempotency key was already used for a different request."],
+    };
+    const mapping = mappings[error.message];
+    if (mapping) throw new ApiError(mapping[0], mapping[1], mapping[2]);
+    // A repository failure during invitation metadata lookup or acceptance
+    // must never fall through as a generic 500: callers should be able to
+    // retry without learning whether a target account or invitation exists.
+    throw new ApiError(
+      503,
+      "governance_store_unavailable",
+      "The role-invitation store is temporarily unavailable. Try again shortly.",
+    );
   };
   const repositoryAgent = (
     agent: AgentRow,
@@ -1151,6 +1300,26 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
   const pairingChallengeIpLimiter = new TokenBucketLimiter(30, 30 / 60);
   const pairingChallengePairLimiter = new TokenBucketLimiter(10, 10 / 60);
   const agentSessionIpLimiter = new TokenBucketLimiter(30, 30 / 60);
+  const topicAdminLimiter = new TokenBucketLimiter(
+    TOPIC_ADMIN_BURST,
+    TOPIC_ADMIN_PER_MINUTE / 60,
+  );
+  const meshInvitationLimiter = new TokenBucketLimiter(
+    MESH_INVITATION_BURST,
+    MESH_INVITATION_PER_MINUTE / 60,
+  );
+  const roleInvitationReadLimiter = new TokenBucketLimiter(
+    ROLE_INVITATION_READ_BURST,
+    ROLE_INVITATION_READ_PER_MINUTE / 60,
+  );
+  const roleInvitationAcceptLimiter = new TokenBucketLimiter(
+    ROLE_INVITATION_ACCEPT_BURST,
+    ROLE_INVITATION_ACCEPT_PER_MINUTE / 60,
+  );
+  const meshRoleMutationLimiter = new TokenBucketLimiter(
+    MESH_ROLE_MUTATION_BURST,
+    MESH_ROLE_MUTATION_PER_MINUTE / 60,
+  );
   // Event observation is a potentially expensive fan-out read in Firestore:
   // one request can touch every public mesh visible to the agent. Apply both
   // an agent-wide and an agent+source guard. Cloud Armor remains the edge-wide
@@ -1183,6 +1352,81 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     if (!result.allowed) {
       throw new ApiError(429, code, message, result.retryAfterSeconds);
     }
+  };
+  const enforceGovernanceRate = async (
+    accountId: string,
+    options: {
+      bucket?: string;
+      code?: string;
+      message?: string;
+      capacity?: number;
+      perMinute?: number;
+    } = {},
+  ): Promise<void> => {
+    const bucket = options.bucket ?? "topic";
+    const code = options.code ?? "topic_rate_limited";
+    const message = options.message ?? "Topic administration is temporarily rate limited. Try again shortly.";
+    const limits = (() => {
+      switch (bucket) {
+        case "mesh-invitation":
+          return { capacity: MESH_INVITATION_BURST, perMinute: MESH_INVITATION_PER_MINUTE };
+        case "role-invitation-read":
+          return { capacity: ROLE_INVITATION_READ_BURST, perMinute: ROLE_INVITATION_READ_PER_MINUTE };
+        case "role-invitation-accept":
+          return { capacity: ROLE_INVITATION_ACCEPT_BURST, perMinute: ROLE_INVITATION_ACCEPT_PER_MINUTE };
+        case "mesh-role-mutation":
+          return { capacity: MESH_ROLE_MUTATION_BURST, perMinute: MESH_ROLE_MUTATION_PER_MINUTE };
+        default:
+          return { capacity: TOPIC_ADMIN_BURST, perMinute: TOPIC_ADMIN_PER_MINUTE };
+      }
+    })();
+    const capacity = options.capacity ?? limits.capacity;
+    const perMinute = options.perMinute ?? limits.perMinute;
+    if (!Number.isSafeInteger(capacity) || capacity < 1 || !Number.isFinite(perMinute) || perMinute <= 0) {
+      throw new ApiError(500, "configuration_error", "Invalid governance rate-limit configuration.");
+    }
+    if (repository?.consumeGovernanceRateLimit) {
+      let result: { allowed: boolean; retryAfterSeconds: number };
+      try {
+        result = await repository.consumeGovernanceRateLimit({
+          accountId,
+          bucket,
+          now: database.now(),
+          capacity,
+          refillPerSecond: perMinute / 60,
+        });
+      } catch (error) {
+        throw new ApiError(
+          503,
+          "governance_store_unavailable",
+          error instanceof Error ? error.message : "The governance store is unavailable.",
+        );
+      }
+      if (!result.allowed) {
+        throw new ApiError(
+          429,
+          code,
+          message,
+          result.retryAfterSeconds,
+        );
+      }
+      return;
+    }
+    const limiter = (() => {
+      switch (bucket) {
+        case "mesh-invitation":
+          return meshInvitationLimiter;
+        case "role-invitation-read":
+          return roleInvitationReadLimiter;
+        case "role-invitation-accept":
+          return roleInvitationAcceptLimiter;
+        case "mesh-role-mutation":
+          return meshRoleMutationLimiter;
+        default:
+          return topicAdminLimiter;
+      }
+    })();
+    enforceEndpointRate(limiter, accountId, code, message);
   };
   const pageAuthorityJoin = webMcpTransfersSession
     ? `JOIN agent_authority aa
@@ -1455,6 +1699,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }
     if (!durable) return undefined;
     const pairing = pairingFromRepository(durable);
+    // In Firestore mode this is an authoritative read, not a request to
+    // materialize a partial SQLite row. A claimed pairing references the
+    // durable agent/account and inserting it first would violate the local
+    // projection's foreign keys on a fresh API replica. Write projections
+    // only through the explicit hydration paths that insert dependencies in
+    // the correct order.
+    if (repository) return pairing;
     database.transaction(() => {
       db.prepare(
         `INSERT INTO pairings(
@@ -1510,6 +1761,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }
     if (!durable) return undefined;
     const pairing = pairingFromRepository(durable);
+    if (repository) return pairing;
     database.transaction(() => {
       db.prepare(
         `INSERT INTO pairings(
@@ -1564,21 +1816,9 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         );
       }
       if (!durable) return null;
-      db.prepare(
-        `INSERT INTO pairing_challenges(id, pairing_id, message, created_at, expires_at, used_at)
-         VALUES(?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           pairing_id = excluded.pairing_id, message = excluded.message,
-           created_at = excluded.created_at, expires_at = excluded.expires_at,
-           used_at = excluded.used_at`,
-      ).run(
-        durable.challengeId,
-        durable.pairingId,
-        durable.message,
-        durable.createdAt,
-        durable.expiresAt,
-        durable.usedAt,
-      );
+      // Durable challenge rows are sufficient for verification and consume;
+      // do not mirror them into a fresh SQLite projection where the pairing
+      // (and its referenced agent/account) may not yet have been hydrated.
       return durable;
     }
     const local = db
@@ -1677,9 +1917,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       return false;
     }
     const durableAgent = await repository.findAgentById(durableSession.agentId);
-    if (!durableAgent) return false;
+    if (!durableAgent) {
+      return false;
+    }
     const account = await repository.findAccountById(durableAgent.ownerAccountId);
-    if (!account) return false;
+    if (!account) {
+      return false;
+    }
     database.transaction(() => {
       db.prepare(
         `INSERT OR IGNORE INTO accounts(id, email, display_name, password_hash, created_at)
@@ -3381,10 +3625,48 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     return row ? moderationCaseFromRow(row) : null;
   };
 
-  const listModerationCasesForRoute = async (meshId: string): Promise<RepositoryModerationCase[]> => {
+  const listModerationCasesForRoute = async (input: {
+    meshId: string;
+    state?: RepositoryModerationCase["state"];
+    after?: { updatedAt: string; caseId: string };
+    limit: number;
+  }): Promise<RepositoryModerationCasesPage> => {
+    if (repository?.listModerationCasesPage) {
+      try {
+        return await repository.listModerationCasesPage(input);
+      } catch (error) {
+        throw new ApiError(
+          503,
+          "moderation_store_unavailable",
+          error instanceof Error ? error.message : "The moderation store is unavailable.",
+        );
+      }
+    }
     if (repository?.listModerationCases) {
       try {
-        return await repository.listModerationCases(meshId);
+        const cases = await repository.listModerationCases(input.meshId);
+        const filtered = input.state
+          ? cases.filter((moderationCase) => moderationCase.state === input.state)
+          : cases;
+        // Older repository implementations returned an unordered bounded
+        // list. Normalize before applying the cursor so the compatibility
+        // path has the same newest-first semantics as Firestore/SQLite.
+        filtered.sort((left, right) =>
+          right.updatedAt.localeCompare(left.updatedAt) || right.caseId.localeCompare(left.caseId));
+        const start = input.after
+          ? filtered.findIndex((moderationCase) =>
+              moderationCase.updatedAt < input.after!.updatedAt ||
+              (moderationCase.updatedAt === input.after!.updatedAt && moderationCase.caseId < input.after!.caseId))
+          : 0;
+        const offset = start < 0 ? filtered.length : start;
+        const page = filtered.slice(offset, offset + input.limit);
+        const last = page.at(-1);
+        return {
+          cases: page,
+          nextAfter: filtered.length > offset + input.limit && last
+            ? { updatedAt: last.updatedAt, caseId: last.caseId }
+            : null,
+        };
       } catch (error) {
         throw new ApiError(
           503,
@@ -3396,9 +3678,24 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     const rows = db.prepare(
       `SELECT id, post_id, mesh_id, reason, state, severity, created_at,
               updated_at, resolved_at, resolution
-       FROM moderation_cases WHERE mesh_id = ? ORDER BY updated_at DESC, id ASC`,
-    ).all(meshId) as ModerationCaseRow[];
-    return rows.map(moderationCaseFromRow);
+       FROM moderation_cases
+       WHERE mesh_id = ? ${input.state ? "AND state = ?" : ""}
+         ${input.after ? "AND (updated_at < ? OR (updated_at = ? AND id < ?))" : ""}
+       ORDER BY updated_at DESC, id DESC LIMIT ?`,
+    ).all(
+      input.meshId,
+      ...(input.state ? [input.state] : []),
+      ...(input.after ? [input.after.updatedAt, input.after.updatedAt, input.after.caseId] : []),
+      input.limit + 1,
+    ) as ModerationCaseRow[];
+    const pageRows = rows.slice(0, input.limit);
+    const last = pageRows.at(-1);
+    return {
+      cases: pageRows.map(moderationCaseFromRow),
+      nextAfter: rows.length > input.limit && last
+        ? { updatedAt: last.updated_at, caseId: last.id }
+        : null,
+    };
   };
 
   const listJoinRequestsForRoute = async (meshId: string): Promise<RepositoryJoinRequest[]> => {
@@ -3446,6 +3743,18 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     expiresAt: invitation.expiresAt,
     redeemedAt: invitation.redeemedAt,
     redeemedAgentId: invitation.redeemedAgentId,
+  });
+
+  const meshRoleInvitationRepresentation = (invitation: RepositoryMeshRoleInvitation) => ({
+    id: invitation.invitationId,
+    meshId: invitation.meshId,
+    role: invitation.role,
+    createdByAccountId: invitation.createdByAccountId,
+    status: invitation.status,
+    createdAt: invitation.createdAt,
+    expiresAt: invitation.expiresAt,
+    redeemedAt: invitation.redeemedAt,
+    redeemedByAccountId: invitation.redeemedByAccountId,
   });
 
   const listMeshInvitationsForRoute = async (meshId: string): Promise<RepositoryMeshInvitation[]> => {
@@ -5607,11 +5916,26 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
 
       let meshId: string;
       if (kind === "topic") {
-        const topic = db.prepare("SELECT mesh_id FROM topics WHERE id = ?").get(resourceId) as
-          | { mesh_id: string }
-          | undefined;
-        if (!topic) throw new ApiError(404, "topic_not_found", "Conversation not found.");
-        meshId = topic.mesh_id;
+        if (repository?.findTopicById) {
+          let topic: RepositoryTopicInput | null;
+          try {
+            topic = await repository.findTopicById(resourceId);
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "preference_store_unavailable",
+              error instanceof Error ? error.message : "The activity preference store is unavailable.",
+            );
+          }
+          if (!topic) throw new ApiError(404, "topic_not_found", "Conversation not found.");
+          meshId = topic.meshId;
+        } else {
+          const topic = db.prepare("SELECT mesh_id FROM topics WHERE id = ?").get(resourceId) as
+            | { mesh_id: string }
+            | undefined;
+          if (!topic) throw new ApiError(404, "topic_not_found", "Conversation not found.");
+          meshId = topic.mesh_id;
+        }
       } else {
         const parts = resourceId.split(":");
         if (parts.length !== 4 || parts[0] !== "traffic" || parts.slice(1).some((part) => !part)) {
@@ -5619,38 +5943,62 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         }
         meshId = parts[1]!;
       }
-      const mesh = readMesh(meshId);
-      if (mesh.visibility !== "public") {
-        const role = await meshRoleForAuthoritatively(principal.accountId, meshId);
-        if (!role) throw new ApiError(403, "mesh_access_denied", "You do not have access to this mesh.");
-      }
-      const current = db.prepare(
-        `SELECT watching, muted FROM human_activity_preferences
-         WHERE account_id = ? AND kind = ? AND resource_id = ?`,
-      ).get(principal.accountId, kind, resourceId) as
-        | { watching: number; muted: number }
-        | undefined;
-      const preference: RepositoryHumanActivityPreference = {
-        accountId: principal.accountId,
-        kind,
-        resourceId,
-        watching: requestedWatching === undefined ? current?.watching === 1 : requestedWatching as boolean,
-        muted: requestedMuted === undefined ? current?.muted === 1 : requestedMuted as boolean,
-        updatedAt: database.now(),
-      };
+      let preference: RepositoryHumanActivityPreference;
       if (repository) {
         if (!repository.upsertHumanActivityPreference) {
           throw new ApiError(503, "preference_store_unavailable", "The activity preference store is unavailable.");
         }
+        const patch: RepositoryHumanActivityPreferencePatch = {
+          accountId: principal.accountId,
+          kind,
+          resourceId,
+          meshId,
+          ...(requestedWatching === undefined ? {} : { watching: requestedWatching as boolean }),
+          ...(requestedMuted === undefined ? {} : { muted: requestedMuted as boolean }),
+          updatedAt: database.now(),
+          humanSessionHash: principal.sessionHash,
+        };
         try {
-          await repository.upsertHumanActivityPreference(preference);
+          preference = await repository.upsertHumanActivityPreference(patch);
         } catch (error) {
-          throw new ApiError(
-            503,
-            "preference_store_unavailable",
-            error instanceof Error ? error.message : "The activity preference store is unavailable.",
-          );
+          const message = error instanceof Error ? error.message : "The activity preference store is unavailable.";
+          if (message === "topic_not_found") {
+            throw new ApiError(404, "topic_not_found", "Conversation not found.");
+          }
+          if (message === "mesh_not_found") {
+            throw new ApiError(404, "mesh_not_found", "Mesh not found.");
+          }
+          if (message === "mesh_access_denied") {
+            throw new ApiError(403, "mesh_access_denied", "You do not have access to this mesh.");
+          }
+          if (message === "mesh_governance_denied") {
+            // The durable transaction rechecks the session after the route's
+            // initial authentication. A revoked/expired session therefore
+            // fails closed even when the request raced another replica.
+            throw new ApiError(401, "authentication_required", "Sign in is required.");
+          }
+          throw new ApiError(503, "preference_store_unavailable", message);
         }
+      } else {
+        const mesh = readMesh(meshId);
+        if (mesh.visibility !== "public") {
+          const role = await meshRoleForAuthoritatively(principal.accountId, meshId);
+          if (!role) throw new ApiError(403, "mesh_access_denied", "You do not have access to this mesh.");
+        }
+        const current = db.prepare(
+          `SELECT watching, muted FROM human_activity_preferences
+           WHERE account_id = ? AND kind = ? AND resource_id = ?`,
+        ).get(principal.accountId, kind, resourceId) as
+          | { watching: number; muted: number }
+          | undefined;
+        preference = {
+          accountId: principal.accountId,
+          kind,
+          resourceId,
+          watching: requestedWatching === undefined ? current?.watching === 1 : requestedWatching as boolean,
+          muted: requestedMuted === undefined ? current?.muted === 1 : requestedMuted as boolean,
+          updatedAt: database.now(),
+        };
       }
       db.prepare(
         `INSERT INTO human_activity_preferences(
@@ -6120,7 +6468,81 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             const { email: _email, ...withoutEmail } = roleSummary;
             return withoutEmail;
           });
-        return { body: { mesh: meshSummary(mesh, principal.accountId), role, roles } };
+        // Recheck the durable visibility and role immediately before sending
+        // governance metadata. A public-to-private transition can race the
+        // initial read above; returning the cached roles/topics in that case
+        // would disclose a private mesh to a non-member.
+        let finalMesh = mesh;
+        let finalRole = role;
+        if (repository?.findMeshById && repository.findMeshHumanRole) {
+          let authoritativeFinalMesh: RepositoryMeshInput | null;
+          try {
+            [authoritativeFinalMesh, finalRole] = await Promise.all([
+              repository.findMeshById(meshId),
+              repository.findMeshHumanRole(meshId, principal.accountId),
+            ]);
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "governance_store_unavailable",
+              error instanceof Error ? error.message : "The governance store is unavailable.",
+            );
+          }
+          if (!authoritativeFinalMesh) throw new ApiError(404, "mesh_not_found", "Mesh not found.");
+          finalMesh = {
+            id: authoritativeFinalMesh.meshId,
+            owner_account_id: authoritativeFinalMesh.ownerAccountId,
+            name: authoritativeFinalMesh.name,
+            description: authoritativeFinalMesh.description,
+            visibility: authoritativeFinalMesh.visibility,
+            join_policy: authoritativeFinalMesh.admission,
+            created_at: authoritativeFinalMesh.createdAt,
+          };
+        }
+        if (!finalRole && finalMesh.visibility !== "public") {
+          throw new ApiError(403, "mesh_access_denied", "You cannot view this mesh governance.");
+        }
+        // A replica-local SQLite roster can retain a collaborator after a
+        // role removal was committed on another API replica. When Firestore is
+        // authoritative, use its metadata-only directory entry (which performs
+        // a transaction-consistent role read) for the response instead of the
+        // stale compatibility projection. Public meshes may legitimately have
+        // no directory entry if they disappeared between the terminal checks;
+        // fail closed with an empty roster rather than disclose cached roles.
+        if (repository?.listMeshDirectoryForAccount) {
+          let directory: RepositoryMeshDirectoryEntry[];
+          try {
+            directory = await repository.listMeshDirectoryForAccount(principal.accountId);
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "governance_store_unavailable",
+              error instanceof Error ? error.message : "The governance store is unavailable.",
+            );
+          }
+          const entry = directory.find((candidate) => candidate.mesh.meshId === meshId);
+          // Do not combine an absent authoritative entry with the replica's
+          // cached mesh summary. The entry is the complete metadata boundary;
+          // if it disappeared between the terminal checks, fail closed rather
+          // than returning stale topics, members, or activity for a mesh that
+          // may have just become private or archived.
+          if (!entry) {
+            throw new ApiError(404, "mesh_not_found", "Mesh not found.");
+          }
+          const authoritativeRole = entry.role;
+          if (!authoritativeRole && entry.mesh.visibility !== "public") {
+            throw new ApiError(403, "mesh_access_denied", "You cannot view this mesh governance.");
+          }
+          const authoritativeSummary = meshSummaryFromDirectory(entry);
+          return {
+            body: {
+              mesh: authoritativeSummary,
+              role: authoritativeRole,
+              roles: authoritativeSummary.roles,
+            },
+          };
+        }
+        return { body: { mesh: meshSummary(finalMesh, principal.accountId), role: finalRole, roles } };
       }
       requireCsrf(request, principal);
       await requireMeshRole(principal.accountId, meshId, ["owner"]);
@@ -6130,22 +6552,31 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           throw new ApiError(400, "invalid_request", `${key} is not allowed.`);
         }
       }
-      const name = input.name === undefined ? mesh.name : requiredString(input, "name", { max: 80 });
+      const name = input.name === undefined ? undefined : requiredString(input, "name", { max: 80 });
       const description = input.description === undefined
-        ? mesh.description
+        ? undefined
         : optionalString(input, "description", 500) ?? "";
-      const visibility = input.visibility === undefined ? mesh.visibility : input.visibility;
-      const joinPolicy = input.joinPolicy === undefined ? mesh.join_policy : input.joinPolicy;
-      if (!["public", "unlisted", "private"].includes(String(visibility))) {
+      const visibility = input.visibility === undefined ? undefined : input.visibility;
+      const joinPolicy = input.joinPolicy === undefined ? undefined : input.joinPolicy;
+      if (visibility !== undefined && !["public", "unlisted", "private"].includes(String(visibility))) {
         throw new ApiError(400, "invalid_mesh", "visibility must be public, unlisted, or private.");
       }
-      if (!["open", "approval", "invite_only"].includes(String(joinPolicy))) {
+      if (joinPolicy !== undefined && !["open", "approval", "invite_only"].includes(String(joinPolicy))) {
         throw new ApiError(400, "invalid_mesh", "joinPolicy is invalid.");
+      }
+      if (name === undefined && description === undefined && visibility === undefined && joinPolicy === undefined) {
+        throw new ApiError(400, "invalid_mesh", "Set at least one governance field.");
       }
       const now = database.now();
       const governanceEventId = database.id("evt");
       const governanceAuditId = database.id("audit");
-      const governancePayload = { meshId, visibility, joinPolicy };
+      const governancePayload = {
+        meshId,
+        ...(name === undefined ? {} : { name }),
+        ...(description === undefined ? {} : { description }),
+        ...(visibility === undefined ? {} : { visibility }),
+        ...(joinPolicy === undefined ? {} : { joinPolicy }),
+      };
       const governanceEvent: RepositoryEventInput = {
         eventId: governanceEventId,
         type: "mesh.governance.updated",
@@ -6165,30 +6596,64 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         action: "mesh.governance.updated",
         resourceType: "mesh",
         resourceId: meshId,
-        data: { visibility, joinPolicy },
+        data: governancePayload,
         createdAt: now,
       };
-      await durableWrite("mesh governance update", async () => {
-        await repository?.upsertMesh?.({
+      const governancePatch: RepositoryMeshGovernancePatch = {
+        meshId,
+        ...(name === undefined ? {} : { name }),
+        ...(description === undefined ? {} : { description }),
+        ...(visibility === undefined ? {} : { visibility: visibility as RepositoryMeshGovernancePatch["visibility"] }),
+        ...(joinPolicy === undefined ? {} : { admission: joinPolicy as RepositoryMeshGovernancePatch["admission"] }),
+        updatedAt: now,
+        actingAccountId: principal.accountId,
+        humanSessionHash: principal.sessionHash,
+        event: governanceEvent,
+        audit: governanceAudit,
+      };
+      let committedMesh: RepositoryMeshInput;
+      if (repository?.updateMeshGovernance) {
+        try {
+          committedMesh = await repository.updateMeshGovernance(governancePatch);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "The governance store is unavailable.";
+          if (message === "mesh_not_found") throw new ApiError(404, "mesh_not_found", "Mesh not found.");
+          if (message === "mesh_governance_denied") {
+            throw new ApiError(403, "mesh_governance_denied", "You do not have the required mesh role.");
+          }
+          throw new ApiError(503, "governance_store_unavailable", message);
+        }
+      } else {
+        // SQLite and focused test doubles use the complete merged shape for
+        // compatibility. The production repository above is the authoritative
+        // compare-and-set path that never trusts this projection snapshot.
+        committedMesh = {
           meshId,
           ownerAccountId: mesh.owner_account_id,
-          name,
-          description,
-          visibility: visibility as "public" | "unlisted" | "private",
-          admission: joinPolicy as "open" | "approval" | "invite_only",
+          name: name ?? mesh.name,
+          description: description ?? mesh.description,
+          visibility: (visibility ?? mesh.visibility) as RepositoryMeshInput["visibility"],
+          admission: (joinPolicy ?? mesh.join_policy) as RepositoryMeshInput["admission"],
           lifecycle: "active",
           createdAt: mesh.created_at,
           updatedAt: now,
           actingAccountId: principal.accountId,
           humanSessionHash: principal.sessionHash,
-          event: governanceEvent,
-          audit: governanceAudit,
+        };
+        await durableWrite("mesh governance update", async () => {
+          await repository?.upsertMesh?.({ ...committedMesh, event: governanceEvent, audit: governanceAudit });
         });
-      });
+      }
       database.transaction(() => {
         db.prepare(
           `UPDATE meshes SET name = ?, description = ?, visibility = ?, join_policy = ? WHERE id = ?`,
-        ).run(name, description, String(visibility), String(joinPolicy), meshId);
+        ).run(
+          committedMesh.name,
+          committedMesh.description,
+          committedMesh.visibility,
+          committedMesh.admission,
+          meshId,
+        );
         emitAudit({
           auditId: governanceAuditId,
           createdAt: now,
@@ -6198,17 +6663,422 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           action: "mesh.governance.updated",
           resourceType: "mesh",
           resourceId: meshId,
-          data: { visibility, joinPolicy },
-          durable: Boolean(repository?.upsertMesh),
+          data: governancePayload,
+          durable: Boolean(repository?.updateMeshGovernance ?? repository?.upsertMesh),
         });
         emitEvent("mesh.governance.updated", null, meshId, null, governancePayload, {
           eventId: governanceEventId,
           occurredAt: now,
           sessionId: principal.sessionHash,
-          durable: Boolean(repository?.upsertMesh),
+          durable: Boolean(repository?.updateMeshGovernance ?? repository?.upsertMesh),
         });
       });
       return { body: { mesh: meshSummary(readMesh(meshId), principal.accountId) } };
+    }
+
+    const meshTopicListMatch = matchingPath(path, /^\/v1\/meshes\/([^/]+)\/topics$/);
+    if (meshTopicListMatch && (method === "GET" || method === "POST")) {
+      const principal = await requireHuman(request, true);
+      const meshId = decodeURIComponent(meshTopicListMatch[1]);
+      if (method === "GET") {
+        if (repository?.listMeshDirectoryForAccount) {
+          let directory: RepositoryMeshDirectoryEntry[];
+          try {
+            directory = await repository.listMeshDirectoryForAccount(principal.accountId);
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "topic_store_unavailable",
+              error instanceof Error ? error.message : "The topic store is unavailable.",
+            );
+          }
+          const entry = directory.find((candidate) => candidate.mesh.meshId === meshId);
+          if (!entry) throw new ApiError(404, "mesh_not_found", "Mesh not found.");
+          return {
+            body: {
+              topics: entry.topics.map(({ topic, activityCount, recentActivityCount, participantAgentIds, lastActivityAt }) => ({
+                id: topic.topicId,
+                meshId: topic.meshId,
+                name: topic.name,
+                title: topic.title,
+                description: topic.description,
+                tags: topic.tags,
+                activityCount,
+                recentActivityCount,
+                participantAgentIds,
+                lastActivityAt,
+                createdAt: topic.createdAt,
+              })),
+            },
+          };
+        }
+        const mesh = readMesh(meshId);
+        const role = await meshRoleForAuthoritatively(principal.accountId, meshId);
+        if (!role && mesh.visibility !== "public") {
+          throw new ApiError(403, "mesh_access_denied", "You cannot view topics in this mesh.");
+        }
+        return { body: { topics: meshSummary(mesh, principal.accountId).topics } };
+      }
+
+      requireCsrf(request, principal);
+      await requireMeshRole(principal.accountId, meshId, ["owner", "steward"]);
+      await enforceGovernanceRate(principal.accountId);
+      const input = asObject(await readJson(request));
+      for (const key of Object.keys(input)) {
+        if (!["name", "title", "description", "tags"].includes(key)) {
+          throw new ApiError(400, "invalid_request", `${key} is not allowed.`);
+        }
+      }
+      const name = requiredString(input, "name", {
+        min: 2,
+        max: 64,
+        pattern: /^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$/i,
+      }).toLowerCase();
+      const title = requiredString(input, "title", { max: 100 });
+      const description = optionalString(input, "description", 500) ?? "";
+      const tags = input.tags === undefined
+        ? []
+        : (() => {
+            if (!Array.isArray(input.tags) || input.tags.length > 12) {
+              throw new ApiError(400, "invalid_topic", "tags must be an array with at most 12 entries.");
+            }
+            return input.tags.map((tag) => {
+              if (typeof tag !== "string" || tag.trim().length < 1 || tag.trim().length > 32) {
+                throw new ApiError(400, "invalid_topic", "Each topic tag must be between 1 and 32 characters.");
+              }
+              return tag.trim().toLowerCase();
+            });
+          })();
+      const now = database.now();
+      const topicId = database.id("topic");
+      const eventId = database.id("evt");
+      const auditId = database.id("audit");
+      const payload = { topicId, meshId, name, title, description, tags };
+      const event: RepositoryEventInput = {
+        eventId,
+        type: "mesh.topic.created",
+        meshId,
+        topicId,
+        agentId: null,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload,
+        occurredAt: now,
+      };
+      const audit: RepositoryAuditInput = {
+        auditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: "mesh.topic.created",
+        resourceType: "topic",
+        resourceId: topicId,
+        data: payload,
+        createdAt: now,
+      };
+      if (repository && typeof repository.createTopic !== "function") {
+        throw new ApiError(503, "topic_store_unavailable", "The topic store is unavailable.");
+      }
+      await durableWrite("topic create", async () => {
+        await repository?.createTopic?.({
+          topicId,
+          meshId,
+          name,
+          title,
+          description,
+          tags,
+          createdAt: now,
+          actingAccountId: principal.accountId,
+          humanSessionHash: principal.sessionHash,
+          event,
+          audit,
+        });
+      });
+      if (repository?.createTopic && repository?.loadProjection) {
+        await refreshHumanProjection(principal.accountId);
+      } else if (!repository) {
+        database.transaction(() => {
+          if (db.prepare("SELECT 1 FROM topics WHERE id = ?").get(topicId)) {
+            throw new ApiError(409, "topic_already_exists", "That topic already exists.");
+          }
+          const topicCount = db
+            .prepare("SELECT COUNT(*) AS count FROM topics WHERE mesh_id = ?")
+            .get(meshId) as { count: number };
+          if (Number(topicCount.count) >= MAX_TOPICS_PER_MESH) {
+            throw new ApiError(429, "topic_limit_reached", "This mesh has reached its topic limit.");
+          }
+          if (db.prepare("SELECT 1 FROM topics WHERE mesh_id = ? AND name = ?").get(meshId, name)) {
+            throw new ApiError(409, "topic_name_taken", "Choose a different topic name.");
+          }
+          db.prepare(
+            `INSERT INTO topics(id, mesh_id, name, title, description, tags_json, created_at)
+             VALUES(?, ?, ?, ?, ?, ?, ?)`,
+          ).run(topicId, meshId, name, title, description, JSON.stringify(tags), now);
+          emitAudit({
+            auditId,
+            createdAt: now,
+            actorType: "human",
+            actorId: principal.accountId,
+            sessionId: principal.sessionHash,
+            action: "mesh.topic.created",
+            resourceType: "topic",
+            resourceId: topicId,
+            data: payload,
+          });
+          emitEvent("mesh.topic.created", null, meshId, topicId, payload, {
+            eventId,
+            occurredAt: now,
+            sessionId: principal.sessionHash,
+          });
+        });
+      }
+      const summary = meshSummary(readMesh(meshId), principal.accountId);
+      return {
+        status: 201,
+        body: { topic: summary.topics.find((topic) => topic.id === topicId) ?? payload },
+      };
+    }
+
+    const meshTopicItemMatch = matchingPath(path, /^\/v1\/meshes\/([^/]+)\/topics\/([^/]+)$/);
+    if (meshTopicItemMatch && (method === "PUT" || method === "DELETE")) {
+      const principal = await requireHuman(request, true);
+      requireCsrf(request, principal);
+      const meshId = decodeURIComponent(meshTopicItemMatch[1]);
+      const topicId = decodeURIComponent(meshTopicItemMatch[2]);
+      await requireMeshRole(principal.accountId, meshId, ["owner", "steward"]);
+      await enforceGovernanceRate(principal.accountId);
+      let currentTopic: RepositoryTopicInput | null = null;
+      if (repository?.findTopicById) {
+        try {
+          currentTopic = await repository.findTopicById(topicId);
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "topic_store_unavailable",
+            error instanceof Error ? error.message : "The topic store is unavailable.",
+          );
+        }
+      } else {
+        const row = db.prepare(
+          `SELECT id, mesh_id, name, title, description, tags_json, created_at
+           FROM topics WHERE id = ?`,
+        ).get(topicId) as {
+          id: string;
+          mesh_id: string;
+          name: string;
+          title: string;
+          description: string;
+          tags_json: string;
+          created_at: string;
+        } | undefined;
+        if (row) {
+          let parsedTags: string[] = [];
+          try {
+            const rawTags = JSON.parse(row.tags_json) as unknown;
+            if (Array.isArray(rawTags)) parsedTags = rawTags.map(String);
+          } catch {
+            parsedTags = [];
+          }
+          currentTopic = {
+            topicId: row.id,
+            meshId: row.mesh_id,
+            name: row.name,
+            title: row.title,
+            description: row.description,
+            tags: parsedTags,
+            createdAt: row.created_at,
+          };
+        }
+      }
+      if (!currentTopic || currentTopic.meshId !== meshId) {
+        throw new ApiError(404, "topic_not_found", "Topic not found.");
+      }
+      const now = database.now();
+      if (method === "DELETE") {
+        const eventId = database.id("evt");
+        const auditId = database.id("audit");
+        const payload = { topicId, meshId };
+        const event: RepositoryEventInput = {
+          eventId,
+          type: "mesh.topic.deleted",
+          meshId,
+          topicId,
+          agentId: null,
+          sessionId: principal.sessionHash,
+          runtimeKind: null,
+          payload,
+          occurredAt: now,
+        };
+        const audit: RepositoryAuditInput = {
+          auditId,
+          actorType: "human",
+          actorId: principal.accountId,
+          sessionId: principal.sessionHash,
+          action: "mesh.topic.deleted",
+          resourceType: "topic",
+          resourceId: topicId,
+          data: payload,
+          createdAt: now,
+        };
+        if (repository && typeof repository.deleteTopic !== "function") {
+          throw new ApiError(503, "topic_store_unavailable", "The topic store is unavailable.");
+        }
+        await durableWrite("topic delete", async () => {
+          await repository?.deleteTopic?.({
+            topicId,
+            meshId,
+            deletedAt: now,
+            actingAccountId: principal.accountId,
+            humanSessionHash: principal.sessionHash,
+            event,
+            audit,
+          });
+        });
+        if (repository?.deleteTopic && repository?.loadProjection) {
+          await refreshHumanProjection(principal.accountId);
+        } else if (!repository) {
+          database.transaction(() => {
+            const topicCount = db
+              .prepare("SELECT COUNT(*) AS count FROM topics WHERE mesh_id = ?")
+              .get(meshId) as { count: number };
+            if (Number(topicCount.count) <= 1) {
+              throw new ApiError(409, "last_topic", "A mesh must keep at least one topic.");
+            }
+            if (db.prepare("SELECT 1 FROM posts WHERE topic_id = ? LIMIT 1").get(topicId)) {
+              throw new ApiError(409, "topic_not_empty", "Topics with retained posts cannot be deleted.");
+            }
+            db.prepare("DELETE FROM follows WHERE topic_id = ?").run(topicId);
+            db.prepare("DELETE FROM topics WHERE id = ? AND mesh_id = ?").run(topicId, meshId);
+            emitAudit({
+              auditId,
+              createdAt: now,
+              actorType: "human",
+              actorId: principal.accountId,
+              sessionId: principal.sessionHash,
+              action: "mesh.topic.deleted",
+              resourceType: "topic",
+              resourceId: topicId,
+              data: payload,
+            });
+            // The local compatibility schema cascades topic references from
+            // `events`; retain the deleted id in the payload while keeping
+            // the event row itself reference-free so the audit survives.
+            emitEvent("mesh.topic.deleted", null, meshId, null, payload, {
+              eventId,
+              occurredAt: now,
+              sessionId: principal.sessionHash,
+            });
+          });
+        }
+        return { body: { meshId, topicId, deleted: true } };
+      }
+
+      const input = asObject(await readJson(request));
+      for (const key of Object.keys(input)) {
+        if (!["name", "title", "description", "tags"].includes(key)) {
+          throw new ApiError(400, "invalid_request", `${key} is not allowed.`);
+        }
+      }
+      const name = input.name === undefined
+        ? currentTopic.name
+        : requiredString(input, "name", {
+            min: 2,
+            max: 64,
+            pattern: /^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$/i,
+          }).toLowerCase();
+      const title = input.title === undefined ? currentTopic.title : requiredString(input, "title", { max: 100 });
+      const description = input.description === undefined
+        ? currentTopic.description
+        : optionalString(input, "description", 500) ?? "";
+      const tags = input.tags === undefined
+        ? currentTopic.tags
+        : (() => {
+            if (!Array.isArray(input.tags) || input.tags.length > 12) {
+              throw new ApiError(400, "invalid_topic", "tags must be an array with at most 12 entries.");
+            }
+            return input.tags.map((tag) => {
+              if (typeof tag !== "string" || tag.trim().length < 1 || tag.trim().length > 32) {
+                throw new ApiError(400, "invalid_topic", "Each topic tag must be between 1 and 32 characters.");
+              }
+              return tag.trim().toLowerCase();
+            });
+          })();
+      const eventId = database.id("evt");
+      const auditId = database.id("audit");
+      const payload = { topicId, meshId, name, title, description, tags };
+      const event: RepositoryEventInput = {
+        eventId,
+        type: "mesh.topic.updated",
+        meshId,
+        topicId,
+        agentId: null,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload,
+        occurredAt: now,
+      };
+      const audit: RepositoryAuditInput = {
+        auditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: "mesh.topic.updated",
+        resourceType: "topic",
+        resourceId: topicId,
+        data: payload,
+        createdAt: now,
+      };
+      if (repository && typeof repository.updateTopic !== "function") {
+        throw new ApiError(503, "topic_store_unavailable", "The topic store is unavailable.");
+      }
+      await durableWrite("topic update", async () => {
+        await repository?.updateTopic?.({
+          topicId,
+          meshId,
+          name,
+          title,
+          description,
+          tags,
+          updatedAt: now,
+          actingAccountId: principal.accountId,
+          humanSessionHash: principal.sessionHash,
+          event,
+          audit,
+        });
+      });
+      if (repository?.updateTopic && repository?.loadProjection) {
+        await refreshHumanProjection(principal.accountId);
+      } else if (!repository) {
+        database.transaction(() => {
+          if (db.prepare("SELECT 1 FROM topics WHERE mesh_id = ? AND name = ? AND id <> ?").get(meshId, name, topicId)) {
+            throw new ApiError(409, "topic_name_taken", "Choose a different topic name.");
+          }
+          db.prepare(
+            `UPDATE topics SET name = ?, title = ?, description = ?, tags_json = ?
+             WHERE id = ? AND mesh_id = ?`,
+          ).run(name, title, description, JSON.stringify(tags), topicId, meshId);
+          emitAudit({
+            auditId,
+            createdAt: now,
+            actorType: "human",
+            actorId: principal.accountId,
+            sessionId: principal.sessionHash,
+            action: "mesh.topic.updated",
+            resourceType: "topic",
+            resourceId: topicId,
+            data: payload,
+          });
+          emitEvent("mesh.topic.updated", null, meshId, topicId, payload, {
+            eventId,
+            occurredAt: now,
+            sessionId: principal.sessionHash,
+          });
+        });
+      }
+      const summary = meshSummary(readMesh(meshId), principal.accountId);
+      return {
+        body: { topic: summary.topics.find((topic) => topic.id === topicId) ?? payload },
+      };
     }
 
     const meshInvitationListMatch = matchingPath(path, /^\/v1\/meshes\/([^/]+)\/invitations$/);
@@ -6218,9 +7088,20 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       await requireMeshRole(principal.accountId, meshId, ["owner", "steward"]);
       if (method === "GET") {
         const invitations = await listMeshInvitationsForRoute(meshId);
+        // Revalidate both the browser session and the durable governance role
+        // after the potentially slow invitation read. A role removal on
+        // another replica must not leave a stale private invitation roster in
+        // the response.
+        const terminalPrincipal = await requireHuman(request, false, { touchSession: false });
+        await requireMeshRole(terminalPrincipal.accountId, meshId, ["owner", "steward"]);
         return { body: { invitations: invitations.map(meshInvitationRepresentation) } };
       }
       requireCsrf(request, principal);
+      await enforceGovernanceRate(principal.accountId, {
+        bucket: "mesh-invitation",
+        code: "mesh_invitation_rate_limited",
+        message: "Mesh invitations are temporarily rate limited. Try again shortly.",
+      });
       const input = asObject(await readJson(request));
       for (const key of Object.keys(input)) {
         if (!["agentId", "expiresInSeconds"].includes(key)) {
@@ -6310,6 +7191,9 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           }
           if (error instanceof Error && error.message === "agent_not_found") {
             throw new ApiError(404, "agent_not_found", "Agent not found.");
+          }
+          if (error instanceof Error && error.message === "invitation_limit_reached") {
+            throw new ApiError(429, "invitation_limit_reached", "This mesh has reached the 50 active-invitation limit.");
           }
           throw new ApiError(
             503,
@@ -6407,6 +7291,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       const meshId = decodeURIComponent(meshInvitationRevokeMatch[1]);
       const invitationId = decodeURIComponent(meshInvitationRevokeMatch[2]);
       await requireMeshRole(principal.accountId, meshId, ["owner", "steward"]);
+      await enforceGovernanceRate(principal.accountId, {
+        bucket: "mesh-invitation",
+        code: "mesh_invitation_rate_limited",
+        message: "Mesh invitations are temporarily rate limited. Try again shortly.",
+      });
       const now = database.now();
       const eventId = database.id("evt");
       const auditId = database.id("audit");
@@ -6513,6 +7402,456 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       return { body: { invitationId, meshId, status: "revoked" } };
     }
 
+    const meshRoleInvitationCollectionMatch = matchingPath(
+      path,
+      /^\/v1\/meshes\/([^/]+)\/role-invitations$/,
+    );
+    if ((method === "GET" || method === "POST") && meshRoleInvitationCollectionMatch) {
+      const principal = await requireHuman(request, true);
+      const meshId = decodeURIComponent(meshRoleInvitationCollectionMatch[1]);
+      await requireMeshRole(principal.accountId, meshId, ["owner"]);
+      if (method === "GET") {
+        await enforceGovernanceRate(principal.accountId, {
+          bucket: "role-invitation-read",
+          code: "role_invitation_rate_limited",
+          message: "Role-invitation reads are temporarily rate limited. Try again shortly.",
+        });
+        let invitations: RepositoryMeshRoleInvitation[] = [];
+        try {
+          invitations = await roleInvitationStore.listMeshRoleInvitations!(meshId);
+        } catch (error) {
+          mapRoleInvitationError(error);
+        }
+        // Return the value only after the durable read succeeds; keep the
+        // session and role barrier outside the repository-error mapper so an
+        // authorization failure is not mislabeled as a store outage.
+        const terminalPrincipal = await requireHuman(request, false, { touchSession: false });
+        await requireMeshRole(terminalPrincipal.accountId, meshId, ["owner"]);
+        return { body: { invitations: invitations.map(meshRoleInvitationRepresentation) } };
+      }
+      requireCsrf(request, principal);
+      await enforceGovernanceRate(principal.accountId);
+      const input = asObject(await readJson(request));
+      for (const key of Object.keys(input)) {
+        if (!["email", "role", "expiresInSeconds"].includes(key)) {
+          throw new ApiError(400, "invalid_request", `${key} is not allowed.`);
+        }
+      }
+      // Do not resolve the email to an account here. A role invitation is a
+      // one-use capability addressed by a peppered fingerprint; account
+      // existence is revealed only to the authenticated target at acceptance.
+      const email = normalizeEmail(requiredString(input, "email", { max: 254 }));
+      const role = input.role === undefined ? "observer" : input.role;
+      if (role !== "owner" && role !== "steward" && role !== "observer") {
+        throw new ApiError(400, "invalid_role", "role must be owner, steward, or observer.");
+      }
+      const rawExpiry = input.expiresInSeconds;
+      const expiresInSeconds = rawExpiry === undefined ? 7 * 24 * 60 * 60 : rawExpiry;
+      if (
+        typeof expiresInSeconds !== "number" ||
+        !Number.isSafeInteger(expiresInSeconds) ||
+        expiresInSeconds < 60 ||
+        expiresInSeconds > 30 * 24 * 60 * 60
+      ) {
+        throw new ApiError(400, "invalid_request", "expiresInSeconds must be between 60 seconds and 30 days.");
+      }
+      const nowDate = database.clock.now();
+      const now = nowDate.toISOString();
+      const expiresAt = addSeconds(nowDate, expiresInSeconds);
+      const invitationId = database.id("role-invite");
+      const token = randomToken(32);
+      const tokenHash = sha256(token);
+      const targetEmailHash = hmacSha256(email, invitationPepper);
+      const eventId = database.id("evt");
+      const auditId = database.id("audit");
+      const payload = { invitationId, meshId, role, expiresAt };
+      const event: RepositoryEventInput = {
+        eventId,
+        type: "mesh.role.invitation.created",
+        meshId,
+        topicId: null,
+        agentId: null,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload,
+        occurredAt: now,
+      };
+      const audit: RepositoryAuditInput = {
+        auditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: "mesh.role.invitation.created",
+        resourceType: "mesh_role_invitation",
+        resourceId: invitationId,
+        data: payload,
+        createdAt: now,
+      };
+      let created!: RepositoryMeshRoleInvitation;
+      try {
+        created = await roleInvitationStore.createMeshRoleInvitation!({
+          invitationId,
+          meshId,
+          tokenHash,
+          targetEmailHash,
+          role,
+          createdByAccountId: principal.accountId,
+          createdAt: now,
+          expiresAt,
+          actingAccountId: principal.accountId,
+          humanSessionHash: principal.sessionHash,
+          event,
+          audit,
+        });
+      } catch (error) {
+        mapRoleInvitationError(error);
+      }
+      return {
+        status: 201,
+        body: {
+          invitation: meshRoleInvitationRepresentation(created),
+          // The plaintext token is returned once to the inviter for delivery
+          // through their trusted channel. It is never stored or logged.
+          token,
+        },
+      };
+    }
+
+    const meshRoleInvitationRevokeMatch = matchingPath(
+      path,
+      /^\/v1\/meshes\/([^/]+)\/role-invitations\/([^/]+)\/revoke$/,
+    );
+    if (method === "POST" && meshRoleInvitationRevokeMatch) {
+      const principal = await requireHuman(request, true);
+      requireCsrf(request, principal);
+      const meshId = decodeURIComponent(meshRoleInvitationRevokeMatch[1]);
+      const invitationId = decodeURIComponent(meshRoleInvitationRevokeMatch[2]);
+      await requireMeshRole(principal.accountId, meshId, ["owner"]);
+      await enforceGovernanceRate(principal.accountId);
+      const now = database.now();
+      const eventId = database.id("evt");
+      const auditId = database.id("audit");
+      const payload = { invitationId, meshId };
+      try {
+        await roleInvitationStore.revokeMeshRoleInvitation!({
+          invitationId,
+          meshId,
+          revokedAt: now,
+          actingAccountId: principal.accountId,
+          humanSessionHash: principal.sessionHash,
+          event: {
+            eventId,
+            type: "mesh.role.invitation.revoked",
+            meshId,
+            topicId: null,
+            agentId: null,
+            sessionId: principal.sessionHash,
+            runtimeKind: null,
+            payload,
+            occurredAt: now,
+          },
+          audit: {
+            auditId,
+            actorType: "human",
+            actorId: principal.accountId,
+            sessionId: principal.sessionHash,
+            action: "mesh.role.invitation.revoked",
+            resourceType: "mesh_role_invitation",
+            resourceId: invitationId,
+            data: payload,
+            createdAt: now,
+          },
+        });
+      } catch (error) {
+        mapRoleInvitationError(error);
+      }
+      return { body: { invitationId, meshId, status: "revoked" } };
+    }
+
+    if (method === "GET" && path === "/v1/account/role-invitations") {
+      const principal = await requireHuman(request, false, { touchSession: false });
+      await enforceGovernanceRate(principal.accountId, {
+        bucket: "role-invitation-read",
+        code: "role_invitation_rate_limited",
+        message: "Role-invitation reads are temporarily rate limited. Try again shortly.",
+      });
+      const emailHashes = roleInvitationEmailHashes(normalizeEmail(principal.email));
+      const pages = await Promise.all(
+        emailHashes.map((emailHash) => roleInvitationStore.listMeshRoleInvitationsForEmail!(emailHash)),
+      );
+      const unique = new Map<string, RepositoryMeshRoleInvitation>();
+      for (const invitation of pages.flat()) unique.set(invitation.invitationId, invitation);
+      const invitations = [...unique.values()].sort(
+        (left, right) => right.createdAt.localeCompare(left.createdAt) || left.invitationId.localeCompare(right.invitationId),
+      );
+      // The list can span multiple durable reads. Ensure a logout, expiry, or
+      // provider-side account change that races those reads fails closed before
+      // returning invitation metadata.
+      await requireHuman(request, false, { touchSession: false });
+      return { body: { invitations: invitations.map(meshRoleInvitationRepresentation) } };
+    }
+
+    const roleInvitationAcceptMatch = matchingPath(
+      path,
+      /^\/v1\/account\/role-invitations\/([^/]+)\/accept$/,
+    );
+    if (method === "POST" && roleInvitationAcceptMatch) {
+      const principal = await requireHuman(request, true);
+      requireCsrf(request, principal);
+      await enforceGovernanceRate(principal.accountId, {
+        bucket: "role-invitation-accept",
+        code: "role_invitation_rate_limited",
+        message: "Role-invitation acceptance is temporarily rate limited. Try again shortly.",
+      });
+      const invitationId = decodeURIComponent(roleInvitationAcceptMatch[1]);
+      const input = asObject(await readJson(request));
+      for (const key of Object.keys(input)) {
+        if (key !== "token") throw new ApiError(400, "invalid_request", `${key} is not allowed.`);
+      }
+      const token = requiredString(input, "token", { min: 16, max: 512 });
+      const key = requireIdempotencyKey(request);
+      const requestHash = sha256(JSON.stringify({ invitationId, token }));
+      const now = database.now();
+      let invitationMeta: RepositoryMeshRoleInvitation | undefined;
+      let targetEmailHash: string | undefined;
+      try {
+        for (const emailHash of roleInvitationEmailHashes(normalizeEmail(principal.email))) {
+          const candidate = await roleInvitationStore.findMeshRoleInvitation!({
+            invitationId,
+            targetEmailHash: emailHash,
+          });
+          if (candidate) {
+            invitationMeta = candidate;
+            targetEmailHash = emailHash;
+            break;
+          }
+        }
+      } catch (error) {
+        // The event/audit payload is part of the same durable mutation. Do not
+        // fabricate mesh/role metadata or silently continue when the lookup
+        // path is unavailable.
+        mapRoleInvitationError(error);
+      }
+      if (!invitationMeta) {
+        throw new ApiError(
+          403,
+          "role_invitation_invalid",
+          "That role invitation is not addressed to this account.",
+        );
+      }
+      const meshId = invitationMeta.meshId;
+      const role = invitationMeta.role;
+      const payload = { invitationId, meshId, role, accountId: principal.accountId };
+      let accepted!: Awaited<ReturnType<NonNullable<MeshrRepository["acceptMeshRoleInvitation"]>>>;
+      try {
+        accepted = await roleInvitationStore.acceptMeshRoleInvitation!({
+          invitationId,
+          tokenHash: sha256(token),
+          targetEmailHash,
+          accountId: principal.accountId,
+          humanSessionHash: principal.sessionHash,
+          acceptedAt: now,
+          idempotencyKey: key,
+          requestHash,
+          event: {
+            eventId: database.id("evt"),
+            type: "mesh.role.invitation.accepted",
+            meshId,
+            topicId: null,
+            agentId: null,
+            sessionId: principal.sessionHash,
+            runtimeKind: null,
+            payload,
+            occurredAt: now,
+          },
+          audit: {
+            auditId: database.id("audit"),
+            actorType: "human",
+            actorId: principal.accountId,
+            sessionId: principal.sessionHash,
+            action: "mesh.role.invitation.accepted",
+            resourceType: "mesh_role_invitation",
+            resourceId: invitationId,
+            data: payload,
+            createdAt: now,
+          },
+        });
+      } catch (error) {
+        mapRoleInvitationError(error);
+      }
+      if (repository?.loadProjection) await refreshHumanProjection(principal.accountId);
+      return {
+        status: accepted.duplicate ? 200 : 201,
+        body: {
+          invitation: meshRoleInvitationRepresentation(accepted.invitation),
+          role: accepted.role,
+          duplicate: accepted.duplicate,
+        },
+      };
+    }
+
+    const meshRoleCollectionMatch = matchingPath(path, /^\/v1\/meshes\/([^/]+)\/roles$/);
+    if (method === "POST" && meshRoleCollectionMatch) {
+      // The pre-launch email-assignment endpoint is intentionally retired:
+      // it both revealed account existence and granted a role without target
+      // consent. Use /role-invitations and require the recipient to accept.
+      throw new ApiError(
+        410,
+        "role_invitation_required",
+        "Human roles are granted through an invitation that the recipient accepts.",
+      );
+      /*
+      const principal = await requireHuman(request, true);
+      requireCsrf(request, principal);
+      const meshId = decodeURIComponent(meshRoleCollectionMatch[1]);
+      await requireMeshRole(principal.accountId, meshId, ["owner"]);
+      const input = asObject(await readJson(request));
+      for (const key of Object.keys(input)) {
+        if (key !== "email" && key !== "role") {
+          throw new ApiError(400, "invalid_request", `${key} is not allowed.`);
+        }
+      }
+      const email = normalizeEmail(requiredString(input, "email", { max: 254 }));
+      const role = input.role === undefined ? "observer" : input.role;
+      if (role !== "owner" && role !== "steward" && role !== "observer") {
+        throw new ApiError(400, "invalid_role", "role must be owner, steward, or observer.");
+      }
+      if (role === "owner") {
+        throw new ApiError(
+          409,
+          "owner_transfer_requires_member",
+          "Add the account as a steward or observer before transferring ownership.",
+        );
+      }
+      let targetAccount: {
+        accountId: string;
+        email: string;
+        displayName: string;
+        createdAt: string;
+      } | null = null;
+      const localAccount = db
+        .prepare("SELECT id, email, display_name, created_at FROM accounts WHERE email = ? COLLATE NOCASE")
+        .get(email) as
+        | { id: string; email: string; display_name: string; created_at: string }
+        | undefined;
+      if (localAccount) {
+        targetAccount = {
+          accountId: localAccount.id,
+          email: localAccount.email,
+          displayName: localAccount.display_name,
+          createdAt: localAccount.created_at,
+        };
+      } else if (repository?.findAccountByEmail) {
+        try {
+          targetAccount = await repository.findAccountByEmail(email);
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "governance_store_unavailable",
+            error instanceof Error ? error.message : "The account store is unavailable.",
+          );
+        }
+      } else if (repository) {
+        throw new ApiError(503, "governance_store_unavailable", "The account store is unavailable.");
+      }
+      if (!targetAccount) throw new ApiError(404, "account_not_found", "No Meshr account exists for that email.");
+      if (targetAccount.accountId === principal.accountId) {
+        throw new ApiError(400, "self_role_change", "You already own this mesh.");
+      }
+      const current = await meshRoleForAuthoritatively(targetAccount.accountId, meshId);
+      const now = database.now();
+      const roleEventId = database.id("evt");
+      const roleAuditId = database.id("audit");
+      const roleEventType = current ? "mesh.role.updated" : "mesh.role.added";
+      const rolePayload = { meshId, accountId: targetAccount.accountId, role };
+      const roleEvent: RepositoryEventInput = {
+        eventId: roleEventId,
+        type: roleEventType,
+        meshId,
+        topicId: null,
+        agentId: null,
+        sessionId: principal.sessionHash,
+        runtimeKind: null,
+        payload: rolePayload,
+        occurredAt: now,
+      };
+      const roleAudit: RepositoryAuditInput = {
+        auditId: roleAuditId,
+        actorType: "human",
+        actorId: principal.accountId,
+        sessionId: principal.sessionHash,
+        action: roleEventType,
+        resourceType: "mesh_human_role",
+        resourceId: `${meshId}:${targetAccount.accountId}`,
+        data: { role, email: targetAccount.email },
+        createdAt: now,
+      };
+      if (repository && typeof repository.upsertMeshHumanRole !== "function") {
+        throw new ApiError(503, "governance_store_unavailable", "The role store is unavailable.");
+      }
+      await durableWrite("mesh role add", async () => {
+        await repository?.upsertMeshHumanRole?.({
+          meshId,
+          accountId: targetAccount!.accountId,
+          role,
+          createdAt: current ? now : targetAccount!.createdAt,
+          updatedAt: now,
+          actingAccountId: principal.accountId,
+          humanSessionHash: principal.sessionHash,
+          event: roleEvent,
+          audit: roleAudit,
+        });
+      });
+      if (repository?.upsertMeshHumanRole && repository?.loadProjection) {
+        await refreshHumanProjection(principal.accountId);
+      } else if (!repository) {
+        database.transaction(() => {
+          const mesh = db.prepare("SELECT owner_account_id FROM meshes WHERE id = ?").get(meshId) as
+            | { owner_account_id: string | null }
+            | undefined;
+          if (!mesh) throw new ApiError(404, "mesh_not_found", "Mesh not found.");
+          db.prepare(
+            `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
+             VALUES(?, ?, ?, ?, ?)
+             ON CONFLICT(mesh_id, account_id) DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at`,
+          ).run(meshId, targetAccount!.accountId, role, current ? now : targetAccount!.createdAt, now);
+          syncCanonicalOwner(meshId);
+          emitAudit({
+            auditId: roleAuditId,
+            createdAt: now,
+            actorType: "human",
+            actorId: principal.accountId,
+            sessionId: principal.sessionHash,
+            action: roleEventType,
+            resourceType: "mesh_human_role",
+            resourceId: `${meshId}:${targetAccount!.accountId}`,
+            data: { role, email: targetAccount!.email },
+          });
+          emitEvent(roleEventType, null, meshId, null, rolePayload, {
+            eventId: roleEventId,
+            occurredAt: now,
+            sessionId: principal.sessionHash,
+          });
+        });
+      }
+      return {
+        body: {
+          meshId,
+          accountId: targetAccount.accountId,
+          role,
+          member: {
+            accountId: targetAccount.accountId,
+            role,
+            displayName: targetAccount.displayName,
+            email: targetAccount.email,
+            createdAt: current ? now : targetAccount.createdAt,
+            updatedAt: now,
+          },
+        },
+      };
+      */
+    }
+
     const meshRoleMatch = matchingPath(path, /^\/v1\/meshes\/([^/]+)\/roles\/([^/]+)$/);
     if ((method === "PUT" || method === "DELETE") && meshRoleMatch) {
       const principal = await requireHuman(request, true);
@@ -6520,7 +7859,26 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       const meshId = decodeURIComponent(meshRoleMatch[1]);
       const accountId = decodeURIComponent(meshRoleMatch[2]);
       await requireMeshRole(principal.accountId, meshId, ["owner"]);
-      readMesh(meshId);
+      if (repository?.findMeshById) {
+        let durableMesh: RepositoryMeshInput | null;
+        try {
+          durableMesh = await repository.findMeshById(meshId);
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "governance_store_unavailable",
+            error instanceof Error ? error.message : "The mesh store is unavailable.",
+          );
+        }
+        if (!durableMesh) throw new ApiError(404, "mesh_not_found", "Mesh not found.");
+      } else {
+        readMesh(meshId);
+      }
+      await enforceGovernanceRate(principal.accountId, {
+        bucket: "mesh-role-mutation",
+        code: "mesh_role_rate_limited",
+        message: "Mesh role changes are temporarily rate limited. Try again shortly.",
+      });
       let targetAccountExists = Boolean(db.prepare("SELECT 1 FROM accounts WHERE id = ?").get(accountId));
       if (!targetAccountExists && repository?.findAccountById) {
         try {
@@ -6537,7 +7895,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (method === "DELETE") {
         const current = await meshRoleForAuthoritatively(accountId, meshId);
         if (!current) return { body: { meshId, accountId, removed: false } };
-        if (current === "owner") {
+        if (current === "owner" && !repository) {
           const ownerCount = db
             .prepare("SELECT COUNT(*) AS count FROM mesh_human_roles WHERE mesh_id = ? AND role = 'owner'")
             .get(meshId) as { count: number };
@@ -6581,29 +7939,33 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             roleRemovalAudit,
           );
         });
-        database.transaction(() => {
-          db.prepare("DELETE FROM mesh_human_roles WHERE mesh_id = ? AND account_id = ?")
-            .run(meshId, accountId);
-          syncCanonicalOwner(meshId);
-          emitAudit({
-            auditId: roleRemovalAuditId,
-            createdAt: now,
-            actorType: "human",
-            actorId: principal.accountId,
-            sessionId: principal.sessionHash,
-            action: "mesh.role.removed",
-            resourceType: "mesh_human_role",
-            resourceId: `${meshId}:${accountId}`,
-            data: { role: current },
-            durable: Boolean(repository?.deleteMeshHumanRole),
+        if (repository?.loadProjection) {
+          await refreshHumanProjection(principal.accountId);
+        } else {
+          database.transaction(() => {
+            db.prepare("DELETE FROM mesh_human_roles WHERE mesh_id = ? AND account_id = ?")
+              .run(meshId, accountId);
+            syncCanonicalOwner(meshId);
+            emitAudit({
+              auditId: roleRemovalAuditId,
+              createdAt: now,
+              actorType: "human",
+              actorId: principal.accountId,
+              sessionId: principal.sessionHash,
+              action: "mesh.role.removed",
+              resourceType: "mesh_human_role",
+              resourceId: `${meshId}:${accountId}`,
+              data: { role: current },
+              durable: Boolean(repository?.deleteMeshHumanRole),
+            });
+            emitEvent("mesh.role.removed", null, meshId, null, roleRemovalPayload, {
+              eventId: roleRemovalEventId,
+              occurredAt: now,
+              sessionId: principal.sessionHash,
+              durable: Boolean(repository?.deleteMeshHumanRole),
+            });
           });
-          emitEvent("mesh.role.removed", null, meshId, null, roleRemovalPayload, {
-            eventId: roleRemovalEventId,
-            occurredAt: now,
-            sessionId: principal.sessionHash,
-            durable: Boolean(repository?.deleteMeshHumanRole),
-          });
-        });
+        }
         return { body: { meshId, accountId, removed: true } };
       }
       const input = asObject(await readJson(request));
@@ -6612,7 +7974,25 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         throw new ApiError(400, "invalid_role", "role must be owner, steward, or observer.");
       }
       const current = await meshRoleForAuthoritatively(accountId, meshId);
-      if (current === "owner" && role !== "owner") {
+      // Role invitations are the only path that can create a new human
+      // membership. This legacy update endpoint is intentionally update-only;
+      // accepting a missing role here would let an owner bypass recipient
+      // consent by guessing a discoverable account id.
+      if (method === "PUT" && !current) {
+        throw new ApiError(
+          409,
+          "role_invitation_required",
+          "Invite this account and wait for it to accept before changing its role.",
+        );
+      }
+      if (role === "owner") {
+        throw new ApiError(
+          409,
+          "owner_transfer_requires_acceptance",
+          "Ownership transfer requires the target account to explicitly accept it.",
+        );
+      }
+      if (!repository && current === "owner") {
         const ownerCount = db
           .prepare("SELECT COUNT(*) AS count FROM mesh_human_roles WHERE mesh_id = ? AND role = 'owner'")
           .get(meshId) as { count: number };
@@ -6659,48 +8039,36 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           audit: roleUpdateAudit,
         });
       });
-      database.transaction(() => {
-        if (role === "owner") {
-          // Firestore promotes one canonical owner and demotes its previous
-          // owner atomically. Mirror that transfer in the local read
-          // projection so the next response cannot briefly expose two owners.
-          const previousOwner = db.prepare(
-            `SELECT account_id FROM mesh_human_roles
-             WHERE mesh_id = ? AND role = 'owner' AND account_id <> ?
-             ORDER BY created_at, account_id LIMIT 1`,
-          ).get(meshId, accountId) as { account_id: string } | undefined;
-          if (previousOwner) {
-            db.prepare(
-              `UPDATE mesh_human_roles SET role = 'steward', updated_at = ?
-               WHERE mesh_id = ? AND account_id = ? AND role = 'owner'`,
-            ).run(now, meshId, previousOwner.account_id);
-          }
-        }
-        db.prepare(
-          `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
-           VALUES(?, ?, ?, ?, ?)
-           ON CONFLICT(mesh_id, account_id) DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at`,
-        ).run(meshId, accountId, role, now, now);
-        syncCanonicalOwner(meshId);
-        emitAudit({
-          auditId: roleUpdateAuditId,
-          createdAt: now,
-          actorType: "human",
-          actorId: principal.accountId,
-          sessionId: principal.sessionHash,
-          action: "mesh.role.updated",
-          resourceType: "mesh_human_role",
-          resourceId: `${meshId}:${accountId}`,
-          data: { role },
-          durable: Boolean(repository?.upsertMeshHumanRole),
+      if (repository?.loadProjection) {
+        await refreshHumanProjection(principal.accountId);
+      } else {
+        database.transaction(() => {
+          db.prepare(
+            `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
+             VALUES(?, ?, ?, ?, ?)
+             ON CONFLICT(mesh_id, account_id) DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at`,
+          ).run(meshId, accountId, role, now, now);
+          syncCanonicalOwner(meshId);
+          emitAudit({
+            auditId: roleUpdateAuditId,
+            createdAt: now,
+            actorType: "human",
+            actorId: principal.accountId,
+            sessionId: principal.sessionHash,
+            action: "mesh.role.updated",
+            resourceType: "mesh_human_role",
+            resourceId: `${meshId}:${accountId}`,
+            data: { role },
+            durable: Boolean(repository?.upsertMeshHumanRole),
+          });
+          emitEvent("mesh.role.updated", null, meshId, null, roleUpdatePayload, {
+            eventId: roleUpdateEventId,
+            occurredAt: now,
+            sessionId: principal.sessionHash,
+            durable: Boolean(repository?.upsertMeshHumanRole),
+          });
         });
-        emitEvent("mesh.role.updated", null, meshId, null, roleUpdatePayload, {
-          eventId: roleUpdateEventId,
-          occurredAt: now,
-          sessionId: principal.sessionHash,
-          durable: Boolean(repository?.upsertMeshHumanRole),
-        });
-      });
+      }
       return { body: { meshId, accountId, role } };
     }
 
@@ -6708,95 +8076,55 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       path,
       /^\/v1\/meshes\/([^/]+)\/agents\/([^/]+)$/,
     );
-    if ((method === "PUT" || method === "DELETE") && meshAgentMembershipMatch) {
+    if (method === "PUT" && meshAgentMembershipMatch) {
+      // A human cannot force-join an agent owned by another account. Agent
+      // admission is an explicit native-session operation (open join,
+      // approval request, or one-use invitation); governance may only remove
+      // an existing membership here.
+      throw new ApiError(
+        405,
+        "agent_membership_requires_admission",
+        "Agents must join from their native session or redeem a mesh invitation.",
+      );
+    }
+    if (method === "DELETE" && meshAgentMembershipMatch) {
       const principal = await requireHuman(request, true);
       requireCsrf(request, principal);
       const meshId = decodeURIComponent(meshAgentMembershipMatch[1]);
       const agentId = decodeURIComponent(meshAgentMembershipMatch[2]);
-      const mesh = readMesh(meshId);
+      if (repository?.findMeshById) {
+        let durableMesh: RepositoryMeshInput | null;
+        try {
+          durableMesh = await repository.findMeshById(meshId);
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "governance_store_unavailable",
+            error instanceof Error ? error.message : "The mesh store is unavailable.",
+          );
+        }
+        if (!durableMesh) throw new ApiError(404, "mesh_not_found", "Mesh not found.");
+      } else {
+        readMesh(meshId);
+      }
       await requireMeshRole(principal.accountId, meshId, ["owner", "steward"]);
-      const agent = db
+      const localAgent = db
         .prepare("SELECT * FROM agents WHERE id = ?")
         .get(agentId) as unknown as AgentRow | undefined;
+      let agent: AgentRow | RepositoryAgentInput | null = localAgent ?? null;
+      if (!agent && repository?.findAgentById) {
+        try {
+          agent = await repository.findAgentById(agentId);
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "governance_store_unavailable",
+            error instanceof Error ? error.message : "The agent store is unavailable.",
+          );
+        }
+      }
       if (!agent) throw new ApiError(404, "agent_not_found", "Agent not found.");
       const now = database.now();
-      if (method === "PUT") {
-        const existing = db
-          .prepare("SELECT 1 FROM mesh_members WHERE mesh_id = ? AND agent_id = ?")
-          .get(meshId, agentId);
-        if (!existing) {
-          const count = db
-            .prepare("SELECT COUNT(*) AS count FROM mesh_members WHERE agent_id = ?")
-            .get(agentId) as { count: number };
-          if (Number(count.count) >= MAX_JOINED_MESHES_PER_AGENT) {
-            throw new ApiError(429, "agent_mesh_limit_reached", "This agent has reached its mesh limit.");
-          }
-        }
-        const membershipEventId = database.id("evt");
-        const membershipAuditId = database.id("audit");
-        const membershipPayload = { meshId, agentId };
-        const membershipEvent: RepositoryEventInput = {
-          eventId: membershipEventId,
-          type: "mesh.agent.joined",
-          meshId,
-          topicId: null,
-          agentId,
-          sessionId: principal.sessionHash,
-          runtimeKind: null,
-          payload: membershipPayload,
-          occurredAt: now,
-        };
-        const membershipAudit: RepositoryAuditInput = {
-          auditId: membershipAuditId,
-          actorType: "human",
-          actorId: principal.accountId,
-          sessionId: principal.sessionHash,
-          action: "mesh.agent.added",
-          resourceType: "mesh_agent_membership",
-          resourceId: `${meshId}:${agentId}`,
-          data: membershipPayload,
-          createdAt: now,
-        };
-        await durableWrite("mesh membership update", async () => {
-          await repository?.upsertMeshAgentMembership?.({
-            meshId,
-            agentId,
-            status: "joined",
-            attentionPolicy: JSON.parse(agent.attention_json) as Record<string, unknown>,
-            admissionProvenance: "invite",
-            joinedAt: now,
-            updatedAt: now,
-            actingAccountId: principal.accountId,
-            humanSessionHash: principal.sessionHash,
-            event: membershipEvent,
-            audit: membershipAudit,
-          });
-        });
-        database.transaction(() => {
-          db.prepare(
-            "INSERT OR IGNORE INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)",
-          ).run(meshId, agentId, now);
-          emitAudit({
-            auditId: membershipAuditId,
-            createdAt: now,
-            actorType: "human",
-            actorId: principal.accountId,
-            sessionId: principal.sessionHash,
-            action: "mesh.agent.added",
-            resourceType: "mesh_agent_membership",
-            resourceId: `${meshId}:${agentId}`,
-            data: { meshId, agentId },
-            durable: Boolean(repository?.upsertMeshAgentMembership),
-          });
-          emitEvent("mesh.agent.joined", agentId, meshId, null, membershipPayload, {
-            eventId: membershipEventId,
-            occurredAt: now,
-            sessionId: principal.sessionHash,
-            durable: Boolean(repository?.upsertMeshAgentMembership),
-          });
-        });
-        return { status: existing ? 200 : 201, body: { meshId, agentId, status: "joined" } };
-      }
       const membershipRemovalEventId = database.id("evt");
       const membershipRemovalAuditId = database.id("audit");
       const membershipRemovalPayload = { meshId, agentId };
@@ -6837,27 +8165,31 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           audit: membershipRemovalAudit,
         });
       });
-      database.transaction(() => {
-        db.prepare("DELETE FROM mesh_members WHERE mesh_id = ? AND agent_id = ?").run(meshId, agentId);
-        emitAudit({
-          auditId: membershipRemovalAuditId,
-          createdAt: now,
-          actorType: "human",
-          actorId: principal.accountId,
-          sessionId: principal.sessionHash,
-          action: "mesh.agent.removed",
-          resourceType: "mesh_agent_membership",
-          resourceId: `${meshId}:${agentId}`,
-          data: { meshId, agentId },
-          durable: Boolean(repository?.upsertMeshAgentMembership),
+      if (repository?.loadProjection) {
+        await refreshHumanProjection(principal.accountId);
+      } else {
+        database.transaction(() => {
+          db.prepare("DELETE FROM mesh_members WHERE mesh_id = ? AND agent_id = ?").run(meshId, agentId);
+          emitAudit({
+            auditId: membershipRemovalAuditId,
+            createdAt: now,
+            actorType: "human",
+            actorId: principal.accountId,
+            sessionId: principal.sessionHash,
+            action: "mesh.agent.removed",
+            resourceType: "mesh_agent_membership",
+            resourceId: `${meshId}:${agentId}`,
+            data: { meshId, agentId },
+            durable: Boolean(repository?.upsertMeshAgentMembership),
+          });
+          emitEvent("mesh.agent.removed", agentId, meshId, null, membershipRemovalPayload, {
+            eventId: membershipRemovalEventId,
+            occurredAt: now,
+            sessionId: principal.sessionHash,
+            durable: Boolean(repository?.upsertMeshAgentMembership),
+          });
         });
-        emitEvent("mesh.agent.removed", agentId, meshId, null, membershipRemovalPayload, {
-          eventId: membershipRemovalEventId,
-          occurredAt: now,
-          sessionId: principal.sessionHash,
-          durable: Boolean(repository?.upsertMeshAgentMembership),
-        });
-      });
+      }
       return { body: { meshId, agentId, status: "removed" } };
     }
 
@@ -6888,6 +8220,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           resolvedAt: joinRequest.resolvedAt,
         };
       }));
+      const terminalPrincipal = await requireHuman(request, false, { touchSession: false });
+      await requireMeshRole(terminalPrincipal.accountId, meshId, ["owner", "steward"]);
       return { body: { requests } };
     }
 
@@ -6906,16 +8240,26 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         throw new ApiError(400, "invalid_decision", "decision must be approved or denied.");
       }
       const decision = input.decision;
+      // Resolve the pending request before constructing durable artifacts so
+      // the Firestore outbox envelope carries the agent attribution that the
+      // topology/audit consumers need. The repository transaction rechecks
+      // pending status and mesh identity, so a concurrent resolution still
+      // fails closed rather than allowing a stale event to be written.
+      const pendingJoinRequest = await findJoinRequestForRoute(requestId);
+      if (!pendingJoinRequest || pendingJoinRequest.meshId !== meshId || pendingJoinRequest.status !== "pending") {
+        throw new ApiError(404, "join_request_not_found", "Join request is not pending.");
+      }
+      const pendingAgentId = pendingJoinRequest.agentId;
       const now = database.now();
       const joinResolutionEventId = database.id("evt");
       const joinResolutionAuditId = database.id("audit");
-      const joinResolutionPayload = { requestId, meshId, decision };
+      const joinResolutionPayload = { requestId, meshId, agentId: pendingAgentId, decision };
       const joinResolutionEvent: RepositoryEventInput = {
         eventId: joinResolutionEventId,
         type: `mesh.agent.${decision}`,
         meshId,
         topicId: null,
-        agentId: null,
+        agentId: pendingAgentId,
         sessionId: principal.sessionHash,
         runtimeKind: null,
         payload: joinResolutionPayload,
@@ -7204,12 +8548,36 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       const mesh = await findMeshForModeration(meshId);
       if (!mesh) throw new ApiError(404, "mesh_not_found", "Mesh not found.");
       const role = await requireMeshRole(principal.accountId, meshId, ["owner", "steward"]);
-      const cases = await listModerationCasesForRoute(meshId);
-      const entries = await Promise.all(cases.map(async (moderationCase) => {
+      const stateParam = url.searchParams.get("state") ?? undefined;
+      if (stateParam && !["queued", "reviewing", "resolved", "appealed"].includes(stateParam)) {
+        throw new ApiError(400, "invalid_moderation_state", "state must be queued, reviewing, resolved, or appealed.");
+      }
+      const cursor = parseCursor(url.searchParams.get("after"));
+      const limit = parsePositiveInteger(url.searchParams.get("limit"), 50, 100, 1);
+      const page = await listModerationCasesForRoute({
+        meshId,
+        state: stateParam as RepositoryModerationCase["state"] | undefined,
+        after: cursor ? { updatedAt: cursor.createdAt, caseId: cursor.id } : undefined,
+        limit,
+      });
+      const entries = await Promise.all(page.cases.map(async (moderationCase) => {
         const post = await findPostForModeration(moderationCase.postId);
         return moderationCaseRepresentation(moderationCase, post, role === "owner" || role === "steward");
       }));
-      return { body: { cases: entries } };
+      // Moderation entries can include retained post bodies. Revalidate the
+      // browser session and durable governance role after all reads complete so
+      // a concurrent demotion, logout, or private-mesh transition cannot turn
+      // a stale precheck into a data disclosure.
+      const terminalPrincipal = await requireHuman(request, false, { touchSession: false });
+      await requireMeshRole(terminalPrincipal.accountId, meshId, ["owner", "steward"]);
+      return {
+        body: {
+          cases: entries,
+          nextCursor: page.nextAfter
+            ? encodeCursor({ created_at: page.nextAfter.updatedAt, id: page.nextAfter.caseId })
+            : null,
+        },
+      };
     }
 
     const moderationActionMatch = matchingPath(
@@ -7981,6 +9349,37 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           const parsed = Date.parse(String((active as { expires_at?: unknown }).expires_at ?? ""));
           if (Number.isFinite(parsed)) activeExpiresAtMs = parsed;
         }
+        // The SQLite adapter is a disposable local projection, but it still
+        // needs to exercise the same bounded recovery contract as Firestore.
+        // An expired predecessor may request one more signed challenge only
+        // while the local authority fence still names that exact native
+        // session/epoch. A stale replica or a page handoff therefore remains
+        // rejected instead of turning expiry into an implicit re-login.
+        if (!repository && !active && pairing.agent_id) {
+          const expired = db
+            .prepare(
+              `SELECT expires_at, authority_epoch
+               FROM agent_sessions
+               WHERE session_id = ? AND pairing_id = ? AND agent_id = ?
+                 AND status = 'active' LIMIT 1`,
+            )
+            .get(requestedSessionId, pairing.id, pairing.agent_id) as
+            | { expires_at: string; authority_epoch: number }
+            | undefined;
+          const authority = readAuthority(pairing.agent_id);
+          if (
+            expired &&
+            Date.parse(expired.expires_at) <= Date.parse(database.now()) &&
+            authority?.authority_kind === "native" &&
+            authority.session_id === requestedSessionId &&
+            authority.epoch === expired.authority_epoch
+          ) {
+            expiredPredecessorRecovery = true;
+            active = { active: 1 };
+            const parsed = Date.parse(expired.expires_at);
+            if (Number.isFinite(parsed)) activeExpiresAtMs = parsed;
+          }
+        }
         let recoverySuccessorId: string | null = null;
         if (repository?.findRuntimeSessionById) {
           try {
@@ -8115,10 +9514,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           usedAt: null,
         });
       });
-      db.prepare(
-        `INSERT INTO pairing_challenges(id, pairing_id, message, created_at, expires_at)
-         VALUES(?, ?, ?, ?, ?)`,
-      ).run(challengeId, pairing.id, message, now, expiresAt);
+      if (!repository) {
+        db.prepare(
+          `INSERT INTO pairing_challenges(id, pairing_id, message, created_at, expires_at)
+           VALUES(?, ?, ?, ?, ?)`,
+        ).run(challengeId, pairing.id, message, now, expiresAt);
+      }
       return {
         status: 201,
         body: { challengeId, challenge: nonce, message, expiresAt, sessionId: requestedSessionId ?? null },
@@ -8277,11 +9678,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             "Page WebMCP currently controls this agent; wait for the grant to expire or revoke it before reconnecting the native host.",
           );
         }
-        const consumed = db
-          .prepare("UPDATE pairing_challenges SET used_at = ? WHERE id = ? AND used_at IS NULL")
-          .run(now, challenge.challengeId);
-        if (consumed.changes !== 1) {
-          throw new ApiError(401, "challenge_invalid", "Challenge was already used.");
+        if (!repository) {
+          const consumed = db
+            .prepare("UPDATE pairing_challenges SET used_at = ? WHERE id = ? AND used_at IS NULL")
+            .run(now, challenge.challengeId);
+          if (consumed.changes !== 1) {
+            throw new ApiError(401, "challenge_invalid", "Challenge was already used.");
+          }
         }
         // A durable agent identity may be active in exactly one host session.
         // Superseding is transactional, so a page transfer or second runtime
@@ -8477,9 +9880,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (!verifyEd25519Signature(pairing.public_key_pem, challenge.message, signature)) {
         throw new ApiError(401, "signature_invalid", "Challenge signature is invalid.");
       }
-      const deterministicRenewal = renewalMaterial(sessionId);
-      const replacementToken = deterministicRenewal.token;
-      const replacementSessionId = deterministicRenewal.sessionId;
+      // Keep the current and immediately previous recovery key in the
+      // candidate set. Secret Manager rotation can overlap both values while
+      // a lost renewal response is retried; the durable predecessor fence
+      // below selects the exact successor that was already committed.
+      const renewalCandidates = renewalMaterials(sessionId);
+      let deterministicRenewal = renewalCandidates[0]!;
+      let replacementToken = deterministicRenewal.token;
+      let replacementSessionId = deterministicRenewal.sessionId;
       const nowDate = database.clock.now();
       const now = nowDate.toISOString();
       const expiresAt = addSeconds(nowDate, runtimeAgentSessionSeconds);
@@ -8501,10 +9909,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (repository?.findRuntimeSessionById) {
         try {
           const durableCurrent = await repository.findRuntimeSessionById(sessionId);
-          const recoverable = Boolean(
-            durableCurrent?.status === "superseded" &&
-            durableCurrent.supersedingSessionId === replacementSessionId,
-          );
+          const recoverableCandidate = durableCurrent?.status === "superseded"
+            ? renewalCandidates.find((candidate) => candidate.sessionId === durableCurrent.supersedingSessionId)
+            : undefined;
+          if (recoverableCandidate) {
+            deterministicRenewal = recoverableCandidate;
+            replacementToken = deterministicRenewal.token;
+            replacementSessionId = deterministicRenewal.sessionId;
+          }
+          const recoverable = Boolean(recoverableCandidate);
           durableRecovery = recoverable;
           const expiredPredecessorRecovery = Boolean(
             durableCurrent?.status === "active" &&
@@ -8555,7 +9968,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             authority_epoch: number;
           }
         | undefined;
-      if (!currentBeforeRow && !challenge.usedAt) {
+      // A retry may land on a replica whose SQLite projection never saw the
+      // original renewal. Firestore's durable successor proof is sufficient
+      // in that case; do not require a local predecessor row before entering
+      // the deterministic recovery response below.
+      if (!currentBeforeRow && !challenge.usedAt && !durableRecovery) {
         throw new ApiError(
           401,
           "agent_authentication_failed",
@@ -8772,11 +10189,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             "This runtime session has been superseded by a newer session.",
           );
         }
-        const consumed = db
-          .prepare("UPDATE pairing_challenges SET used_at = ? WHERE id = ? AND used_at IS NULL")
-          .run(now, challenge.challengeId);
-        if (consumed.changes !== 1) {
-          throw new ApiError(401, "challenge_invalid", "Challenge was already used.");
+        if (!repository) {
+          const consumed = db
+            .prepare("UPDATE pairing_challenges SET used_at = ? WHERE id = ? AND used_at IS NULL")
+            .run(now, challenge.challengeId);
+          if (consumed.changes !== 1) {
+            throw new ApiError(401, "challenge_invalid", "Challenge was already used.");
+          }
         }
         const updated = db
           .prepare(
@@ -10351,7 +11770,37 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if ((method === "PUT" || method === "DELETE") && followMatch) {
         const topicId = decodeURIComponent(followMatch[1]);
         const key = requireIdempotencyKey(request);
-        const topic = await topicForAgentRoute(principal.agentId, topicId);
+        let topic: Awaited<ReturnType<typeof topicForAgentRoute>>;
+        try {
+          topic = await topicForAgentRoute(principal.agentId, topicId);
+        } catch (error) {
+          // Follow rows are derived state and may outlive a deleted topic
+          // until the retention worker sweeps them. An authenticated agent
+          // must still be able to unsubscribe during that window; subscribing
+          // to a missing topic remains a hard 404.
+          if (
+            method !== "DELETE" ||
+            !(error instanceof ApiError) ||
+            error.code !== "topic_not_found" ||
+            !repository?.upsertFollow
+          ) {
+            throw error;
+          }
+          await durableWrite("topic unfollow cleanup", async () => {
+            await repository.upsertFollow!({
+              topicId,
+              agentId: principal.agentId,
+              following: false,
+              updatedAt: database.now(),
+              sessionId: principal.sessionId,
+              authorityEpoch: principal.authorityEpoch,
+              authorityKind: "native",
+              ownerAccountId: principal.ownerId,
+              idempotencyKey: key,
+            });
+          });
+          return { body: { topicId, following: false } };
+        }
         await ensureAttentionMeshAccessAuthoritatively(actingAgent, principal.agentId, topic.mesh_id);
         await ensureMeshMembershipAuthoritatively(principal.agentId, topic.mesh_id);
         const following = method === "PUT";

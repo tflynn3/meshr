@@ -7,6 +7,9 @@ export interface ProductionSettings {
   identityProjectId?: string;
   identityApiKey?: string;
   renewalRecoverySecret?: string;
+  renewalRecoveryPreviousSecret?: string;
+  invitationPepper?: string;
+  invitationPepperPrevious?: string;
   eventIngestUrl?: string;
   internalToken?: string;
 }
@@ -23,6 +26,9 @@ export function productionSettings(
     process.env.MESHR_IDENTITY_PROJECT_ID?.trim() || process.env.GOOGLE_CLOUD_PROJECT?.trim();
   const identityApiKey = process.env.MESHR_IDENTITY_API_KEY?.trim();
   const renewalRecoverySecret = process.env.MESHR_RENEWAL_RECOVERY_SECRET?.trim();
+  const renewalRecoveryPreviousSecret = process.env.MESHR_RENEWAL_RECOVERY_SECRET_PREVIOUS?.trim();
+  const invitationPepper = process.env.MESHR_INVITATION_PEPPER?.trim();
+  const invitationPepperPrevious = process.env.MESHR_INVITATION_PEPPER_PREVIOUS?.trim();
   return {
     environment: normalizedEnvironment,
     storage,
@@ -32,6 +38,9 @@ export function productionSettings(
     identityProjectId,
     identityApiKey,
     renewalRecoverySecret,
+    renewalRecoveryPreviousSecret,
+    invitationPepper,
+    invitationPepperPrevious,
     eventIngestUrl: process.env.MESHR_EVENT_INGEST_URL?.trim(),
     internalToken: process.env.MESHR_INTERNAL_TOKEN?.trim(),
   };
@@ -56,6 +65,9 @@ export function assertProductionSettings(settings: ProductionSettings): void {
   if (!usable(settings.identityProjectId)) missing.push("MESHR_IDENTITY_PROJECT_ID or GOOGLE_CLOUD_PROJECT");
   if (!usable(settings.identityApiKey)) missing.push("MESHR_IDENTITY_API_KEY");
   if (!usable(settings.renewalRecoverySecret)) missing.push("MESHR_RENEWAL_RECOVERY_SECRET");
+  if (!usable(settings.renewalRecoveryPreviousSecret)) missing.push("MESHR_RENEWAL_RECOVERY_SECRET_PREVIOUS");
+  if (!usable(settings.invitationPepper)) missing.push("MESHR_INVITATION_PEPPER");
+  if (!usable(settings.invitationPepperPrevious)) missing.push("MESHR_INVITATION_PEPPER_PREVIOUS");
   if (!usable(settings.eventIngestUrl)) missing.push("MESHR_EVENT_INGEST_URL");
   if (!usable(settings.internalToken)) missing.push("MESHR_INTERNAL_TOKEN");
   if (missing.length) {

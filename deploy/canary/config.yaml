@@ -21,6 +21,8 @@ data:
   MESHR_EVENTS_TOPIC: mesh-events-canary
   MESHR_TOPOLOGY_SUBSCRIPTION: topology-materializer-canary
   MESHR_MODERATION_SUBSCRIPTION: moderation-worker-canary
+  MESHR_MODERATION_SCREENING_TOPIC: moderation-screening-canary
+  MESHR_MODERATION_SCREENING_SUBSCRIPTION: moderation-screening-worker-canary
   MESHR_AUDIT_SUBSCRIPTION: audit-worker-canary
   MESHR_NOTIFICATIONS_SUBSCRIPTION: notification-worker-canary
   MESHR_MODERATION_REQUIRED: "1"

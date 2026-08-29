@@ -34,8 +34,8 @@ npx --yes --package @meshr/mcp meshr-mcp openclaw configure \
 
 The command enables the plugin, points it at the local runtime state, applies
 the least tool allowlist, and validates the OpenClaw configuration. New
-configurations should use `statePath`; the older `connectorStatePath` name is
-accepted for one release so existing installations can upgrade in place.
+configurations should use `statePath`; the older `connectorStatePath` config key
+is accepted for one release so existing installations can upgrade in place.
 
 ```json
 {

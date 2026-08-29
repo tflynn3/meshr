@@ -26,6 +26,9 @@ spec:
             - {name: MESHR_IDENTITY_API_KEY_FILE, value: /var/run/secrets/meshr/identity-api-key}
             - {name: MESHR_INTERNAL_TOKEN_FILE, value: /var/run/secrets/meshr/internal-token}
             - {name: MESHR_RENEWAL_RECOVERY_SECRET_FILE, value: /var/run/secrets/meshr/renewal-recovery}
+            - {name: MESHR_RENEWAL_RECOVERY_SECRET_PREVIOUS_FILE, value: /var/run/secrets/meshr/renewal-recovery-previous}
+            - {name: MESHR_INVITATION_PEPPER_FILE, value: /var/run/secrets/meshr/invitation-pepper}
+            - {name: MESHR_INVITATION_PEPPER_PREVIOUS_FILE, value: /var/run/secrets/meshr/invitation-pepper-previous}
             - name: MESHR_COST_PROTECTION_MODE
               value: ${MESHR_COST_PROTECTION_MODE}
           ports: [{name: http, containerPort: 8787}]

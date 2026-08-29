@@ -42,6 +42,10 @@ rules:
   - apiGroups: [apps]
     resources: [deployments, replicasets]
     verbs: [get, list, watch]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    resourceNames: [moderation-worker-canary, moderation-screening-worker-canary]
+    verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [pods, services]
     verbs: [get, list, watch]
@@ -61,6 +65,31 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: meshr-canary-rollout-reader
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: meshr-canary-metrics-reader
+rules:
+  - apiGroups: [apiregistration.k8s.io]
+    resources: [apiservices]
+    resourceNames: [v1beta1.external.metrics.k8s.io]
+    verbs: [get]
+  - apiGroups: [external.metrics.k8s.io]
+    resources: ["pubsub.googleapis.com|subscription|num_undelivered_messages"]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: meshr-canary-metrics-reader
+subjects:
+  - kind: User
+    name: meshr-ci-canary@${GCP_PROJECT_ID}.iam.gserviceaccount.com
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: meshr-canary-metrics-reader
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

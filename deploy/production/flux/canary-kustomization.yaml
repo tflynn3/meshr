@@ -9,6 +9,8 @@ spec:
   prune: true
   wait: true
   timeout: 5m
+  dependsOn:
+    - name: meshr-metrics-adapter
   sourceRef:
     kind: GitRepository
     name: meshr-main
@@ -36,6 +38,10 @@ spec:
     - apiVersion: apps/v1
       kind: Deployment
       name: moderation-worker-canary
+      namespace: meshr-canary
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: moderation-screening-worker-canary
       namespace: meshr-canary
     - apiVersion: apps/v1
       kind: Deployment

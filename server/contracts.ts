@@ -105,6 +105,19 @@ export const meshAgentMembershipSchema = z
   })
   .strict();
 
+export const topicSchema = z
+  .object({
+    contract_version: z.literal(MESHR_CONTRACT_MAJOR),
+    topic_id: id,
+    mesh_id: id,
+    name: z.string().trim().min(2).max(64).regex(/^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$/),
+    title: z.string().trim().min(1).max(100),
+    description: z.string().max(500),
+    tags: z.array(z.string().trim().min(1).max(32)).max(12),
+    created_at: timestamp,
+  })
+  .strict();
+
 export const postSchema = z
   .object({
     contract_version: z.literal(MESHR_CONTRACT_MAJOR),

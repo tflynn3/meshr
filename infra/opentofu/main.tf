@@ -142,6 +142,22 @@ locals {
         { field_path = "role", order = "ASCENDING" },
       ]
     }
+    mesh_role_invitations_mesh_status_expiry = {
+      collection = "mesh_role_invitations"
+      fields = [
+        { field_path = "mesh_id", order = "ASCENDING" },
+        { field_path = "status", order = "ASCENDING" },
+        { field_path = "expires_at", order = "ASCENDING" },
+      ]
+    }
+    mesh_invitations_mesh_status_expiry = {
+      collection = "mesh_invitations"
+      fields = [
+        { field_path = "mesh_id", order = "ASCENDING" },
+        { field_path = "status", order = "ASCENDING" },
+        { field_path = "expires_at", order = "ASCENDING" },
+      ]
+    }
     webmcp_grants_agent_revoked = {
       collection = "webmcp_grants"
       fields = [
@@ -194,6 +210,23 @@ locals {
       fields = [
         { field_path = "expiry_pending", order = "ASCENDING" },
         { field_path = "expires_at", order = "ASCENDING" },
+      ]
+    }
+    moderation_cases_mesh_updated = {
+      collection = "moderation_cases"
+      fields = [
+        { field_path = "mesh_id", order = "ASCENDING" },
+        { field_path = "updated_at", order = "DESCENDING" },
+        { field_path = "__name__", order = "DESCENDING" },
+      ]
+    }
+    moderation_cases_mesh_state_updated = {
+      collection = "moderation_cases"
+      fields = [
+        { field_path = "mesh_id", order = "ASCENDING" },
+        { field_path = "state", order = "ASCENDING" },
+        { field_path = "updated_at", order = "DESCENDING" },
+        { field_path = "__name__", order = "DESCENDING" },
       ]
     }
     pairings_agent_status = {
@@ -363,6 +396,7 @@ locals {
     pairing_expiry           = { collection = "pairings", field = "pending_expires_at_ttl" }
     pairing_challenge_expiry = { collection = "pairing_challenges", field = "expires_at_ttl" }
     mesh_invitation_expiry   = { collection = "mesh_invitations", field = "expires_at_ttl" }
+    role_invitation_expiry   = { collection = "mesh_role_invitations", field = "expires_at_ttl" }
   }
   # Cloudflare is the only public edge for the proxied Gateway records. Keep
   # the origin closed to direct requests and rate-limit on the end-user IP
@@ -623,6 +657,25 @@ resource "google_pubsub_topic" "dead_letter_canary" {
   depends_on = [google_project_service.required]
 }
 
+# Moderation intake stores a durable inbox row, then publishes a separate
+# screening job. Keeping this queue independent means its undelivered metric
+# measures provider work rather than the short Firestore-enqueue transaction.
+resource "google_pubsub_topic" "moderation_screening" {
+  name = "moderation-screening"
+  message_storage_policy {
+    allowed_persistence_regions = [var.region]
+  }
+  depends_on = [google_project_service.required]
+}
+
+resource "google_pubsub_topic" "moderation_screening_canary" {
+  name = "moderation-screening-canary"
+  message_storage_policy {
+    allowed_persistence_regions = [var.region]
+  }
+  depends_on = [google_project_service.required]
+}
+
 resource "google_pubsub_subscription" "dead_letter" {
   name                       = "mesh-events-dlq-replay"
   topic                      = google_pubsub_topic.dead_letter.id
@@ -691,6 +744,48 @@ resource "google_pubsub_subscription" "canary_workers" {
   depends_on = [google_pubsub_topic.dead_letter_canary]
 }
 
+resource "google_pubsub_subscription" "moderation_screening" {
+  name  = "moderation-screening-worker"
+  topic = google_pubsub_topic.moderation_screening.id
+
+  enable_message_ordering    = true
+  ack_deadline_seconds       = 30
+  retain_acked_messages      = true
+  message_retention_duration = "2592000s"
+
+  dead_letter_policy {
+    dead_letter_topic     = google_pubsub_topic.dead_letter.id
+    max_delivery_attempts = 10
+  }
+
+  retry_policy {
+    minimum_backoff = "10s"
+    maximum_backoff = "600s"
+  }
+  depends_on = [google_pubsub_topic.dead_letter]
+}
+
+resource "google_pubsub_subscription" "moderation_screening_canary" {
+  name  = "moderation-screening-worker-canary"
+  topic = google_pubsub_topic.moderation_screening_canary.id
+
+  enable_message_ordering    = true
+  ack_deadline_seconds       = 30
+  retain_acked_messages      = true
+  message_retention_duration = "2592000s"
+
+  dead_letter_policy {
+    dead_letter_topic     = google_pubsub_topic.dead_letter_canary.id
+    max_delivery_attempts = 10
+  }
+
+  retry_policy {
+    minimum_backoff = "10s"
+    maximum_backoff = "600s"
+  }
+  depends_on = [google_pubsub_topic.dead_letter_canary]
+}
+
 # Pub/Sub's service agent must be able to forward exhausted deliveries to the
 # DLQ and acknowledge them on each source subscription. Without these grants
 # a configured dead-letter policy silently behaves like an ordinary retry.
@@ -720,6 +815,20 @@ resource "google_pubsub_subscription_iam_member" "dead_letter_canary_service_age
   for_each     = google_pubsub_subscription.canary_workers
   project      = var.project_id
   subscription = each.value.name
+  role         = "roles/pubsub.subscriber"
+  member       = "serviceAccount:service-${data.google_project.current.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+}
+
+resource "google_pubsub_subscription_iam_member" "dead_letter_screening_service_agent" {
+  project      = var.project_id
+  subscription = google_pubsub_subscription.moderation_screening.name
+  role         = "roles/pubsub.subscriber"
+  member       = "serviceAccount:service-${data.google_project.current.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+}
+
+resource "google_pubsub_subscription_iam_member" "dead_letter_screening_canary_service_agent" {
+  project      = var.project_id
+  subscription = google_pubsub_subscription.moderation_screening_canary.name
   role         = "roles/pubsub.subscriber"
   member       = "serviceAccount:service-${data.google_project.current.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
 }
@@ -807,6 +916,42 @@ resource "google_firestore_index" "mesh_roles_account_role" {
   }
   fields {
     field_path = "role"
+    order      = "ASCENDING"
+  }
+}
+
+resource "google_firestore_index" "mesh_role_invitations_mesh_status_expiry" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "mesh_role_invitations"
+  fields {
+    field_path = "mesh_id"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "status"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "expires_at"
+    order      = "ASCENDING"
+  }
+}
+
+resource "google_firestore_index" "mesh_invitations_mesh_status_expiry" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "mesh_invitations"
+  fields {
+    field_path = "mesh_id"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "status"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "expires_at"
     order      = "ASCENDING"
   }
 }
@@ -1167,6 +1312,46 @@ resource "google_firestore_index" "moderation_inbox_due" {
   }
 }
 
+resource "google_firestore_index" "moderation_cases_mesh_updated" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "moderation_cases"
+  fields {
+    field_path = "mesh_id"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "updated_at"
+    order      = "DESCENDING"
+  }
+  fields {
+    field_path = "__name__"
+    order      = "DESCENDING"
+  }
+}
+
+resource "google_firestore_index" "moderation_cases_mesh_state_updated" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "moderation_cases"
+  fields {
+    field_path = "mesh_id"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "state"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "updated_at"
+    order      = "DESCENDING"
+  }
+  fields {
+    field_path = "__name__"
+    order      = "DESCENDING"
+  }
+}
+
 resource "google_firestore_index" "canary" {
   for_each   = local.canary_firestore_indexes
   project    = var.project_id
@@ -1383,6 +1568,14 @@ resource "google_firestore_field" "mesh_invitation_expiry_ttl" {
   project    = var.project_id
   database   = google_firestore_database.default.name
   collection = "mesh_invitations"
+  field      = "expires_at_ttl"
+  ttl_config {}
+}
+
+resource "google_firestore_field" "mesh_role_invitation_expiry_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "mesh_role_invitations"
   field      = "expires_at_ttl"
   ttl_config {}
 }
@@ -1690,6 +1883,28 @@ resource "google_service_account" "ingest_canary" {
   account_id   = "meshr-ingest-canary"
   display_name = "Meshr canary event ingest least-privilege runtime"
   depends_on   = [google_project_service.required]
+}
+
+# The HPA's Pub/Sub backlog metric is served by the pinned GKE
+# custom-metrics-stackdriver-adapter. Keep its Workload Identity separate from
+# application workers: it needs Cloud Monitoring read access, but no
+# Firestore, Pub/Sub publish, Secret Manager, or Cloud Run permissions.
+resource "google_service_account" "metrics_adapter" {
+  account_id   = "meshr-metrics-adapter"
+  display_name = "Meshr GKE external metrics adapter"
+  depends_on   = [google_project_service.required]
+}
+
+resource "google_project_iam_member" "metrics_adapter_monitoring_viewer" {
+  project = var.project_id
+  role    = "roles/monitoring.viewer"
+  member  = "serviceAccount:${google_service_account.metrics_adapter.email}"
+}
+
+resource "google_service_account_iam_member" "metrics_adapter_workload_identity" {
+  service_account_id = google_service_account.metrics_adapter.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[custom-metrics/custom-metrics-stackdriver-adapter]"
 }
 
 # Screening is isolated behind a small authenticated adapter. The event-plane
@@ -2210,6 +2425,20 @@ resource "google_pubsub_subscription_iam_member" "canary_worker_subscriber" {
   member       = "serviceAccount:${google_service_account.canary_worker[each.key].email}"
 }
 
+resource "google_pubsub_subscription_iam_member" "moderation_screening_worker_subscriber" {
+  project      = var.project_id
+  subscription = google_pubsub_subscription.moderation_screening.name
+  role         = "roles/pubsub.subscriber"
+  member       = "serviceAccount:${google_service_account.worker["moderation_worker"].email}"
+}
+
+resource "google_pubsub_subscription_iam_member" "canary_moderation_screening_worker_subscriber" {
+  project      = var.project_id
+  subscription = google_pubsub_subscription.moderation_screening_canary.name
+  role         = "roles/pubsub.subscriber"
+  member       = "serviceAccount:${google_service_account.canary_worker["moderation_worker"].email}"
+}
+
 resource "google_project_iam_member" "ingest_firestore" {
   project = var.project_id
   role    = "roles/datastore.user"
@@ -2261,6 +2490,20 @@ resource "google_pubsub_topic_iam_member" "ingest_canary_topic_viewer" {
   topic   = google_pubsub_topic.events_canary.name
   role    = "roles/pubsub.viewer"
   member  = "serviceAccount:${google_service_account.ingest_canary.email}"
+}
+
+resource "google_pubsub_topic_iam_member" "moderation_screening_publisher" {
+  project = var.project_id
+  topic   = google_pubsub_topic.moderation_screening.name
+  role    = "roles/pubsub.publisher"
+  member  = "serviceAccount:${google_service_account.worker["moderation_worker"].email}"
+}
+
+resource "google_pubsub_topic_iam_member" "canary_moderation_screening_publisher" {
+  project = var.project_id
+  topic   = google_pubsub_topic.moderation_screening_canary.name
+  role    = "roles/pubsub.publisher"
+  member  = "serviceAccount:${google_service_account.canary_worker["moderation_worker"].email}"
 }
 
 # GKE Workload Identity links the namespaced service accounts in the
@@ -2493,6 +2736,37 @@ resource "google_secret_manager_secret" "renewal_recovery" {
   depends_on = [google_project_service.required]
 }
 
+resource "google_secret_manager_secret" "renewal_recovery_previous" {
+  secret_id = "meshr-renewal-recovery-previous"
+  replication {
+    auto {}
+  }
+  # Keep exactly one previous recovery key available during rotation so a
+  # retry can recover a successor committed by an older API replica.
+  depends_on = [google_project_service.required]
+}
+
+resource "google_secret_manager_secret" "invitation_pepper" {
+  secret_id = "meshr-invitation-pepper"
+  replication {
+    auto {}
+  }
+  # HMAC pepper for role-invitation addressing. Populate a version through
+  # Secret Manager before the first API rollout; Terraform never stores the
+  # plaintext value in state.
+  depends_on = [google_project_service.required]
+}
+
+resource "google_secret_manager_secret" "invitation_pepper_previous" {
+  secret_id = "meshr-invitation-pepper-previous"
+  replication {
+    auto {}
+  }
+  # Outstanding role invitations can live for thirty days; retain the
+  # previous HMAC pepper for that overlap window during rotation.
+  depends_on = [google_project_service.required]
+}
+
 resource "google_secret_manager_secret" "canary_internal_token" {
   secret_id = "meshr-canary-internal-token"
   replication {
@@ -2511,6 +2785,30 @@ resource "google_secret_manager_secret" "canary_identity_api_key" {
 
 resource "google_secret_manager_secret" "canary_renewal_recovery" {
   secret_id = "meshr-canary-renewal-recovery"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.required]
+}
+
+resource "google_secret_manager_secret" "canary_renewal_recovery_previous" {
+  secret_id = "meshr-canary-renewal-recovery-previous"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.required]
+}
+
+resource "google_secret_manager_secret" "canary_invitation_pepper" {
+  secret_id = "meshr-canary-invitation-pepper"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.required]
+}
+
+resource "google_secret_manager_secret" "canary_invitation_pepper_previous" {
+  secret_id = "meshr-canary-invitation-pepper-previous"
   replication {
     auto {}
   }
@@ -2538,6 +2836,27 @@ resource "google_secret_manager_secret_iam_member" "api_renewal_recovery" {
   member    = "serviceAccount:${google_service_account.api.email}"
 }
 
+resource "google_secret_manager_secret_iam_member" "api_renewal_recovery_previous" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.renewal_recovery_previous.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.api.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "api_invitation_pepper" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.invitation_pepper.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.api.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "api_invitation_pepper_previous" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.invitation_pepper_previous.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.api.email}"
+}
+
 resource "google_secret_manager_secret_iam_member" "api_canary_identity_api_key" {
   project   = var.project_id
   secret_id = google_secret_manager_secret.canary_identity_api_key.secret_id
@@ -2555,6 +2874,27 @@ resource "google_secret_manager_secret_iam_member" "api_canary_internal_token" {
 resource "google_secret_manager_secret_iam_member" "api_canary_renewal_recovery" {
   project   = var.project_id
   secret_id = google_secret_manager_secret.canary_renewal_recovery.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.api_canary.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "api_canary_renewal_recovery_previous" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.canary_renewal_recovery_previous.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.api_canary.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "api_canary_invitation_pepper" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.canary_invitation_pepper.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.api_canary.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "api_canary_invitation_pepper_previous" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.canary_invitation_pepper_previous.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.api_canary.email}"
 }

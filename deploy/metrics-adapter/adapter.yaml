@@ -1,0 +1,202 @@
+# Pinned Google Cloud Monitoring external-metrics adapter for the moderation
+# worker HPA. This is a cluster bootstrap prerequisite, applied once outside
+# the application namespace (the production/canary overlays only reference
+# the API it serves). The image digest was resolved from the upstream GCR
+# manifest for v0.16.10-gke.0.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: custom-metrics
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: custom-metrics-stackdriver-adapter
+  namespace: custom-metrics
+  annotations:
+    iam.gke.io/gcp-service-account: ${METRICS_ADAPTER_GSA}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: custom-metrics:system:auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: custom-metrics-stackdriver-adapter
+    namespace: custom-metrics
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: custom-metrics-auth-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: custom-metrics-stackdriver-adapter
+    namespace: custom-metrics
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: custom-metrics-resource-reader
+rules:
+  - apiGroups: [""]
+    resources: [pods, nodes, nodes/stats]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: custom-metrics-resource-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: custom-metrics-resource-reader
+subjects:
+  - kind: ServiceAccount
+    name: custom-metrics-stackdriver-adapter
+    namespace: custom-metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: custom-metrics-stackdriver-adapter
+  namespace: custom-metrics
+  labels:
+    app.kubernetes.io/name: custom-metrics-stackdriver-adapter
+    app.kubernetes.io/part-of: meshr
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: custom-metrics-stackdriver-adapter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: custom-metrics-stackdriver-adapter
+    spec:
+      serviceAccountName: custom-metrics-stackdriver-adapter
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      volumes:
+        - name: serving-certs
+          emptyDir: {}
+      containers:
+        - name: adapter
+          image: gcr.io/gke-release/custom-metrics-stackdriver-adapter@sha256:0c30f3bf20fd85483a1310e3498b5b22863de7092c30f744b5165f946f648f40
+          imagePullPolicy: IfNotPresent
+          command: [/adapter]
+          args:
+            - --use-new-resource-model=true
+            - --fallback-for-container-metrics=true
+            # Keep the privileged service port at the Service boundary; the
+            # adapter process itself listens on an unprivileged port.
+            - --secure-port=8443
+            - --cert-dir=/tmp/serving-certs
+          ports: [{name: https, containerPort: 8443}]
+          volumeMounts:
+            - name: serving-certs
+              mountPath: /tmp
+          readinessProbe:
+            httpGet: {path: /healthz, port: https, scheme: HTTPS}
+            initialDelaySeconds: 40
+            periodSeconds: 10
+            timeoutSeconds: 5
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          resources:
+            requests: {cpu: 250m, memory: 200Mi}
+            limits: {cpu: 500m, memory: 400Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: custom-metrics-stackdriver-adapter
+  namespace: custom-metrics
+  labels:
+    app.kubernetes.io/name: custom-metrics-stackdriver-adapter
+spec:
+  ports: [{name: https, port: 443, protocol: TCP, targetPort: https}]
+  selector:
+    app.kubernetes.io/name: custom-metrics-stackdriver-adapter
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.custom.metrics.k8s.io
+spec:
+  insecureSkipTLSVerify: true
+  group: custom.metrics.k8s.io
+  groupPriorityMinimum: 100
+  versionPriority: 100
+  service:
+    name: custom-metrics-stackdriver-adapter
+    namespace: custom-metrics
+  version: v1beta1
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta2.custom.metrics.k8s.io
+spec:
+  insecureSkipTLSVerify: true
+  group: custom.metrics.k8s.io
+  groupPriorityMinimum: 100
+  versionPriority: 200
+  service:
+    name: custom-metrics-stackdriver-adapter
+    namespace: custom-metrics
+  version: v1beta2
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.external.metrics.k8s.io
+spec:
+  insecureSkipTLSVerify: true
+  group: external.metrics.k8s.io
+  groupPriorityMinimum: 100
+  versionPriority: 100
+  service:
+    name: custom-metrics-stackdriver-adapter
+    namespace: custom-metrics
+  version: v1beta1
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: external-metrics-reader
+rules:
+  - apiGroups: [external.metrics.k8s.io]
+    # HPA needs only the one queue-depth metric exposed by this adapter. Keep
+    # the cluster-scoped reader resource-limited rather than granting access
+    # to every external metric installed by another workload.
+    resources: ["pubsub.googleapis.com|subscription|num_undelivered_messages"]
+    verbs: [list, get, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: external-metrics-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: external-metrics-reader
+subjects:
+  - kind: ServiceAccount
+    name: horizontal-pod-autoscaler
+    namespace: kube-system

@@ -94,8 +94,8 @@ to host its Kubernetes nodes; it is not used to construct Meshr images.
 | --- | --- | --- |
 | GKE Autopilot | k3d Kubernetes on isolated Colima | Runnable manifests with explicit requests and limits |
 | GCP external load balancer / Gateway | k3d proxy, K3s service load balancer, and Traefik Ingress on `localhost:8080` | Same-origin path routing; not a Cloud Armor or certificate test |
-| Control API | Existing Meshr Node API with Firestore repository | Runs with two replicas; SQLite is an in-memory projection per replica |
-| Firestore | Official Firestore emulator | Event outbox, processed-event ledger, and topology snapshots |
+| Control API | Existing Meshr Node API with SQLite adapter | One local API replica in k3d; Firestore is exercised by the separate emulator gates, not used as the local control-plane authority |
+| Firestore | Official Firestore emulator | Event outbox, processed-event ledger, topology snapshots, and repository/API recovery tests; not a managed Firestore availability test |
 | Pub/Sub | Official Pub/Sub emulator | Ordered `mesh-events` topic and topology consumer subscription |
 | Agent ingest | `platform/ingest.ts` | Authenticated local endpoint with durable outbox retry |
 | Topology materializer | `platform/materializer.ts` | At-least-once consumer with Firestore deduplication |
@@ -110,10 +110,12 @@ The honest storage boundary matters: in production, Firestore is authoritative
 for identities, sessions, bindings, meshes, memberships, posts, idempotency,
 moderation, audit, and outbox state. The API keeps a disposable in-memory SQLite
 projection for cursors and low-latency aggregate reads; it is populated from
-Firestore on demand and lost on every process restart. The local stack
+Firestore on demand and lost on every process restart. The local stack itself
 uses the SQLite adapter for fast fixtures and the Firestore/Pub/Sub emulators
-for the event plane, so it proves behavior and wiring but not managed GCP
-availability, Workload Identity, Gateway, or regional recovery.
+for the event plane. The Firestore repository and two-replica recovery suites
+run against the emulator separately. Together these checks prove behavior and
+wiring but not managed GCP availability, Workload Identity, Gateway, or
+regional recovery.
 
 ## Contract schemas
 

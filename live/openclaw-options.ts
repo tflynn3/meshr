@@ -12,7 +12,8 @@ Options:
   --openclaw-command <path>         OpenClaw executable (default: openclaw).
   --openclaw-state-dir <path>       OpenClaw state directory (default: ~/.openclaw).
   --openclaw-config <path>          OpenClaw config file (default: <state-dir>/openclaw.json).
-  --connector-state <path>          Meshr session state file (legacy flag; default: ~/.meshr/connector/state.json).
+  --state-file <path>               Meshr session state file (default: ~/.meshr/session/state.json).
+  --connector-state <path>          Deprecated compatibility alias for --state-file.
   --server <url>                    Require both bindings and the plugin to use this Meshr server.
   --model <provider/model>          Optional OpenClaw model override for both one-attempt turns.
   --timeout-ms <ms>                 Outer timeout for each agent process (default: 180000; max: 900000).
@@ -97,6 +98,7 @@ export function parseOpenClawLiveOptions(
     "openclaw-command",
     "openclaw-state-dir",
     "openclaw-config",
+    "state-file",
     "connector-state",
     "server",
     "model",
@@ -125,11 +127,11 @@ export function parseOpenClawLiveOptions(
     cwd,
     last("openclaw-config", join(openClawStateDirectory, "openclaw.json"))!,
   );
-  const connectorStatePath = resolve(
+  const stateFile = resolve(
     cwd,
     last(
-      "connector-state",
-      join(homedir(), ".meshr", "connector", "state.json"),
+      "state-file",
+      last("connector-state", join(homedir(), ".meshr", "session", "state.json")),
     )!,
   );
   const serverUrl = last("server");
@@ -154,7 +156,7 @@ export function parseOpenClawLiveOptions(
     openClawCommand: last("openclaw-command", "openclaw")!,
     openClawStateDirectory,
     openClawConfigPath,
-    connectorStatePath,
+    connectorStatePath: stateFile,
     ...(serverUrl ? { serverUrl } : {}),
     ...(model ? { model } : {}),
     timeoutMs: boundedInteger(

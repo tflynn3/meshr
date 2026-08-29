@@ -15,13 +15,19 @@ require_command() {
 }
 
 select_runtime() {
-  require_command colima
   require_command docker
-  if ! colima status --profile "$colima_profile" >/dev/null 2>&1; then
-    colima start --profile "$colima_profile" --runtime docker --vm-type qemu --kubernetes=false \
-      --cpu 4 --memory 8 --disk 40
+  # macOS development uses an isolated Colima VM so the default Docker
+  # context remains untouched. Linux CI runners already provide an isolated
+  # Docker daemon; requiring Colima there made the canonical k3d gate
+  # impossible to run in GitHub Actions.
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    require_command colima
+    if ! colima status --profile "$colima_profile" >/dev/null 2>&1; then
+      colima start --profile "$colima_profile" --runtime docker --vm-type qemu --kubernetes=false \
+        --cpu 4 --memory 8 --disk 40
+    fi
+    docker context use "colima-${colima_profile}" >/dev/null
   fi
-  docker context use "colima-${colima_profile}" >/dev/null
   docker info >/dev/null
 }
 
@@ -92,7 +98,43 @@ logs() {
 smoke() {
   select_runtime
   select_cluster
-  (cd "$repo_root" && bazelisk build //:smoke && node bazel-bin/smoke.mjs)
+  local event_file
+  event_file="$(mktemp "${TMPDIR:-/tmp}/meshr-local-smoke-event.XXXXXX")"
+  trap 'rm -f "$event_file"' RETURN
+  wait_http() {
+    local url="$1"
+    local attempts=0
+    until curl --fail --silent --show-error "$url" >/dev/null 2>&1; do
+      attempts=$((attempts + 1))
+      if (( attempts >= 60 )); then
+        echo "timed out waiting for $url after rollout" >&2
+        return 1
+      fi
+      sleep 1
+    done
+  }
+  (
+    cd "$repo_root"
+    bazelisk build //:smoke
+    MESHR_LOCAL_SMOKE_EVENT_FILE="$event_file" node bazel-bin/smoke.mjs
+  )
+  kubectl -n "$namespace" rollout restart \
+    deployment/api deployment/web deployment/ingest \
+    deployment/topology-materializer deployment/live-gateway
+  kubectl -n "$namespace" rollout status deployment/api --timeout=5m
+  kubectl -n "$namespace" rollout status deployment/web --timeout=5m
+  kubectl -n "$namespace" rollout status deployment/ingest --timeout=5m
+  kubectl -n "$namespace" rollout status deployment/topology-materializer --timeout=5m
+  kubectl -n "$namespace" rollout status deployment/live-gateway --timeout=5m
+  # Traefik can briefly retain the old endpoint set after the deployment
+  # rollout reports complete. Warm the same-origin ingress before replaying so
+  # a transient 504 is not mistaken for event-plane loss.
+  wait_http http://localhost:8080/healthz
+  wait_http http://localhost:8080/
+  (
+    cd "$repo_root"
+    MESHR_LOCAL_SMOKE_REPLAY_FILE="$event_file" node bazel-bin/smoke.mjs
+  )
 }
 
 down() {

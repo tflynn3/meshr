@@ -85,9 +85,15 @@ by this stack (the API key can be copied from the sensitive Terraform output):
 gcloud secrets versions add meshr-identity-api-key --data-file=identity-api-key.txt
 openssl rand -base64 32 | gcloud secrets versions add meshr-internal-token --data-file=-
 openssl rand -base64 32 | gcloud secrets versions add meshr-renewal-recovery --data-file=-
+openssl rand -base64 32 | gcloud secrets versions add meshr-renewal-recovery-previous --data-file=-
+openssl rand -base64 32 | gcloud secrets versions add meshr-invitation-pepper --data-file=-
+openssl rand -base64 32 | gcloud secrets versions add meshr-invitation-pepper-previous --data-file=-
 gcloud secrets versions add meshr-canary-identity-api-key --data-file=identity-api-key.txt
 openssl rand -base64 32 | gcloud secrets versions add meshr-canary-internal-token --data-file=-
 openssl rand -base64 32 | gcloud secrets versions add meshr-canary-renewal-recovery --data-file=-
+openssl rand -base64 32 | gcloud secrets versions add meshr-canary-renewal-recovery-previous --data-file=-
+openssl rand -base64 32 | gcloud secrets versions add meshr-canary-invitation-pepper --data-file=-
+openssl rand -base64 32 | gcloud secrets versions add meshr-canary-invitation-pepper-previous --data-file=-
 ```
 
 Autopilot node VMs use the dedicated `gke_node_service_account_id` identity
@@ -105,6 +111,18 @@ topics are isolated, and its datastore IAM grants are conditioned on the
 matching database resources. The public live gateway has a viewer grant only
 for the aggregate topology database; it cannot read accounts, sessions, posts,
 moderation, or audit data.
+
+Rotate the recovery and invitation keys in two complete rollouts because CSI
+mounted values and the API keyrings are read once at process start. First write
+the new value to each `*-previous` secret while leaving the old value as the
+primary, then roll every API replica to the overlapping `{old,new}` keyring.
+Only after that rollout is healthy, write the new value as primary (retaining
+the old value in `*-previous`) and roll every replica again to `{new,old}`.
+Keep the immediately retired primary in the previous slot for the full
+renewal/invitation overlap window (at least 30 days) before replacing it. The
+API accepts both key slots for deterministic renewal recovery and
+role-invitation lookup, while newly issued credentials always use the primary
+slot. Do not remove the previous slot during either rolling deploy.
 
 OpenTofu creates separate keyless GitHub Actions identities for artifact builds,
 canary promotion, and production promotion. Set the
@@ -158,3 +176,25 @@ GCP budget thresholds are alerts, not a hard spending cap. Application cost
 protection is configured in Kubernetes and the API: at 95% projected spend,
 preserve login, reads, owner controls, and moderation while blocking new
 sessions and mesh creation before reducing write/fan-out quotas.
+
+The moderation-screening-worker HPA also depends on the cluster-scoped GKE external
+metrics adapter. Moderation intake publishes a durable screening job after it
+records the Firestore inbox row, so this subscription backlog measures actual
+provider work rather than an already-acknowledged source event. OpenTofu creates its dedicated Workload Identity service
+account and exposes it as `metrics_adapter_service_account`; install the
+pinned manifest and create the Flux substitution before reconciling either
+application overlay:
+
+```bash
+export METRICS_ADAPTER_GSA="$(tofu -chdir=infra/opentofu output -raw metrics_adapter_service_account)"
+envsubst < deploy/metrics-adapter/adapter.yaml | kubectl apply -f -
+kubectl -n flux-system create configmap meshr-metrics-adapter-values \
+  --from-literal=METRICS_ADAPTER_GSA="$METRICS_ADAPTER_GSA" \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f deploy/production/flux/metrics-adapter-kustomization.yaml
+```
+
+The Flux Kustomization waits for the adapter `APIService`; the production and
+canary application Kustomizations declare it in `dependsOn`. Run
+`scripts/check-gke-metrics-adapter.sh` for each moderation HPA before approving
+promotion.

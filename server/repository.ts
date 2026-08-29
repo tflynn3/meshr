@@ -6,6 +6,13 @@ import type {
 } from "./firestoreRepository.ts";
 import type { RuntimeKind, SocialProvider } from "./types.ts";
 
+/**
+ * Topic administration writes a topic plus event, audit, and outbox records.
+ * Keep that bounded so an otherwise-authorized account cannot turn the topic
+ * directory into an unbounded read/write amplification vector.
+ */
+export const MAX_TOPICS_PER_MESH = 50;
+
 export interface RepositoryAgentInput {
   agentId: string;
   /** The current runtime binding. A persistent agent may receive a new binding on reconnect. */
@@ -81,6 +88,21 @@ export interface RepositoryMeshInput {
   humanSessionHash?: string;
 }
 
+/** Field-level mesh governance update. The authoritative adapter resolves the
+ * current mesh inside its transaction and merges only the fields supplied by
+ * the caller, so a stale replica cannot reopen a private mesh or overwrite a
+ * concurrent owner edit with an old snapshot. */
+export interface RepositoryMeshGovernancePatch extends RepositoryMutationArtifacts {
+  meshId: string;
+  name?: string;
+  description?: string;
+  visibility?: "public" | "unlisted" | "private";
+  admission?: "open" | "approval" | "invite_only";
+  updatedAt: string;
+  actingAccountId: string;
+  humanSessionHash: string;
+}
+
 export interface RepositoryTopicInput {
   topicId: string;
   meshId: string;
@@ -89,6 +111,34 @@ export interface RepositoryTopicInput {
   description: string;
   tags: string[];
   createdAt: string;
+}
+
+export interface RepositoryTopicCreateInput extends RepositoryTopicInput {
+  /** Authenticated human that is creating the topic. */
+  actingAccountId: string;
+  humanSessionHash: string;
+}
+
+export interface RepositoryTopicUpdateInput {
+  topicId: string;
+  meshId: string;
+  name: string;
+  title: string;
+  description: string;
+  tags: string[];
+  updatedAt: string;
+  /** Authenticated human that is updating the topic. */
+  actingAccountId: string;
+  humanSessionHash: string;
+}
+
+export interface RepositoryTopicDeleteInput {
+  topicId: string;
+  meshId: string;
+  deletedAt: string;
+  /** Authenticated human that is deleting the topic. */
+  actingAccountId: string;
+  humanSessionHash: string;
 }
 
 /** A topic row scoped to one agent's current browse authority. */
@@ -336,6 +386,12 @@ export interface RepositoryModerationCase {
   resolvedAt: string | null;
 }
 
+export interface RepositoryModerationCasesPage {
+  cases: RepositoryModerationCase[];
+  /** Opaque to callers; null means there are no older cases. */
+  nextAfter: { updatedAt: string; caseId: string } | null;
+}
+
 export interface RepositoryJoinRequest {
   requestId: string;
   meshId: string;
@@ -361,6 +417,22 @@ export interface RepositoryMeshInvitation {
   redeemedAgentId: string | null;
 }
 
+export type RepositoryMeshRoleInvitationStatus = "active" | "redeemed" | "revoked" | "expired";
+
+/** A one-use, expiring human role invitation addressed by an HMAC email
+ * fingerprint. The plaintext email and token are never persisted. */
+export interface RepositoryMeshRoleInvitation {
+  invitationId: string;
+  meshId: string;
+  role: "owner" | "steward" | "observer";
+  createdByAccountId: string;
+  status: RepositoryMeshRoleInvitationStatus;
+  createdAt: string;
+  expiresAt: string;
+  redeemedAt: string | null;
+  redeemedByAccountId: string | null;
+}
+
 export type RepositoryActivityPreferenceKind = "topic" | "link";
 
 export interface RepositoryHumanActivityPreference {
@@ -370,6 +442,21 @@ export interface RepositoryHumanActivityPreference {
   watching: boolean;
   muted: boolean;
   updatedAt: string;
+}
+
+/** Field-level browser observation update. The authoritative adapter resolves
+ * the resource's mesh and rechecks session/access inside its transaction so a
+ * stale replica cannot overwrite a concurrent preference or private mesh
+ * transition. */
+export interface RepositoryHumanActivityPreferencePatch {
+  accountId: string;
+  kind: RepositoryActivityPreferenceKind;
+  resourceId: string;
+  meshId: string;
+  watching?: boolean;
+  muted?: boolean;
+  updatedAt: string;
+  humanSessionHash: string;
 }
 
 /**
@@ -438,6 +525,9 @@ export interface MeshrRepository {
     humanSessionHash?: string,
   ): Promise<void>;
   upsertMesh?(input: RepositoryMeshInput & RepositoryMutationArtifacts): Promise<void>;
+  /** Atomically merges owner-governed mesh fields against the authoritative
+   * document and returns the committed mesh. */
+  updateMeshGovernance?(input: RepositoryMeshGovernancePatch): Promise<RepositoryMeshInput>;
   /** Atomically creates a mesh, its first topic/owner role, and initial agent
    * memberships. Production callers must prefer this over a sequence of
    * independent upserts so a crash can never leave an ownerless mesh. */
@@ -450,6 +540,18 @@ export interface MeshrRepository {
     requestHash?: string;
   } & RepositoryMutationArtifacts): Promise<{ duplicate: boolean }>;
   upsertTopic?(input: RepositoryTopicInput): Promise<void>;
+  /** Cross-replica token bucket for bounded human governance mutations. */
+  consumeGovernanceRateLimit?(input: {
+    accountId: string;
+    bucket: string;
+    now: string;
+    capacity: number;
+    refillPerSecond: number;
+  }): Promise<{ allowed: boolean; retryAfterSeconds: number }>;
+  /** Durable owner/steward topic administration. */
+  createTopic?(input: RepositoryTopicCreateInput & RepositoryMutationArtifacts): Promise<void>;
+  updateTopic?(input: RepositoryTopicUpdateInput & RepositoryMutationArtifacts): Promise<void>;
+  deleteTopic?(input: RepositoryTopicDeleteInput & RepositoryMutationArtifacts): Promise<void>;
   upsertMeshHumanRole?(input: {
     meshId: string;
     accountId: string;
@@ -517,6 +619,47 @@ export interface MeshrRepository {
     actingAccountId: string;
     humanSessionHash: string;
   } & RepositoryMutationArtifacts): Promise<void>;
+  createMeshRoleInvitation?(input: {
+    invitationId: string;
+    meshId: string;
+    tokenHash: string;
+    targetEmailHash: string;
+    role: "owner" | "steward" | "observer";
+    createdByAccountId: string;
+    createdAt: string;
+    expiresAt: string;
+    actingAccountId: string;
+    humanSessionHash: string;
+  } & RepositoryMutationArtifacts): Promise<RepositoryMeshRoleInvitation>;
+  /** Direct, bounded lookup used by token redemption; avoids a capped inbox query. */
+  findMeshRoleInvitation?(input: {
+    invitationId: string;
+    targetEmailHash: string;
+  }): Promise<RepositoryMeshRoleInvitation | null>;
+  listMeshRoleInvitations?(meshId: string): Promise<RepositoryMeshRoleInvitation[]>;
+  listMeshRoleInvitationsForEmail?(targetEmailHash: string): Promise<RepositoryMeshRoleInvitation[]>;
+  revokeMeshRoleInvitation?(input: {
+    invitationId: string;
+    meshId: string;
+    revokedAt: string;
+    actingAccountId: string;
+    humanSessionHash: string;
+  } & RepositoryMutationArtifacts): Promise<void>;
+  acceptMeshRoleInvitation?(input: {
+    invitationId: string;
+    tokenHash: string;
+    /** HMAC of the authenticated recipient's email, selected from the active key overlap. */
+    targetEmailHash?: string;
+    accountId: string;
+    humanSessionHash: string;
+    acceptedAt: string;
+    idempotencyKey?: string;
+    requestHash?: string;
+  } & RepositoryMutationArtifacts): Promise<{
+    invitation: RepositoryMeshRoleInvitation;
+    role: "owner" | "steward" | "observer";
+    duplicate: boolean;
+  }>;
   upsertJoinRequest?(input: {
     requestId: string;
     meshId: string;
@@ -573,7 +716,9 @@ export interface MeshrRepository {
     agent: RepositoryAgentInput;
   }>;
   listHumanActivityPreferences?(accountId: string): Promise<RepositoryHumanActivityPreference[]>;
-  upsertHumanActivityPreference?(input: RepositoryHumanActivityPreference): Promise<void>;
+  upsertHumanActivityPreference?(
+    input: RepositoryHumanActivityPreferencePatch,
+  ): Promise<RepositoryHumanActivityPreference>;
   revokeHumanSession?(tokenHash: string, revokedAt: string): Promise<void>;
   revokeWebMcpGrants?(humanSessionHash: string, revokedAt: string): Promise<void>;
   appendEvent?(input: RepositoryEventInput): Promise<void>;
@@ -598,6 +743,12 @@ export interface MeshrRepository {
   } & RepositoryMutationArtifacts): Promise<void>;
   findModerationCase?(caseId: string): Promise<RepositoryModerationCase | null>;
   listModerationCases?(meshId: string): Promise<RepositoryModerationCase[]>;
+  listModerationCasesPage?(input: {
+    meshId: string;
+    state?: RepositoryModerationCaseState;
+    after?: { updatedAt: string; caseId: string };
+    limit: number;
+  }): Promise<RepositoryModerationCasesPage>;
   updatePostModeration?(input: {
     caseId: string;
     postId: string;
@@ -670,6 +821,8 @@ export interface MeshrRepository {
     provider: SocialProvider,
     subject: string,
   ): Promise<RepositoryAccount | null>;
+  /** Resolve an existing account for an explicit owner-invited collaborator. */
+  findAccountByEmail(email: string): Promise<RepositoryAccount | null>;
   findAccountById(accountId: string): Promise<RepositoryAccount | null>;
   createSocialAccount(input: {
     provider: SocialProvider;

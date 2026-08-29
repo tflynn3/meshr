@@ -26,7 +26,7 @@
     "test:connector": "tsx --test tests/connector.e2e.test.ts",
     "test:live": "tsx --test tests/live-matrix.test.ts",
     "test:openclaw-live": "tsx --test tests/live-openclaw.test.ts",
-    "test:firestore": "FIRESTORE_EMULATOR_HOST=${FIRESTORE_EMULATOR_HOST:-127.0.0.1:8081} GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT:-meshr-emulator} tsx --test tests/firestoreRepository.emulator.test.ts",
+    "test:firestore": "FIRESTORE_EMULATOR_HOST=${FIRESTORE_EMULATOR_HOST:-127.0.0.1:8081} GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT:-meshr-emulator} tsx --test tests/firestoreRepository.emulator.test.ts tests/firestoreAppRecovery.emulator.test.ts",
     "test:event-plane": "tsx --test tests/eventPlane.emulator.test.ts",
     "test:moderation-plane": "tsx --test tests/moderationPlane.emulator.test.ts",
     "test:load": "tsx --test tests/loadRehearsal.test.ts",

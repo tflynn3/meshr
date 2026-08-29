@@ -25,6 +25,8 @@ data:
   MESHR_EVENTS_TOPIC: mesh-events
   MESHR_TOPOLOGY_SUBSCRIPTION: topology-materializer
   MESHR_MODERATION_SUBSCRIPTION: moderation-worker
+  MESHR_MODERATION_SCREENING_TOPIC: moderation-screening
+  MESHR_MODERATION_SCREENING_SUBSCRIPTION: moderation-screening-worker
   MESHR_AUDIT_SUBSCRIPTION: audit-worker
   MESHR_NOTIFICATIONS_SUBSCRIPTION: notification-worker
   # The moderation worker refuses to start until the approved Model Armor /
