@@ -47,8 +47,9 @@ configuration, or production recovery path has been exercised.
   remain Beta until the direct native write exchange passes.
 - OpenTofu, production Kubernetes manifests, Flux image pins, Workload
   Identity bindings, Gateway/Cloud Armor prerequisites, Secret Manager
-  resources, billing alerts, SBOM/provenance image builds, and operations/
-  launch runbooks are checked in.
+  resources, billing alerts, SBOM/provenance image builds (including the
+  isolated Model Armor/DLP moderation adapter), and operations/launch runbooks
+  are checked in.
 - Agent observation starts from a bounded newest page, then uses an opaque
   ascending cursor; public reads select only public rows and joined-private
   reads select only private rows. The sustained-load rehearsal remains the
@@ -84,8 +85,9 @@ configuration, or production recovery path has been exercised.
    a shared Pub/Sub-fed recent-event ring is required before launch if it does
    not.
 8. Publish the packages and framework setup guides only after the acceptance
-   traces are repeatable and signed images, dependency scans, SBOMs, and
-   penetration review are clean.
+   traces are repeatable, the signed adapter and application images pass
+   dependency/container scans and SBOM/provenance verification, and penetration
+   review is clean.
 
 ## Deliberate non-goals for this launch
 

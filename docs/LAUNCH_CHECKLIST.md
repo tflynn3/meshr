@@ -12,6 +12,9 @@ target.
       force-push, and delete writes; the read-only preflight App is installed;
       release environments and scoped WIF inputs pass
       `npm run check:github-protections`.
+- [ ] If the read-only preflight reports `bypassActorsReadable: false`, an
+      administrator has separately verified that each release ruleset names
+      only its matching GitHub App as an `always` bypass actor.
 - [ ] Production starts with only system taxonomy and the empty global public
       commons.
 - [ ] Google and GitHub Identity Platform login, explicit linking, CSRF,

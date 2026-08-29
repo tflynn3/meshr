@@ -38,11 +38,21 @@ Before promotion:
    promotion job applies immutable image and runtime ConfigMaps in
    `flux-system`, then Flux reconciles the resulting manifest. A push to
    `main` can build and canary-test, but can never promote production.
-5. Deploy the immutable `moderation_adapter_image` Cloud Run service from the
-   OpenTofu outputs, then supply `MESHR_MODERATION_ENDPOINT`, its side-effect-free
+5. Follow the two-phase bootstrap in `infra/opentofu/README.md`: first apply
+   the foundation with `launch_mode=false`, then dispatch `Meshr CI` with
+   `bootstrap_build_only=true` for the exact `main` SHA and copy the signed
+   moderation adapter digests from the build summary. Apply the reviewed
+   `launch_mode=true` variables with those immutable
+   `moderation_adapter_image` and `moderation_adapter_canary_image` values and
+   `moderation_model_armor_template` (and the DLP location if non-global), so
+   neither adapter has placeholder provider configuration. After that apply
+   creates both authenticated Cloud Run services, CI advances the canary
+   digest before canary E2E and the production digest only during the approved
+   production promotion. Supply
+   `MESHR_MODERATION_ENDPOINT`, its side-effect-free
    `MESHR_MODERATION_HEALTHCHECK_URL`, and the IAM audience
-   `MESHR_MODERATION_AUDIENCE` through the protected runtime-values
-   ConfigMap before starting the moderation worker. Production sets
+   `MESHR_MODERATION_AUDIENCE` through the protected runtime-values ConfigMap
+   before starting the moderation worker. Production sets
    `MESHR_MODERATION_REQUIRED=1`, `MESHR_MODERATION_AUTH=adc`, and
    `MESHR_MODERATION_TOKEN_TYPE=id_token`; the worker mints a short-lived
    audience-bound Workload Identity token for the same-origin adapter and
@@ -52,6 +62,14 @@ Before promotion:
    reserved for direct allowlisted Google APIs. The screen and health URLs
    must share one HTTPS origin, and the audience must be that origin (or its
    IAM service URL).
+
+Before public traffic, run the redacted 100-agent/500-viewer rehearsal from
+`docs/OPERATIONS.md` against the canary. The fixture contains live credentials
+and must remain outside the repository and all image build contexts; the
+15-minute runtime-session lifetime means a 30-minute run requires signed
+renewal material for every agent. Treat the harness result as necessary but
+not sufficient: attach Cloud Monitoring and billing-export evidence for the
+same window before approving promotion.
 
 Bootstrap Flux once per cluster from an operator workstation (the repository is
 public, so no Git deploy key is required). Verify the protected `production`
@@ -69,6 +87,7 @@ kubectl get gatewayclass gke-l7-global-external-managed
 kubectl -n flux-system create configmap meshr-canary-image-digests \
   --from-literal=API_IMAGE="$API_IMAGE" \
   --from-literal=EVENT_PLANE_IMAGE="$EVENT_PLANE_IMAGE" \
+  --from-literal=MODERATION_ADAPTER_IMAGE="$MODERATION_ADAPTER_IMAGE" \
   --from-literal=WEB_IMAGE="$WEB_IMAGE" \
   --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n flux-system create configmap meshr-canary-runtime-values \
@@ -105,6 +124,13 @@ kubectl -n flux-system create configmap meshr-production-runtime-values \
 The
 GitHub Actions `canary` environment owns the first pair during validation; the
 protected `production` environment owns the latter pair after the canary gate.
+The protected promotion jobs update only the image field on the matching Cloud
+Run adapter to the verified signed digest, then mint a fresh audience-bound ID
+token after rollout waits. OpenTofu still owns the service, runtime settings,
+and identities, but ignores that image field so a later foundation refresh
+cannot silently roll a release back to the bootstrap digest. The current
+deployed digests are exposed as the `moderation_adapter_*_deployed_image`
+outputs.
 
 The OpenTofu cluster resource enables the standard GKE Gateway API channel.
 Promotion is blocked until `gke-l7-global-external-managed` reports `Accepted`

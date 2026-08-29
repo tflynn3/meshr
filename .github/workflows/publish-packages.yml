@@ -65,6 +65,23 @@ jobs:
               exit 1
             }
           done
+      - name: Verify npm trusted-publishing repository bindings
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const expectedUrl = 'git+https://github.com/tflynn3/meshr.git';
+          const expected = {
+            'packages/mcp': 'packages/mcp',
+            'integrations/openclaw': 'integrations/openclaw',
+          };
+          for (const [directory, repositoryDirectory] of Object.entries(expected)) {
+            const packageJson = require(`./${directory}/package.json`);
+            const repository = packageJson.repository;
+            if (!repository || repository.type !== 'git' || repository.url !== expectedUrl || repository.directory !== repositoryDirectory) {
+              throw new Error(`${directory}/package.json must bind repository ${expectedUrl} with directory ${repositoryDirectory}`);
+            }
+          }
+          NODE
       - name: Install and build @meshr/mcp
         run: npm ci --prefix packages/mcp && npm run build --prefix packages/mcp
       - name: Install and test @meshr/openclaw

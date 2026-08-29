@@ -233,7 +233,7 @@ function assertBranchProtection(repo, targetBranch, { requireVerify }) {
   };
 }
 
-function assertReleaseRuleset(repo, targetBranch, expectedAppId) {
+function assertReleaseRuleset(repo, targetBranch, expectedAppId, { allowUnreadableBypassActors = false } = {}) {
   const summaries = ghApi(`repos/${repo}/rulesets?includes_parents=true&per_page=100`);
   if (summaries.__error) fail(`Cannot inspect GitHub rulesets: ${summaries.__error}`);
   if (!Array.isArray(summaries)) fail(`GitHub returned an invalid ruleset list for ${repo}.`);
@@ -260,6 +260,7 @@ function assertReleaseRuleset(repo, targetBranch, expectedAppId) {
   if (exact.length !== 1) {
     fail(`Branch ${targetBranch} must have exactly one active branch ruleset scoped to refs/heads/${targetBranch}; found ${exact.length}.`);
   }
+  let bypassActorsReadable = true;
   for (const candidate of matching) {
     const rules = Array.isArray(candidate.rules) ? candidate.rules : [];
     if (!rules.some((rule) => rule?.type === "pull_request")) {
@@ -270,6 +271,20 @@ function assertReleaseRuleset(repo, targetBranch, expectedAppId) {
     }
     if (!rules.some((rule) => rule?.type === "non_fast_forward")) {
       fail(`Every active ruleset applying to ${targetBranch} must reject force-pushes.`);
+    }
+    // GitHub's ruleset detail endpoint omits bypass_actors for tokens that can
+    // read repository metadata but do not have administration:write. The
+    // automated workflow intentionally uses that read-only token. Preserve a
+    // fail-closed full check, while allowing the metadata preflight to report
+    // this as an explicit human/admin verification boundary instead of
+    // claiming it proved the release App wiring.
+    const hasBypassActorsField = Object.prototype.hasOwnProperty.call(candidate, "bypass_actors");
+    if (!hasBypassActorsField) {
+      if (!allowUnreadableBypassActors) {
+        fail(`Every ruleset applying to ${targetBranch} must expose bypass actors to the release preflight identity.`);
+      }
+      bypassActorsReadable = false;
+      continue;
     }
     const bypassActors = Array.isArray(candidate.bypass_actors) ? candidate.bypass_actors : [];
     const integrationActors = bypassActors.filter((actor) =>
@@ -298,8 +313,9 @@ function assertReleaseRuleset(repo, targetBranch, expectedAppId) {
   return {
     branch: targetBranch,
     rulesetIds: matching.map((candidate) => candidate.id),
-    bypassAppId: expected,
+    bypassAppId: bypassActorsReadable ? expected : null,
     bypassMode: "always",
+    bypassActorsReadable,
   };
 }
 
@@ -326,11 +342,12 @@ function assertDistinctReleaseAppIds(canaryId, productionId) {
   return { canaryId, productionId };
 }
 
-function assertReleaseTagRuleset(repo) {
+function assertReleaseTagRuleset(repo, { allowUnreadableBypassActors = false } = {}) {
   const summaries = ghApi(`repos/${repo}/rulesets?includes_parents=true&per_page=100`);
   if (summaries.__error) fail(`Cannot inspect GitHub tag rulesets: ${summaries.__error}`);
   if (!Array.isArray(summaries)) fail(`GitHub returned an invalid ruleset list for ${repo}.`);
   const matching = [];
+  let bypassActorsReadable = true;
   for (const summary of summaries) {
     if (summary?.enforcement !== "active" || summary?.target !== "tag" || !Number.isInteger(Number(summary.id))) continue;
     const detail = ghApi(`repos/${repo}/rulesets/${summary.id}`);
@@ -343,6 +360,13 @@ function assertReleaseTagRuleset(repo) {
     if (!hasNoDeletion || !hasNoRewrite) {
       fail("The v* tag ruleset must reject deletion and non-fast-forward updates.");
     }
+    const hasBypassActorsField = Object.prototype.hasOwnProperty.call(detail, "bypass_actors");
+    if (!hasBypassActorsField) {
+      if (!allowUnreadableBypassActors) {
+        fail("The immutable v* tag ruleset must expose bypass actors to the release preflight identity.");
+      }
+      bypassActorsReadable = false;
+    }
     const bypassActors = Array.isArray(detail.bypass_actors) ? detail.bypass_actors : [];
     if (bypassActors.length) {
       fail("The immutable v* tag ruleset must not grant bypass actors.");
@@ -353,7 +377,7 @@ function assertReleaseTagRuleset(repo) {
   if (matching.length !== 1) {
     fail(`Exactly one active tag ruleset must protect immutable v* release tags; found ${matching.length}.`);
   }
-  return matching[0];
+  return { ...matching[0], bypassActorsReadable };
 }
 
 function main() {
@@ -379,19 +403,31 @@ function main() {
 
   const releaseApps = metadataOnly ? null : assertDistinctReleaseApps();
   const releaseRulesets = [
-    assertReleaseRuleset(repository, "canary", releaseApps?.canaryId),
-    assertReleaseRuleset(repository, "production", releaseApps?.productionId),
+    assertReleaseRuleset(repository, "canary", releaseApps?.canaryId, {
+      allowUnreadableBypassActors: metadataOnly,
+    }),
+    assertReleaseRuleset(repository, "production", releaseApps?.productionId, {
+      allowUnreadableBypassActors: metadataOnly,
+    }),
   ];
   if (metadataOnly) {
-    // The read-only App cannot read protected environment variables, so use
-    // the bypass actor IDs returned by each ruleset to prove that canary and
-    // production have separate release identities before promotion jobs run.
-    assertDistinctReleaseAppIds(
-      Number(releaseRulesets[0]?.bypassAppId),
-      Number(releaseRulesets[1]?.bypassAppId),
-    );
+    // The read-only App cannot read protected environment variables and GitHub
+    // omits bypass_actors from ruleset details without administration:write.
+    // If the field is available, prove the two release integrations are
+    // distinct; otherwise surface the exact admin verification still needed
+    // rather than pretending this preflight checked it.
+    if (releaseRulesets.every((ruleset) => ruleset.bypassActorsReadable)) {
+      assertDistinctReleaseAppIds(
+        Number(releaseRulesets[0]?.bypassAppId),
+        Number(releaseRulesets[1]?.bypassAppId),
+      );
+    } else {
+      console.warn("Release App bypass actors were not exposed to the read-only preflight identity; verify canary and production ruleset bypass wiring with an administrator before promotion.");
+    }
   }
-  const releaseTagRuleset = assertReleaseTagRuleset(repository);
+  const releaseTagRuleset = assertReleaseTagRuleset(repository, {
+    allowUnreadableBypassActors: metadataOnly,
+  });
 
   // The automated metadata preflight runs with a dedicated read-only GitHub
   // App. Environment-scoped credential names are checked by the protected

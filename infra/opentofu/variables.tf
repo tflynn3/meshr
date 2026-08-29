@@ -62,6 +62,58 @@ variable "moderation_adapter_image" {
   }
 }
 
+variable "moderation_adapter_canary_image" {
+  type        = string
+  description = "Immutable Cloud Run image digest for the canary moderation adapter. Keep this separate from the production adapter so canary promotion cannot update both services at once. Required for launch_mode=true."
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = var.moderation_adapter_canary_image == null || can(
+      regex("^.+@sha256:[a-f0-9]{64}$", trimspace(var.moderation_adapter_canary_image)),
+    )
+    error_message = "moderation_adapter_canary_image must be null or an immutable image reference ending in @sha256:<64 lowercase hex characters>."
+  }
+}
+
+variable "moderation_model_armor_template" {
+  type        = string
+  description = "Fully qualified Model Armor template resource used by the moderation adapter. Required for launch_mode=true."
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = var.moderation_model_armor_template == null || can(
+      regex("^projects/[A-Za-z0-9][A-Za-z0-9-_.:]{0,99}/locations/[A-Za-z0-9][A-Za-z0-9-_.-]{0,62}/templates/[A-Za-z0-9][A-Za-z0-9-_.-]{0,99}$", trimspace(var.moderation_model_armor_template)),
+    )
+    error_message = "moderation_model_armor_template must be null or a fully qualified projects/<project>/locations/<location>/templates/<template> resource."
+  }
+}
+
+variable "moderation_model_armor_endpoint" {
+  type        = string
+  description = "Optional HTTPS Model Armor API endpoint override; leave null to derive the regional rep.googleapis.com endpoint."
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = var.moderation_model_armor_endpoint == null || can(
+      regex("^https://modelarmor\\.[A-Za-z0-9][A-Za-z0-9.-]*\\.rep\\.googleapis\\.com/?$|^https://modelarmor\\.googleapis\\.com/?$", trimspace(var.moderation_model_armor_endpoint)),
+    )
+    error_message = "moderation_model_armor_endpoint must be the regional modelarmor.<location>.rep.googleapis.com endpoint (or the global Model Armor endpoint) over HTTPS."
+  }
+}
+
+variable "moderation_dlp_location" {
+  type        = string
+  description = "Sensitive Data Protection processing location used by the moderation adapter."
+  default     = "global"
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9-_.-]{0,62}$", trimspace(var.moderation_dlp_location)))
+    error_message = "moderation_dlp_location must be a valid Google Cloud location name."
+  }
+}
+
 variable "gateway_hostname" {
   type        = string
   description = "Deprecated compatibility input; the stack now reserves and publishes a static global Gateway address."

@@ -4,6 +4,11 @@
   "private": false,
   "type": "module",
   "description": "Native MCP session host for Meshr agents.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tflynn3/meshr.git",
+    "directory": "packages/mcp"
+  },
   "scripts": {
     "build": "node build.mjs",
     "prepack": "npm run build",

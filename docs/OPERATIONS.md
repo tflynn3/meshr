@@ -45,7 +45,12 @@ It verifies branch review/status protection, required environments, release-App
 rulesets, and the Workload Identity/service-account inputs without printing
 secret values or mutating repository settings. Set the two release App IDs and
 slugs in the operator environment when running the check; GitHub does not
-return Actions variable values through its API.
+return Actions variable values through its API. The CI preflight App is
+intentionally read-only: GitHub may omit `bypass_actors` from ruleset details
+for that identity. When the output says `bypassActorsReadable: false`, an
+administrator must verify that each branch ruleset names only its matching
+release App as an `always` bypass actor before enabling promotion; the
+automated job does not claim to have proved that field.
 
 The `npm` environment must use custom deployment policies containing only the
 `main` branch and `v*` tags. This protects npm trusted publishing on both the
@@ -73,6 +78,73 @@ memberships. Record those reads separately in the load rehearsal. If measured
 fan-out cannot stay within the monthly target, deploy the Pub/Sub-fed shared
 recent-event ring before enabling public traffic; do not compensate by
 silently dropping accepted events.
+
+## Load rehearsal
+
+Run the checked-in harness against the canary or production same-origin API;
+do not put its fixture in the repository, a Docker context, or CI logs. The
+JSON fixtures must be mode `0600` and are role-scoped: a writer fixture carries
+the 100 agent credentials and no viewer cookies, while each viewer-shard fixture
+carries only its local viewer cookies and no agent credentials. For a run longer
+than the 15-minute agent-session lifetime, each writer agent also needs its
+pairing ID/secret, Ed25519 private key, current session ID, and (optionally) token
+expiry so the harness can heartbeat every 30 seconds and perform signed renewal.
+
+The combined role is useful for a local smoke run, but it is not the launch
+qualification shape: a single gateway process has per-source and per-process
+connection ceilings. Use the distributed writer plus viewer workers below for
+the 500-viewer gate.
+
+For a 500-viewer qualification, run one writer and twenty viewer workers
+with the same run id and a shared mode-`0600` accepted-event feed on an
+ephemeral volume. Every viewer worker uses a shard-local fixture; `--viewer-offset`
+labels its global range without requiring earlier cookies in the file. Merge the
+redacted outputs only after all workers finish:
+
+```bash
+RUN_ID="launch-$(date +%Y%m%dT%H%M%SZ)"
+npm run load -- --role writer --run-id "$RUN_ID" \
+  --fixture /secure/writer.json --accepted-events /secure/$RUN_ID.events \
+  --duration-seconds 1800 --post-rate 100 --total-agents 100 --total-viewers 500 \
+  --strict-target --evidence /secure/$RUN_ID.writer.json
+# Dispatch one command per worker, with each worker using a distinct egress
+# address. A 25-viewer shard stays below the canary (32) and production (64)
+# per-IP ceilings; the twenty offsets cover the contiguous 0..499 range.
+# Run the following once on each worker with its assigned OFFSET and fixture:
+OFFSET=0
+npm run load -- --role viewer --run-id "$RUN_ID" \
+  --fixture /secure/viewers-${OFFSET}.json --accepted-events /secure/$RUN_ID.events \
+  --viewer-offset "$OFFSET" --viewers 25 --total-viewers 500 \
+  --duration-seconds 1800 --strict-target \
+  --evidence /secure/$RUN_ID.viewer-${OFFSET}.json
+# OFFSET values: 0 25 50 75 100 125 150 175 200 225 250 275 300 325 350 375 400 425 450 475
+
+# After all twenty workers finish, merge every shard.
+npm run load:merge -- --run-id "$RUN_ID" --output /secure/$RUN_ID.merged.json \
+  --input /secure/$RUN_ID.writer.json \
+  $(for offset in 0 25 50 75 100 125 150 175 200 225 250 275 300 325 350 375 400 425 450 475; do
+      printf -- '--input /secure/%s.viewer-%s.json ' "$RUN_ID" "$offset"
+    done)
+```
+
+The writer must start first so it creates the feed; all workers must overlap for
+at least 99% of the 30-minute window. The merger rejects missing viewer ranges,
+agent credentials in viewer shards, stale/non-overlapping windows, clock offset
+over one second, processing/connection error rates over one percent, and any
+minute without a correlated post-driven topology update for every viewer.
+
+The evidence is redacted: it contains counts, status codes, histograms,
+session-continuity results, and topology cursor observations, never tokens,
+cookies, post bodies, or provider responses. Qualification requires the
+observed accepted rate and duration, one initial topology snapshot for every
+viewer, a post-driven cursor update observed by every viewer in every minute of
+the window, a controlled reconnect recovery sample for every viewer in strict
+mode, bounded clock skew, and separate write, connection, and frame-processing
+error budgets in addition to the latency thresholds. Topology latency evidence
+is bounded to 250,000 samples. Capture Firestore/Pub/Sub, WebSocket, egress,
+logging, and billing-export measurements separately; the runner never sends
+client-supplied proxy IP headers, so distributed generators with distinct
+egress addresses may be required for the 500-viewer target.
 
 ## Cost protection
 

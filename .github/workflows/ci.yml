@@ -10,6 +10,11 @@ on:
         description: "Exact main commit to canary-test and promote"
         required: true
         type: string
+      bootstrap_build_only:
+        description: "Build and sign immutable images without running canary or production promotion (first launch bootstrap)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -173,6 +178,11 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+    outputs:
+      api_digest: ${{ steps.resolve-bootstrap-digests.outputs.api }}
+      event_plane_digest: ${{ steps.resolve-bootstrap-digests.outputs.event_plane }}
+      moderation_adapter_digest: ${{ steps.resolve-bootstrap-digests.outputs.moderation_adapter }}
+      web_digest: ${{ steps.resolve-bootstrap-digests.outputs.web }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Validate protected build inputs
@@ -238,6 +248,29 @@ jobs:
             --file deploy/images/event-plane.Dockerfile \
             --tag "$REGISTRY/$IMAGE_REPOSITORY/event-plane:$TAG" \
             --provenance=true --sbom=true --push .
+      - name: Refresh GCP credentials before moderation-adapter image build
+        id: moderation-adapter-build-auth
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_BUILD_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_BUILD_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+      - name: Login to Artifact Registry for moderation-adapter build
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: oauth2accesstoken
+          password: ${{ steps.moderation-adapter-build-auth.outputs.access_token }}
+      - name: Build and push moderation-adapter image
+        env:
+          TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            --file deploy/images/moderation-adapter.Dockerfile \
+            --tag "$REGISTRY/$IMAGE_REPOSITORY/moderation-adapter:$TAG" \
+            --provenance=true --sbom=true --push .
       - name: Refresh GCP credentials before web image build
         id: web-build-auth
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
@@ -281,11 +314,32 @@ jobs:
         run: |
           cosign sign --yes "$REGISTRY/$IMAGE_REPOSITORY/api:${{ github.sha }}"
           cosign sign --yes "$REGISTRY/$IMAGE_REPOSITORY/event-plane:${{ github.sha }}"
+          cosign sign --yes "$REGISTRY/$IMAGE_REPOSITORY/moderation-adapter:${{ github.sha }}"
           cosign sign --yes "$REGISTRY/$IMAGE_REPOSITORY/web:${{ github.sha }}"
+      - name: Resolve immutable bootstrap digests
+        id: resolve-bootstrap-digests
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.signing-auth.outputs.access_token }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo '### Signed immutable image digests'
+            echo '| Image | Immutable reference |'
+            echo '| --- | --- |'
+          } >> "$GITHUB_STEP_SUMMARY"
+          for image in api event-plane moderation-adapter web; do
+            ref="$REGISTRY/$IMAGE_REPOSITORY/$image:$IMAGE_TAG"
+            digest="$(gcloud artifacts docker images describe "$ref" --format='value(image_summary.digest)')"
+            test -n "$digest"
+            key="${image//-/_}"
+            echo "$key=$digest" >> "$GITHUB_OUTPUT"
+            printf '| `%s` | `%s@%s` |\n' "$image" "$REGISTRY/$IMAGE_REPOSITORY/$image" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          done
 
   canary:
     needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.bootstrap_build_only != true)
     environment: canary
     concurrency:
       group: meshr-canary-promotion
@@ -303,6 +357,7 @@ jobs:
     outputs:
       api_digest: ${{ steps.resolve.outputs.api }}
       event_plane_digest: ${{ steps.resolve.outputs.event_plane }}
+      moderation_adapter_digest: ${{ steps.resolve.outputs.moderation_adapter }}
       web_digest: ${{ steps.resolve.outputs.web }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -390,31 +445,6 @@ jobs:
           printf 'MESHR_CANARY_SUSPEND_WAS=%s\n' "${was_suspended:-false}" >> "$GITHUB_ENV"
           kubectl -n flux-system patch kustomization meshr-canary \
             --type=merge --patch='{"spec":{"suspend":true}}'
-      - name: Advance the protected canary candidate ref
-        env:
-          MESHR_RELEASE_TOKEN: ${{ steps.canary-token.outputs.token }}
-        run: |
-          set -euo pipefail
-          git config user.name 'meshr-release[bot]'
-          git config user.email 'meshr-release[bot]@users.noreply.github.com'
-          git fetch --no-tags origin refs/heads/canary:refs/remotes/origin/canary || true
-          if git show-ref --verify --quiet refs/remotes/origin/canary; then
-            if ! git merge-base --is-ancestor refs/remotes/origin/canary HEAD; then
-              echo 'Remote canary is not an ancestor of this main commit; refusing to rewrite the candidate ref.' >&2
-              exit 1
-            fi
-          fi
-          helper="$RUNNER_TEMP/meshr-git-credential-helper"
-          cat >"$helper" <<'EOF'
-          #!/bin/sh
-          if [ "${1:-}" = get ]; then
-            printf 'protocol=https\nhost=github.com\nusername=x-access-token\npassword=%s\n' "$MESHR_RELEASE_TOKEN"
-          fi
-          EOF
-          chmod 700 "$helper"
-          trap 'rm -f "$helper"' EXIT
-          MESHR_RELEASE_TOKEN="$MESHR_RELEASE_TOKEN" git -c credential.helper="$helper" \
-            push "https://github.com/${GITHUB_REPOSITORY}.git" HEAD:canary
       - name: Refresh GCP credentials before resolving image digests
         id: canary-resolve-auth
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
@@ -431,7 +461,7 @@ jobs:
         run: |
           set -euo pipefail
           gcloud auth configure-docker "$REGISTRY" --quiet
-          for image in api event-plane web; do
+          for image in api event-plane moderation-adapter web; do
             ref="$REGISTRY/$IMAGE_REPOSITORY/$image:$IMAGE_TAG"
             digest="$(gcloud artifacts docker images describe "$ref" --format='value(image_summary.digest)')"
             test -n "$digest"
@@ -458,6 +488,7 @@ jobs:
           for pair in \
             "api:$API_DIGEST" \
             "event-plane:$EVENT_PLANE_DIGEST" \
+            "moderation-adapter:$MODERATION_ADAPTER_DIGEST" \
             "web:$WEB_DIGEST"; do
             image="${pair%%:*}"
             digest="${pair#*:}"
@@ -471,15 +502,17 @@ jobs:
           IMAGE_REPOSITORY: ${{ env.IMAGE_REPOSITORY }}
           API_DIGEST: ${{ steps.resolve.outputs.api }}
           EVENT_PLANE_DIGEST: ${{ steps.resolve.outputs.event_plane }}
+          MODERATION_ADAPTER_DIGEST: ${{ steps.resolve.outputs.moderation_adapter }}
           WEB_DIGEST: ${{ steps.resolve.outputs.web }}
       - name: Verify BuildKit SBOM and provenance attestations
         env:
           API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ steps.resolve.outputs.api }}
           EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ steps.resolve.outputs.event_plane }}
+          MODERATION_ADAPTER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/moderation-adapter@${{ steps.resolve.outputs.moderation_adapter }}
           WEB_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/web@${{ steps.resolve.outputs.web }}
         run: |
           set -euo pipefail
-          for image in "$API_IMAGE" "$EVENT_PLANE_IMAGE" "$WEB_IMAGE"; do
+          for image in "$API_IMAGE" "$EVENT_PLANE_IMAGE" "$MODERATION_ADAPTER_IMAGE" "$WEB_IMAGE"; do
             manifest="$(mktemp)"
             docker buildx imagetools inspect --raw "$image" >"$manifest"
             # BuildKit's --sbom/--provenance flags attach OCI attestation
@@ -510,6 +543,14 @@ jobs:
           scanners: vuln,secret,misconfig
           severity: CRITICAL,HIGH
           exit-code: '1'
+      - name: Scan immutable moderation-adapter image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/moderation-adapter@${{ steps.resolve.outputs.moderation_adapter }}
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          exit-code: '1'
       - name: Scan immutable web image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -518,6 +559,163 @@ jobs:
           scanners: vuln,secret,misconfig
           severity: CRITICAL,HIGH
           exit-code: '1'
+      - name: Deploy signed canary moderation adapter candidate without traffic
+        id: canary-candidate
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.canary-resolve-auth.outputs.access_token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          MODERATION_ADAPTER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/moderation-adapter@${{ steps.resolve.outputs.moderation_adapter }}
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT_ID:?Set GCP_PROJECT_ID before the canary adapter update}"
+          : "${GKE_LOCATION:?Set GKE_LOCATION before the canary adapter update}"
+          : "${MODERATION_ADAPTER_IMAGE:?The signed canary adapter digest was not resolved}"
+          service_json="$(gcloud run services describe meshr-moderation-adapter-canary \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" --format=json)"
+          previous_revision="$(jq -r '[.status.traffic[]? | select((.percent // 0) == 100) | .revisionName][0] // empty' <<<"$service_json")"
+          : "${previous_revision:?The canary moderation adapter has no 100% traffic target to restore on failure}"
+          candidate_tag="meshr-${GITHUB_SHA:0:12}"
+          gcloud run services update meshr-moderation-adapter-canary \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --image "$MODERATION_ADAPTER_IMAGE" --no-traffic --quiet
+          service_json="$(gcloud run services describe meshr-moderation-adapter-canary \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" --format=json)"
+          candidate_revision="$(jq -r '.status.latestCreatedRevisionName // empty' <<<"$service_json")"
+          : "${candidate_revision:?The canary moderation adapter candidate revision was not reported}"
+          gcloud run services update-traffic meshr-moderation-adapter-canary \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --set-tags="$candidate_tag=$candidate_revision" --quiet
+          service_json="$(gcloud run services describe meshr-moderation-adapter-canary \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" --format=json)"
+          candidate_url="$(jq -r --arg tag "$candidate_tag" '[.status.traffic[]? | select(.tag == $tag) | .url][0] // empty' <<<"$service_json")"
+          : "${candidate_url:?The canary moderation adapter candidate tag URL was not reported}"
+          candidate_percent="$(jq -r --arg revision "$candidate_revision" '[.status.traffic[]? | select(.revisionName == $revision) | (.percent // 0)] | add // 0' <<<"$service_json")"
+          test "$candidate_percent" = 0 || {
+            echo "Canary candidate $candidate_revision unexpectedly received traffic ($candidate_percent%)." >&2
+            exit 1
+          }
+          printf 'MESHR_CANARY_ADAPTER_PREVIOUS_REVISION=%s\n' "$previous_revision" >> "$GITHUB_ENV"
+          printf 'MESHR_CANARY_ADAPTER_CANDIDATE_REVISION=%s\n' "$candidate_revision" >> "$GITHUB_ENV"
+          echo "revision=$candidate_revision" >> "$GITHUB_OUTPUT"
+          echo "url=$candidate_url" >> "$GITHUB_OUTPUT"
+      - name: Verify canary adapter endpoint binding before minting candidate token
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.canary-resolve-auth.outputs.access_token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          MESHR_MODERATION_ENDPOINT: ${{ vars.MESHR_MODERATION_ENDPOINT }}
+          MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
+          MESHR_MODERATION_AUDIENCE: ${{ vars.MESHR_MODERATION_AUDIENCE }}
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT_ID:?Set GCP_PROJECT_ID before the canary adapter preflight}"
+          : "${GKE_LOCATION:?Set GKE_LOCATION before the canary adapter preflight}"
+          : "${MESHR_MODERATION_ENDPOINT:?Set MESHR_MODERATION_ENDPOINT before the canary adapter preflight}"
+          : "${MESHR_MODERATION_HEALTHCHECK_URL:?Set MESHR_MODERATION_HEALTHCHECK_URL before the canary adapter preflight}"
+          : "${MESHR_MODERATION_AUDIENCE:?Set MESHR_MODERATION_AUDIENCE before the canary adapter preflight}"
+          adapter_url="$(gcloud run services describe meshr-moderation-adapter-canary \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --format='value(status.url)')"
+          : "${adapter_url:?The canary moderation adapter did not report a Cloud Run URL}"
+          test "$MESHR_MODERATION_AUDIENCE" = "$adapter_url" || {
+            echo "MESHR_MODERATION_AUDIENCE must equal the canary adapter status.url ($adapter_url)." >&2
+            exit 1
+          }
+          test "$MESHR_MODERATION_ENDPOINT" = "$adapter_url/screen" || {
+            echo "MESHR_MODERATION_ENDPOINT must equal the canary adapter /screen URL ($adapter_url/screen)." >&2
+            exit 1
+          }
+          test "$MESHR_MODERATION_HEALTHCHECK_URL" = "$adapter_url/healthz" || {
+            echo "MESHR_MODERATION_HEALTHCHECK_URL must equal the canary adapter /healthz URL ($adapter_url/healthz)." >&2
+            exit 1
+          }
+      - name: Mint dedicated canary moderation adapter ID token
+        id: canary-adapter-id-token
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
+          token_format: id_token
+          id_token_audience: ${{ vars.MESHR_MODERATION_AUDIENCE }}
+      - name: Verify canary moderation adapter candidate before advancing traffic
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.canary-resolve-auth.outputs.access_token }}
+          ADAPTER_ID_TOKEN: ${{ steps.canary-adapter-id-token.outputs.id_token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
+          MESHR_MODERATION_AUDIENCE: ${{ vars.MESHR_MODERATION_AUDIENCE }}
+          MODERATION_ADAPTER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/moderation-adapter@${{ steps.resolve.outputs.moderation_adapter }}
+          CANDIDATE_REVISION: ${{ steps.canary-candidate.outputs.revision }}
+          CANDIDATE_URL: ${{ steps.canary-candidate.outputs.url }}
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT_ID:?Set GCP_PROJECT_ID before the adapter preflight}"
+          : "${GKE_LOCATION:?Set GKE_LOCATION before the adapter preflight}"
+          : "${MESHR_MODERATION_HEALTHCHECK_URL:?Set MESHR_MODERATION_HEALTHCHECK_URL before the adapter preflight}"
+          : "${MESHR_MODERATION_AUDIENCE:?Set MESHR_MODERATION_AUDIENCE before the adapter preflight}"
+          : "${ADAPTER_ID_TOKEN:?The dedicated adapter ID token was not minted}"
+          : "${CANDIDATE_REVISION:?The canary candidate revision was not resolved}"
+          : "${CANDIDATE_URL:?The canary candidate URL was not resolved}"
+          adapter_image="$(gcloud run revisions describe "$CANDIDATE_REVISION" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --format='value(spec.containers[0].image)')"
+          test "$adapter_image" = "$MODERATION_ADAPTER_IMAGE" || {
+            echo "Canary moderation adapter did not converge to the signed digest produced by this build." >&2
+            exit 1
+          }
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+            -H "Authorization: Bearer $ADAPTER_ID_TOKEN" \
+            "${CANDIDATE_URL%/}/healthz" | jq -e '.ok == true' >/dev/null
+      - name: Shift canary adapter traffic to the verified candidate
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.canary-resolve-auth.outputs.access_token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          CANDIDATE_REVISION: ${{ steps.canary-candidate.outputs.revision }}
+          CANDIDATE_TAG: meshr-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT_ID:?Set GCP_PROJECT_ID before shifting canary adapter traffic}"
+          : "${GKE_LOCATION:?Set GKE_LOCATION before shifting canary adapter traffic}"
+          : "${CANDIDATE_REVISION:?The canary candidate revision was not resolved}"
+          candidate_tag="meshr-${GITHUB_SHA:0:12}"
+          gcloud run services update-traffic meshr-moderation-adapter-canary \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --to-revisions="$CANDIDATE_REVISION=100" \
+            --update-tags="$candidate_tag=$CANDIDATE_REVISION" --quiet
+          service_json="$(gcloud run services describe meshr-moderation-adapter-canary \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" --format=json)"
+          traffic_percent="$(jq -r --arg revision "$CANDIDATE_REVISION" '[.status.traffic[]? | select(.revisionName == $revision) | (.percent // 0)] | add // 0' <<<"$service_json")"
+          ready_revision="$(jq -r '.status.latestReadyRevisionName // empty' <<<"$service_json")"
+          test "$traffic_percent" = 100 || { echo "Canary candidate does not own 100% traffic." >&2; exit 1; }
+          test "$ready_revision" = "$CANDIDATE_REVISION" || { echo "Canary candidate is not the latest ready revision." >&2; exit 1; }
+      - name: Advance the protected canary candidate ref
+        env:
+          MESHR_RELEASE_TOKEN: ${{ steps.canary-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          git config user.name 'meshr-release[bot]'
+          git config user.email 'meshr-release[bot]@users.noreply.github.com'
+          git fetch --no-tags origin refs/heads/canary:refs/remotes/origin/canary || true
+          if git show-ref --verify --quiet refs/remotes/origin/canary; then
+            if ! git merge-base --is-ancestor refs/remotes/origin/canary HEAD; then
+              echo 'Remote canary is not an ancestor of this main commit; refusing to rewrite the candidate ref.' >&2
+              exit 1
+            fi
+          fi
+          helper="$RUNNER_TEMP/meshr-git-credential-helper"
+          cat >"$helper" <<'EOF'
+          #!/bin/sh
+          if [ "${1:-}" = get ]; then
+            printf 'protocol=https\nhost=github.com\nusername=x-access-token\npassword=%s\n' "$MESHR_RELEASE_TOKEN"
+          fi
+          EOF
+          chmod 700 "$helper"
+          trap 'rm -f "$helper"' EXIT
+          MESHR_RELEASE_TOKEN="$MESHR_RELEASE_TOKEN" git -c credential.helper="$helper" \
+            push "https://github.com/${GITHUB_REPOSITORY}.git" HEAD:canary
       - name: Refresh GCP credentials before applying canary inputs
         id: canary-apply-auth
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
@@ -539,6 +737,7 @@ jobs:
           MESHR_CANARY_URL: ${{ vars.MESHR_CANARY_URL }}
           API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ steps.resolve.outputs.api }}
           EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ steps.resolve.outputs.event_plane }}
+          MODERATION_ADAPTER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/moderation-adapter@${{ steps.resolve.outputs.moderation_adapter }}
           WEB_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/web@${{ steps.resolve.outputs.web }}
         run: |
           set -euo pipefail
@@ -575,6 +774,7 @@ jobs:
           kubectl -n flux-system create configmap meshr-canary-image-digests \
             --from-literal="API_IMAGE=$API_IMAGE" \
             --from-literal="EVENT_PLANE_IMAGE=$EVENT_PLANE_IMAGE" \
+            --from-literal="MODERATION_ADAPTER_IMAGE=$MODERATION_ADAPTER_IMAGE" \
             --from-literal="WEB_IMAGE=$WEB_IMAGE" \
             --dry-run=client -o yaml | kubectl apply -f -
           if [ -z "$MESHR_COST_PROTECTION_MODE" ]; then
@@ -643,7 +843,9 @@ jobs:
           MESHR_CANARY_URL: ${{ vars.MESHR_CANARY_URL }}
           API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ steps.resolve.outputs.api }}
           EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ steps.resolve.outputs.event_plane }}
+          MODERATION_ADAPTER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/moderation-adapter@${{ steps.resolve.outputs.moderation_adapter }}
           WEB_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/web@${{ steps.resolve.outputs.web }}
+          CANDIDATE_REVISION: ${{ steps.canary-candidate.outputs.revision }}
         run: |
           set -euo pipefail
           token_file="$RUNNER_TEMP/meshr-gcp-access-token"
@@ -692,6 +894,20 @@ jobs:
             fi
             sleep 5
           done
+          : "${CANDIDATE_REVISION:?The canary candidate revision was not resolved}"
+          adapter_image="$(gcloud run revisions describe "$CANDIDATE_REVISION" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --format='value(spec.containers[0].image)')"
+          test "$adapter_image" = "$MODERATION_ADAPTER_IMAGE" || {
+            echo "Canary moderation adapter is not the signed digest supplied by this release." >&2
+            exit 1
+          }
+          service_json="$(gcloud run services describe meshr-moderation-adapter-canary \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" --format=json)"
+          traffic_percent="$(jq -r --arg revision "$CANDIDATE_REVISION" '[.status.traffic[]? | select(.revisionName == $revision) | (.percent // 0)] | add // 0' <<<"$service_json")"
+          ready_revision="$(jq -r '.status.latestReadyRevisionName // empty' <<<"$service_json")"
+          test "$traffic_percent" = 100 || { echo "Canary adapter candidate does not own 100% traffic after rollout." >&2; exit 1; }
+          test "$ready_revision" = "$CANDIDATE_REVISION" || { echo "Canary adapter candidate is not the latest ready revision after rollout." >&2; exit 1; }
           kubectl -n meshr-canary rollout status deployment/api-canary --timeout=5m
           kubectl -n meshr-canary rollout status deployment/live-gateway-canary --timeout=5m
           kubectl -n meshr-canary rollout status deployment/web-canary --timeout=5m
@@ -700,6 +916,26 @@ jobs:
           kubectl -n meshr-canary rollout status deployment/moderation-worker-canary --timeout=5m
           kubectl -n meshr-canary rollout status deployment/audit-worker-canary --timeout=5m
           kubectl -n meshr-canary rollout status deployment/notification-worker-canary --timeout=5m
+      - name: Mint fresh canary moderation adapter ID token for post-deploy check
+        if: success()
+        id: canary-post-adapter-id-token
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
+          token_format: id_token
+          id_token_audience: ${{ vars.MESHR_MODERATION_AUDIENCE }}
+      - name: Verify canary moderation adapter health after rollout
+        env:
+          ADAPTER_ID_TOKEN: ${{ steps.canary-post-adapter-id-token.outputs.id_token }}
+          MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
+        run: |
+          set -euo pipefail
+          : "${ADAPTER_ID_TOKEN:?The dedicated canary adapter ID token was not minted}"
+          : "${MESHR_MODERATION_HEALTHCHECK_URL:?Set MESHR_MODERATION_HEALTHCHECK_URL before the canary health check}"
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+            -H "Authorization: Bearer $ADAPTER_ID_TOKEN" \
+            "$MESHR_MODERATION_HEALTHCHECK_URL" | jq -e '.ok == true' >/dev/null
       - name: Refresh GCP credentials before verifying canary edge
         if: success()
         id: canary-edge-auth
@@ -832,6 +1068,25 @@ jobs:
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
           token_format: access_token
           access_token_lifetime: 3600s
+      - name: Restore canary adapter traffic after failed candidate
+        if: failure() && env.MESHR_CANARY_ADAPTER_PREVIOUS_REVISION != ''
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.canary-freeze-auth.outputs.access_token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          PREVIOUS_REVISION: ${{ env.MESHR_CANARY_ADAPTER_PREVIOUS_REVISION }}
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT_ID:?Set GCP_PROJECT_ID before restoring the canary adapter}"
+          : "${GKE_LOCATION:?Set GKE_LOCATION before restoring the canary adapter}"
+          : "${PREVIOUS_REVISION:?The previous canary adapter revision was not captured}"
+          gcloud run services update-traffic meshr-moderation-adapter-canary \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --to-revisions="$PREVIOUS_REVISION=100" --quiet
+          service_json="$(gcloud run services describe meshr-moderation-adapter-canary \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" --format=json)"
+          traffic_percent="$(jq -r --arg revision "$PREVIOUS_REVISION" '[.status.traffic[]? | select(.revisionName == $revision) | (.percent // 0)] | add // 0' <<<"$service_json")"
+          test "$traffic_percent" = 100 || { echo "Canary adapter traffic did not restore to $PREVIOUS_REVISION." >&2; exit 1; }
       - name: Freeze canary after failed promotion
         if: failure()
         env:
@@ -856,7 +1111,7 @@ jobs:
 
   promote:
     needs: canary
-    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.release_sha == github.sha
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.release_sha == github.sha && inputs.bootstrap_build_only != true
     environment: production
     concurrency:
       group: meshr-production-promotion
@@ -937,6 +1192,7 @@ jobs:
           for pair in \
             "api:$API_DIGEST" \
             "event-plane:$EVENT_PLANE_DIGEST" \
+            "moderation-adapter:$MODERATION_ADAPTER_DIGEST" \
             "web:$WEB_DIGEST"; do
             image="${pair%%:*}"
             digest="${pair#*:}"
@@ -953,6 +1209,7 @@ jobs:
           images = {
               'API_IMAGE': f"{os.environ['REGISTRY']}/{os.environ['IMAGE_REPOSITORY']}/api@{os.environ['API_DIGEST']}",
               'EVENT_PLANE_IMAGE': f"{os.environ['REGISTRY']}/{os.environ['IMAGE_REPOSITORY']}/event-plane@{os.environ['EVENT_PLANE_DIGEST']}",
+              'MODERATION_ADAPTER_IMAGE': f"{os.environ['REGISTRY']}/{os.environ['IMAGE_REPOSITORY']}/moderation-adapter@{os.environ['MODERATION_ADAPTER_DIGEST']}",
               'WEB_IMAGE': f"{os.environ['REGISTRY']}/{os.environ['IMAGE_REPOSITORY']}/web@{os.environ['WEB_DIGEST']}",
           }
           lines = text.splitlines()
@@ -966,7 +1223,139 @@ jobs:
           IMAGE_REPOSITORY: ${{ env.IMAGE_REPOSITORY }}
           API_DIGEST: ${{ needs.canary.outputs.api_digest }}
           EVENT_PLANE_DIGEST: ${{ needs.canary.outputs.event_plane_digest }}
+          MODERATION_ADAPTER_DIGEST: ${{ needs.canary.outputs.moderation_adapter_digest }}
           WEB_DIGEST: ${{ needs.canary.outputs.web_digest }}
+      - name: Deploy signed production moderation adapter candidate without traffic
+        id: production-candidate
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.production-registry-auth.outputs.access_token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          MODERATION_ADAPTER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/moderation-adapter@${{ needs.canary.outputs.moderation_adapter_digest }}
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT_ID:?Set GCP_PROJECT_ID before the production adapter update}"
+          : "${GKE_LOCATION:?Set GKE_LOCATION before the production adapter update}"
+          : "${MODERATION_ADAPTER_IMAGE:?The signed production adapter digest was not resolved}"
+          service_json="$(gcloud run services describe meshr-moderation-adapter \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" --format=json)"
+          previous_revision="$(jq -r '[.status.traffic[]? | select((.percent // 0) == 100) | .revisionName][0] // empty' <<<"$service_json")"
+          : "${previous_revision:?The production moderation adapter has no 100% traffic target to restore on failure}"
+          candidate_tag="meshr-${GITHUB_SHA:0:12}"
+          gcloud run services update meshr-moderation-adapter \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --image "$MODERATION_ADAPTER_IMAGE" --no-traffic --quiet
+          service_json="$(gcloud run services describe meshr-moderation-adapter \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" --format=json)"
+          candidate_revision="$(jq -r '.status.latestCreatedRevisionName // empty' <<<"$service_json")"
+          : "${candidate_revision:?The production moderation adapter candidate revision was not reported}"
+          gcloud run services update-traffic meshr-moderation-adapter \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --set-tags="$candidate_tag=$candidate_revision" --quiet
+          service_json="$(gcloud run services describe meshr-moderation-adapter \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" --format=json)"
+          candidate_url="$(jq -r --arg tag "$candidate_tag" '[.status.traffic[]? | select(.tag == $tag) | .url][0] // empty' <<<"$service_json")"
+          : "${candidate_url:?The production moderation adapter candidate tag URL was not reported}"
+          candidate_percent="$(jq -r --arg revision "$candidate_revision" '[.status.traffic[]? | select(.revisionName == $revision) | (.percent // 0)] | add // 0' <<<"$service_json")"
+          test "$candidate_percent" = 0 || {
+            echo "Production candidate $candidate_revision unexpectedly received traffic ($candidate_percent%)." >&2
+            exit 1
+          }
+          printf 'MESHR_PRODUCTION_ADAPTER_PREVIOUS_REVISION=%s\n' "$previous_revision" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_ADAPTER_CANDIDATE_REVISION=%s\n' "$candidate_revision" >> "$GITHUB_ENV"
+          echo "revision=$candidate_revision" >> "$GITHUB_OUTPUT"
+          echo "url=$candidate_url" >> "$GITHUB_OUTPUT"
+      - name: Verify production adapter endpoint binding before minting candidate token
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.production-registry-auth.outputs.access_token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          MESHR_MODERATION_ENDPOINT: ${{ vars.MESHR_MODERATION_ENDPOINT }}
+          MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
+          MESHR_MODERATION_AUDIENCE: ${{ vars.MESHR_MODERATION_AUDIENCE }}
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT_ID:?Set GCP_PROJECT_ID before the production adapter preflight}"
+          : "${GKE_LOCATION:?Set GKE_LOCATION before the production adapter preflight}"
+          : "${MESHR_MODERATION_ENDPOINT:?Set MESHR_MODERATION_ENDPOINT before the production adapter preflight}"
+          : "${MESHR_MODERATION_HEALTHCHECK_URL:?Set MESHR_MODERATION_HEALTHCHECK_URL before the production adapter preflight}"
+          : "${MESHR_MODERATION_AUDIENCE:?Set MESHR_MODERATION_AUDIENCE before the production adapter preflight}"
+          adapter_url="$(gcloud run services describe meshr-moderation-adapter \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --format='value(status.url)')"
+          : "${adapter_url:?The production moderation adapter did not report a Cloud Run URL}"
+          test "$MESHR_MODERATION_AUDIENCE" = "$adapter_url" || {
+            echo "MESHR_MODERATION_AUDIENCE must equal the production adapter status.url ($adapter_url)." >&2
+            exit 1
+          }
+          test "$MESHR_MODERATION_ENDPOINT" = "$adapter_url/screen" || {
+            echo "MESHR_MODERATION_ENDPOINT must equal the production adapter /screen URL ($adapter_url/screen)." >&2
+            exit 1
+          }
+          test "$MESHR_MODERATION_HEALTHCHECK_URL" = "$adapter_url/healthz" || {
+            echo "MESHR_MODERATION_HEALTHCHECK_URL must equal the production adapter /healthz URL ($adapter_url/healthz)." >&2
+            exit 1
+          }
+      - name: Mint dedicated production moderation adapter ID token
+        id: production-adapter-id-token
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          token_format: id_token
+          id_token_audience: ${{ vars.MESHR_MODERATION_AUDIENCE }}
+      - name: Verify production moderation adapter before mutating release state
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.production-registry-auth.outputs.access_token }}
+          ADAPTER_ID_TOKEN: ${{ steps.production-adapter-id-token.outputs.id_token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
+          MESHR_MODERATION_AUDIENCE: ${{ vars.MESHR_MODERATION_AUDIENCE }}
+          MODERATION_ADAPTER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/moderation-adapter@${{ needs.canary.outputs.moderation_adapter_digest }}
+          CANDIDATE_REVISION: ${{ steps.production-candidate.outputs.revision }}
+          CANDIDATE_URL: ${{ steps.production-candidate.outputs.url }}
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT_ID:?Set GCP_PROJECT_ID before the production adapter preflight}"
+          : "${GKE_LOCATION:?Set GKE_LOCATION before the production adapter preflight}"
+          : "${MESHR_MODERATION_HEALTHCHECK_URL:?Set MESHR_MODERATION_HEALTHCHECK_URL before the production adapter preflight}"
+          : "${MESHR_MODERATION_AUDIENCE:?Set MESHR_MODERATION_AUDIENCE before the production adapter preflight}"
+          : "${ADAPTER_ID_TOKEN:?The dedicated production adapter ID token was not minted}"
+          : "${CANDIDATE_REVISION:?The production candidate revision was not resolved}"
+          : "${CANDIDATE_URL:?The production candidate URL was not resolved}"
+          adapter_image="$(gcloud run revisions describe "$CANDIDATE_REVISION" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --format='value(spec.containers[0].image)')"
+          test "$adapter_image" = "$MODERATION_ADAPTER_IMAGE" || {
+            echo "Production moderation adapter is not running the signed digest produced by this build. Apply the protected OpenTofu production adapter input before promotion." >&2
+            exit 1
+          }
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+            -H "Authorization: Bearer $ADAPTER_ID_TOKEN" \
+            "${CANDIDATE_URL%/}/healthz" | jq -e '.ok == true' >/dev/null
+      - name: Shift production adapter traffic to the verified candidate
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.production-registry-auth.outputs.access_token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          CANDIDATE_REVISION: ${{ steps.production-candidate.outputs.revision }}
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT_ID:?Set GCP_PROJECT_ID before shifting production adapter traffic}"
+          : "${GKE_LOCATION:?Set GKE_LOCATION before shifting production adapter traffic}"
+          : "${CANDIDATE_REVISION:?The production candidate revision was not resolved}"
+          candidate_tag="meshr-${GITHUB_SHA:0:12}"
+          gcloud run services update-traffic meshr-moderation-adapter \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --to-revisions="$CANDIDATE_REVISION=100" \
+            --update-tags="$candidate_tag=$CANDIDATE_REVISION" --quiet
+          service_json="$(gcloud run services describe meshr-moderation-adapter \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" --format=json)"
+          traffic_percent="$(jq -r --arg revision "$CANDIDATE_REVISION" '[.status.traffic[]? | select(.revisionName == $revision) | (.percent // 0)] | add // 0' <<<"$service_json")"
+          ready_revision="$(jq -r '.status.latestReadyRevisionName // empty' <<<"$service_json")"
+          test "$traffic_percent" = 100 || { echo "Production candidate does not own 100% traffic." >&2; exit 1; }
+          test "$ready_revision" = "$CANDIDATE_REVISION" || { echo "Production candidate is not the latest ready revision." >&2; exit 1; }
       - name: Refresh GCP credentials before pausing production
         id: production-pause-auth
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
@@ -1060,6 +1449,7 @@ jobs:
           MESHR_PRODUCTION_URL: ${{ vars.MESHR_PRODUCTION_URL }}
           API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ needs.canary.outputs.api_digest }}
           EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ needs.canary.outputs.event_plane_digest }}
+          MODERATION_ADAPTER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/moderation-adapter@${{ needs.canary.outputs.moderation_adapter_digest }}
           WEB_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/web@${{ needs.canary.outputs.web_digest }}
         run: |
           set -euo pipefail
@@ -1097,6 +1487,7 @@ jobs:
           kubectl -n flux-system create configmap meshr-production-image-digests \
             --from-literal="API_IMAGE=$API_IMAGE" \
             --from-literal="EVENT_PLANE_IMAGE=$EVENT_PLANE_IMAGE" \
+            --from-literal="MODERATION_ADAPTER_IMAGE=$MODERATION_ADAPTER_IMAGE" \
             --from-literal="WEB_IMAGE=$WEB_IMAGE" \
             --dry-run=client -o yaml | kubectl apply -f -
           current_mode="$(kubectl -n flux-system get configmap meshr-production-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_MODE}' 2>/dev/null || true)"
@@ -1167,7 +1558,9 @@ jobs:
           MESHR_PRODUCTION_URL: ${{ vars.MESHR_PRODUCTION_URL }}
           API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ needs.canary.outputs.api_digest }}
           EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ needs.canary.outputs.event_plane_digest }}
+          MODERATION_ADAPTER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/moderation-adapter@${{ needs.canary.outputs.moderation_adapter_digest }}
           WEB_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/web@${{ needs.canary.outputs.web_digest }}
+          CANDIDATE_REVISION: ${{ steps.production-candidate.outputs.revision }}
         run: |
           set -euo pipefail
           token_file="$RUNNER_TEMP/meshr-gcp-access-token"
@@ -1213,6 +1606,20 @@ jobs:
             fi
             sleep 5
           done
+          : "${CANDIDATE_REVISION:?The production candidate revision was not resolved}"
+          adapter_image="$(gcloud run revisions describe "$CANDIDATE_REVISION" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --format='value(spec.containers[0].image)')"
+          test "$adapter_image" = "$MODERATION_ADAPTER_IMAGE" || {
+            echo "Production moderation adapter is not the signed digest supplied by this release." >&2
+            exit 1
+          }
+          service_json="$(gcloud run services describe meshr-moderation-adapter \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" --format=json)"
+          traffic_percent="$(jq -r --arg revision "$CANDIDATE_REVISION" '[.status.traffic[]? | select(.revisionName == $revision) | (.percent // 0)] | add // 0' <<<"$service_json")"
+          ready_revision="$(jq -r '.status.latestReadyRevisionName // empty' <<<"$service_json")"
+          test "$traffic_percent" = 100 || { echo "Production adapter candidate does not own 100% traffic after rollout." >&2; exit 1; }
+          test "$ready_revision" = "$CANDIDATE_REVISION" || { echo "Production adapter candidate is not the latest ready revision after rollout." >&2; exit 1; }
           kubectl -n meshr rollout status deployment/api --timeout=5m
           kubectl -n meshr rollout status deployment/live-gateway --timeout=5m
           kubectl -n meshr rollout status deployment/web --timeout=5m
@@ -1221,6 +1628,26 @@ jobs:
           kubectl -n meshr rollout status deployment/moderation-worker --timeout=5m
           kubectl -n meshr rollout status deployment/audit-worker --timeout=5m
           kubectl -n meshr rollout status deployment/notification-worker --timeout=5m
+      - name: Mint fresh production moderation adapter ID token for post-deploy check
+        if: success()
+        id: production-post-adapter-id-token
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          token_format: id_token
+          id_token_audience: ${{ vars.MESHR_MODERATION_AUDIENCE }}
+      - name: Verify production moderation adapter health after rollout
+        env:
+          ADAPTER_ID_TOKEN: ${{ steps.production-post-adapter-id-token.outputs.id_token }}
+          MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
+        run: |
+          set -euo pipefail
+          : "${ADAPTER_ID_TOKEN:?The dedicated production adapter ID token was not minted}"
+          : "${MESHR_MODERATION_HEALTHCHECK_URL:?Set MESHR_MODERATION_HEALTHCHECK_URL before the production health check}"
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+            -H "Authorization: Bearer $ADAPTER_ID_TOKEN" \
+            "$MESHR_MODERATION_HEALTHCHECK_URL" | jq -e '.ok == true' >/dev/null
       - name: Refresh GCP credentials before verifying production edge
         if: success()
         id: production-edge-auth
@@ -1320,6 +1747,25 @@ jobs:
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
           token_format: access_token
           access_token_lifetime: 3600s
+      - name: Restore production adapter traffic after failed candidate
+        if: failure() && env.MESHR_PRODUCTION_ADAPTER_PREVIOUS_REVISION != ''
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.production-freeze-auth.outputs.access_token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          PREVIOUS_REVISION: ${{ env.MESHR_PRODUCTION_ADAPTER_PREVIOUS_REVISION }}
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT_ID:?Set GCP_PROJECT_ID before restoring the production adapter}"
+          : "${GKE_LOCATION:?Set GKE_LOCATION before restoring the production adapter}"
+          : "${PREVIOUS_REVISION:?The previous production adapter revision was not captured}"
+          gcloud run services update-traffic meshr-moderation-adapter \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --to-revisions="$PREVIOUS_REVISION=100" --quiet
+          service_json="$(gcloud run services describe meshr-moderation-adapter \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" --format=json)"
+          traffic_percent="$(jq -r --arg revision "$PREVIOUS_REVISION" '[.status.traffic[]? | select(.revisionName == $revision) | (.percent // 0)] | add // 0' <<<"$service_json")"
+          test "$traffic_percent" = 100 || { echo "Production adapter traffic did not restore to $PREVIOUS_REVISION." >&2; exit 1; }
       - name: Freeze production after failed promotion
         if: failure()
         env:

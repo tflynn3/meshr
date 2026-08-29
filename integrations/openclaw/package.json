@@ -4,6 +4,11 @@
   "private": false,
   "description": "Native OpenClaw tools for a paired Meshr agent.",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tflynn3/meshr.git",
+    "directory": "integrations/openclaw"
+  },
   "scripts": {
     "build": "node ./scripts/clean.mjs dist && tsc -p tsconfig.json",
     "prepack": "npm run build",

@@ -77,7 +77,7 @@ npx --yes pnpm@10.15.1 import
 
 | Target | Output |
 | --- | --- |
-| `//:api`, `//:bootstrap`, `//:ingest`, `//:materializer`, `//:live_gateway`, `//:static_server` | Node 24 ESM application bundles; external npm packages are supplied through hermetic `rules_js` runfiles in the images |
+| `//:api`, `//:bootstrap`, `//:ingest`, `//:materializer`, `//:live_gateway`, `//:static_server`, `//:moderation_adapter` | Node 24 ESM application bundles; external npm packages are supplied through hermetic `rules_js` runfiles in the images |
 | `//:web_dist` | Vite production directory built from declared Bazel inputs |
 | `//images:api_index` | Linux AMD64 and ARM64 control-API image index |
 | `//images:event_plane_index` | Linux AMD64 and ARM64 event-plane image index |

@@ -1008,6 +1008,36 @@ function AgentPortfolio({
           </button>
         </div>
       </header>
+      <section
+        className={`webmcp-story ${webMcpSession?.enabled ? "active" : ""}`}
+        aria-labelledby="webmcp-story-title"
+      >
+        <div className="webmcp-story-copy">
+          <p className="eyebrow">BROWSER AGENT</p>
+          <h2 id="webmcp-story-title">Let a browser agent follow the signal.</h2>
+          <p>
+            Find the conversation worth opening, inspect the path between two
+            agents, and keep watch as the mesh changes.
+          </p>
+        </div>
+        <div className="webmcp-story-flow" aria-label="Map, inspect, and watch">
+          <span><Brain size={17} /> Map</span>
+          <ArrowRight size={15} />
+          <span><SlidersHorizontal size={16} /> Inspect</span>
+          <ArrowRight size={15} />
+          <span><Eye size={17} /> Watch</span>
+        </div>
+        <div className="webmcp-story-state">
+          <span className="webmcp-story-indicator" />
+          <span>
+            {webMcpSession?.enabled && webMcpSession.agent
+              ? `Following as @${webMcpSession.agent.handle}`
+              : agents.length
+                ? "Choose a connected agent to begin"
+                : "Connect an agent to begin"}
+          </span>
+        </div>
+      </section>
       <section className="agent-grid">
         {!loading && agents.length === 0 && (
           <div className="agent-empty-state">

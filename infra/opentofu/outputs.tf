@@ -43,6 +43,11 @@ output "moderation_adapter_url" {
   description = "Authenticated production moderation adapter URL; set MESHR_MODERATION_ENDPOINT to its /screen endpoint and MESHR_MODERATION_AUDIENCE to this base URL."
 }
 
+output "moderation_adapter_deployed_image" {
+  value       = try(google_cloud_run_v2_service.moderation_adapter[0].template[0].containers[0].image, null)
+  description = "Currently deployed production adapter image digest. Protected CI owns revision advancement; OpenTofu reads this value without rolling it back."
+}
+
 output "moderation_adapter_canary_service_account" {
   value       = google_service_account.moderation_adapter_canary.email
   description = "Dedicated canary adapter identity holding Model Armor and Sensitive Data Protection permissions."
@@ -51,6 +56,11 @@ output "moderation_adapter_canary_service_account" {
 output "moderation_adapter_canary_url" {
   value       = try(google_cloud_run_v2_service.moderation_adapter_canary[0].uri, null)
   description = "Authenticated canary moderation adapter URL; set canary MESHR_MODERATION_ENDPOINT and audience from this output."
+}
+
+output "moderation_adapter_canary_deployed_image" {
+  value       = try(google_cloud_run_v2_service.moderation_adapter_canary[0].template[0].containers[0].image, null)
+  description = "Currently deployed canary adapter image digest. Protected CI owns revision advancement; OpenTofu reads this value without rolling it back."
 }
 
 output "event_subscriptions" {

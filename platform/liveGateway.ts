@@ -2,7 +2,9 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { createHash } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import { createFirestore, eventPlaneConfig } from "./googleClients.ts";
+import { liveCredentialValue, liveSourceAddress } from "./liveConnectionIdentity.ts";
 import { loadRuntimeSecrets } from "./runtimeSecrets.ts";
+import { ExpiringCache } from "./topologyCache.ts";
 
 /**
  * The live gateway is a read-only projection service. It never accepts a
@@ -72,10 +74,10 @@ const costProtectionMode = readCostProtectionMode();
 // into one frame is safe. Under cost protection this bounds both Firestore
 // reads and per-viewer fan-out while preserving the latest cursor.
 const fanoutRefreshDelayMs = costProtectionMode === "throttle"
-  ? 2_000
+  ? 5_000
   : costProtectionMode === "protect"
-    ? 1_000
-    : 200;
+    ? 2_000
+    : 1_000;
 const fanoutMinimumIntervalMs = fanoutRefreshDelayMs;
 
 interface ClientState {
@@ -89,6 +91,7 @@ interface ClientState {
   authorization?: string;
   authPending: boolean;
   authDirty: boolean;
+  authGeneration: number;
   authCheckedAt: number;
   credentialKey: string;
   ipKey: string;
@@ -99,6 +102,8 @@ const activeCredentialCounts = new Map<string, number>();
 const activeIpCounts = new Map<string, number>();
 const pendingCredentialCounts = new Map<string, number>();
 const pendingIpCounts = new Map<string, number>();
+const topologyWatchers = new Map<string, () => void>();
+const topologyGenerations = new Map<string, number>();
 let pendingConnectionCount = 0;
 
 function connectionKey(value: string): string {
@@ -106,13 +111,21 @@ function connectionKey(value: string): string {
 }
 
 function requestCredentialKey(request: IncomingMessage): string {
-  const credential = headerValue(request.headers.cookie) ?? headerValue(request.headers.authorization) ?? "anonymous";
-  return connectionKey(credential);
+  // Match the authorization precedence used by /v1/live/authorize: an agent
+  // bearer grant is the principal even when a caller also sends arbitrary
+  // cookies. Hashing the cookie first would let one valid bearer rotate a
+  // cookie value and evade the per-credential connection cap.
+  const authorization = headerValue(request.headers.authorization);
+  return connectionKey(liveCredentialValue(headerValue(request.headers.cookie), authorization));
 }
 
 function requestIpKey(request: IncomingMessage): string {
-  const forwarded = headerValue(request.headers["x-forwarded-for"])?.split(",", 1)[0]?.trim();
-  return connectionKey(forwarded || request.socket.remoteAddress || "unknown");
+  // Only trust the address asserted by the authenticated Cloudflare edge.
+  // X-Forwarded-For is client-controlled when the gateway is reachable
+  // directly, so accepting it would let a single caller evade the per-IP
+  // connection cap by rotating that header.
+  const cloudflareAddress = headerValue(request.headers["cf-connecting-ip"])?.trim();
+  return connectionKey(liveSourceAddress(cloudflareAddress, request.socket.remoteAddress));
 }
 
 interface ConnectionReservation {
@@ -178,6 +191,7 @@ function removeClient(socket: WebSocket): void {
   const state = clients.get(socket);
   if (!state) return;
   clients.delete(socket);
+  if (!meshHasSubscribers(state.meshId)) stopTopologyWatcher(state.meshId);
   decrementCount(activeCredentialCounts, state.credentialKey);
   decrementCount(activeIpCounts, state.ipKey);
   console.log(JSON.stringify({
@@ -187,6 +201,16 @@ function removeClient(socket: WebSocket): void {
     mesh_id: state.meshId,
     clients: clients.size,
   }));
+}
+
+function stopTopologyWatcher(meshId: string): void {
+  const stop = topologyWatchers.get(meshId);
+  if (!stop) return;
+  topologyWatchers.delete(meshId);
+  topologyGenerations.delete(meshId);
+  snapshotCache.invalidate(meshId);
+  activityCache.delete(meshId);
+  stop();
 }
 
 function json(response: ServerResponse, status: number, body: unknown): void {
@@ -206,6 +230,11 @@ function originAllowed(request: IncomingMessage): boolean {
 
 function headerValue(value: string | string[] | undefined): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function markAuthDirty(state: ClientState): void {
+  state.authGeneration += 1;
+  state.authDirty = true;
 }
 
 async function authorizeCredentials(
@@ -281,7 +310,14 @@ async function reauthorizeForFanout(
   // visibility without granting this public workload access to private
   // session fences.
   if (!force && !state.authDirty && Date.now() - state.authCheckedAt < liveAuthCacheMs) return true;
-  if (state.authPending) return false;
+  if (state.authPending) {
+    // A normal topology event can overlap an in-flight check. Do not turn
+    // that benign fan-out race into a new access generation: at high traffic
+    // rates it would make every check stale and suppress fan-out forever.
+    // Actual revocation/access-epoch callbacks call markAuthDirty themselves.
+    return false;
+  }
+  const generation = state.authGeneration;
   state.authPending = true;
   try {
     const access = await authorizeCredentials(state.meshId, {
@@ -298,6 +334,13 @@ async function reauthorizeForFanout(
     current.principal = access.principal;
     current.agentId = access.agentId;
     current.meshVisibility = access.meshVisibility;
+    if (current.authGeneration !== generation) {
+      // Access changed while this request was in flight. Do not send the
+      // result to a fan-out cycle; the queued reauthorization below will
+      // establish the current decision first.
+      markAuthDirty(current);
+      return false;
+    }
     current.authDirty = false;
     current.authCheckedAt = Date.now();
     return true;
@@ -307,7 +350,12 @@ async function reauthorizeForFanout(
     return false;
   } finally {
     const current = clients.get(socket);
-    if (current) current.authPending = false;
+    if (current) {
+      current.authPending = false;
+      if (current.authGeneration !== generation && current.authDirty && current.alive) {
+        queueMicrotask(() => void reauthorizeForFanout(socket, current, true));
+      }
+    }
   }
 }
 
@@ -328,7 +376,17 @@ function send(socket: WebSocket, body: unknown): boolean {
   return true;
 }
 
-const snapshotCache = new Map<string, { expiresAt: number; value: Record<string, unknown> | null }>();
+const snapshotCache = new ExpiringCache<Record<string, unknown> | null>(1_000);
+
+function topologyGeneration(meshId: string): number {
+  return topologyGenerations.get(meshId) ?? 0;
+}
+
+function markTopologyDirty(meshId: string): void {
+  topologyGenerations.set(meshId, topologyGeneration(meshId) + 1);
+  snapshotCache.invalidate(meshId);
+  activityCache.delete(meshId);
+}
 
 // A public activity response is safe to share between viewers of the same
 // public mesh. Keep it at the gateway and coalesce refreshes so a topology
@@ -356,6 +414,7 @@ async function readPublicActivity(
   if (credentials.cookie) headers.set("cookie", credentials.cookie);
   if (credentials.authorization) headers.set("authorization", credentials.authorization);
   if (internalToken) headers.set("x-meshr-live-internal", internalToken);
+  const startedGeneration = topologyGeneration(meshId);
   const pending = fetch(
     `${apiUrl}/v1/activity/public?shared=1&meshId=${encodeURIComponent(meshId)}`,
     {
@@ -416,6 +475,16 @@ async function readPublicActivity(
     })
     .catch(() => null)
     .then((value) => {
+      // A topology watch may fire while the API request is in flight. Do not
+      // repopulate the cache with a response that predates that dirty signal.
+      if (topologyGeneration(meshId) !== startedGeneration) {
+        // Do not delete a newer request that started after the invalidation.
+        // Without this identity check, a slow pre-dirty response could erase
+        // the current pending entry and cause duplicate API reads for viewers.
+        const current = activityCache.get(meshId);
+        if (current?.pending === pending) activityCache.delete(meshId);
+        return value;
+      }
       activityCache.set(meshId, { expiresAt: Date.now() + 500, value });
       return value;
     });
@@ -425,33 +494,39 @@ async function readPublicActivity(
 
 async function readSnapshot(meshId: string): Promise<Record<string, unknown> | null> {
   const cached = snapshotCache.get(meshId);
-  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (cached !== undefined) return cached;
+  // A watch callback can arrive while the Firestore read is in flight. Keep
+  // this to one bounded query per refresh cadence: refreshMesh compares the
+  // generation before and after the read, avoids caching a dirty result, and
+  // schedules one coalesced retry. Retrying here would multiply reads under a
+  // busy mesh.
+  const startedGeneration = topologyGeneration(meshId);
   const shards = await firestore
     .collection("topology_shards")
     .where("mesh_id", "==", meshId)
     .limit(32)
     .get();
-  if (shards.empty) {
-    snapshotCache.set(meshId, { expiresAt: Date.now() + 1_000, value: null });
-    return null;
-  }
-  const data = shards.docs
-    .map((document) => document.data() as Record<string, unknown>)
-    .sort((left, right) => String(right.latest_occurred_at ?? "").localeCompare(String(left.latest_occurred_at ?? "")));
-  const snapshot: Record<string, unknown> = {
-    mesh_id: meshId,
-    revision: data.reduce((sum, shard) => sum + Number(shard.revision ?? 0), 0),
-    event_count: data.reduce((sum, shard) => sum + Number(shard.event_count ?? 0), 0),
-    latest_event_id: data[0]?.latest_event_id ?? null,
-    latest_event_type: data[0]?.latest_event_type ?? null,
-    latest_agent_id: data[0]?.latest_agent_id ?? null,
-    latest_runtime_kind: data[0]?.latest_runtime_kind ?? null,
-    latest_occurred_at: data[0]?.latest_occurred_at ?? null,
-    updated_at: data[0]?.updated_at ?? null,
-    shards: shards.size,
-  };
-  snapshotCache.set(meshId, { expiresAt: Date.now() + 1_000, value: snapshot });
-  return snapshot;
+  const latest = shards.empty
+    ? null
+    : (() => {
+        const data = shards.docs
+          .map((document) => document.data() as Record<string, unknown>)
+          .sort((left, right) => String(right.latest_occurred_at ?? "").localeCompare(String(left.latest_occurred_at ?? "")));
+        return {
+          mesh_id: meshId,
+          revision: data.reduce((sum, shard) => sum + Number(shard.revision ?? 0), 0),
+          event_count: data.reduce((sum, shard) => sum + Number(shard.event_count ?? 0), 0),
+          latest_event_id: data[0]?.latest_event_id ?? null,
+          latest_event_type: data[0]?.latest_event_type ?? null,
+          latest_agent_id: data[0]?.latest_agent_id ?? null,
+          latest_runtime_kind: data[0]?.latest_runtime_kind ?? null,
+          latest_occurred_at: data[0]?.latest_occurred_at ?? null,
+          updated_at: data[0]?.updated_at ?? null,
+          shards: shards.size,
+        } satisfies Record<string, unknown>;
+      })();
+  if (startedGeneration === topologyGeneration(meshId)) snapshotCache.set(meshId, latest);
+  return latest;
 }
 
 const server = createServer(async (request, response) => {
@@ -583,11 +658,13 @@ server.on("upgrade", async (request, socket, head) => {
         authorization: headerValue(request.headers.authorization),
         authPending: false,
         authDirty: false,
+        authGeneration: 0,
         authCheckedAt: Date.now(),
         credentialKey: reservation!.credentialKey,
         ipKey: reservation!.ipKey,
       };
       clients.set(websocket, state);
+      startTopologyWatcher(meshId);
       console.log(JSON.stringify({
         component: "meshr-live-gateway",
         event: "live.connection",
@@ -643,9 +720,32 @@ function meshHasSubscribers(meshId: string): boolean {
   return false;
 }
 
+function startTopologyWatcher(meshId: string): void {
+  if (topologyWatchers.has(meshId)) return;
+  const stop = firestore.collection("topology_shards")
+    .where("mesh_id", "==", meshId)
+    .onSnapshot(
+      (snapshot) => {
+        if (!meshHasSubscribers(meshId)) return;
+        // The listener is the dirty signal. Invalidate the warm values before
+        // scheduling the coalesced refresh; otherwise a lone event inside the
+        // one-second snapshot TTL can be read from cache and never fan out.
+        // The pending refresh and minimum interval still coalesce bursts, so
+        // this is bounded by the gateway refresh cadence rather than event
+        // rate.
+        markTopologyDirty(meshId);
+        scheduleMeshRefresh(meshId);
+      },
+      (error) => console.error("topology mesh watch failed", { mesh_id: meshId, error }),
+    );
+  topologyWatchers.set(meshId, stop);
+}
+
 async function refreshMesh(meshId: string): Promise<void> {
   if (!meshHasSubscribers(meshId)) return;
+  const readGeneration = topologyGeneration(meshId);
   const snapshotValue = await readSnapshot(meshId);
+  const refreshGeneration = topologyGeneration(meshId);
   const cursor = snapshotCursor(snapshotValue ?? undefined);
   const candidates = [...clients.entries()].filter(([, state]) => state.meshId === meshId);
   const authorized = await Promise.all(
@@ -676,6 +776,13 @@ async function refreshMesh(meshId: string): Promise<void> {
     });
   }
   lastMeshFanoutAt.set(meshId, Date.now());
+  // Topology generations are a freshness hint, not an availability fence:
+  // the bounded snapshot just read is still useful progress at high write
+  // rates. Never cache a dirty read (readSnapshot already enforces that), and
+  // queue one coalesced follow-up so the next cursor catches up.
+  if (refreshGeneration !== readGeneration || refreshGeneration !== topologyGeneration(meshId)) {
+    scheduleMeshRefresh(meshId);
+  }
 }
 
 function scheduleMeshRefresh(meshId: string): void {
@@ -690,30 +797,6 @@ function scheduleMeshRefresh(meshId: string): void {
   pendingMeshRefreshes.set(meshId, timer);
 }
 
-const stopWatching = firestore.collection("topology_shards").onSnapshot(
-  (snapshot) => {
-    const changedMeshes = new Set<string>();
-    for (const change of snapshot.docChanges()) {
-      const data = (change.doc.data() ?? {}) as Record<string, unknown>;
-      const meshId = String(data.mesh_id ?? change.doc.id.replace(/:\d+$/, ""));
-      if (meshId) changedMeshes.add(meshId);
-      if (meshId && String(data.latest_event_type ?? "").startsWith("mesh.")) {
-        for (const [, state] of clients) {
-          if (state.meshId === meshId) state.authDirty = true;
-        }
-      }
-    }
-    for (const meshId of changedMeshes) {
-      // Invalidate caches even when there are no subscribers, but do not read
-      // Firestore or fan out a frame until a viewer is actually present.
-      snapshotCache.delete(meshId);
-      activityCache.delete(meshId);
-      scheduleMeshRefresh(meshId);
-    }
-  },
-  (error) => console.error("topology watch failed", error),
-);
-
 // Access epochs are written only for mesh visibility, role, and admission
 // events. They invalidate the short per-socket authorization cache without
 // forcing a Firestore/API read for every ordinary post fan-out.
@@ -724,7 +807,7 @@ const stopWatchingAccessEpochs = firestore.collection("mesh_access_epochs").onSn
     );
     if (!changedMeshes.size) return;
     for (const [, state] of clients) {
-      if (changedMeshes.has(state.meshId)) state.authDirty = true;
+      if (changedMeshes.has(state.meshId)) markAuthDirty(state);
     }
   },
   (error) => console.error("mesh access epoch watch failed", error),
@@ -746,7 +829,7 @@ const stopWatchingLiveAccess = firestore.collection("live_access_epochs").onSnap
         : undefined;
       for (const [socket, state] of clients) {
         if (agentId && state.agentId !== agentId) continue;
-        state.authDirty = true;
+        markAuthDirty(state);
         void reauthorizeForFanout(socket, state, true);
       }
     }
@@ -790,7 +873,8 @@ async function shutdown(): Promise<void> {
   clearInterval(heartbeat);
   for (const timer of pendingMeshRefreshes.values()) clearTimeout(timer);
   pendingMeshRefreshes.clear();
-  stopWatching();
+  for (const stop of topologyWatchers.values()) stop();
+  topologyWatchers.clear();
   stopWatchingAccessEpochs();
   stopWatchingLiveAccess();
   for (const socket of clients.keys()) socket.close(1001, "server shutdown");

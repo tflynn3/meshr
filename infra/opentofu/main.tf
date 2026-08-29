@@ -428,6 +428,8 @@ locals {
     try(trimspace(var.github_oauth_client_id), ""),
     try(trimspace(var.github_oauth_client_secret), ""),
     try(trimspace(coalesce(var.moderation_adapter_image, "")), ""),
+    try(trimspace(coalesce(var.moderation_adapter_canary_image, "")), ""),
+    try(trimspace(coalesce(var.moderation_model_armor_template, "")), ""),
   ]
 }
 
@@ -442,7 +444,7 @@ resource "terraform_data" "launch_guard" {
         for value in local.launch_required_inputs :
         trimspace(value) != ""
       ])
-      error_message = "launch_mode=true requires project_id, billing_account_id, both Google/GitHub OAuth client ID and secret values, and an immutable moderation_adapter_image digest. Leave launch_mode=false only for validation plans."
+      error_message = "launch_mode=true requires project_id, billing_account_id, both Google/GitHub OAuth client ID and secret values, immutable production and canary moderation adapter digests, and a Model Armor template resource. Leave launch_mode=false only for validation plans."
     }
   }
 }
@@ -1709,6 +1711,29 @@ resource "google_cloud_run_v2_service" "moderation_adapter" {
     service_account = google_service_account.moderation_adapter.email
     containers {
       image = var.moderation_adapter_image
+      env {
+        name  = "MESHR_ENV"
+        value = "production"
+      }
+      env {
+        name  = "GOOGLE_CLOUD_PROJECT"
+        value = var.project_id
+      }
+      env {
+        name  = "MESHR_MODEL_ARMOR_TEMPLATE"
+        value = coalesce(var.moderation_model_armor_template, "")
+      }
+      dynamic "env" {
+        for_each = var.moderation_model_armor_endpoint == null ? [] : [var.moderation_model_armor_endpoint]
+        content {
+          name  = "MESHR_MODEL_ARMOR_ENDPOINT"
+          value = env.value
+        }
+      }
+      env {
+        name  = "MESHR_DLP_LOCATION"
+        value = var.moderation_dlp_location
+      }
       resources {
         limits = {
           cpu    = "1"
@@ -1718,11 +1743,20 @@ resource "google_cloud_run_v2_service" "moderation_adapter" {
     }
   }
 
+  # The protected promotion workflow advances this service to the exact
+  # signed digest after canary/release approval. Keep OpenTofu responsible for
+  # the service, identity, and runtime configuration, but do not let a later
+  # apply with bootstrap tfvars silently roll the adapter back to an older
+  # image. The workflow records and verifies the deployed digest explicitly.
+  lifecycle {
+    ignore_changes = [template[0].containers[0].image]
+  }
+
   depends_on = [google_project_service.required]
 }
 
 resource "google_cloud_run_v2_service" "moderation_adapter_canary" {
-  count               = var.moderation_adapter_image == null ? 0 : 1
+  count               = var.moderation_adapter_canary_image == null ? 0 : 1
   name                = "meshr-moderation-adapter-canary"
   location            = var.region
   ingress             = "INGRESS_TRAFFIC_ALL"
@@ -1731,7 +1765,30 @@ resource "google_cloud_run_v2_service" "moderation_adapter_canary" {
   template {
     service_account = google_service_account.moderation_adapter_canary.email
     containers {
-      image = var.moderation_adapter_image
+      image = var.moderation_adapter_canary_image
+      env {
+        name  = "MESHR_ENV"
+        value = "production"
+      }
+      env {
+        name  = "GOOGLE_CLOUD_PROJECT"
+        value = var.project_id
+      }
+      env {
+        name  = "MESHR_MODEL_ARMOR_TEMPLATE"
+        value = coalesce(var.moderation_model_armor_template, "")
+      }
+      dynamic "env" {
+        for_each = var.moderation_model_armor_endpoint == null ? [] : [var.moderation_model_armor_endpoint]
+        content {
+          name  = "MESHR_MODEL_ARMOR_ENDPOINT"
+          value = env.value
+        }
+      }
+      env {
+        name  = "MESHR_DLP_LOCATION"
+        value = var.moderation_dlp_location
+      }
       resources {
         limits = {
           cpu    = "1"
@@ -1739,6 +1796,13 @@ resource "google_cloud_run_v2_service" "moderation_adapter_canary" {
         }
       }
     }
+  }
+
+  # See the production adapter lifecycle rule above. Canary image revisions
+  # are advanced only by the protected canary promotion job and must survive a
+  # routine infrastructure refresh using the original bootstrap variables.
+  lifecycle {
+    ignore_changes = [template[0].containers[0].image]
   }
 
   depends_on = [google_project_service.required]
@@ -1881,6 +1945,77 @@ resource "google_project_iam_member" "ci_canary_deploy_artifact_reader" {
   member  = "serviceAccount:${google_service_account.ci_canary_deploy.email}"
 }
 
+resource "google_project_iam_member" "ci_deploy_cloud_run_viewer" {
+  project = var.project_id
+  role    = "roles/run.viewer"
+  member  = "serviceAccount:${google_service_account.ci_deploy.email}"
+}
+
+resource "google_project_iam_member" "ci_canary_deploy_cloud_run_viewer" {
+  project = var.project_id
+  role    = "roles/run.viewer"
+  member  = "serviceAccount:${google_service_account.ci_canary_deploy.email}"
+}
+
+# Promotion jobs perform an authenticated adapter health preflight before
+# mutating the canary or production release refs. Keep these invoker grants
+# service-scoped and environment-specific; the deploy identities do not gain
+# permission to invoke any other Cloud Run service.
+resource "google_cloud_run_v2_service_iam_member" "ci_deploy_moderation_adapter_invoker" {
+  count    = var.moderation_adapter_image == null ? 0 : 1
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.moderation_adapter[0].name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.ci_deploy.email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "ci_canary_deploy_moderation_adapter_invoker" {
+  count    = var.moderation_adapter_canary_image == null ? 0 : 1
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.moderation_adapter_canary[0].name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.ci_canary_deploy.email}"
+}
+
+# The protected promotion jobs move only the already signed moderation-adapter
+# digest onto their matching Cloud Run service before they mint an ID token and
+# run health checks. Keep the update permission service-scoped and pair it with
+# actAs on the dedicated runtime identity; no other Cloud Run service can be
+# changed by either release identity.
+resource "google_cloud_run_v2_service_iam_member" "ci_deploy_moderation_adapter_developer" {
+  count    = var.moderation_adapter_image == null ? 0 : 1
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.moderation_adapter[0].name
+  role     = "roles/run.developer"
+  member   = "serviceAccount:${google_service_account.ci_deploy.email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "ci_canary_deploy_moderation_adapter_developer" {
+  count    = var.moderation_adapter_canary_image == null ? 0 : 1
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.moderation_adapter_canary[0].name
+  role     = "roles/run.developer"
+  member   = "serviceAccount:${google_service_account.ci_canary_deploy.email}"
+}
+
+resource "google_service_account_iam_member" "ci_deploy_moderation_adapter_act_as" {
+  count              = var.moderation_adapter_image == null ? 0 : 1
+  service_account_id = google_service_account.moderation_adapter.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.ci_deploy.email}"
+}
+
+resource "google_service_account_iam_member" "ci_canary_deploy_moderation_adapter_act_as" {
+  count              = var.moderation_adapter_canary_image == null ? 0 : 1
+  service_account_id = google_service_account.moderation_adapter_canary.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.ci_canary_deploy.email}"
+}
+
 resource "google_project_iam_member" "gke_nodes_default_node_service_account" {
   project = var.project_id
   role    = "roles/container.defaultNodeServiceAccount"
@@ -2020,7 +2155,7 @@ resource "google_project_iam_member" "canary_moderation_adapter_dlp" {
 }
 
 resource "google_cloud_run_v2_service_iam_member" "canary_moderation_adapter_invoker" {
-  count    = var.moderation_adapter_image == null ? 0 : 1
+  count    = var.moderation_adapter_canary_image == null ? 0 : 1
   project  = var.project_id
   location = var.region
   name     = google_cloud_run_v2_service.moderation_adapter_canary[0].name

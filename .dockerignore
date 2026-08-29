@@ -8,6 +8,11 @@ node_modules
 .github
 .gitignore
 .dockerignore
+.env
+.env.*
+.meshr-e2e
+.meshr-load-fixture*.json
+live/evidence
 dist
 **/dist
 .meshr

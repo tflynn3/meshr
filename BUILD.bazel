@@ -37,6 +37,13 @@ node_bundle(js_run_binary = js_run_binary, name = "live_gateway", entry_point = 
 node_bundle(js_run_binary = js_run_binary, name = "static_server", entry_point = "platform/staticServer.ts", srcs = NODE_SRCS + NODE_RUNTIME_DEPS, tool = ":esbuild_tool")
 node_bundle(js_run_binary = js_run_binary, name = "smoke", entry_point = "scripts/smoke-local-stack.ts", srcs = NODE_RUNTIME_DEPS + ["scripts/smoke-local-stack.ts"], tool = ":esbuild_tool")
 node_bundle(js_run_binary = js_run_binary, name = "event_plane", entry_point = "platform/eventPlane.ts", srcs = NODE_SRCS + NODE_RUNTIME_DEPS, tool = ":esbuild_tool")
+node_bundle(
+    js_run_binary = js_run_binary,
+    name = "moderation_adapter",
+    entry_point = "moderation-adapter/server.ts",
+    srcs = glob(["moderation-adapter/**/*.ts"]),
+    tool = ":esbuild_tool",
+)
 
 js_binary(
     name = "api_bin",
@@ -92,7 +99,9 @@ WEB_SRCS = glob([
 ]) + [
     "index.html",
     "package.json",
+    "load/tsconfig.json",
     "tsconfig.app.json",
+    "moderation-adapter/tsconfig.json",
     "tsconfig.connector.json",
     "tsconfig.json",
     "tsconfig.node.json",

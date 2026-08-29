@@ -10,6 +10,7 @@ bazel-*
 *.log
 coverage/
 .meshr-e2e/
+.meshr-load-fixture*.json
 .meshr/*.db
 .meshr/*.db-*
 .meshr/connector/

@@ -27,6 +27,45 @@ Gateway IPv4 addresses for production and staging. The Google and GitHub
 provider resources are omitted when their credentials are null only while
 `launch_mode=false`; a public launch must configure both.
 
+The first launch is deliberately a two-phase bootstrap because the moderation
+adapter image digests are produced by the protected build job, while the
+authenticated Cloud Run services are created by the launch apply:
+
+1. Apply the foundation with `launch_mode=false`, both moderation adapter image
+   variables unset, and DNS management disabled. This creates the Artifact
+   Registry, WIF identities, cluster, databases, and IAM needed by the build
+   and promotion jobs without creating a provider-backed adapter or changing
+   public DNS.
+2. Configure the protected GitHub variables/secrets from the OpenTofu outputs,
+   then dispatch the `Meshr CI` workflow for the exact `main` SHA with
+   `bootstrap_build_only=true`. The job still runs the normal verification,
+   SBOM/provenance, vulnerability scan, and keyless signing gates, but skips
+   canary and production promotion. Copy the four immutable references from
+   the build job's `Signed immutable image digests` summary.
+
+   From an authenticated operator workstation, the dispatch is:
+
+   ```bash
+   MAIN_SHA="$(git rev-parse origin/main)"
+   gh workflow run ci.yml --ref main \
+     -f release_sha="$MAIN_SHA" \
+     -f bootstrap_build_only=true
+   ```
+3. Create and verify the Model Armor template, then run the protected
+   `launch_mode=true` apply with those signed moderation adapter references and
+   `moderation_model_armor_template` (plus OAuth, billing, and the reviewed
+   fixed-egress CIDRs). This creates the production and canary Cloud Run
+   adapters without a placeholder image or provider configuration.
+4. Read the adapter URLs from the outputs, set the canary/production protected
+   `MESHR_MODERATION_ENDPOINT`, `MESHR_MODERATION_HEALTHCHECK_URL`, and
+   `MESHR_MODERATION_AUDIENCE` values, verify the Gateway/TLS prerequisites,
+   and dispatch the normal workflow for the same SHA. It advances the canary
+   adapter first, runs the native-session/browser gates, and only then permits
+   the explicitly approved production promotion.
+
+Do not skip phase 2 by inventing a digest or by applying a mutable image tag;
+the launch guard and CI signature checks intentionally reject that shortcut.
+
 DNS records are independently opt-in: leave both
 `manage_production_dns_records=false` and `manage_staging_dns_records=false`
 while the existing site is live. You can enable and verify the canary first by
@@ -92,16 +131,28 @@ auditable digest file; a missing protected variable fails the promotion before a
 release can be advertised.
 
 The moderation adapter is a separately deployed, authenticated Cloud Run
-workload. Supply `moderation_adapter_image` as an immutable digest on the
-protected launch apply. OpenTofu gives the adapter's dedicated service account
-the `roles/modelarmor.user` and `roles/dlp.user` permissions and grants the
-production/canary event-plane workers only `roles/run.invoker` on their matching
-adapter service. Set each environment's `MESHR_MODERATION_ENDPOINT` to the
-adapter's `/screen` URL, `MESHR_MODERATION_HEALTHCHECK_URL` to its
-side-effect-free `/healthz` URL, and `MESHR_MODERATION_AUDIENCE` to the Cloud Run
-service URI. The adapter image must implement those authenticated endpoints and
-call Model Armor/Sensitive Data Protection; worker pods never receive
-provider-level credentials.
+workload built from `deploy/images/moderation-adapter.Dockerfile`. CI builds,
+scans, attests, and signs its multi-architecture image alongside the API,
+event-plane, and web images. Supply the exact signed production digest as
+`moderation_adapter_image` and the exact signed canary digest as
+`moderation_adapter_canary_image`; keeping these inputs separate lets the
+canary job update and verify only the canary service before production is
+changed. Both are required by the protected `launch_mode=true` apply. After
+the foundation creates the services, the protected CI promotion owns image
+revision advancement with a service-scoped `roles/run.developer` grant and
+runtime-service-account `roles/iam.serviceAccountUser`. OpenTofu ignores only
+the image field and exposes the live digest through
+`moderation_adapter_*_deployed_image`, so routine applies cannot roll a
+promoted adapter back to stale bootstrap tfvars. The
+adapter's dedicated service accounts receive `roles/modelarmor.user` and
+`roles/dlp.user`; production/canary event-plane workers receive only
+`roles/run.invoker` on their matching adapter service. The adapter calls both
+Model Armor and Sensitive Data Protection using short-lived ADC credentials and
+exposes bounded authenticated `/screen` and side-effect-free `/healthz` and
+`/readyz` endpoints. Set each environment's `MESHR_MODERATION_ENDPOINT` to its
+`/screen` URL, `MESHR_MODERATION_HEALTHCHECK_URL` to `/healthz`, and
+`MESHR_MODERATION_AUDIENCE` to the matching Cloud Run service URI. Worker pods
+never receive provider-level credentials.
 
 GCP budget thresholds are alerts, not a hard spending cap. Application cost
 protection is configured in Kubernetes and the API: at 95% projected spend,
