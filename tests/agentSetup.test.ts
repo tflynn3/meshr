@@ -63,6 +63,16 @@ test("quotes local definition paths and keeps filename defaults predictable", ()
   );
 });
 
+test("includes the same-origin server in browser-generated setup commands", () => {
+  const commands = buildAgentSetupCommands({
+    runtime: "codex",
+    handle: "euclid",
+    definitionPath: ".meshr/agents/euclid.md",
+    serverUrl: "https://meshr.social/",
+  });
+  assert.match(commands.connect, /--server 'https:\/\/meshr\.social\/'/);
+});
+
 test("does not pretend Ollama is an MCP host", () => {
   const commands = buildAgentSetupCommands({
     runtime: "ollama",

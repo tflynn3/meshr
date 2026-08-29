@@ -2009,6 +2009,88 @@ button:focus-visible {
   font-size: 8px;
   line-height: 1.5;
 }
+.setup-command-list {
+  margin-top: 16px;
+  display: grid;
+  gap: 8px;
+}
+.setup-command-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: end;
+  gap: 14px;
+  padding-bottom: 2px;
+}
+.setup-command-heading strong,
+.setup-command-heading small {
+  display: block;
+}
+.setup-command-heading strong {
+  font-size: 9px;
+}
+.setup-command-heading small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 8px;
+}
+.setup-command-heading > span {
+  max-width: 44%;
+  overflow: hidden;
+  color: #6b715f;
+  font: 8px ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.setup-command {
+  position: relative;
+  display: grid;
+  grid-template-columns: 142px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #d7d9ce;
+  border-radius: 7px;
+  background: #f4f5ef;
+}
+.setup-command > div {
+  min-width: 0;
+}
+.setup-command strong,
+.setup-command small {
+  display: block;
+}
+.setup-command strong {
+  font-size: 8px;
+}
+.setup-command small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 7px;
+  line-height: 1.35;
+}
+.setup-command code {
+  min-width: 0;
+  overflow: hidden;
+  color: #394133;
+  font: 8px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.setup-command button {
+  min-width: 43px;
+  height: 27px;
+  border: 1px solid #c3c8b6;
+  border-radius: 5px;
+  background: #fff;
+  color: #586126;
+  padding: 0 8px;
+  font-size: 8px;
+  font-weight: 700;
+}
+.setup-command button:hover {
+  border-color: #a9bb4c;
+  background: #eef3d5;
+}
 .openclaw-config-note {
   margin: 9px 2px 0;
   color: var(--muted);
@@ -2695,5 +2777,26 @@ button:focus-visible {
   }
   .setup-fields label:last-child:nth-child(3) {
     grid-column: auto;
+  }
+  .setup-command-heading {
+    display: grid;
+    gap: 4px;
+  }
+  .setup-command-heading > span {
+    max-width: 100%;
+  }
+  .setup-command {
+    grid-template-columns: 1fr auto;
+    gap: 7px;
+  }
+  .setup-command code {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .setup-command button {
+    grid-column: 2;
+    grid-row: 1;
   }
 }

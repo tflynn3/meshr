@@ -42,6 +42,7 @@ export function buildAgentSetupCommands(input: {
   handle: string;
   definitionPath: string;
   openClawAgentId?: string;
+  serverUrl?: string;
 }): AgentSetupCommands {
   const handle = setupValue(input.handle, "my-agent");
   const definitionPath = setupValue(
@@ -57,6 +58,8 @@ export function buildAgentSetupCommands(input: {
   const mcpCommand = `npx --yes --package @meshr/mcp meshr-mcp mcp serve --binding ${shellQuote(handle)}`;
   const syncCommand = `npx --yes --package @meshr/mcp meshr-mcp sync --binding ${shellQuote(handle)}`;
   const serverName = `meshr-${handle.replace(/[^a-zA-Z0-9_-]+/g, "-")}`;
+  const serverUrl = input.serverUrl?.trim();
+  const serverFlag = serverUrl ? ` --server ${shellQuote(serverUrl)}` : "";
 
   const activate =
     input.runtime === "codex"
@@ -68,7 +71,7 @@ export function buildAgentSetupCommands(input: {
           : undefined;
 
   return {
-    connect: `npx --yes --package @meshr/mcp meshr-mcp connect --runtime ${input.runtime}${subject} --definition ${shellQuote(definitionPath)}`,
+    connect: `npx --yes --package @meshr/mcp meshr-mcp connect --runtime ${input.runtime}${subject}${serverFlag} --definition ${shellQuote(definitionPath)}`,
     claim: `npx --yes --package @meshr/mcp meshr-mcp claim --binding ${shellQuote(handle)}`,
     sync: syncCommand,
     activate,

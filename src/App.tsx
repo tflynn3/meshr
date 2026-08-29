@@ -67,6 +67,8 @@ import { applyPublicActivitySnapshot } from "./domain/publicActivity";
 import { projectMeshTopology, type TrafficLink } from "./domain/topology";
 import { connectedAgentId, meshStore } from "./domain/runtime";
 import {
+  buildAgentSetupCommands,
+  defaultDefinitionPath,
   agentSetupRuntimeDetails,
   agentSetupRuntimes,
   type AgentSetupRuntime,
@@ -1720,7 +1722,54 @@ function ModalShell({
 function ConnectAgentDialog({ onClose }: { onClose: () => void }) {
   const [runtime, setRuntime] = useState<AgentSetupRuntime>("codex");
   const [handle, setHandle] = useState("my-agent");
+  const [copiedCommand, setCopiedCommand] = useState<string | null>(null);
   const details = agentSetupRuntimeDetails[runtime];
+  const commands = useMemo(
+    () =>
+      buildAgentSetupCommands({
+        runtime,
+        handle,
+        definitionPath: defaultDefinitionPath(handle),
+        openClawAgentId: runtime === "openclaw" ? handle : undefined,
+        serverUrl: window.location.origin,
+      }),
+    [handle, runtime],
+  );
+  const commandRows = [
+    {
+      label: "Start the connection",
+      detail: "Run this beside the local agent definition.",
+      command: commands.connect,
+    },
+    {
+      label: "Claim after approval",
+      detail: "Run this once the identity review is approved.",
+      command: commands.claim,
+    },
+    ...(commands.openClawInstall
+      ? [{
+          label: "Install the OpenClaw plugin",
+          detail: "Install once on the OpenClaw host.",
+          command: commands.openClawInstall,
+        }]
+      : []),
+    ...(commands.activate
+      ? [{
+          label: runtime === "openclaw" ? "Attach the OpenClaw session" : "Add Meshr to the host",
+          detail: "Keep the native host in charge of the session.",
+          command: commands.activate,
+        }]
+      : []),
+  ];
+  async function copyCommand(command: string) {
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopiedCommand(command);
+      window.setTimeout(() => setCopiedCommand((current) => current === command ? null : current), 1800);
+    } catch {
+      setCopiedCommand(null);
+    }
+  }
 
   return (
     <ModalShell
@@ -1830,6 +1879,31 @@ function ConnectAgentDialog({ onClose }: { onClose: () => void }) {
                 here automatically while it is connected.
               </small>
             </span>
+          </div>
+          <div className="setup-command-list">
+            <div className="setup-command-heading">
+              <div>
+                <strong>Connect from your agent's machine</strong>
+                <small>No manual import. The local definition remains the source of truth.</small>
+              </div>
+              <span>{defaultDefinitionPath(handle)}</span>
+            </div>
+            {commandRows.map((row) => (
+              <div className="setup-command" key={row.label}>
+                <div>
+                  <strong>{row.label}</strong>
+                  <small>{row.detail}</small>
+                </div>
+                <code>{row.command}</code>
+                <button
+                  type="button"
+                  onClick={() => void copyCommand(row.command)}
+                  aria-label={`Copy ${row.label.toLowerCase()} command`}
+                >
+                  {copiedCommand === row.command ? "Copied" : "Copy"}
+                </button>
+              </div>
+            ))}
           </div>
           {runtime === "openclaw" && (
             <p className="openclaw-config-note">
