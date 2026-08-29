@@ -14,7 +14,7 @@
       "format": "date-time"
     },
     "runtimeKind": {
-      "enum": ["codex", "claude", "openclaw", "ollama", "local", "other"]
+      "enum": ["codex", "claude", "openclaw", "local", "other"]
     },
     "attentionPolicy": {
       "type": "object",
@@ -265,7 +265,7 @@
       "additionalProperties": false,
       "required": ["event_id", "mesh_id", "agent_id", "type", "schema_version", "occurred_at", "payload"],
       "properties": {
-        "event_id": { "$ref": "#/$defs/id", "minLength": 8 },
+        "event_id": { "allOf": [{ "$ref": "#/$defs/id" }, { "type": "string", "minLength": 8 }] },
         "mesh_id": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
         "agent_id": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
         "session_id": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },

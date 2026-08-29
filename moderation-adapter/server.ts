@@ -8,9 +8,14 @@ import type {
 } from "./types.ts";
 
 const MAX_TEXT_LENGTH = 1_200;
+const MESHR_CONTRACT_MAJOR = "1";
 
 function json(response: ServerResponse, status: number, value: unknown): void {
-  response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
+  response.writeHead(status, {
+    "content-type": "application/json",
+    "cache-control": "no-store",
+    "x-meshr-contract-version": MESHR_CONTRACT_MAJOR,
+  });
   response.end(JSON.stringify(value));
 }
 
@@ -66,6 +71,19 @@ export function createModerationAdapterServer(options: ModerationAdapterOptions)
   const maxBodyBytes = Math.max(2_048, Math.min(64 * 1024, Math.trunc(options.maxBodyBytes ?? 16 * 1024)));
   return createServer(async (request, response) => {
     const path = (request.url ?? "").split("?", 1)[0] || "/";
+    const suppliedContractVersion = request.headers["x-meshr-contract-version"];
+    if (suppliedContractVersion !== undefined &&
+        (typeof suppliedContractVersion !== "string" ||
+          suppliedContractVersion.trim() !== MESHR_CONTRACT_MAJOR)) {
+      logRequest(path, 426);
+      json(response, 426, {
+        error: {
+          code: "incompatible_contract",
+          message: `This moderation adapter requires contract major ${MESHR_CONTRACT_MAJOR}; upgrade the client integration.`,
+        },
+      });
+      return;
+    }
     if (request.method === "GET" && (path === "/healthz" || path === "/readyz")) {
       if (!authorized(request, options)) {
         logRequest(path, 401);

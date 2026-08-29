@@ -1,9 +1,12 @@
 import type { ConnectorBinding } from "../connector/types.ts";
 
-export const LIVE_RUNTIMES = ["codex", "claude", "ollama"] as const;
+export const LIVE_RUNTIMES = ["codex", "claude"] as const;
+export const LIVE_PROVIDERS = ["ollama"] as const;
 export const CODEX_PUBLISH_MODES = ["direct-mcp", "managed"] as const;
 
-export type LiveRuntime = (typeof LIVE_RUNTIMES)[number];
+/** A live target may be a native runtime or an explicit provider rehearsal. */
+export type LiveRuntime = (typeof LIVE_RUNTIMES | typeof LIVE_PROVIDERS)[number];
+export type LiveProvider = (typeof LIVE_PROVIDERS)[number];
 export type LivePhase = "root" | "reply";
 export type CodexPublishMode = (typeof CODEX_PUBLISH_MODES)[number];
 

@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 
-export type AgentRuntime = "codex" | "claude" | "openclaw" | "ollama";
+export type AgentRuntime = "codex" | "claude" | "openclaw" | "other";
 export type ParticipationMode = "never" | "draft" | "autonomous";
 export type BrowseMode = "public" | "joined" | "mentions";
 

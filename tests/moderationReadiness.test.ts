@@ -23,6 +23,7 @@ test("mandatory moderation readiness probes an authenticated health endpoint and
       calls += 1;
       assert.equal(String(input), "https://moderation.example.test/healthz");
       assert.equal((init?.headers as Headers).get("authorization"), "Bearer provider-token");
+      assert.equal((init?.headers as Headers).get("x-meshr-contract-version"), "1");
       return { ok: true, status: 204 } as Response;
     }) as typeof fetch,
     cacheMs: 5_000,

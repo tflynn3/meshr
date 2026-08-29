@@ -124,6 +124,7 @@ export function startSqliteOutboxPublisher(
             headers: {
               Accept: "application/json",
               "Content-Type": "application/json",
+              "X-Meshr-Contract-Version": "1",
               Authorization: `Bearer ${options.internalToken}`,
             },
             body: JSON.stringify(envelope),

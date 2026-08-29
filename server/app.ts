@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { isIP, type AddressInfo } from "node:net";
 import type { DatabaseSync } from "node:sqlite";
 import { CURRENT_SCHEMA_VERSION, MeshrDatabase } from "./database.ts";
+import { publicRuntimeKind } from "./types.ts";
 import {
   assertEd25519PublicKey,
   constantTimeStringEqual,
@@ -265,7 +266,7 @@ function agentFromRow(row: AgentRow): StoredAgentProfile {
     interests: JSON.parse(row.interests_json) as string[],
     personality: row.personality,
     attention: JSON.parse(row.attention_json) as StoredAgentProfile["attention"],
-    runtime: row.runtime,
+    runtime: publicRuntimeKind(row.runtime),
     runtimeLabel: row.runtime_label,
     runtimeSubject: row.runtime_subject,
     definitionDigest: row.definition_digest,
@@ -284,7 +285,7 @@ function agentFromRepository(agent: RepositoryAgentInput): StoredAgentProfile {
     interests: agent.interests,
     personality: agent.personality,
     attention: agent.attention as StoredAgentProfile["attention"],
-    runtime: agent.runtime,
+    runtime: publicRuntimeKind(agent.runtime),
     runtimeLabel: agent.runtimeLabel,
     runtimeSubject: agent.runtimeSubject,
     definitionDigest: agent.definitionDigest,
@@ -477,7 +478,7 @@ function pairingRepresentation(row: PairingRow) {
     id: row.id,
     code: row.code,
     status: row.status,
-    runtime: row.runtime,
+    runtime: publicRuntimeKind(row.runtime),
     label: row.runtime_label,
     externalSubject: row.external_subject,
     requestedProfile: row.requested_profile_json
@@ -3393,7 +3394,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           .get(agentId) as { session_id: string; runtime_kind: RuntimeKind } | undefined)
       : undefined;
     const sessionId = context.sessionId ?? activeSession?.session_id ?? null;
-    const runtimeKind = context.runtimeKind ?? activeSession?.runtime_kind ?? null;
+    const rawRuntimeKind = context.runtimeKind ?? activeSession?.runtime_kind ?? null;
+    // Legacy/provider fixtures may still carry the internal `ollama` marker;
+    // never emit that value on the public event contract. Ollama is a model
+    // provider used through an MCP-capable host, not a Meshr runtime.
+    const runtimeKind = rawRuntimeKind == null ? null : publicRuntimeKind(rawRuntimeKind);
     const eventId = context.eventId ?? database.id("evt");
     const createdAt = context.occurredAt ?? database.now();
     const result = db
@@ -9833,7 +9838,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         body: {
           sessionId: session.session_id,
           agentId: session.agent_id,
-          runtime: session.runtime_kind,
+          runtime: publicRuntimeKind(session.runtime_kind),
           status: "online",
           createdAt: session.created_at,
           expiresAt: session.expires_at,

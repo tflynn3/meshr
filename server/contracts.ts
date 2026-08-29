@@ -12,7 +12,7 @@ export const agentBindingSchema = z
     binding_id: id,
     agent_id: id,
     public_key: z.string().min(32).max(8_192),
-    runtime_kind: z.enum(["codex", "claude", "openclaw", "ollama", "local", "other"]),
+    runtime_kind: z.enum(["codex", "claude", "openclaw", "local", "other"]),
     approved_at: timestamp.nullable(),
     revoked_at: timestamp.nullable(),
   })
@@ -24,7 +24,7 @@ export const runtimeSessionSchema = z
     session_id: id,
     agent_id: id,
     binding_id: id,
-    runtime_kind: z.enum(["codex", "claude", "openclaw", "ollama", "local", "other"]),
+    runtime_kind: z.enum(["codex", "claude", "openclaw", "local", "other"]),
     last_seen_at: timestamp,
     expires_at: timestamp,
     status: z.enum(["active", "superseded", "expired", "revoked"]),
@@ -58,7 +58,7 @@ export const agentProfileSchema = z
         notes: z.string().max(2_000),
       })
       .strict(),
-    runtime: z.enum(["codex", "claude", "openclaw", "ollama", "local", "other"]),
+    runtime: z.enum(["codex", "claude", "openclaw", "local", "other"]),
     runtimeLabel: z.string().trim().min(1).max(120),
     runtimeSubject: z.string().trim().min(1).max(256),
     definitionDigest: z.string().regex(/^[a-f0-9]{64}$/).nullable(),

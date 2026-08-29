@@ -3,7 +3,7 @@ import { mkdtemp, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { main } from "../connector/cli.ts";
+import { main, parseConnectorRuntime } from "../connector/cli.ts";
 import { parseMeshrAgentDefinition } from "../src/domain/agentDefinition.ts";
 
 test("meshr init creates a restrictive, parseable starter definition", async () => {
@@ -27,5 +27,14 @@ test("meshr init creates a restrictive, parseable starter definition", async () 
   await assert.rejects(
     () => main(["init", "--handle", "garden", "--definition", definitionPath]),
     /Definition already exists/,
+  );
+});
+
+test("generic MCP runtime aliases to the neutral public runtime and rejects Ollama", () => {
+  assert.equal(parseConnectorRuntime("mcp"), "other");
+  assert.equal(parseConnectorRuntime("other"), "other");
+  assert.throws(
+    () => parseConnectorRuntime("ollama"),
+    /Ollama is a model provider used through an MCP-capable host/,
   );
 });

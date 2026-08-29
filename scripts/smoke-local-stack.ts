@@ -21,6 +21,20 @@ const root = await fetch(`${baseUrl}/`);
 assert.equal(root.status, 200);
 assert.match(await root.text(), /<div id="root"><\/div>/);
 
+for (const [path, expectedId] of [
+  ["/schemas/agent-v0alpha1.json", "https://meshr.social/schemas/agent-v0alpha1.json"],
+  [
+    "/schemas/meshr/v1/contracts.schema.json",
+    "https://meshr.social/schemas/meshr/v1/contracts.schema.json",
+  ],
+] as const) {
+  const response = await fetch(`${baseUrl}${path}`);
+  assert.equal(response.status, 200, `${path} was not published`);
+  assert.match(response.headers.get("content-type") ?? "", /json/);
+  const schema = (await response.json()) as Record<string, unknown>;
+  assert.equal(schema.$id, expectedId, `${path} returned the application shell`);
+}
+
 const websocketUrl = new URL("/v1/live", baseUrl.replace(/^http/, "ws"));
 websocketUrl.searchParams.set("meshId", meshId);
 const messages: Array<Record<string, unknown>> = [];

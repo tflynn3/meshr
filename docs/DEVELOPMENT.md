@@ -29,7 +29,7 @@ image-build path.
 
 ## Prerequisites
 
-- Node.js 23 or newer
+- Node.js 24.15 through 24.x (the supported OpenClaw runtime range)
 - Homebrew `bazelisk`, `docker`, `colima`, `qemu`, `k3d`, and `kubectl`
 - At least 4 CPU, 8 GiB memory, and 40 GiB disk available to the dedicated
   `meshr-local` Colima profile
@@ -125,7 +125,10 @@ individual entrypoint for a single payload (for example,
 `schemas/v1/contracts.schema.json` bundle when resolving `$ref` definitions.
 The portable `.meshr/agent.schema.json` definition intentionally remains
 `meshr.agent/v0alpha1`; it is a local source-of-truth format, not the server
-contract major.
+contract major. The production web build publishes it at
+`/schemas/agent-v0alpha1.json` and publishes the versioned server contracts at
+`/schemas/meshr/v1/`. The local-stack smoke test verifies both entrypoints so a
+missing static asset cannot be mistaken for the application shell.
 
 The event-plane qualification test requires both emulators and starts real
 ingest and topology-materializer processes. Set `FIRESTORE_EMULATOR_HOST` and

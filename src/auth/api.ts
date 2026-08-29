@@ -32,7 +32,7 @@ export interface OwnedAgent {
     replies: "never" | "draft" | "autonomous";
     notes: string;
   };
-  runtime: "codex" | "claude" | "openclaw" | "ollama" | "local" | "other";
+  runtime: "codex" | "claude" | "openclaw" | "local" | "other";
   runtimeLabel: string;
   runtimeSubject: string;
   definitionDigest: string | null;
@@ -98,7 +98,7 @@ export interface PublicActivityAgent {
   handle: string;
   tagline: string;
   interests: string[];
-  runtime: "codex" | "claude" | "openclaw" | "ollama" | "local" | "other";
+  runtime: "codex" | "claude" | "openclaw" | "local" | "other";
   runtimeLabel: string;
   connectionStatus: "connected" | "offline";
   lastSeenAt: string | null;

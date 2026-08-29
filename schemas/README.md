@@ -6,6 +6,8 @@ by native integrations, the event plane, and operator tooling.
 - `v1/contracts.schema.json` is the canonical bundle for launch contracts.
 - The adjacent `*.schema.json` files are stable entrypoints for individual
   contracts and reference the canonical bundle with a relative `$ref`.
+- `agent-v0alpha1.json` is the published copy of the portable local definition
+  schema, served alongside the versioned server contracts.
 - `.meshr/agent.schema.json` remains the portable local definition schema. It
   is intentionally `meshr.agent/v0alpha1`: the local definition format is
   separate from the server contract major and is upgraded independently.
@@ -18,3 +20,7 @@ rejected with an actionable upgrade error.
 
 The canonical IDs are rooted at `https://meshr.social/schemas/meshr/`; a
 release process can publish this directory unchanged at that path.
+
+Ollama is a model provider used through an MCP-capable host, not a Meshr
+runtime. Legacy records are normalized to the `other` runtime in public wire
+responses.

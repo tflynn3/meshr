@@ -45,8 +45,7 @@ import type {
   RepositoryHumanActivityPreference,
   RepositoryHumanActivityPreferencePatch,
 } from "./repository.ts";
-import type { Clock, RuntimeKind, SocialProvider } from "./types.ts";
-import { systemClock } from "./types.ts";
+import { publicRuntimeKind, systemClock, type Clock, type RuntimeKind, type SocialProvider } from "./types.ts";
 
 export interface FirestoreRepositoryOptions {
   firestore: Firestore;
@@ -909,7 +908,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       mesh_id: input.meshId,
       agent_id: input.agentId,
       session_id: input.sessionId,
-      runtime_kind: input.runtimeKind,
+      runtime_kind: input.runtimeKind == null ? null : publicRuntimeKind(input.runtimeKind),
       type: input.type,
       occurred_at: input.occurredAt,
       payload,
@@ -3302,7 +3301,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           mesh_id: input.meshId,
           agent_id: input.agentId,
           session_id: input.sessionId,
-          runtime_kind: input.runtimeKind,
+          runtime_kind: input.runtimeKind == null ? null : publicRuntimeKind(input.runtimeKind),
           type: "mesh.join_requested",
           occurred_at: now,
           payload: { requestId, meshId: input.meshId, agentId: input.agentId },
@@ -3376,7 +3375,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         mesh_id: input.meshId,
         agent_id: input.agentId,
         session_id: input.sessionId,
-        runtime_kind: input.runtimeKind,
+        runtime_kind: input.runtimeKind == null ? null : publicRuntimeKind(input.runtimeKind),
         type: "mesh.agent.joined",
         occurred_at: now,
         payload: {
@@ -4161,7 +4160,10 @@ export class FirestoreMeshrRepository implements MeshrRepository {
             mesh_id: eventMeshId,
             agent_id: input.agentId,
             session_id: sessionId,
-            runtime_kind: (authority.get("runtime_kind") ?? null) as RuntimeKind | null,
+            runtime_kind:
+              authority.get("runtime_kind") == null
+                ? null
+                : publicRuntimeKind(String(authority.get("runtime_kind")) as RuntimeKind),
             type: input.following ? "topic.followed" : "topic.unfollowed",
             schema_version: 1,
             occurred_at: occurredAt,
@@ -6405,7 +6407,10 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         mesh_id: input.meshId,
         agent_id: input.agentId,
         session_id: input.sessionId,
-        runtime_kind: (authority.get("runtime_kind") ?? null) as RuntimeKind | null,
+        runtime_kind:
+          authority.get("runtime_kind") == null
+            ? null
+            : publicRuntimeKind(String(authority.get("runtime_kind")) as RuntimeKind),
         type: input.eventType,
         schema_version: 1,
         occurred_at: now,

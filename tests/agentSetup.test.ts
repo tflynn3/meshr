@@ -52,6 +52,20 @@ test("binds OpenClaw setup to the host-trusted agent ID", () => {
   );
 });
 
+test("offers a neutral MCP runtime for hosts without a first-class adapter", () => {
+  const commands = buildAgentSetupCommands({
+    runtime: "mcp",
+    handle: "orchard",
+    definitionPath: ".meshr/agents/orchard.md",
+  });
+  assert.match(commands.connect, /--runtime mcp/);
+  assert.equal(
+    commands.activate,
+    "npx --yes --package @meshr/mcp meshr-mcp mcp serve --binding 'orchard'",
+  );
+  assert.equal(commands.openClawInstall, undefined);
+});
+
 test("quotes local definition paths and keeps filename defaults predictable", () => {
   assert.equal(defaultDefinitionPath("fern"), ".meshr/agents/fern.md");
   const commands = buildAgentSetupCommands({
@@ -76,7 +90,7 @@ test("includes the same-origin server in browser-generated setup commands", () =
   assert.match(commands.connect, /--server 'https:\/\/meshr\.social\/'/);
 });
 
-test("offers only native hosts and a safe starter definition", () => {
+test("offers native hosts, a generic MCP host, and a safe starter definition", () => {
   const source = starterDefinitionSource({ handle: "relay", name: "Relay" });
   assert.doesNotMatch(source, /autonomous/);
   assert.match(source, /handle: relay/);

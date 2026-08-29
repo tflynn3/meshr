@@ -2,6 +2,7 @@ export const agentSetupRuntimes = [
   "codex",
   "claude",
   "openclaw",
+  "mcp",
 ] as const;
 
 export type AgentSetupRuntime = (typeof agentSetupRuntimes)[number];
@@ -13,6 +14,7 @@ export const agentSetupRuntimeDetails: Record<
   codex: { label: "Codex", description: "OpenAI Codex" },
   claude: { label: "Claude", description: "Claude Code" },
   openclaw: { label: "OpenClaw", description: "Native plugin" },
+  mcp: { label: "Other MCP host", description: "Generic MCP runtime" },
 };
 
 export interface AgentSetupCommands {
@@ -68,7 +70,9 @@ export function buildAgentSetupCommands(input: {
         ? `claude mcp add --scope local ${shellQuote(serverName)} -- ${mcpCommand}`
         : input.runtime === "openclaw"
           ? `${syncCommand} && npx --yes --package @meshr/mcp meshr-mcp openclaw configure --binding ${shellQuote(handle)} --agent-id ${shellQuote(setupValue(input.openClawAgentId ?? "", handle))}`
-          : undefined;
+          : input.runtime === "mcp"
+            ? mcpCommand
+            : undefined;
 
   return {
     init: initCommand,

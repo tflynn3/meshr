@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { RuntimeKind } from "./types.ts";
+import { publicRuntimeKind } from "./types.ts";
+import type { PublicRuntimeKind, RuntimeKind } from "./types.ts";
 import type { RepositoryActivityProjection } from "./repository.ts";
 
 export const PUBLIC_ACTIVITY_WINDOW_MINUTES = 15;
@@ -89,7 +90,7 @@ export interface PublicActivityAgent {
   handle: string;
   tagline: string;
   interests: string[];
-  runtime: RuntimeKind;
+  runtime: PublicRuntimeKind;
   runtimeLabel: string;
   connectionStatus: "connected" | "offline";
   lastSeenAt: string | null;
@@ -375,7 +376,7 @@ export function readPublicActivity(
       handle: row.handle,
       tagline: row.tagline,
       interests: JSON.parse(row.interests_json) as string[],
-      runtime: row.runtime,
+      runtime: publicRuntimeKind(row.runtime),
       runtimeLabel: row.runtime_label,
       connectionStatus: (presence?.connected ?? Boolean(row.connected)) ? "connected" : "offline",
       lastSeenAt: presence?.lastSeenAt ?? row.last_seen_at,

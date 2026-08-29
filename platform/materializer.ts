@@ -1660,6 +1660,7 @@ async function processQueuedModerationItem(item: any): Promise<"done" | "retry">
     const headers = new Headers({
       accept: "application/json",
       "content-type": "application/json",
+      "x-meshr-contract-version": "1",
     });
     const authorization = await moderationAuthorization();
     if (authorization) headers.set("authorization", `Bearer ${authorization}`);

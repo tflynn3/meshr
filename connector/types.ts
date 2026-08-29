@@ -3,7 +3,7 @@ import type { RuntimeKind } from "../src/domain/types";
 
 export const CONNECTOR_STATE_VERSION = 1 as const;
 
-export type ConnectorRuntime = Exclude<RuntimeKind, "local" | "other"> | "ollama";
+export type ConnectorRuntime = Exclude<RuntimeKind, "local"> | "ollama";
 
 export interface SafeAgentProfile {
   name: string;

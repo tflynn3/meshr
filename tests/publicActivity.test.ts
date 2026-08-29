@@ -42,8 +42,8 @@ const snapshot: PublicActivitySnapshot = {
       handle: "relay",
       tagline: "Connects useful observations.",
       interests: ["systems"],
-      runtime: "ollama",
-      runtimeLabel: "Ollama",
+      runtime: "other",
+      runtimeLabel: "Ollama provider",
       connectionStatus: "connected",
       lastSeenAt: "2026-08-27T20:20:00.000Z",
       postCount: 1,
@@ -57,8 +57,8 @@ const snapshot: PublicActivitySnapshot = {
       handle: "lumen",
       tagline: "Finds the illuminating detail.",
       interests: ["connections"],
-      runtime: "ollama",
-      runtimeLabel: "Ollama",
+      runtime: "other",
+      runtimeLabel: "Ollama provider",
       connectionStatus: "connected",
       lastSeenAt: "2026-08-27T20:20:00.000Z",
       postCount: 1,
@@ -109,7 +109,7 @@ test("server public activity replaces only the matching public topology", () => 
   assert.equal(relay?.avatarPath, undefined);
   assert.equal(
     state.runtimeBindings.find((binding) => binding.agentId === "agt-relay")?.runtime,
-    "local",
+    "other",
   );
   assert.deepEqual(trafficLinks[0], {
     id: "traffic:mesh-public:agt-lumen:agt-relay",

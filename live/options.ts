@@ -1,9 +1,11 @@
 import { resolve } from "node:path";
 import {
   CODEX_PUBLISH_MODES,
+  LIVE_PROVIDERS,
   LIVE_RUNTIMES,
   type CodexPublishMode,
   type LiveMatrixOptions,
+  type LiveProvider,
   type LiveRuntime,
 } from "./types.ts";
 
@@ -12,8 +14,10 @@ export const LIVE_MATRIX_HELP = `Usage:
 
 Options:
   --dry-run                         Validate readiness and print plans without model calls or posts.
-  --runtime <name[,name]>           Run codex, claude, ollama, or a comma-separated subset.
+  --runtime <name[,name]>           Run codex, claude, or a comma-separated subset.
   --bindings <runtime=a,b>          Select two connected binding IDs or handles for a runtime.
+  --provider <name[,name]>          Add an explicit model-provider rehearsal (ollama).
+  --provider-bindings <provider=a,b> Select two bindings for a provider rehearsal.
   --state-dir <path>                Meshr session state directory (default: ~/.meshr/session).
   --server <url>                    Require all selected bindings to use this Meshr server.
   --timeout-ms <ms>                 One-attempt phase timeout (default: 300000; max: 900000).
@@ -30,7 +34,7 @@ Options:
   --claude-budget-usd <amount>      Maximum per Claude invocation (default: 0.25; max: 2).
   --help                            Show this help.
 
-Each runtime gets one root invocation and one reply invocation. There are no retries.`;
+Each selected target gets one root invocation and one reply invocation. There are no retries.`;
 
 interface RawOption {
   name: string;
@@ -64,9 +68,16 @@ function tokenize(values: string[]): RawOption[] {
 
 function asRuntime(value: string): LiveRuntime {
   if (!LIVE_RUNTIMES.includes(value as LiveRuntime)) {
-    throw new Error(`Unsupported live runtime: ${value}.`);
+    throw new Error(`Unsupported live runtime: ${value}. Use --provider for model providers.`);
   }
   return value as LiveRuntime;
+}
+
+function asProvider(value: string): LiveProvider {
+  if (!LIVE_PROVIDERS.includes(value as LiveProvider)) {
+    throw new Error(`Unsupported live provider: ${value}.`);
+  }
+  return value as LiveProvider;
 }
 
 function asCodexPublishMode(value: string): CodexPublishMode {
@@ -114,6 +125,8 @@ export function parseLiveMatrixOptions(
     "help",
     "runtime",
     "bindings",
+    "provider",
+    "provider-bindings",
     "state-dir",
     "server",
     "timeout-ms",
@@ -146,9 +159,19 @@ export function parseLiveMatrixOptions(
       .map((item) => item.trim())
       .filter(Boolean),
   );
-  const runtimes = runtimeValues.length
+  const nativeRuntimes = runtimeValues.length
     ? [...new Set(runtimeValues.map(asRuntime))]
     : [...LIVE_RUNTIMES];
+  const providers = valuesFor("provider").flatMap((value) =>
+    value
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean),
+  );
+  const runtimes = [...new Set<LiveRuntime>([
+    ...nativeRuntimes,
+    ...providers.map(asProvider),
+  ])];
 
   const bindings: LiveMatrixOptions["bindings"] = {};
   for (const value of valuesFor("bindings")) {
@@ -167,6 +190,24 @@ export function parseLiveMatrixOptions(
       );
     }
     bindings[runtime] = selectors as [string, string];
+  }
+  for (const value of valuesFor("provider-bindings")) {
+    const equal = value.indexOf("=");
+    if (equal <= 0) {
+      throw new Error("--provider-bindings must use provider=first,second.");
+    }
+    const provider = asProvider(value.slice(0, equal));
+    const selectors = value
+      .slice(equal + 1)
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (selectors.length !== 2) {
+      throw new Error(
+        `--provider-bindings for ${provider} must contain exactly two selectors.`,
+      );
+    }
+    bindings[provider] = selectors as [string, string];
   }
 
   const timeout = last("timeout-ms", "300000")!;

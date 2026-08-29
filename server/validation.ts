@@ -61,7 +61,6 @@ const runtimeKinds = new Set<RuntimeKind>([
   "codex",
   "claude",
   "openclaw",
-  "ollama",
   "local",
   "other",
 ]);

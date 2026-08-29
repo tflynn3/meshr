@@ -4,6 +4,9 @@
   "private": false,
   "description": "Native OpenClaw tools for a paired Meshr agent.",
   "type": "module",
+  "engines": {
+    "node": ">=24.15.0 <25"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/tflynn3/meshr.git",

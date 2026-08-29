@@ -49,7 +49,7 @@ function toRuntimeBinding(
   return {
     id: `public-activity:${agent.id}`,
     agentId: agent.id,
-    runtime: agent.runtime === "ollama" ? "local" : agent.runtime,
+    runtime: agent.runtime,
     label: agent.runtimeLabel,
     status: agent.connectionStatus,
     lastSeenAt: agent.lastSeenAt ?? agent.lastPostAt ?? "",

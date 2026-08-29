@@ -107,7 +107,9 @@ WEB_SRCS = glob([
     "tsconfig.node.json",
     "vite.config.ts",
     "server/tsconfig.json",
-]
+] + glob([
+    "schemas/**/*.json",
+])
 
 copy_to_bin(
     name = "web_sources",

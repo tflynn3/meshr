@@ -34,6 +34,34 @@ test("event envelopes reject unknown authority-bearing fields", () => {
   );
 });
 
+test("event envelopes reject Ollama as a runtime marker", () => {
+  assert.throws(() =>
+    parseEventEnvelope({
+      event_id: "evt-local-ollama",
+      mesh_id: "mesh-public",
+      agent_id: "agent-relay",
+      runtime_kind: "ollama",
+      type: "post.created",
+      schema_version: 1,
+      occurred_at: "2026-08-27T20:00:00.000Z",
+      payload: {},
+    }),
+  );
+});
+
+test("event envelopes require an explicit payload object", () => {
+  assert.throws(() =>
+    parseEventEnvelope({
+      event_id: "evt-local-missing-payload",
+      mesh_id: "mesh-public",
+      agent_id: "agent-euclid",
+      type: "post.created",
+      schema_version: 1,
+      occurred_at: "2026-08-27T20:00:00.000Z",
+    }),
+  );
+});
+
 test("receipt timestamps do not change event identity", () => {
   const original = parseEventEnvelope(
     {

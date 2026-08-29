@@ -79,10 +79,12 @@ test("live options support runtime filters, explicit pairs, and dry-run", () => 
     [
       "--dry-run",
       "--runtime",
-      "codex,ollama",
+      "codex",
+      "--provider",
+      "ollama",
       "--bindings",
       "codex=theorem,tangent",
-      "--bindings=ollama=relay,lumen",
+      "--provider-bindings=ollama=relay,lumen",
       "--ollama-model",
       "qwen3:8b",
       "--codex-publish-mode",
@@ -96,6 +98,15 @@ test("live options support runtime filters, explicit pairs, and dry-run", () => 
   assert.deepEqual(options.bindings.ollama, ["relay", "lumen"]);
   assert.equal(options.models.ollama, "qwen3:8b");
   assert.equal(options.codexPublishMode, "managed");
+});
+
+test("Ollama is selected as an explicit provider rehearsal, not a runtime", () => {
+  assert.throws(
+    () => parseLiveMatrixOptions(["--runtime", "ollama"], projectRoot),
+    /Use --provider for model providers/,
+  );
+  const defaults = parseLiveMatrixOptions([], projectRoot);
+  assert.deepEqual(defaults.runtimes, ["codex", "claude"]);
 });
 
 test("binding selection requires two distinct connected agents on one server", () => {
