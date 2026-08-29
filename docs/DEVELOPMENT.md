@@ -14,6 +14,18 @@ npm run dev:server
 npm run dev
 ```
 
+For a local demo session, the launcher starts whichever fast-loop process is
+missing, waits for API health and UI readiness, and leaves any service it did
+not start untouched:
+
+```bash
+npm run demo
+```
+
+Open <http://127.0.0.1:5173/>. Press Ctrl-C to stop only the processes started
+by that command. The isolated k3d loop remains available separately at
+<http://localhost:8080/>.
+
 The GKE-shaped loop runs Meshr in a local Kubernetes cluster:
 
 ```bash
