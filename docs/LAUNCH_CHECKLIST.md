@@ -8,6 +8,10 @@ target.
 - [ ] Clean-environment OpenTofu apply in `us-central1`.
 - [ ] Cloudflare delegation, `meshr.social`, and reserved
       `staging.meshr.social` verified with Full (strict) TLS.
+- [ ] GitHub `main`, `canary`, and `production` refs reject ordinary,
+      force-push, and delete writes; the read-only preflight App is installed;
+      release environments and scoped WIF inputs pass
+      `npm run check:github-protections`.
 - [ ] Production starts with only system taxonomy and the empty global public
       commons.
 - [ ] Google and GitHub Identity Platform login, explicit linking, CSRF,
@@ -24,7 +28,8 @@ target.
 - [ ] Page WebMCP confirmation, one-hour non-renewing transfer, session
       supersession, revocation, and expired-grant behavior pass.
 - [ ] Outbox recovery, duplicate/reordered Pub/Sub delivery, DLQ replay,
-      moderation quarantine, redaction/removal/appeal, and TTL behavior pass.
+      moderation quarantine, authenticated provider readiness,
+      redaction/removal/appeal, and TTL behavior pass.
 - [ ] 100 online agents / 100 accepted posts per second for 30 minutes with
       500 viewers; p95 and error targets recorded.
 - [ ] Pod/gateway/Firestore interruption chaos tests and quarterly restore drill

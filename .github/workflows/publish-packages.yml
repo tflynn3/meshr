@@ -4,32 +4,60 @@ on:
   push:
     tags: ["v*.*.*"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Exact immutable semver tag to publish (must already be on protected main)"
+        required: true
+        type: string
 
 permissions:
   contents: read
   id-token: write
+
+concurrency:
+  group: meshr-npm-publish
+  cancel-in-progress: false
 
 # npm trusted publishing supplies a short-lived OIDC exchange instead of a
 # long-lived npm token. Configure the protected `npm` environment and trusted
 # publisher entries for both packages before creating a release tag.
 jobs:
   publish:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     environment: npm
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # A manual run may select only an existing tag. Never publish the
+          # branch/ref that happened to be selected in the Actions UI.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - name: Verify release version
-        if: github.ref_type == 'tag'
+      - name: Verify immutable release tag and main ancestry
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
+          case "$RELEASE_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "Release ref must be an exact vMAJOR.MINOR.PATCH tag" >&2; exit 1 ;;
+          esac
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          release_sha="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          test "$release_sha" = "$(git rev-parse HEAD)"
+          git merge-base --is-ancestor "$release_sha" refs/remotes/origin/main || {
+            echo "Release tag $RELEASE_TAG is not an ancestor of protected main" >&2
+            exit 1
+          }
+          printf 'RELEASE_TAG=%s\nRELEASE_SHA=%s\n' "$RELEASE_TAG" "$release_sha" >> "$GITHUB_ENV"
           expected="${RELEASE_TAG#v}"
-          test "$expected" != "$RELEASE_TAG"
+          test "$expected" != "$RELEASE_TAG" && [[ "$expected" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           for package in packages/mcp integrations/openclaw; do
             actual="$(node -p "require('./$package/package.json').version")"
             test "$actual" = "$expected" || {
@@ -41,9 +69,9 @@ jobs:
         run: npm ci --prefix packages/mcp && npm run build --prefix packages/mcp
       - name: Install and test @meshr/openclaw
         run: npm ci --prefix integrations/openclaw && npm test --prefix integrations/openclaw
-      - name: Publish @meshr/mcp
-        working-directory: packages/mcp
-        run: npm publish --provenance --access public
-      - name: Publish @meshr/openclaw
-        working-directory: integrations/openclaw
-        run: npm publish --provenance --access public
+      # Pack and inspect both artifacts before publishing either one. The
+      # publication script is resumable: if a prior run published MCP but
+      # failed before OpenClaw, it verifies MCP's registry integrity and then
+      # continues with the missing package.
+      - name: Publish release packages (resumable)
+        run: node scripts/publish-npm-packages.mjs packages/mcp integrations/openclaw

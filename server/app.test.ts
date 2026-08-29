@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { generateKeyPairSync, sign } from "node:crypto";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -677,6 +677,9 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
   assert.equal(events.response.status, 200);
   assert.ok(events.json.events.some((event: any) => event.type === "post.created"));
   assert.ok(events.json.events.some((event: any) => event.type === "reply.created"));
+  assert.ok(events.json.events
+    .filter((event: any) => event.type === "post.created" || event.type === "reply.created")
+    .every((event: any) => event.topicId === topicId));
   assert.ok(events.json.nextAfter > 0);
 
   const noHumanPostRoute = await requestJson(baseUrl, "/v1/posts", {
@@ -912,6 +915,105 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
   });
   assert.equal(login.response.status, 200);
   assert.match(cookieFrom(login.response), /^meshr_session=/);
+});
+
+test("durable event polling rechecks native session authority after a raced query", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "meshr-event-race-test-"));
+  const clock = new TestClock();
+  const token = "race-agent-token";
+  const tokenHash = createHash("sha256").update(token).digest("hex");
+  const sessionId = "session-event-race";
+  const agentId = "agent-event-race";
+  const accountId = "account-event-race";
+  const now = clock.now().toISOString();
+  const expiresAt = new Date(clock.now().getTime() + 60 * 60_000).toISOString();
+  let queryStarted!: () => void;
+  let releaseQuery!: () => void;
+  const queryStartedPromise = new Promise<void>((resolve) => { queryStarted = resolve; });
+  const queryReleasePromise = new Promise<void>((resolve) => { releaseQuery = resolve; });
+  let revoked = false;
+  const repository = {
+    listAgentEvents: async () => {
+      queryStarted();
+      await queryReleasePromise;
+      return {
+        events: [{
+          eventId: "private-raced-event",
+          type: "post.created",
+          meshId: "mesh-private",
+          topicId: "topic-private",
+          agentId,
+          sessionId,
+          runtimeKind: "openclaw",
+          payload: { observation: "should not be returned" },
+          occurredAt: now,
+        }],
+        nextAfter: null,
+      };
+    },
+    findRuntimeSessionById: async () => revoked ? null : {
+      tokenHash,
+      agentId,
+      bindingId: "binding-event-race",
+      sessionId,
+      authorityEpoch: 1,
+      createdAt: now,
+      expiresAt,
+      lastSeenAt: now,
+      status: "active",
+      supersedingSessionId: null,
+    },
+  } as unknown as MeshrRepository;
+  const app = createMeshrServer({
+    dbPath: join(directory, "meshr.db"),
+    clock,
+    repository,
+  });
+  const { baseUrl } = await app.listen();
+  running.push({ app, baseUrl, directory, clock });
+  app.database.sqlite.exec(`
+    INSERT INTO accounts(id, email, display_name, password_hash, created_at)
+    VALUES('${accountId}', 'event-race@example.test', 'Event Race', '', '${now}');
+    INSERT INTO agents(
+      id, owner_account_id, name, handle, tagline, interests_json,
+      personality, attention_json, runtime, runtime_label, runtime_subject,
+      public_key_pem, definition_digest, created_at, updated_at
+    ) VALUES(
+      '${agentId}', '${accountId}', 'Event Race Agent', 'event-race-agent',
+      'Verifies terminal event authority', '["testing"]', 'Careful',
+      '{"browse":"public","rootPosts":"autonomous","replies":"autonomous"}',
+      'openclaw', 'Race fixture', 'fixture:event-race', 'fixture-key', NULL,
+      '${now}', '${now}'
+    );
+    INSERT INTO pairings(
+      id, code, secret_hash, runtime, runtime_label, external_subject,
+      public_key_pem, requested_profile_json, definition_digest, status,
+      owner_account_id, agent_id, created_at, expires_at, approved_at, claimed_at
+    ) VALUES(
+      'binding-event-race', 'RACE-TEST', 'fixture-secret', 'openclaw',
+      'Race fixture', 'fixture:event-race', 'fixture-key', NULL, NULL, 'claimed',
+      '${accountId}', '${agentId}', '${now}', '${expiresAt}', '${now}', '${now}'
+    );
+    INSERT INTO agent_sessions(
+      token_hash, agent_id, pairing_id, created_at, expires_at, last_seen_at,
+      session_id, runtime_kind, status, authority_epoch
+    ) VALUES(
+      '${tokenHash}', '${agentId}', 'binding-event-race', '${now}', '${expiresAt}',
+      '${now}', '${sessionId}', 'openclaw', 'active', 1
+    );
+    INSERT INTO agent_authority(agent_id, epoch, authority_kind, session_id, updated_at)
+    VALUES('${agentId}', 1, 'native', '${sessionId}', '${now}');
+  `);
+
+  const pending = requestJson(baseUrl, "/v1/agent/events?limit=10", {
+    authorization: `Bearer ${token}`,
+  });
+  await queryStartedPromise;
+  revoked = true;
+  releaseQuery();
+  const raced = await pending;
+  assert.equal(raced.response.status, 401);
+  assert.equal(raced.json.error.code, "agent_authentication_failed");
 });
 
 test("pending pairings expire deterministically and cannot be approved", async () => {

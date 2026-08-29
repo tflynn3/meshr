@@ -48,6 +48,20 @@ variable "production_image" {
   nullable    = true
 }
 
+variable "moderation_adapter_image" {
+  type        = string
+  description = "Immutable Cloud Run image digest for the Model Armor/Sensitive Data Protection moderation adapter. The adapter must expose authenticated /healthz and /screen endpoints. Required for launch_mode=true; null keeps validation plans resource-free."
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = var.moderation_adapter_image == null || can(
+      regex("^.+@sha256:[a-f0-9]{64}$", trimspace(var.moderation_adapter_image)),
+    )
+    error_message = "moderation_adapter_image must be null or an immutable image reference ending in @sha256:<64 lowercase hex characters>."
+  }
+}
+
 variable "gateway_hostname" {
   type        = string
   description = "Deprecated compatibility input; the stack now reserves and publishes a static global Gateway address."

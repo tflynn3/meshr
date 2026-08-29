@@ -8,4 +8,7 @@ data:
   # adapter. Keep this separate from production so a canary change cannot
   # silently roll the public deployment.
   GCP_PROJECT_ID: PROJECT_ID
+  MESHR_MODERATION_ENDPOINT: https://moderation.example.invalid/screen
+  MESHR_MODERATION_HEALTHCHECK_URL: https://moderation.example.invalid/healthz
+  MESHR_MODERATION_AUDIENCE: https://moderation.example.invalid
   MESHR_COST_PROTECTION_MODE: normal

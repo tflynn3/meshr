@@ -28,20 +28,34 @@ Before promotion:
 3. Confirm the clean production database contains only the public commons and
    system taxonomy. No prototype accounts, posts, credentials, or evidence are
    imported.
-4. Promote the exact signed image digests through the protected `production`
-   environment. The promotion job applies the immutable image and runtime
-   ConfigMaps in `flux-system`, then Flux reconciles the resulting manifest.
-5. Supply `MESHR_MODERATION_ENDPOINT` through the protected runtime-values
+4. Create the protected `canary` and `production` release branches before
+   launch (separate environment-scoped GitHub App private keys are used to mint
+   short-lived release tokens; each App is the sole bypass actor in its branch
+   ruleset), then start an explicit
+   `workflow_dispatch` on `main`, supplying the exact
+   `release_sha` that passed canary. The protected `production` environment
+   must approve the run before it promotes the signed image digests. The
+   promotion job applies immutable image and runtime ConfigMaps in
+   `flux-system`, then Flux reconciles the resulting manifest. A push to
+   `main` can build and canary-test, but can never promote production.
+5. Deploy the immutable `moderation_adapter_image` Cloud Run service from the
+   OpenTofu outputs, then supply `MESHR_MODERATION_ENDPOINT`, its side-effect-free
+   `MESHR_MODERATION_HEALTHCHECK_URL`, and the IAM audience
+   `MESHR_MODERATION_AUDIENCE` through the protected runtime-values
    ConfigMap before starting the moderation worker. Production sets
-   `MESHR_MODERATION_REQUIRED=1` and `MESHR_MODERATION_AUTH=adc`; the worker
-   mints a short-lived Workload Identity bearer for the adapter and fails
-   closed rather than silently publishing without the approved Model
-   Armor/Sensitive Data Protection adapter. Use `id_token` plus an explicit
-   audience only when the adapter is an IAM-protected Cloud Run service.
+   `MESHR_MODERATION_REQUIRED=1`, `MESHR_MODERATION_AUTH=adc`, and
+   `MESHR_MODERATION_TOKEN_TYPE=id_token`; the worker mints a short-lived
+   audience-bound Workload Identity token for the same-origin adapter and
+   fails closed unless the health endpoint is reachable. The event worker has
+   only Cloud Run invocation permission; the adapter's dedicated service
+   account is the only identity with Model Armor/DLP permissions. Access tokens are
+   reserved for direct allowlisted Google APIs. The screen and health URLs
+   must share one HTTPS origin, and the audience must be that origin (or its
+   IAM service URL).
 
 Bootstrap Flux once per cluster from an operator workstation (the repository is
-public, so no Git deploy key is required). Ensure the protected `production`
-branch exists after the first approved promotion; production Flux must never be
+public, so no Git deploy key is required). Verify the protected `production`
+branch exists before the first promotion; production Flux must never be
 pointed at `main`. The canary source follows the protected `canary` candidate
 branch, which CI advances only after verification and signing. Install the Flux controllers and
 Gateway API CRDs first, then create the protected substitution ConfigMaps
@@ -60,6 +74,8 @@ kubectl -n flux-system create configmap meshr-canary-image-digests \
 kubectl -n flux-system create configmap meshr-canary-runtime-values \
   --from-literal=GCP_PROJECT_ID="$GCP_PROJECT_ID" \
   --from-literal=MESHR_MODERATION_ENDPOINT="$MESHR_MODERATION_ENDPOINT" \
+  --from-literal=MESHR_MODERATION_HEALTHCHECK_URL="$MESHR_MODERATION_HEALTHCHECK_URL" \
+  --from-literal=MESHR_MODERATION_AUDIENCE="$MESHR_MODERATION_AUDIENCE" \
   --from-literal=MESHR_COST_PROTECTION_MODE=normal \
   --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f deploy/production/flux/source.yaml
@@ -72,7 +88,21 @@ kubectl apply -f deploy/production/flux/canary-kustomization.yaml
 
 The bootstrap commands seed the canary inputs. Before enabling public traffic,
 also create `meshr-production-image-digests` and
-`meshr-production-runtime-values` with the exact signed release values. The
+`meshr-production-runtime-values` with the exact signed release values,
+including `MESHR_MODERATION_ENDPOINT` and
+`MESHR_MODERATION_HEALTHCHECK_URL` and `MESHR_MODERATION_AUDIENCE`. For example:
+
+```bash
+kubectl -n flux-system create configmap meshr-production-runtime-values \
+  --from-literal=GCP_PROJECT_ID="$GCP_PROJECT_ID" \
+  --from-literal=MESHR_MODERATION_ENDPOINT="$MESHR_MODERATION_ENDPOINT" \
+  --from-literal=MESHR_MODERATION_HEALTHCHECK_URL="$MESHR_MODERATION_HEALTHCHECK_URL" \
+  --from-literal=MESHR_MODERATION_AUDIENCE="$MESHR_MODERATION_AUDIENCE" \
+  --from-literal=MESHR_COST_PROTECTION_MODE=normal \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+The
 GitHub Actions `canary` environment owns the first pair during validation; the
 protected `production` environment owns the latter pair after the canary gate.
 

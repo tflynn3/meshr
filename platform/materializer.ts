@@ -1,8 +1,13 @@
 import { createServer } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import { parseEventEnvelope } from "./eventEnvelope.ts";
+import { createModerationReadinessProbe } from "./moderationReadiness.ts";
 import { Timestamp } from "@google-cloud/firestore";
 import { createFirestore, createPubSub, eventPlaneConfig } from "./googleClients.ts";
+import {
+  isActivityWithinRecentWindow,
+  TOPOLOGY_ACTIVITY_WINDOW_MINUTES,
+} from "./activityWindow.ts";
 
 const config = eventPlaneConfig();
 const firestore = createFirestore(config.projectId, config.databaseId);
@@ -50,6 +55,7 @@ const moderationTokenType = process.env.MESHR_MODERATION_TOKEN_TYPE?.trim().toLo
   : "access_token";
 const moderationAudience = process.env.MESHR_MODERATION_AUDIENCE?.trim() || "";
 const moderationRequired = process.env.MESHR_MODERATION_REQUIRED === "1";
+const moderationHealthcheckUrl = process.env.MESHR_MODERATION_HEALTHCHECK_URL?.trim();
 if (moderationAuth !== "none" && moderationAuth !== "static" && moderationAuth !== "adc") {
   throw new Error("MESHR_MODERATION_AUTH must be none, static, or adc.");
 }
@@ -102,13 +108,29 @@ async function moderationAuthorization(): Promise<string | undefined> {
   cachedModerationToken = { value, expiresAt: now + lifetimeMs };
   return value;
 }
+
+const moderationReadiness = createModerationReadinessProbe({
+  endpoint: moderationEndpoint,
+  healthcheckUrl: moderationHealthcheckUrl,
+  auth: moderationAuth,
+  token: moderationToken,
+  tokenType: moderationTokenType,
+  audience: moderationAudience,
+  required: moderationRequired,
+  environment: process.env.MESHR_ENV?.trim() || "local",
+  authorization: moderationAuthorization,
+});
+if (requestedConsumer === "moderation" && moderationRequired && moderationReadiness.configError) {
+  throw new Error(
+    `Invalid mandatory moderation provider configuration (${moderationReadiness.configError}); configure the approved adapter and health endpoint.`,
+  );
+}
 let moderationSweepTimer: NodeJS.Timeout | undefined;
 let activityCompactionTimer: NodeJS.Timeout | undefined;
 let activitySnapshotTimer: NodeJS.Timeout | undefined;
 
 const TOPOLOGY_SHARDS = 32;
 const TOPOLOGY_ACTIVITY_SHARDS = 32;
-const TOPOLOGY_ACTIVITY_WINDOW_MINUTES = 15;
 // These bounds apply before serialization as well as to the final snapshot.
 // Firestore rejects a document above 1 MiB; keeping each shard and each side
 // of the mesh snapshot below ~300 KiB leaves room for IDs, timestamps, and
@@ -854,13 +876,8 @@ async function processMessage(
     // the rolling bucket/recent shard. Otherwise a late replay could reset a
     // compacted marker and cause the compactor to subtract unrelated current
     // activity from the same shard.
-    const activityWindowCutoffMs = Math.floor(
-      (Date.now() - TOPOLOGY_ACTIVITY_WINDOW_MINUTES * 60 * 1_000) / 60_000,
-    ) * 60_000;
     const activityWithinRecentWindow = activityEligible &&
-      Number.isFinite(activityBucketMs) &&
-      activityBucketMs >= activityWindowCutoffMs &&
-      activityBucketMs <= Math.floor(Date.now() / 60_000) * 60_000;
+      isActivityWithinRecentWindow(activityBucketMs, Date.now());
     const liveAccessRef = consumer === "topology" && envelope.type === "live.access.changed"
       ? store.collection("live_access_epochs").doc(envelope.agent_id ? `agent:${envelope.agent_id}` : "global")
       : undefined;
@@ -1427,8 +1444,22 @@ async function applyModerationDecision(claim: ModerationClaim, decision: {
       updated_at: now,
     };
     if (decision.action === "redact") postUpdate.body = "[Content redacted by automated moderation]";
-    transaction.update(postRef, postUpdate);
     const meshId = currentPost.get("mesh_id") == null ? null : String(currentPost.get("mesh_id"));
+    // Resolve visibility inside the same transaction as the moderation state
+    // transition. This keeps private moderation traffic out of the public
+    // observation stream even when a mesh changes visibility while a provider
+    // decision is in flight.
+    const meshSnapshot = meshId
+      ? await transaction.get(firestore.collection("meshes").doc(meshId))
+      : undefined;
+    const observationScope = meshId == null
+      ? "system"
+      : meshSnapshot?.exists && meshSnapshot.get("visibility") === "public"
+        ? "public"
+        : "private";
+    // Firestore requires all transaction reads to complete before the first
+    // write. Resolve mesh visibility above, then apply the moderation update.
+    transaction.update(postRef, postUpdate);
     const agentId = currentPost.get("agent_id") == null ? null : String(currentPost.get("agent_id"));
     const sessionId = currentPost.get("session_id") == null ? null : String(currentPost.get("session_id"));
     const runtimeKind = currentPost.get("runtime_kind") == null ? null : String(currentPost.get("runtime_kind"));
@@ -1475,6 +1506,7 @@ async function applyModerationDecision(claim: ModerationClaim, decision: {
       contract_version: 1,
       envelope,
       mesh_id: meshId,
+      observation_scope: observationScope,
       event_id: eventId,
       status: "pending",
       attempts: 0,
@@ -1685,7 +1717,7 @@ const server = createServer((request, response) => {
       dependencyCheck,
       ...activeSubscriptions.map(({ subscription }) => subscription.exists()),
     ])
-      .then(([dependency, ...subscriptionResults]) => {
+      .then(async ([dependency, ...subscriptionResults]) => {
         const subscriptionsReady = subscriptionResults.every((result) => result[0] === true);
         if (!dependency || !subscriptionsReady) {
           response.writeHead(503, { "content-type": "application/json" });
@@ -1695,6 +1727,18 @@ const server = createServer((request, response) => {
             error: !dependency ? "dependencies_unavailable" : "subscriptions_unavailable",
           }));
           return;
+        }
+        if (requestedConsumer === "moderation" && moderationRequired) {
+          const provider = await moderationReadiness.check();
+          if (!provider.ok) {
+            response.writeHead(503, { "content-type": "application/json" });
+            response.end(JSON.stringify({
+              ok: false,
+              service: "topology-materializer",
+              error: provider.error ?? "moderation_provider_unreachable",
+            }));
+            return;
+          }
         }
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({ ok: true, service: "topology-materializer" }));

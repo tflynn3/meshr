@@ -32,6 +32,8 @@ data:
   # runtime values. There is no silent production no-op.
   MESHR_MODERATION_REQUIRED: "1"
   MESHR_MODERATION_ENDPOINT: ${MESHR_MODERATION_ENDPOINT}
+  MESHR_MODERATION_HEALTHCHECK_URL: ${MESHR_MODERATION_HEALTHCHECK_URL}
+  MESHR_MODERATION_AUDIENCE: ${MESHR_MODERATION_AUDIENCE}
   MESHR_DEAD_LETTER_TOPIC: mesh-events-dlq
   MESHR_ALLOWED_ORIGINS: https://meshr.social
   # Per-pod and per-credential WebSocket ceilings keep one account or source

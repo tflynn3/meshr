@@ -294,6 +294,8 @@ export interface RepositoryEventInput {
   runtimeKind: RuntimeKind | null;
   payload: unknown;
   occurredAt: string;
+  /** Stable ingest selector used to avoid polling private traffic globally. */
+  observationScope?: "public" | "private" | "system";
 }
 
 export interface RepositoryAuditInput {
@@ -605,6 +607,8 @@ export interface MeshrRepository {
     mesh: RepositoryMeshInput;
     joined: boolean;
   }>>;
+  /** Bounded membership lookup used by page WebMCP transfer setup. */
+  listJoinedMeshIdsForAgent?(agentId: string): Promise<string[]>;
   loadProjection?(input: {
     accountId?: string;
     agentId?: string;

@@ -407,6 +407,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       contract_version: MESHR_CONTRACT_MAJOR,
       envelope,
       mesh_id: null,
+      observation_scope: "system",
       event_id: eventId,
       status: "pending",
       attempts: 0,
@@ -900,6 +901,10 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       // Keep the ordering key denormalized at the document root so the
       // publisher can serialize a mesh without opening every envelope.
       mesh_id: input.meshId,
+      // Visibility itself remains authoritative and is revalidated at read
+      // time. The stable selector keeps private traffic out of the public
+      // candidate stream; production launches with typed scopes only.
+      observation_scope: input.observationScope ?? (input.meshId == null ? "system" : "private"),
       event_id: input.eventId,
       status: "pending",
       attempts: 0,
@@ -2367,9 +2372,10 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       .collection(this.collection("meshes"))
       .where("visibility", "==", "public")
       .where("lifecycle", "==", "active")
-      .limit(2_000)
+      .limit(2_001)
       .get();
-    return snapshot.docs.map((document) => ({
+    if (snapshot.size > 2_000) throw new Error("mesh_directory_too_large");
+    const initial = snapshot.docs.map((document) => ({
       meshId: String(document.get("mesh_id") ?? document.id),
       ownerAccountId: document.get("owner_account_id") == null ? null : String(document.get("owner_account_id")),
       name: String(document.get("name") ?? ""),
@@ -2379,7 +2385,21 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       lifecycle: "active" as const,
       createdAt: String(document.get("created_at") ?? this.now()),
       updatedAt: String(document.get("updated_at") ?? this.now()),
-    })).sort((left, right) => left.name.localeCompare(right.name) || left.meshId.localeCompare(right.meshId));
+    }));
+    // A public-to-private transition may race the broad directory query. A
+    // terminal public query prevents an unauthenticated response from
+    // returning a stale private mesh entry.
+    const finalSnapshot = await this.firestore
+      .collection(this.collection("meshes"))
+      .where("visibility", "==", "public")
+      .where("lifecycle", "==", "active")
+      .limit(2_001)
+      .get();
+    if (finalSnapshot.size > 2_000) throw new Error("mesh_directory_changed_during_read");
+    const finalPublicIds = new Set(finalSnapshot.docs.map((document) => document.id));
+    return initial
+      .filter((mesh) => finalPublicIds.has(mesh.meshId))
+      .sort((left, right) => left.name.localeCompare(right.name) || left.meshId.localeCompare(right.meshId));
   }
 
   async listPublicTopics(meshId: string): Promise<RepositoryTopicInput[]> {
@@ -2940,6 +2960,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
             contract_version: MESHR_CONTRACT_MAJOR,
             envelope,
             mesh_id: input.meshId,
+            observation_scope: mesh.get("visibility") === "public" ? "public" : "private",
             event_id: eventId,
             status: "pending",
             attempts: 0,
@@ -3001,6 +3022,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         contract_version: MESHR_CONTRACT_MAJOR,
         envelope,
         mesh_id: input.meshId,
+        observation_scope: mesh.get("visibility") === "public" ? "public" : "private",
         event_id: eventId,
         status: "pending",
         attempts: 0,
@@ -3306,6 +3328,15 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         }
         return;
       }
+      // Resolve the event mesh before staging any transaction write. Firestore
+      // transactions require all reads to precede the first write, and the
+      // visibility snapshot is needed to scope this follow event correctly.
+      const eventMeshId = input.meshId ?? (
+        topic.get("mesh_id") == null ? null : String(topic.get("mesh_id"))
+      );
+      const eventMesh = eventRef && !event?.exists && eventMeshId
+        ? await transaction.get(this.doc("meshes", eventMeshId))
+        : undefined;
       if (input.following) {
         transaction.set(ref, {
           contract_version: MESHR_CONTRACT_MAJOR,
@@ -3323,7 +3354,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           contract_version: MESHR_CONTRACT_MAJOR,
           envelope: {
             event_id: input.eventId,
-            mesh_id: input.meshId ?? String(topic.get("mesh_id")),
+            mesh_id: eventMeshId,
             agent_id: input.agentId,
             session_id: sessionId,
             runtime_kind: (authority.get("runtime_kind") ?? null) as RuntimeKind | null,
@@ -3335,7 +3366,10 @@ export class FirestoreMeshrRepository implements MeshrRepository {
               following: input.following,
             },
           },
-          mesh_id: input.meshId ?? String(topic.get("mesh_id")),
+          mesh_id: eventMeshId,
+          observation_scope: eventMeshId == null
+            ? "system"
+            : (eventMesh?.get("visibility") === "public" ? "public" : "private"),
           event_id: input.eventId,
           status: "pending",
           attempts: 0,
@@ -3344,7 +3378,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         this.queueOutboxReady(
           transaction,
           eventRef.id,
-          input.meshId ?? String(topic.get("mesh_id")),
+          eventMeshId,
           occurredAt,
         );
       }
@@ -3552,37 +3586,93 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         .collection(this.collection("meshes"))
         .where("visibility", "==", "public")
         .where("lifecycle", "==", "active")
-        .limit(2_000)
+        .limit(2_001)
         .get(),
       this.firestore
         .collection(this.collection("mesh_agent_memberships"))
         .where("agent_id", "==", agentId)
         .where("status", "==", "joined")
-        .limit(100)
+        .limit(101)
         .get(),
     ]);
-    const joinedIds = memberships.docs.map((document) => String(document.get("mesh_id")));
-    const publicIds = publicMeshes.docs.map((document) => String(document.get("mesh_id") ?? document.id));
-    const meshIds = [...new Set([...publicIds, ...joinedIds])];
-    const snapshots = await Promise.all(meshIds.map((meshId) => this.doc("meshes", meshId).get()));
+    if (publicMeshes.size > 2_000) {
+      throw new Error("mesh_directory_too_large");
+    }
+    if (memberships.size > 100) {
+      throw new Error("mesh_membership_limit_exceeded");
+    }
+    const joinedIds = memberships.docs
+      .map((document) => String(document.get("mesh_id") ?? document.id))
+      .filter(Boolean);
     const joinedSet = new Set(joinedIds);
-    return snapshots
-      .filter((snapshot) => snapshot.exists && snapshot.get("lifecycle") === "active")
-      .map((snapshot) => ({
-        mesh: {
-          meshId: snapshot.id,
-          ownerAccountId: snapshot.get("owner_account_id") == null ? null : String(snapshot.get("owner_account_id")),
-          name: String(snapshot.get("name") ?? ""),
-          description: String(snapshot.get("description") ?? ""),
-          visibility: String(snapshot.get("visibility") ?? "private") as RepositoryMeshInput["visibility"],
-          admission: String(snapshot.get("admission") ?? "invite_only") as RepositoryMeshInput["admission"],
-          lifecycle: String(snapshot.get("lifecycle") ?? "active") as RepositoryMeshInput["lifecycle"],
-          createdAt: String(snapshot.get("created_at") ?? this.now()),
-          updatedAt: String(snapshot.get("updated_at") ?? this.now()),
-        },
-        joined: joinedSet.has(snapshot.id),
-      }))
+    const meshFromSnapshot = (snapshot: DocumentSnapshot): RepositoryMeshInput => ({
+      meshId: snapshot.id,
+      ownerAccountId: snapshot.get("owner_account_id") == null ? null : String(snapshot.get("owner_account_id")),
+      name: String(snapshot.get("name") ?? ""),
+      description: String(snapshot.get("description") ?? ""),
+      visibility: String(snapshot.get("visibility") ?? "private") as RepositoryMeshInput["visibility"],
+      admission: String(snapshot.get("admission") ?? "invite_only") as RepositoryMeshInput["admission"],
+      lifecycle: String(snapshot.get("lifecycle") ?? "active") as RepositoryMeshInput["lifecycle"],
+      createdAt: String(snapshot.get("created_at") ?? this.now()),
+      updatedAt: String(snapshot.get("updated_at") ?? this.now()),
+    });
+    // Public snapshots already contain the complete mesh representation. The
+    // old implementation re-read every public document by ID, multiplying a
+    // directory request into thousands of point reads. Only joined IDs absent
+    // from the public snapshot need point reads for private/unlisted meshes.
+    const publicEntries = new Map(
+      publicMeshes.docs.map((snapshot) => [snapshot.id, meshFromSnapshot(snapshot)]),
+    );
+    const privateJoinedIds = joinedIds.filter((meshId) => !publicEntries.has(meshId));
+    const privateJoinedSnapshots = privateJoinedIds.length
+      ? await this.firestore.getAll(...privateJoinedIds.map((meshId) => this.doc("meshes", meshId)))
+      : [];
+    const initial = [
+      ...[...publicEntries.values()].map((mesh) => ({ mesh, joined: joinedSet.has(mesh.meshId) })),
+      ...privateJoinedSnapshots
+        .filter((snapshot) => snapshot.exists && snapshot.get("lifecycle") === "active")
+        .map((snapshot) => ({ mesh: meshFromSnapshot(snapshot), joined: true })),
+    ];
+    // Re-read the public query and memberships at the terminal boundary. A
+    // private-mesh removal or visibility change that races the broad query
+    // must not leak one stale directory item from this response.
+    const [finalPublicMeshes, finalMemberships] = await Promise.all([
+      this.firestore
+        .collection(this.collection("meshes"))
+        .where("visibility", "==", "public")
+        .where("lifecycle", "==", "active")
+        .limit(2_001)
+        .get(),
+      this.firestore
+        .collection(this.collection("mesh_agent_memberships"))
+        .where("agent_id", "==", agentId)
+        .where("status", "==", "joined")
+        .limit(101)
+        .get(),
+    ]);
+    if (finalPublicMeshes.size > 2_000 || finalMemberships.size > 100) {
+      throw new Error("mesh_directory_changed_during_read");
+    }
+    const finalPublicIds = new Set(finalPublicMeshes.docs.map((snapshot) => snapshot.id));
+    const finalJoinedIds = new Set(finalMemberships.docs.map((document) => String(document.get("mesh_id") ?? document.id)));
+    return initial
+      .filter(({ mesh }) => mesh.lifecycle === "active" &&
+        (finalPublicIds.has(mesh.meshId) || finalJoinedIds.has(mesh.meshId)))
+      .map(({ mesh }) => ({ mesh, joined: finalJoinedIds.has(mesh.meshId) }))
       .sort((left, right) => left.mesh.name.localeCompare(right.mesh.name) || left.mesh.meshId.localeCompare(right.mesh.meshId));
+  }
+
+  async listJoinedMeshIdsForAgent(agentId: string): Promise<string[]> {
+    const snapshot = await this.firestore
+      .collection(this.collection("mesh_agent_memberships"))
+      .where("agent_id", "==", agentId)
+      .where("status", "==", "joined")
+      .limit(101)
+      .get();
+    if (snapshot.size > 100) throw new Error("mesh_membership_limit_exceeded");
+    return snapshot.docs
+      .map((document) => String(document.get("mesh_id") ?? document.id))
+      .filter(Boolean);
   }
 
   async listAgentEvents(input: {
@@ -3595,86 +3685,141 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     if (input.after !== undefined && !cursor) throw new Error("invalid_event_cursor");
     if (input.browse === "mentions") return { events: [], nextAfter: null };
     const limit = Math.max(1, Math.min(100, Math.trunc(input.limit)));
-    const [publicMeshes, memberships] = await Promise.all([
-      this.firestore
-        .collection(this.collection("meshes"))
-        .where("visibility", "==", "public")
-        .where("lifecycle", "==", "active")
-        .limit(2_000)
-        .get(),
-      this.firestore
-        .collection(this.collection("mesh_agent_memberships"))
-        .where("agent_id", "==", input.agentId)
-        .where("status", "==", "joined")
-        .limit(100)
-        .get(),
-    ]);
-    const publicMeshIds = new Set(
-      publicMeshes.docs.map((document) => String(document.get("mesh_id") ?? document.id)),
-    );
+    // A cursorless observation is a bounded newest-page read. It gives a
+    // restarted host useful context without walking the 30-day retention
+    // period; the returned newest cursor then moves the host to live-only
+    // polling. Cursor-bearing reads remain strictly ascending and durable.
+    const latestWindow = !cursor;
+    // Read one ordered candidate stream instead of polling every public mesh.
+    // A public observer may see public and joined-private events, so the
+    // candidate stream is intentionally broad; the authority records below
+    // perform the terminal visibility check. Joined-only observers use at most
+    // four Firestore `in` chunks (the 30-value Firestore limit) plus the
+    // nullable/system stream. This keeps expected poll cost bounded even when
+    // the commons grows to thousands of meshes.
+    const memberships = await this.firestore
+      .collection(this.collection("mesh_agent_memberships"))
+      .where("agent_id", "==", input.agentId)
+      .where("status", "==", "joined")
+      .limit(101)
+      .get();
+    if (memberships.size > 100) throw new Error("mesh_membership_limit_exceeded");
     const joinedMeshIds = new Set(
       memberships.docs.map((document) => String(document.get("mesh_id"))),
     );
-    const visibleMeshIds = input.browse === "joined"
-      ? joinedMeshIds
-      : new Set([...publicMeshIds, ...joinedMeshIds]);
-    const scanLimit = Math.min(2_000, Math.max(limit * 8, limit));
+    const candidateScanLimit = Math.min(2_000, Math.max(limit * 8, limit));
     const eventCollection = this.firestore.collection(this.collection("event_outbox"));
-    const visibleMeshChunks: string[][] = [];
-    const visibleIds = [...visibleMeshIds];
-    for (let index = 0; index < visibleIds.length; index += 30) {
-      visibleMeshChunks.push(visibleIds.slice(index, index + 30));
+    const querySpecs: Array<{ baseQuery: Query; scanLimit: number }> = [];
+    if (input.browse === "public") {
+      // Public browse includes the public commons and private meshes this
+      // agent has joined. Keep the public stream exact-page sized because its
+      // rows are already visibility-authorized; only the system stream and
+      // joined-private streams need bounded overscan/terminal filtering.
+      querySpecs.push({
+        baseQuery: eventCollection.where("observation_scope", "==", "public"),
+        scanLimit: limit,
+      });
+      querySpecs.push({
+        baseQuery: eventCollection.where("observation_scope", "==", "system"),
+        scanLimit: candidateScanLimit,
+      });
+      const joinedIds = [...joinedMeshIds];
+      for (let index = 0; index < joinedIds.length; index += 30) {
+        querySpecs.push({
+          // Public rows were already selected above. Restrict this second
+          // stream to private rows so a default membership in the public
+          // commons cannot double-read every commons event.
+          baseQuery: eventCollection
+            .where("observation_scope", "==", "private")
+            .where("mesh_id", "in", joinedIds.slice(index, index + 30)),
+          scanLimit: limit,
+        });
+      }
+    } else {
+      querySpecs.push({
+        baseQuery: eventCollection.where("observation_scope", "==", "system"),
+        scanLimit: candidateScanLimit,
+      });
+      const joinedIds = [...joinedMeshIds];
+      for (let index = 0; index < joinedIds.length; index += 30) {
+        querySpecs.push({
+          baseQuery: eventCollection
+            .where("observation_scope", "==", "private")
+            .where("mesh_id", "in", joinedIds.slice(index, index + 30)),
+          scanLimit: limit,
+        });
+      }
     }
-    // Query only meshes this agent can see. A global event_outbox scan would
-    // make every observer pay for unrelated private traffic as the commons
-    // grows. Firestore's `in` operator is capped at 30 values, so merge the
-    // bounded chunks with the system/null stream below.
-    const queries = [
-      eventCollection.where("mesh_id", "==", null),
-      ...visibleMeshChunks.map((chunk) => eventCollection.where("mesh_id", "in", chunk)),
-    ].map((baseQuery) => {
-      let query = baseQuery.orderBy("created_at", "asc").orderBy(FieldPath.documentId(), "asc");
+    const queries = querySpecs.map(({ baseQuery, scanLimit: queryLimit }) => {
+      let query = baseQuery
+        .orderBy("created_at", latestWindow ? "desc" : "asc")
+        .orderBy(FieldPath.documentId(), latestWindow ? "desc" : "asc");
       if (cursor) query = query.startAfter(cursor.createdAt, cursor.eventId);
-      return query.limit(scanLimit).get();
+      return query.limit(queryLimit).get();
     });
     const snapshots = await Promise.all(queries);
-    const documents = [...new Map(
+    const orderedDocuments = [...new Map(
       snapshots
         .flatMap((snapshot) => snapshot.docs)
         .map((document) => [document.id, document]),
     ).values()].sort((left, right) => {
       const createdCompare = String(left.get("created_at") ?? "").localeCompare(String(right.get("created_at") ?? ""));
       return createdCompare || left.id.localeCompare(right.id);
-    }).slice(0, scanLimit);
-    const events: RepositoryAgentEvent[] = [];
+    });
+    const documents = latestWindow
+      ? orderedDocuments.slice(-candidateScanLimit)
+      : orderedDocuments.slice(0, candidateScanLimit);
+    const candidateMeshIds = [...new Set(documents.flatMap((document) => {
+      const raw = document.data() as Record<string, unknown>;
+      const envelope = raw.envelope && typeof raw.envelope === "object" && !Array.isArray(raw.envelope)
+        ? raw.envelope as Record<string, unknown>
+        : raw;
+      return envelope.mesh_id == null ? [] : [String(envelope.mesh_id)];
+    }))];
+    const candidates: Array<{
+      event: RepositoryAgentEvent;
+      cursor: AgentEventCursor;
+      meshId: string | null;
+      agentId: string | null;
+    }> = [];
     let lastScanned: AgentEventCursor | undefined;
     for (const document of documents) {
       const raw = document.data() as Record<string, unknown>;
       const envelope = raw.envelope && typeof raw.envelope === "object" && !Array.isArray(raw.envelope)
         ? raw.envelope as Record<string, unknown>
         : raw;
+      const payload = envelope.payload && typeof envelope.payload === "object" && !Array.isArray(envelope.payload)
+        ? envelope.payload as Record<string, unknown>
+        : {};
       const eventId = String(raw.event_id ?? envelope.event_id ?? document.id);
       const occurredAt = String(envelope.occurred_at ?? raw.created_at ?? "");
       const createdAt = String(raw.created_at ?? occurredAt);
-      lastScanned = { createdAt, eventId: document.id };
+      const documentCursor = { createdAt, eventId: document.id };
+      lastScanned = documentCursor;
       const meshId = envelope.mesh_id == null ? null : String(envelope.mesh_id);
       const eventAgentId = envelope.agent_id == null ? null : String(envelope.agent_id);
       const visible = meshId === null
         ? eventAgentId === null || eventAgentId === input.agentId
-        : visibleMeshIds.has(meshId);
+        : input.browse === "joined" ? joinedMeshIds.has(meshId) : true;
       if (!visible) continue;
-      events.push({
-        eventId,
-        type: String(envelope.type ?? raw.type ?? "unknown"),
+      candidates.push({
+        cursor: documentCursor,
         meshId,
-        topicId: envelope.topic_id == null ? null : String(envelope.topic_id),
         agentId: eventAgentId,
-        sessionId: envelope.session_id == null ? null : String(envelope.session_id),
-        runtimeKind: envelope.runtime_kind == null ? null : String(envelope.runtime_kind) as RuntimeKind,
-        payload: envelope.payload ?? {},
-        occurredAt,
+        event: {
+          eventId,
+          type: String(envelope.type ?? raw.type ?? "unknown"),
+          meshId,
+          topicId: envelope.topic_id == null
+            ? payload.topic_id == null ? null : String(payload.topic_id)
+            : String(envelope.topic_id),
+          agentId: eventAgentId,
+          sessionId: envelope.session_id == null ? null : String(envelope.session_id),
+          runtimeKind: envelope.runtime_kind == null ? null : String(envelope.runtime_kind) as RuntimeKind,
+          payload: envelope.payload ?? {},
+          occurredAt,
+        },
       });
-      if (events.length >= limit) break;
     }
     // Visibility and membership can change while the bounded outbox queries
     // above are in flight. Re-read those authority records at the terminal
@@ -3682,41 +3827,51 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     // public-to-private transition could leak one stale event from this
     // request. The cursor still advances over the scanned high-water mark so
     // a later poll does not replay events that were intentionally hidden.
-    const [finalPublicMeshes, finalMemberships] = await Promise.all([
-      this.firestore
-        .collection(this.collection("meshes"))
-        .where("visibility", "==", "public")
-        .where("lifecycle", "==", "active")
-        .limit(2_000)
-        .get(),
-      this.firestore
-        .collection(this.collection("mesh_agent_memberships"))
-        .where("agent_id", "==", input.agentId)
-        .where("status", "==", "joined")
-        .limit(100)
-        .get(),
-    ]);
-    const finalPublicMeshIds = new Set(
-      finalPublicMeshes.docs.map((document) => String(document.get("mesh_id") ?? document.id)),
-    );
+    const finalMemberships = await this.firestore
+      .collection(this.collection("mesh_agent_memberships"))
+      .where("agent_id", "==", input.agentId)
+      .where("status", "==", "joined")
+      .limit(101)
+      .get();
+    if (finalMemberships.size > 100) throw new Error("mesh_membership_limit_exceeded");
     const finalJoinedMeshIds = new Set(
       finalMemberships.docs.map((document) => String(document.get("mesh_id"))),
+    );
+    const finalMeshSnapshots = candidateMeshIds.length
+      ? await this.firestore.getAll(...candidateMeshIds.map((meshId) => this.doc("meshes", meshId)))
+      : [];
+    const finalPublicMeshIds = new Set(
+      finalMeshSnapshots
+        .filter((snapshot) => snapshot.exists && snapshot.get("visibility") === "public" && snapshot.get("lifecycle") === "active")
+        .map((snapshot) => snapshot.id),
     );
     const finalVisibleMeshIds = input.browse === "joined"
       ? finalJoinedMeshIds
       : new Set([...finalPublicMeshIds, ...finalJoinedMeshIds]);
-    const visibleEvents = events.filter((event) =>
-      event.meshId === null
-        ? event.agentId === null || event.agentId === input.agentId
-        : finalVisibleMeshIds.has(event.meshId),
+    const visibleCandidates = candidates.filter(({ meshId, agentId }) =>
+      meshId === null
+        ? agentId === null || agentId === input.agentId
+        : finalVisibleMeshIds.has(meshId),
     );
+    const pageCandidates = latestWindow
+      ? visibleCandidates.slice(-limit)
+      : visibleCandidates.slice(0, limit);
+    // If the bounded candidate scan found enough visible events for a full
+    // page, advance only to the last event we actually returned. Advancing
+    // to the scan high-water mark here would silently skip visible events
+    // that were candidates but fell beyond this page. When fewer than `limit`
+    // survive the terminal authority check, the scan high-water mark is safe:
+    // every later candidate was either hidden or already included.
+    const pageCursor = pageCandidates.length >= limit
+      ? pageCandidates[pageCandidates.length - 1]?.cursor
+      : lastScanned;
     return {
-      events: visibleEvents,
+      events: pageCandidates.map(({ event }) => event),
       // Always return a high-water mark. A short page or an empty page may
       // still have scanned private/unjoined events; dropping the cursor would
       // make the next poll replay the stream from the beginning. When nothing
       // new was scanned, preserve the caller's cursor verbatim.
-      nextAfter: lastScanned ? encodeAgentEventCursor(lastScanned) : cursor ? encodeAgentEventCursor(cursor) : null,
+      nextAfter: pageCursor ? encodeAgentEventCursor(pageCursor) : cursor ? encodeAgentEventCursor(cursor) : null,
     };
   }
 
@@ -5367,6 +5522,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         envelope,
         event_id: input.postId,
         mesh_id: input.meshId,
+        observation_scope: mesh.get("visibility") === "public" ? "public" : "private",
         status: "pending",
         attempts: 0,
         created_at: now,

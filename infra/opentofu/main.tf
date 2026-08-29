@@ -16,6 +16,7 @@ locals {
     "monitoring.googleapis.com",
     "modelarmor.googleapis.com",
     "pubsub.googleapis.com",
+    "run.googleapis.com",
     "secretmanager.googleapis.com",
     "securetoken.googleapis.com",
     "serviceusage.googleapis.com",
@@ -275,9 +276,26 @@ locals {
         { field_path = "__name__", order = "ASCENDING" },
       ]
     }
+    event_outbox_observation_scope_created_cursor = {
+      collection = "event_outbox"
+      fields = [
+        { field_path = "observation_scope", order = "ASCENDING" },
+        { field_path = "created_at", order = "ASCENDING" },
+        { field_path = "__name__", order = "ASCENDING" },
+      ]
+    }
     event_outbox_mesh_created_cursor = {
       collection = "event_outbox"
       fields = [
+        { field_path = "mesh_id", order = "ASCENDING" },
+        { field_path = "created_at", order = "ASCENDING" },
+        { field_path = "__name__", order = "ASCENDING" },
+      ]
+    }
+    event_outbox_private_mesh_created_cursor = {
+      collection = "event_outbox"
+      fields = [
+        { field_path = "observation_scope", order = "ASCENDING" },
         { field_path = "mesh_id", order = "ASCENDING" },
         { field_path = "created_at", order = "ASCENDING" },
         { field_path = "__name__", order = "ASCENDING" },
@@ -409,6 +427,7 @@ locals {
     try(trimspace(var.google_oauth_client_secret), ""),
     try(trimspace(var.github_oauth_client_id), ""),
     try(trimspace(var.github_oauth_client_secret), ""),
+    try(trimspace(coalesce(var.moderation_adapter_image, "")), ""),
   ]
 }
 
@@ -423,7 +442,7 @@ resource "terraform_data" "launch_guard" {
         for value in local.launch_required_inputs :
         trimspace(value) != ""
       ])
-      error_message = "launch_mode=true requires project_id, billing_account_id, and both Google/GitHub OAuth client ID and secret values. Leave launch_mode=false only for validation plans."
+      error_message = "launch_mode=true requires project_id, billing_account_id, both Google/GitHub OAuth client ID and secret values, and an immutable moderation_adapter_image digest. Leave launch_mode=false only for validation plans."
     }
   }
 }
@@ -1073,10 +1092,50 @@ resource "google_firestore_index" "event_outbox_created_cursor" {
   }
 }
 
+resource "google_firestore_index" "event_outbox_observation_scope_created_cursor" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "event_outbox"
+  fields {
+    field_path = "observation_scope"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "created_at"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "__name__"
+    order      = "ASCENDING"
+  }
+}
+
 resource "google_firestore_index" "event_outbox_mesh_created_cursor" {
   project    = var.project_id
   database   = google_firestore_database.default.name
   collection = "event_outbox"
+  fields {
+    field_path = "mesh_id"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "created_at"
+    order      = "ASCENDING"
+  }
+  fields {
+    field_path = "__name__"
+    order      = "ASCENDING"
+  }
+}
+
+resource "google_firestore_index" "event_outbox_private_mesh_created_cursor" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "event_outbox"
+  fields {
+    field_path = "observation_scope"
+    order      = "ASCENDING"
+  }
   fields {
     field_path = "mesh_id"
     order      = "ASCENDING"
@@ -1622,6 +1681,69 @@ resource "google_service_account" "ingest_canary" {
   depends_on   = [google_project_service.required]
 }
 
+# Screening is isolated behind a small authenticated adapter. The event-plane
+# workers receive only Cloud Run invocation permission; Model Armor and DLP
+# permissions stay on this dedicated service identity. A launch apply must
+# provide an immutable adapter image, while dry validation plans keep the
+# service absent so no placeholder workload can accidentally reach production.
+resource "google_service_account" "moderation_adapter" {
+  account_id   = "meshr-moderation-adapter"
+  display_name = "Meshr production moderation adapter"
+  depends_on   = [google_project_service.required]
+}
+
+resource "google_service_account" "moderation_adapter_canary" {
+  account_id   = "meshr-mod-adapter-canary"
+  display_name = "Meshr canary moderation adapter"
+  depends_on   = [google_project_service.required]
+}
+
+resource "google_cloud_run_v2_service" "moderation_adapter" {
+  count               = var.moderation_adapter_image == null ? 0 : 1
+  name                = "meshr-moderation-adapter"
+  location            = var.region
+  ingress             = "INGRESS_TRAFFIC_ALL"
+  deletion_protection = true
+
+  template {
+    service_account = google_service_account.moderation_adapter.email
+    containers {
+      image = var.moderation_adapter_image
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "512Mi"
+        }
+      }
+    }
+  }
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_cloud_run_v2_service" "moderation_adapter_canary" {
+  count               = var.moderation_adapter_image == null ? 0 : 1
+  name                = "meshr-moderation-adapter-canary"
+  location            = var.region
+  ingress             = "INGRESS_TRAFFIC_ALL"
+  deletion_protection = true
+
+  template {
+    service_account = google_service_account.moderation_adapter_canary.email
+    containers {
+      image = var.moderation_adapter_image
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "512Mi"
+        }
+      }
+    }
+  }
+
+  depends_on = [google_project_service.required]
+}
+
 # GitHub Actions uses keyless Workload Identity Federation. The attribute
 # condition is intentionally repository-scoped so a token from another
 # repository cannot impersonate the release identity.
@@ -1824,20 +1946,28 @@ resource "google_project_iam_member" "worker_firestore" {
   }
 }
 
-# The moderation adapter uses the least-privilege predefined roles for
-# sanitizing text with existing Model Armor templates and inspecting sensitive
-# data through Sensitive Data Protection. It never receives broad project
-# editor/admin permissions.
-resource "google_project_iam_member" "moderation_model_armor" {
+# Only the adapter workload may call Model Armor. The event-plane worker calls
+# the adapter over its authenticated Cloud Run URL and has no provider-level
+# permissions of its own.
+resource "google_project_iam_member" "moderation_adapter_model_armor" {
   project = var.project_id
   role    = "roles/modelarmor.user"
-  member  = "serviceAccount:${google_service_account.worker["moderation_worker"].email}"
+  member  = "serviceAccount:${google_service_account.moderation_adapter.email}"
 }
 
-resource "google_project_iam_member" "moderation_dlp" {
+resource "google_project_iam_member" "moderation_adapter_dlp" {
   project = var.project_id
   role    = "roles/dlp.user"
-  member  = "serviceAccount:${google_service_account.worker["moderation_worker"].email}"
+  member  = "serviceAccount:${google_service_account.moderation_adapter.email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "moderation_adapter_invoker" {
+  count    = var.moderation_adapter_image == null ? 0 : 1
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.moderation_adapter[0].name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.worker["moderation_worker"].email}"
 }
 
 resource "google_project_iam_member" "live_gateway_topology_firestore" {
@@ -1877,16 +2007,25 @@ resource "google_project_iam_member" "canary_worker_firestore" {
   }
 }
 
-resource "google_project_iam_member" "canary_moderation_model_armor" {
+resource "google_project_iam_member" "canary_moderation_adapter_model_armor" {
   project = var.project_id
   role    = "roles/modelarmor.user"
-  member  = "serviceAccount:${google_service_account.canary_worker["moderation_worker"].email}"
+  member  = "serviceAccount:${google_service_account.moderation_adapter_canary.email}"
 }
 
-resource "google_project_iam_member" "canary_moderation_dlp" {
+resource "google_project_iam_member" "canary_moderation_adapter_dlp" {
   project = var.project_id
   role    = "roles/dlp.user"
-  member  = "serviceAccount:${google_service_account.canary_worker["moderation_worker"].email}"
+  member  = "serviceAccount:${google_service_account.moderation_adapter_canary.email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "canary_moderation_adapter_invoker" {
+  count    = var.moderation_adapter_image == null ? 0 : 1
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.moderation_adapter_canary[0].name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.canary_worker["moderation_worker"].email}"
 }
 
 resource "google_project_iam_member" "canary_live_gateway_topology_firestore" {

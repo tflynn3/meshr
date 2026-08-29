@@ -103,12 +103,20 @@ spec:
           env:
             - name: MESHR_MODERATION_ENDPOINT
               value: ${MESHR_MODERATION_ENDPOINT}
+            - name: MESHR_MODERATION_HEALTHCHECK_URL
+              value: ${MESHR_MODERATION_HEALTHCHECK_URL}
             - name: MESHR_MODERATION_AUTH
               value: adc
             - name: MESHR_MODERATION_TOKEN_TYPE
-              value: access_token
+              value: id_token
+            - name: MESHR_MODERATION_AUDIENCE
+              value: ${MESHR_MODERATION_AUDIENCE}
           ports: [{name: http, containerPort: 8080}]
-          readinessProbe: {httpGet: {path: /readyz, port: http}}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            timeoutSeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
           securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
           resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}

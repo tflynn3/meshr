@@ -37,6 +37,9 @@ function authErrorMessage(error: unknown, mode: AuthMode): string {
     return "Meshr is unavailable. Check the connection and try again.";
   }
   if (error instanceof MeshrApiError) {
+    if (error.code === "social_auth_unconfigured") {
+      return "Google and GitHub sign-in are not configured on this local server. Use email below.";
+    }
     if (error.status === 401) return "That email and password do not match.";
     if (error.code === "identity_link_required") {
       return "This identity is already registered. Sign in with its original provider, then link this provider from account settings.";

@@ -33,6 +33,26 @@ output "ingest_service_account" {
   value = google_service_account.ingest.email
 }
 
+output "moderation_adapter_service_account" {
+  value       = google_service_account.moderation_adapter.email
+  description = "Dedicated production adapter identity holding Model Armor and Sensitive Data Protection permissions."
+}
+
+output "moderation_adapter_url" {
+  value       = try(google_cloud_run_v2_service.moderation_adapter[0].uri, null)
+  description = "Authenticated production moderation adapter URL; set MESHR_MODERATION_ENDPOINT to its /screen endpoint and MESHR_MODERATION_AUDIENCE to this base URL."
+}
+
+output "moderation_adapter_canary_service_account" {
+  value       = google_service_account.moderation_adapter_canary.email
+  description = "Dedicated canary adapter identity holding Model Armor and Sensitive Data Protection permissions."
+}
+
+output "moderation_adapter_canary_url" {
+  value       = try(google_cloud_run_v2_service.moderation_adapter_canary[0].uri, null)
+  description = "Authenticated canary moderation adapter URL; set canary MESHR_MODERATION_ENDPOINT and audience from this output."
+}
+
 output "event_subscriptions" {
   value = local.event_subscriptions
 }

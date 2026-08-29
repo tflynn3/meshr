@@ -71,6 +71,15 @@ const MAX_OWNED_MESHES_PER_ACCOUNT = 10;
 const MAX_JOINED_MESHES_PER_AGENT = 100;
 const MAX_POSTS_PER_MINUTE = 60;
 const POST_BURST = 10;
+// Agent hosts normally poll the activity cursor every few seconds. Keep the
+// read budget generous enough for that cadence, while bounding repeated cursor
+// replays before they fan out into Firestore. A cursorless production read is
+// a bounded newest-page catch-up; it never walks the full retention period.
+const MAX_AGENT_EVENT_READS_PER_MINUTE = 120;
+const AGENT_EVENT_READ_BURST = 30;
+const MAX_AGENT_EVENT_READS_PER_AGENT_MINUTE = 300;
+const AGENT_EVENT_READ_AGENT_BURST = 60;
+const MAX_AGENT_EVENT_PAGE_SIZE = 100;
 const POST_RETENTION_SECONDS = 90 * 24 * 60 * 60;
 const NEW_IDENTITY_REVIEW_POSTS = 5;
 const NEW_IDENTITY_REVIEW_WINDOW_MS = 24 * 60 * 60 * 1_000;
@@ -1120,6 +1129,19 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
   const pairingChallengeIpLimiter = new TokenBucketLimiter(30, 30 / 60);
   const pairingChallengePairLimiter = new TokenBucketLimiter(10, 10 / 60);
   const agentSessionIpLimiter = new TokenBucketLimiter(30, 30 / 60);
+  // Event observation is a potentially expensive fan-out read in Firestore:
+  // one request can touch every public mesh visible to the agent. Apply both
+  // an agent-wide and an agent+source guard. Cloud Armor remains the edge-wide
+  // control; these process-local buckets protect each API replica and bound
+  // cursor replay/mesh fan-out during a provider or edge incident.
+  const agentEventReadLimiter = new TokenBucketLimiter(
+    AGENT_EVENT_READ_BURST,
+    MAX_AGENT_EVENT_READS_PER_MINUTE / 60,
+  );
+  const agentEventReadAgentLimiter = new TokenBucketLimiter(
+    AGENT_EVENT_READ_AGENT_BURST,
+    MAX_AGENT_EVENT_READS_PER_AGENT_MINUTE / 60,
+  );
 
   const requestClientKey = (request: IncomingMessage): string => {
     const forwarded = request.headers["cf-connecting-ip"];
@@ -5122,7 +5144,20 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           .prepare("SELECT mesh_id FROM mesh_members WHERE agent_id = ?")
           .all(agent.id) as Array<{ mesh_id: string }>).map((row) => row.mesh_id),
       );
-      if (repository?.listMeshesForAgent) {
+      if (repository?.listJoinedMeshIdsForAgent) {
+        try {
+          transferMeshIds.clear();
+          for (const meshId of await repository.listJoinedMeshIdsForAgent(agent.id)) {
+            transferMeshIds.add(meshId);
+          }
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "mesh_store_unavailable",
+            error instanceof Error ? error.message : "The mesh store is unavailable.",
+          );
+        }
+      } else if (repository?.listMeshesForAgent) {
         try {
           const durableMeshes = await repository.listMeshesForAgent(agent.id);
           transferMeshIds.clear();
@@ -8846,6 +8881,22 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         .prepare("SELECT * FROM agents WHERE id = ?")
         .get(principal.agentId) as unknown as AgentRow & { public_key_pem: string };
 
+      if (method === "GET" && path === "/v1/agent/events") {
+        const source = requestClientKey(request);
+        enforceEndpointRate(
+          agentEventReadLimiter,
+          `agent:${principal.agentId}:${source}`,
+          "activity_rate_limited",
+          "Activity observation is being requested too quickly. Retry after the indicated delay.",
+        );
+        enforceEndpointRate(
+          agentEventReadAgentLimiter,
+          `agent:${principal.agentId}`,
+          "activity_rate_limited",
+          "Activity observation is being requested too quickly. Retry after the indicated delay.",
+        );
+      }
+
       if (method === "GET" && path === "/v1/agent/profile") {
         return { body: { agent: serializeAgentProfile(agentFromRow(actingAgent)) } };
       }
@@ -9726,7 +9777,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         const durableAfter = durableAfterRaw && /^\d+$/.test(durableAfterRaw)
           ? undefined
           : durableAfterRaw;
-        const durableLimit = parsePositiveInteger(url.searchParams.get("limit"), 100, 500, 1);
+        const durableLimit = parsePositiveInteger(
+          url.searchParams.get("limit"),
+          MAX_AGENT_EVENT_PAGE_SIZE,
+          MAX_AGENT_EVENT_PAGE_SIZE,
+          1,
+        );
         if (repository?.listAgentEvents) {
           let page;
           try {
@@ -9746,6 +9802,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
               error instanceof Error ? error.message : "The durable activity store is unavailable.",
             );
           }
+          // The event query intentionally uses a broad candidate stream and
+          // can run on a different replica from the session handshake. Recheck
+          // the native session or page grant at the response boundary so a
+          // revocation/supersession racing this read cannot leak even event
+          // metadata from a private mesh.
+          await revalidatePostReadAuthority(principal);
           return {
             body: {
               events: page.events.map((event) => ({
@@ -9767,7 +9829,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           ? new Set(cachedProjection({ agentId: principal.agentId })?.meshes.map((mesh) => mesh.meshId) ?? [])
           : undefined;
         const after = parsePositiveInteger(url.searchParams.get("after"), 0, Number.MAX_SAFE_INTEGER);
-        const limit = parsePositiveInteger(url.searchParams.get("limit"), 100, 500, 1);
+        const limit = parsePositiveInteger(
+          url.searchParams.get("limit"),
+          MAX_AGENT_EVENT_PAGE_SIZE,
+          MAX_AGENT_EVENT_PAGE_SIZE,
+          1,
+        );
         const rows = db
           .prepare(
             `SELECT e.sequence, e.type, e.mesh_id, e.topic_id, e.agent_id, e.data_json, e.created_at

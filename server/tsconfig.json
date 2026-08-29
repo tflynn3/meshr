@@ -14,7 +14,9 @@
   "include": [
     "./**/*.ts",
     "../platform/eventEnvelope.ts",
+    "../platform/activityWindow.ts",
     "../platform/googleClients.ts",
-    "../platform/runtimeSecrets.ts"
+    "../platform/runtimeSecrets.ts",
+    "../platform/moderationReadiness.ts"
   ]
 }

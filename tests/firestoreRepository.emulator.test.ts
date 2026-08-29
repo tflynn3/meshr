@@ -105,6 +105,8 @@ test("Firestore repository preserves the launch authority and outbox contract", 
     assert.deepEqual(liveSessions.map((session) => session.sessionId), [runtimeSessionId]);
     const meshDirectory = await repository.listMeshDirectoryForAccount(account.accountId);
     assert.equal(meshDirectory.some((entry) => entry.mesh.meshId === "mesh-public"), true);
+    const publicMeshes = await repository.listPublicMeshes();
+    assert.deepEqual(publicMeshes.map((mesh) => mesh.meshId), ["mesh-public"]);
 
     const write = await repository.createPostWithOutbox({
       postId,
@@ -194,8 +196,195 @@ test("Firestore repository preserves the launch authority and outbox contract", 
     const ready = await collection("event_outbox_ready").doc(postId).get();
     assert.equal(outbox.exists, true);
     assert.equal(outbox.get("status"), "pending");
+    assert.equal(outbox.get("observation_scope"), "public");
     assert.equal(ready.exists, true);
     assert.equal(ready.get("ordering_key"), "mesh-public");
+    const events = await repository.listAgentEvents({
+      agentId,
+      browse: "public",
+      limit: 10,
+    });
+    assert.equal(events.events.length, 1);
+    assert.equal(events.events[0]?.topicId, "topic-small-discoveries");
+
+    const followEventId = `${prefix}_follow_event`;
+    await repository.upsertFollow({
+      topicId: "topic-small-discoveries",
+      agentId,
+      meshId: "mesh-public",
+      following: true,
+      updatedAt: now,
+      sessionId: runtimeSessionId,
+      authorityEpoch: 1,
+      authorityKind: "native",
+      eventId: followEventId,
+      idempotencyKey: `${prefix}:follow`,
+    });
+    const followOutbox = await collection("event_outbox").doc(followEventId).get();
+    assert.equal(followOutbox.get("observation_scope"), "public");
+    const followEvents = await repository.listAgentEvents({
+      agentId,
+      browse: "public",
+      limit: 10,
+    });
+    assert.equal(followEvents.events.some((event) => event.eventId === followEventId), true);
+
+    // Public browse also includes private meshes this agent has explicitly
+    // joined. The private stream must be selected by membership, while an
+    // unrelated private mesh remains invisible.
+    const privateVisibleMeshId = `${prefix}_private_visible`;
+    const privateHiddenMeshId = `${prefix}_private_hidden`;
+    const privateVisibleEventId = `${prefix}_private_visible_event`;
+    const privateHiddenEventId = `${prefix}_private_hidden_event`;
+    const staleEventId = `${prefix}_stale_event`;
+    const privateBatch = firestore.batch();
+    privateBatch.set(collection("meshes").doc(privateVisibleMeshId), {
+      contract_version: 1,
+      mesh_id: privateVisibleMeshId,
+      owner_account_id: account.accountId,
+      name: "Private joined mesh",
+      description: "A private conformance mesh",
+      visibility: "private",
+      admission: "invite_only",
+      lifecycle: "active",
+      created_at: now,
+      updated_at: now,
+    });
+    privateBatch.set(collection("meshes").doc(privateHiddenMeshId), {
+      contract_version: 1,
+      mesh_id: privateHiddenMeshId,
+      owner_account_id: account.accountId,
+      name: "Private hidden mesh",
+      description: "An unrelated private mesh",
+      visibility: "private",
+      admission: "invite_only",
+      lifecycle: "active",
+      created_at: now,
+      updated_at: now,
+    });
+    privateBatch.set(collection("mesh_agent_memberships").doc(`${privateVisibleMeshId}:${agentId}`), {
+      contract_version: 1,
+      mesh_id: privateVisibleMeshId,
+      agent_id: agentId,
+      status: "joined",
+      attention_policy: { browse: "public" },
+      admission_provenance: "invite",
+      joined_at: now,
+      updated_at: now,
+    });
+    for (const [eventId, meshId] of [
+      [privateVisibleEventId, privateVisibleMeshId],
+      [privateHiddenEventId, privateHiddenMeshId],
+    ] as const) {
+      const createdAt = new Date(Date.parse(now) + (eventId === privateVisibleEventId ? 500 : 600)).toISOString();
+      privateBatch.set(collection("event_outbox").doc(eventId), {
+        contract_version: 1,
+        observation_scope: "private",
+        event_id: eventId,
+        mesh_id: meshId,
+        status: "published",
+        attempts: 1,
+        created_at: createdAt,
+        envelope: {
+          event_id: eventId,
+          schema_version: 1,
+          mesh_id: meshId,
+          agent_id: agentId,
+          session_id: runtimeSessionId,
+          runtime_kind: "openclaw",
+          type: "post.created",
+          occurred_at: createdAt,
+          payload: { topic_id: "topic-small-discoveries" },
+        },
+      });
+    }
+    privateBatch.set(collection("event_outbox").doc(staleEventId), {
+      contract_version: 1,
+      observation_scope: "public",
+      event_id: staleEventId,
+      mesh_id: "mesh-public",
+      status: "published",
+      attempts: 1,
+      created_at: "2026-08-28T17:30:00.000Z",
+      envelope: {
+        event_id: staleEventId,
+        schema_version: 1,
+        mesh_id: "mesh-public",
+        agent_id: agentId,
+        session_id: runtimeSessionId,
+        runtime_kind: "openclaw",
+        type: "post.created",
+        occurred_at: "2026-08-28T17:30:00.000Z",
+        payload: { topic_id: "topic-small-discoveries" },
+      },
+    });
+    await privateBatch.commit();
+    const publicBrowseWithPrivate = await repository.listAgentEvents({
+      agentId,
+      browse: "public",
+      limit: 100,
+    });
+    assert.equal(publicBrowseWithPrivate.events.some((event) => event.eventId === privateVisibleEventId), true);
+    assert.equal(publicBrowseWithPrivate.events.some((event) => event.eventId === privateHiddenEventId), false);
+
+    // A page smaller than the candidate scan must resume from the last
+    // returned visible event, not from the scan high-water mark. This proves
+    // that bounded overscan cannot skip a large public stream.
+    const bulkBatch = firestore.batch();
+    const bulkIds: string[] = [];
+    for (let index = 0; index < 105; index += 1) {
+      const bulkId = `${prefix}_bulk_${String(index).padStart(3, "0")}`;
+      bulkIds.push(bulkId);
+      const createdAt = new Date(Date.parse(now) + (index + 1) * 1_000).toISOString();
+      bulkBatch.set(collection("event_outbox").doc(bulkId), {
+        contract_version: 1,
+        observation_scope: "public",
+        event_id: bulkId,
+        mesh_id: "mesh-public",
+        status: "published",
+        attempts: 1,
+        created_at: createdAt,
+        envelope: {
+          event_id: bulkId,
+          schema_version: 1,
+          mesh_id: "mesh-public",
+          agent_id: agentId,
+          session_id: runtimeSessionId,
+          runtime_kind: "openclaw",
+          type: "post.created",
+          occurred_at: createdAt,
+          payload: { topic_id: "topic-small-discoveries", index },
+        },
+      });
+    }
+    await bulkBatch.commit();
+    const newestPage = await repository.listAgentEvents({
+      agentId,
+      browse: "public",
+      limit: 100,
+    });
+    assert.equal(newestPage.events.length, 100);
+    assert.equal(newestPage.events.some((event) => event.eventId === bulkIds[0]), false);
+    assert.equal(newestPage.events.some((event) => event.eventId === bulkIds.at(-1)), true);
+    assert.equal(newestPage.events.some((event) => event.eventId === staleEventId), false);
+    const pagedIds: string[] = [];
+    // Resume from the pre-bulk cursor so this loop exercises durable
+    // ascending pagination rather than the cursorless newest-page contract.
+    let after: string | undefined = followEvents.nextAfter ?? undefined;
+    for (let page = 0; page < 20; page += 1) {
+      const result = await repository.listAgentEvents({
+        agentId,
+        browse: "public",
+        limit: 10,
+        after,
+      });
+      pagedIds.push(...result.events
+        .map((event) => event.eventId)
+        .filter((eventId) => eventId.startsWith(`${prefix}_bulk_`)));
+      if (result.events.length === 0 || !result.nextAfter) break;
+      after = result.nextAfter;
+    }
+    assert.deepEqual([...new Set(pagedIds)].sort(), [...bulkIds].sort());
   } finally {
     // The random collection prefix isolates tests running against a shared
     // emulator. Delete only this test's collections so a failed test never

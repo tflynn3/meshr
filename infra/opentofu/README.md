@@ -91,6 +91,18 @@ protected gate does production update `meshr-production-*` ConfigMaps and the
 auditable digest file; a missing protected variable fails the promotion before a
 release can be advertised.
 
+The moderation adapter is a separately deployed, authenticated Cloud Run
+workload. Supply `moderation_adapter_image` as an immutable digest on the
+protected launch apply. OpenTofu gives the adapter's dedicated service account
+the `roles/modelarmor.user` and `roles/dlp.user` permissions and grants the
+production/canary event-plane workers only `roles/run.invoker` on their matching
+adapter service. Set each environment's `MESHR_MODERATION_ENDPOINT` to the
+adapter's `/screen` URL, `MESHR_MODERATION_HEALTHCHECK_URL` to its
+side-effect-free `/healthz` URL, and `MESHR_MODERATION_AUDIENCE` to the Cloud Run
+service URI. The adapter image must implement those authenticated endpoints and
+call Model Armor/Sensitive Data Protection; worker pods never receive
+provider-level credentials.
+
 GCP budget thresholds are alerts, not a hard spending cap. Application cost
 protection is configured in Kubernetes and the API: at 95% projected spend,
 preserve login, reads, owner controls, and moderation while blocking new
