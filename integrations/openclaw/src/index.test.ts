@@ -71,7 +71,7 @@ async function stateFile(t: test.TestContext, bindings: TestBinding[]): Promise<
 
 function registeredFactories(config: {
   baseUrl: string;
-  connectorStatePath: string;
+  statePath: string;
 }): Map<string, OpenClawPluginToolFactory> {
   const registrations: RegisteredFactory[] = [];
   const api = {
@@ -125,6 +125,16 @@ test("declares prefixed tools without an agentId parameter", () => {
   }
 });
 
+test("requires the local session state path before loading a binding", () => {
+  const metadata = getToolPluginMetadata(entry);
+  const schema = metadata?.configSchema as {
+    required?: string[];
+    properties?: Record<string, unknown>;
+  };
+  assert.deepEqual(schema.required, ["baseUrl", "statePath"]);
+  assert.ok(schema.properties?.statePath);
+});
+
 test("projects the selected binding attention policy into its tool surface", async (t) => {
   const binding = (
     agentId: string,
@@ -169,7 +179,7 @@ test("projects the selected binding attention policy into its tool surface", asy
   ]);
   const factories = registeredFactories({
     baseUrl: "http://127.0.0.1:8787",
-    connectorStatePath: path,
+    statePath: path,
   });
 
   assert.deepEqual(
@@ -221,7 +231,7 @@ test("projects the selected binding attention policy into its tool surface", asy
 test("fails closed before reading state when trusted agentId is absent", () => {
   const factories = registeredFactories({
     baseUrl: "http://127.0.0.1:8787",
-    connectorStatePath: "/does/not/exist/state.json",
+    statePath: "/does/not/exist/state.json",
   });
   for (const name of expectedTools) {
     assert.equal(instantiate(factories, name, {}), null);
@@ -240,7 +250,7 @@ test("rejects cleartext non-loopback Meshr servers before exposing a bearer-back
   ]);
   const factories = registeredFactories({
     baseUrl: "http://meshr.example",
-    connectorStatePath: path,
+    statePath: path,
   });
 
   assert.throws(
@@ -266,7 +276,7 @@ test("rejects credentials, queries, and fragments in the Meshr base URL", async 
     ]);
     const factories = registeredFactories({
       baseUrl,
-      connectorStatePath: path,
+      statePath: path,
     });
 
     assert.throws(
@@ -288,7 +298,7 @@ test("resolves the trusted agent from a one-shot local session key", async (t) =
   ]);
   const factories = registeredFactories({
     baseUrl: "http://127.0.0.1:8787",
-    connectorStatePath: path,
+    statePath: path,
   });
   const tool = instantiate(factories, "meshr_get_my_agent", {
     sessionKey: "agent:moss:explicit:meshr-live-root",
@@ -325,7 +335,7 @@ test("fails closed when trusted agentId and session key disagree", async (t) => 
   ]);
   const factories = registeredFactories({
     baseUrl: "http://127.0.0.1:8787",
-    connectorStatePath: path,
+    statePath: path,
   });
   assert.equal(
     instantiate(factories, "meshr_get_my_agent", {
@@ -374,7 +384,7 @@ test("isolates bindings by exact runtime subject and Meshr server", async (t) =>
   ]);
   const factories = registeredFactories({
     baseUrl: "http://127.0.0.1:8787",
-    connectorStatePath: path,
+    statePath: path,
   });
 
   assert.equal(instantiate(factories, "meshr_get_my_agent", { agentId: "gamma" }), null);
@@ -420,7 +430,7 @@ test("ignores spoofed identity input and sends stable idempotency", async (t) =>
   ]);
   const factories = registeredFactories({
     baseUrl: "http://127.0.0.1:8787",
-    connectorStatePath: path,
+    statePath: path,
   });
   const publish = instantiate(factories, "meshr_publish_post", { agentId: "alpha" });
   assert.ok(publish);
@@ -470,7 +480,7 @@ test("maps the complete agent tool surface to the current routes", async (t) => 
   ]);
   const factories = registeredFactories({
     baseUrl: "http://127.0.0.1:8787",
-    connectorStatePath: path,
+    statePath: path,
   });
   const calls: Array<{ url: string; method: string; headers: Headers; body?: JsonRecord }> = [];
   const originalFetch = globalThis.fetch;

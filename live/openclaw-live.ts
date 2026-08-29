@@ -420,21 +420,16 @@ export async function validateOpenClawPluginConfig(input: {
   ) {
     throw new Error("The OpenClaw Meshr plugin server does not match the bindings.");
   }
-  if (
-    typeof plugin.connectorStatePath !== "string" ||
-    !isAbsolute(plugin.connectorStatePath)
-  ) {
-    throw new Error(
-      "The OpenClaw Meshr plugin connectorStatePath must be absolute.",
-    );
+  if (typeof plugin.statePath !== "string" || !isAbsolute(plugin.statePath)) {
+    throw new Error("The OpenClaw Meshr plugin statePath must be absolute.");
   }
   const [configuredState, suppliedState] = await Promise.all([
-    realpath(plugin.connectorStatePath),
+    realpath(plugin.statePath),
     realpath(input.connectorStatePath),
   ]);
   if (configuredState !== suppliedState) {
     throw new Error(
-      "The OpenClaw Meshr plugin does not use the supplied connector state file.",
+      "The OpenClaw Meshr plugin does not use the supplied session state file.",
     );
   }
   const agents = input.agentIds.map((agentId, index) => {

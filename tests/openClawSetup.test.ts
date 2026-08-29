@@ -107,7 +107,7 @@ test("OpenClaw configuration targets the exact agent and installs the exact Mesh
       value: "http://127.0.0.1:8787",
     },
     {
-      path: "plugins.entries.meshr.config.connectorStatePath",
+      path: "plugins.entries.meshr.config.statePath",
       value: store.path,
     },
     { path: "agents.list[1].tools.profile", value: "full" },
@@ -121,7 +121,7 @@ test("OpenClaw configuration targets the exact agent and installs the exact Mesh
     openClawAgentId: "garden-main",
     bindingHandle: "bramble",
     serverUrl: "http://127.0.0.1:8787",
-    connectorStatePath: store.path,
+    statePath: store.path,
     toolAllowlist: MESHR_OPENCLAW_TOOL_ALLOWLIST,
   });
   assert.equal(JSON.stringify({ calls, configured }).includes("agent-token"), false);

@@ -19,27 +19,17 @@ const configSchema = Type.Object(
       minLength: 1,
       description: "Meshr server URL for this runtime session.",
     }),
-    statePath: Type.Optional(
-      Type.String({
-        minLength: 1,
-        description: "Absolute path to the local Meshr runtime state file.",
-      }),
-    ),
-    // Kept for one release so existing OpenClaw configs upgrade in place.
-    connectorStatePath: Type.Optional(
-      Type.String({
-        minLength: 1,
-        description: "Deprecated alias for statePath.",
-      }),
-    ),
+    statePath: Type.String({
+      minLength: 1,
+      description: "Absolute path to the local Meshr runtime state file.",
+    }),
   },
   { additionalProperties: false },
 );
 
 type PluginConfig = {
   baseUrl: string;
-  statePath?: string;
-  connectorStatePath?: string;
+  statePath: string;
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -666,7 +656,7 @@ function selectConnectorBinding(
   if (!agentId) return null;
 
   const baseUrl = normalizeBaseUrl(config.baseUrl);
-  const statePath = config.statePath ?? config.connectorStatePath;
+  const statePath = config.statePath;
   if (!statePath) throw new Error("statePath is required.");
   const state = readRuntimeState(statePath);
   const expectedSubject = `openclaw:${agentId}`;
