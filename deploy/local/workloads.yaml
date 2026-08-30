@@ -55,7 +55,7 @@ spec:
               containerPort: 8787
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
           livenessProbe:
             httpGet:
@@ -171,7 +171,7 @@ spec:
         - name: bootstrap-event-plane
           image: meshr-event-plane:dev
           imagePullPolicy: IfNotPresent
-          args: ["/app/event_plane_bin.runfiles/_main/event_plane.mjs", "bootstrap"]
+          args: ["bootstrap"]
           envFrom:
             - configMapRef:
                 name: event-plane
@@ -179,7 +179,7 @@ spec:
         - name: ingest
           image: meshr-event-plane:dev
           imagePullPolicy: IfNotPresent
-          args: ["/app/event_plane_bin.runfiles/_main/event_plane.mjs", "ingest"]
+          args: ["ingest"]
           envFrom:
             - configMapRef:
                 name: event-plane
@@ -246,7 +246,7 @@ spec:
         - name: bootstrap-event-plane
           image: meshr-event-plane:dev
           imagePullPolicy: IfNotPresent
-          args: ["/app/event_plane_bin.runfiles/_main/event_plane.mjs", "bootstrap"]
+          args: ["bootstrap"]
           envFrom:
             - configMapRef:
                 name: event-plane
@@ -254,16 +254,24 @@ spec:
         - name: topology-materializer
           image: meshr-event-plane:dev
           imagePullPolicy: IfNotPresent
-          args: ["/app/event_plane_bin.runfiles/_main/event_plane.mjs", "materializer"]
+          args: ["materializer"]
           envFrom:
             - configMapRef:
                 name: event-plane
+          # Keep the local deployment aligned with production's one-consumer
+          # process model. The all-in-one selector remains useful for direct
+          # emulator invocations, but subscribing to every queue here makes a
+          # restart compete with five streaming-pull connections before the
+          # topology path is ready for the smoke gate.
+          env:
+            - name: MESHR_CONSUMER
+              value: topology
           ports:
             - name: http
               containerPort: 8080
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
           resources:
             requests:
@@ -299,7 +307,7 @@ spec:
         - name: bootstrap-event-plane
           image: meshr-event-plane:dev
           imagePullPolicy: IfNotPresent
-          args: ["/app/event_plane_bin.runfiles/_main/event_plane.mjs", "bootstrap"]
+          args: ["bootstrap"]
           envFrom:
             - configMapRef:
                 name: event-plane
@@ -307,7 +315,7 @@ spec:
         - name: live-gateway
           image: meshr-event-plane:dev
           imagePullPolicy: IfNotPresent
-          args: ["/app/event_plane_bin.runfiles/_main/event_plane.mjs", "live-gateway"]
+          args: ["live-gateway"]
           envFrom:
             - configMapRef:
                 name: event-plane

@@ -1100,7 +1100,8 @@ test("Firestore repository preserves the launch authority and outbox contract", 
       "event_outbox", "event_outbox_ready", "moderation_cases",
       "audit_events", "governance_events", "event_audit", "topology_activity_totals",
       "topology_activity_buckets", "topology_activity_recent", "topology_activity_snapshots",
-      "processed_events", "topology_shards", "topology_events",
+      "projection_bootstrap", "processed_events", "topology_shards", "topology_events",
+      "mesh_access_epochs", "live_access_epochs",
     ];
     for (const name of names) {
       const snapshot = await collection(name).get();
@@ -1280,5 +1281,165 @@ test("Firestore activity preferences and mesh governance merge partial updates a
       if (!snapshot.empty) await firestore.recursiveDelete(collection);
     }
     await firestore.terminate();
+  }
+});
+
+test("Firestore launch bootstrap refuses stale data in an isolated topology database", {
+  skip: !process.env.FIRESTORE_EMULATOR_HOST,
+}, async () => {
+  const projectId = process.env.GOOGLE_CLOUD_PROJECT?.trim() || "meshr-emulator";
+  const authority = new Firestore({ projectId, databaseId: "(default)" });
+  // Use a named database so the test exercises the same authority/projection
+  // split as production rather than accidentally reading the authority
+  // collections through both handles.
+  const topologyDatabaseId = `meshr-topology-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const topology = new Firestore({ projectId, databaseId: topologyDatabaseId });
+  const cleanPrefix = `launch_clean_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const stalePrefix = `launch_stale_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const projectionNames = [
+    "projection_bootstrap",
+    "topology_shards",
+    "topology_events",
+    "topology_activity_snapshots",
+    "topology_activity_totals",
+    "topology_activity_recent",
+    "topology_activity_buckets",
+    "processed_events",
+    "mesh_access_epochs",
+    "live_access_epochs",
+  ];
+  const authorityNames = ["system", "meshes", "topics"];
+  const cleanupPrefix = async (store: Firestore, prefix: string, names: string[]) => {
+    for (const name of names) {
+      const collection = store.collection(`${prefix}_${name}`);
+      const snapshot = await collection.get();
+      if (!snapshot.empty) await store.recursiveDelete(collection);
+    }
+  };
+  const stalePrefixes: string[] = [stalePrefix];
+
+  try {
+    const cleanRepository = new FirestoreMeshrRepository({
+      firestore: authority,
+      topologyFirestore: topology,
+      collectionPrefix: cleanPrefix,
+      invitationPepper: `${cleanPrefix}:pepper`,
+    });
+    await cleanRepository.ensureEmptyProduction();
+    const marker = await topology
+      .collection(`${cleanPrefix}_projection_bootstrap`)
+      .doc("default")
+      .get();
+    assert.equal(marker.exists, true);
+    assert.equal(marker.get("empty_launch"), true);
+    assert.equal(marker.get("authority_bootstrap"), "system/bootstrap");
+    const authorityBootstrap = await authority
+      .collection(`${cleanPrefix}_system`)
+      .doc("bootstrap")
+      .get();
+    assert.equal(typeof authorityBootstrap.get("bootstrap_id"), "string");
+    assert.equal(marker.get("authority_bootstrap_id"), authorityBootstrap.get("bootstrap_id"));
+
+    // Any projection-only stale state must block first launch even when the
+    // authority database has no identities, posts, or bootstrap marker. Test
+    // each collection separately so a future addition cannot accidentally be
+    // omitted from the clean-start attestation scan.
+    for (const [index, collectionName] of projectionNames
+      .filter((name) => name !== "projection_bootstrap")
+      .entries()) {
+      const prefix = index === 0
+        ? stalePrefix
+        : `launch_stale_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 8)}`;
+      if (prefix !== stalePrefix) stalePrefixes.push(prefix);
+      await topology
+        .collection(`${prefix}_${collectionName}`)
+        .doc(`stale-${index}`)
+        .set({ mesh_id: "mesh-old", generated_at: "2026-08-28T18:00:00.000Z" });
+      const staleRepository = new FirestoreMeshrRepository({
+        firestore: authority,
+        topologyFirestore: topology,
+        collectionPrefix: prefix,
+        invitationPepper: `${prefix}:pepper`,
+      });
+      await assert.rejects(
+        staleRepository.ensureEmptyProduction(),
+        new RegExp(`topology_projection_not_empty:${collectionName}`),
+      );
+      assert.equal(
+        (await authority.collection(`${prefix}_system`).doc("bootstrap").get()).exists,
+        false,
+      );
+    }
+  } finally {
+    await cleanupPrefix(authority, cleanPrefix, authorityNames);
+    // Cleanup is intentionally bounded to the named prefixes created by this
+    // test, including each isolated stale projection fixture.
+    for (const prefix of stalePrefixes) {
+      await cleanupPrefix(authority, prefix, authorityNames);
+      await cleanupPrefix(topology, prefix, projectionNames);
+    }
+    await cleanupPrefix(topology, cleanPrefix, projectionNames);
+    await authority.terminate();
+    await topology.terminate();
+  }
+});
+
+test("Firestore API bootstrap is read-only until the protected store job attests projections", {
+  skip: !process.env.FIRESTORE_EMULATOR_HOST,
+}, async () => {
+  const projectId = process.env.GOOGLE_CLOUD_PROJECT?.trim() || "meshr-emulator";
+  const authority = new Firestore({ projectId, databaseId: "(default)" });
+  const topologyDatabaseId = `meshr-topology-reader-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const topology = new Firestore({ projectId, databaseId: topologyDatabaseId });
+  const prefix = `launch_reader_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const names = [
+    "system", "meshes", "topics", "projection_bootstrap", "topology_activity_snapshots",
+    "topology_activity_totals", "topology_activity_recent", "topology_activity_buckets",
+    "topology_shards", "topology_events", "processed_events", "mesh_access_epochs", "live_access_epochs",
+  ];
+  try {
+    const reader = new FirestoreMeshrRepository({
+      firestore: authority,
+      topologyFirestore: topology,
+      collectionPrefix: prefix,
+      projectionBootstrapWriter: false,
+    });
+    await assert.rejects(reader.ensureEmptyProduction(), /production_bootstrap_required/);
+    assert.equal((await authority.collection(`${prefix}_system`).doc("bootstrap").get()).exists, false);
+
+    const bootstrap = new FirestoreMeshrRepository({
+      firestore: authority,
+      topologyFirestore: topology,
+      collectionPrefix: prefix,
+      projectionBootstrapWriter: true,
+    });
+    await bootstrap.ensureEmptyProduction();
+    await reader.ensureEmptyProduction();
+    await reader.checkReady();
+    const markerRef = topology.collection(`${prefix}_projection_bootstrap`).doc("default");
+    await markerRef.update({ authority_bootstrap_id: "stale-generation" });
+    await assert.rejects(reader.ensureEmptyProduction(), /topology_projection_bootstrap_missing/);
+    await bootstrap.ensureEmptyProduction();
+    assert.equal(
+      (await markerRef.get()).get("authority_bootstrap_id"),
+      (await authority.collection(`${prefix}_system`).doc("bootstrap").get()).get("bootstrap_id"),
+    );
+    await topology.collection(`${prefix}_topology_activity_totals`).doc("mesh-stale:0").set({ mesh_id: "mesh-stale" });
+    await markerRef.update({ authority_bootstrap_id: "stale-generation" });
+    await assert.rejects(
+      bootstrap.ensureEmptyProduction(),
+      /topology_projection_not_empty:topology_activity_totals/,
+    );
+  } finally {
+    for (const name of names) {
+      const authorityCollection = authority.collection(`${prefix}_${name}`);
+      const authoritySnapshot = await authorityCollection.get();
+      if (!authoritySnapshot.empty) await authority.recursiveDelete(authorityCollection);
+      const topologyCollection = topology.collection(`${prefix}_${name}`);
+      const topologySnapshot = await topologyCollection.get();
+      if (!topologySnapshot.empty) await topology.recursiveDelete(topologyCollection);
+    }
+    await authority.terminate();
+    await topology.terminate();
   }
 });

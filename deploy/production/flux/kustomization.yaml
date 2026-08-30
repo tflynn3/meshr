@@ -7,14 +7,23 @@ spec:
   interval: 1m
   path: ./deploy/production
   prune: true
-  wait: true
-  timeout: 5m
+  # The topology materializer uses a generation fence that is intentionally
+  # pending until the bootstrap Job is attested by the promotion workflow.
+  # Keep health checks explicit so the first reconcile can apply the Job and
+  # the workflow can patch the expected generation before checking the
+  # materializer rollout itself.
+  wait: false
+  timeout: 15m
   dependsOn:
     - name: meshr-metrics-adapter
   sourceRef:
     kind: GitRepository
     name: meshr
   healthChecks:
+    - apiVersion: batch/v1
+      kind: Job
+      name: production-store-bootstrap
+      namespace: meshr
     - apiVersion: apps/v1
       kind: Deployment
       name: api
@@ -30,10 +39,6 @@ spec:
     - apiVersion: apps/v1
       kind: Deployment
       name: ingest
-      namespace: meshr
-    - apiVersion: apps/v1
-      kind: Deployment
-      name: topology-materializer
       namespace: meshr
     - apiVersion: apps/v1
       kind: Deployment

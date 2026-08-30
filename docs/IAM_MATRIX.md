@@ -9,7 +9,8 @@ needed by a workload.
 
 | Workload / KSA | Google service account | Allowed data plane | Explicitly excluded |
 | --- | --- | --- | --- |
-| API (`meshr-api`) | `meshr-api` | Authority Firestore read/write; topology Firestore read; Identity Platform verification; six API-only Secret Manager values | Pub/Sub publish/subscribe, moderation provider APIs, audit-only CI paths |
+| API (`meshr-api`) | `meshr-api` | Authority Firestore read/write; topology Firestore aggregate read; Identity Platform verification; six API-only Secret Manager values | Pub/Sub publish/subscribe, moderation provider APIs, audit-only CI paths, all topology writes |
+| One-shot store bootstrap (`meshr-bootstrap`) | `meshr-bootstrap` | Authority Firestore initialization and topology `projection_bootstrap/default` attestation during an explicit bootstrap Job | Runtime API traffic, Pub/Sub, moderation provider APIs, continued intended bootstrap operations after the Job completes |
 | Live gateway (`meshr-live-gateway`) | `meshr-live-gateway` | Aggregate topology Firestore read; internal API authorization call; internal token | Authority Firestore, posts, accounts, sessions, moderation, audit, Pub/Sub publish |
 | Ingest (`meshr-ingest`) | `meshr-ingest` | Authority Firestore outbox read/update; publish to the matching `mesh-events` topic; topic metadata read; internal token | Browser credentials, topology database, moderation provider |
 | Topology materializer (`meshr-topology-materializer`) | `meshr-topology` | Subscribe to the topology event subscription; aggregate topology database read/write; bounded event trace | Authority account/session data, moderation provider, Secret Manager |
@@ -111,3 +112,19 @@ Before launch, inspect the rendered bindings and prove all of the following:
 
 The checks require a managed-project IAM readback; emulator and Terraform
 validation prove shape only and are not a production permission proof.
+
+The API never writes the topology attestation. The protected `meshr-bootstrap`
+Job runs the `production-bootstrap` event-plane command with database-scoped
+Firestore permissions, creates the empty authority commons, and records a
+generation-fenced `projection_bootstrap/default` marker. API readiness then
+requires that marker to match the authority `system/bootstrap.bootstrap_id`.
+Canary uses the separate `meshr-bootstrap-canary` identity and databases.
+The bootstrap identity is the only intended marker writer, but IAM cannot
+exclude that document from the topology materializer's database-scoped write
+grant. The materializer never invokes bootstrap code; readiness and the
+generation fence detects an invalid marker or a changed authority generation;
+a same-generation rewrite is not detectable by this marker alone. Strict
+marker-writer exclusivity still requires a separately restricted attestation
+database or service before launch. Until that boundary exists, the protected
+OpenTofu launch guard requires `accept_projection_marker_writer_risk=true` and
+the security owner must record the residual acceptance in the launch checklist.

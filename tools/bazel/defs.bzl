@@ -13,12 +13,12 @@ def node_bundle(js_run_binary, name, entry_point, srcs, tool):
         tool = tool,
     )
 
-def meshr_image(oci_image, name, base, architecture, tars, default_args):
+def meshr_image(oci_image, name, base, architecture, tars, default_args, entrypoint = None):
     oci_image(
         name = name,
         base = base,
         cmd = default_args,
-        entrypoint = ["/nodejs/bin/node"],
+        entrypoint = entrypoint or ["/nodejs/bin/node"],
         env = {"NODE_ENV": "production"},
         labels = {
             "org.opencontainers.image.source": "https://github.com/tflynn3/meshr",
@@ -47,9 +47,10 @@ def meshr_images(oci_image, oci_image_index, oci_load):
             name = "event_plane_{}".format(arch),
             architecture = architecture,
             base = base,
-            default_args = [
+            default_args = ["ingest"],
+            entrypoint = [
+                "/nodejs/bin/node",
                 "/app/event_plane_bin.runfiles/_main/event_plane.mjs",
-                "ingest",
             ],
             tars = ["//:event_plane_{}_layers".format(arch)],
         )

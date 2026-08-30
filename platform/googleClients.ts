@@ -18,10 +18,32 @@ export interface EventPlaneConfig {
   deadLetterTopic: string;
 }
 
+/**
+ * Production deliberately keeps authority and topology in separate named
+ * Firestore databases. IAM Conditions can scope a grant to a database, but
+ * not to a collection or document path; accepting the same ID here would
+ * collapse the API/live-gateway isolation boundary.
+ */
+export function assertSeparatedProductionDatabases(
+  databaseId: string,
+  topologyDatabaseId: string,
+  environment = process.env.MESHR_ENV,
+): void {
+  if (environment?.trim().toLowerCase() !== "production") return;
+  const authority = databaseId.trim();
+  const topology = topologyDatabaseId.trim();
+  if (!authority || !topology) {
+    throw new Error("production Firestore authority and topology database IDs are required");
+  }
+  if (authority === topology) {
+    throw new Error("production Firestore authority and topology databases must be distinct");
+  }
+}
+
 export function eventPlaneConfig(): EventPlaneConfig {
   const topology =
     process.env.MESHR_TOPOLOGY_SUBSCRIPTION?.trim() || "topology-materializer";
-  return {
+  const config: EventPlaneConfig = {
     projectId: process.env.GOOGLE_CLOUD_PROJECT?.trim() || "meshr-local",
     databaseId: process.env.MESHR_FIRESTORE_DATABASE?.trim() || "(default)",
     // Topology is a bounded, aggregate-only read model. Production places it
@@ -47,6 +69,8 @@ export function eventPlaneConfig(): EventPlaneConfig {
     },
     deadLetterTopic: process.env.MESHR_DEAD_LETTER_TOPIC?.trim() || "mesh-events-dlq",
   };
+  assertSeparatedProductionDatabases(config.databaseId, config.topologyDatabaseId);
+  return config;
 }
 
 export function createFirestore(projectId: string, databaseId?: string): Firestore {

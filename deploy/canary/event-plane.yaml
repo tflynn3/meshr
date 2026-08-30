@@ -20,6 +20,9 @@ spec:
           envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
           env:
             - {name: MESHR_INTERNAL_TOKEN_FILE, value: /var/run/secrets/meshr/internal-token}
+            - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
+            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
+            - {name: MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID, value: "${MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID}"}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
@@ -72,6 +75,10 @@ spec:
           image: ${EVENT_PLANE_IMAGE}
           args: ["materializer", "topology"]
           envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
+          env:
+            - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
+            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
+            - {name: MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID, value: "${MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID}"}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
@@ -103,6 +110,10 @@ spec:
           env:
             - name: MESHR_MODERATION_ENDPOINT
               value: ${MESHR_MODERATION_ENDPOINT}
+            - name: MESHR_FIRESTORE_DATABASE
+              value: ${MESHR_FIRESTORE_DATABASE}
+            - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
+              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
             - name: MESHR_MODERATION_HEALTHCHECK_URL
               value: ${MESHR_MODERATION_HEALTHCHECK_URL}
             - name: MESHR_MODERATION_AUTH
@@ -151,6 +162,10 @@ spec:
           env:
             - name: MESHR_MODERATION_ENDPOINT
               value: ${MESHR_MODERATION_ENDPOINT}
+            - name: MESHR_FIRESTORE_DATABASE
+              value: ${MESHR_FIRESTORE_DATABASE}
+            - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
+              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
             - name: MESHR_MODERATION_HEALTHCHECK_URL
               value: ${MESHR_MODERATION_HEALTHCHECK_URL}
             - name: MESHR_MODERATION_AUTH
@@ -223,6 +238,9 @@ spec:
           image: ${EVENT_PLANE_IMAGE}
           args: ["materializer", "audit"]
           envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
+          env:
+            - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
+            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
@@ -249,6 +267,9 @@ spec:
           image: ${EVENT_PLANE_IMAGE}
           args: ["materializer", "notifications"]
           envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
+          env:
+            - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
+            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}

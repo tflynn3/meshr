@@ -496,28 +496,67 @@ locals {
   # operator can authorize a restored database before switching traffic.
   authority_firestore_database_names = distinct(concat(
     [google_firestore_database.default.name],
-    tolist(var.additional_authority_database_names),
+    [for database_name in var.additional_authority_database_names : trimspace(database_name)],
   ))
   authority_firestore_iam_expression = join(" || ", [
     for database_name in local.authority_firestore_database_names :
-    "resource.name == 'projects/${var.project_id}/databases/${database_name}' || resource.name.startsWith('projects/${var.project_id}/databases/${database_name}/documents/')"
+    "resource.name == 'projects/${var.project_id}/databases/${database_name}'"
   ])
   # A point-in-time restore may be promoted by changing the protected runtime
   # value to a temporary topology database. Grant the read/write projection
   # workers that database before the cutover, then remove it after retirement.
   topology_firestore_database_names = distinct(concat(
     [google_firestore_database.projections.name],
-    tolist(var.additional_topology_database_names),
+    [for database_name in var.additional_topology_database_names : trimspace(database_name)],
   ))
   topology_firestore_iam_expression = join(" || ", [
     for database_name in local.topology_firestore_database_names :
-    "resource.name == 'projects/${var.project_id}/databases/${database_name}' || resource.name.startsWith('projects/${var.project_id}/databases/${database_name}/documents/')"
+    "resource.name == 'projects/${var.project_id}/databases/${database_name}'"
   ])
-  canary_topology_firestore_iam_expression = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.canary_projections.name}' || resource.name.startsWith('projects/${var.project_id}/databases/${google_firestore_database.canary_projections.name}/documents/')"
+  # Restore allowlists are operator-controlled inputs. Fail closed if an
+  # authority database is accidentally authorized for projection workers (or
+  # vice versa); an IAM condition cannot repair an overlapping data boundary.
+  firestore_database_allowlist_overlap = setintersection(
+    toset(local.authority_firestore_database_names),
+    toset(local.topology_firestore_database_names),
+  )
+  # These databases are managed by another trust boundary (release audit or
+  # canary). A restore allowlist must never accidentally grant a production
+  # worker access to one of them, even when the operator is changing only one
+  # side of the authority/topology pair.
+  firestore_cross_environment_database_names = toset([
+    google_firestore_database.release_audit.name,
+    google_firestore_database.canary.name,
+    google_firestore_database.canary_projections.name,
+    google_firestore_database.canary_release_audit.name,
+  ])
+  firestore_cross_environment_restore_overlap = setintersection(
+    toset(concat(
+      [for database_name in var.additional_authority_database_names : trimspace(database_name)],
+      [for database_name in var.additional_topology_database_names : trimspace(database_name)],
+    )),
+    local.firestore_cross_environment_database_names,
+  )
+  canary_topology_firestore_iam_expression = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.canary_projections.name}'"
   monitoring_notification_channels = try(
     [google_monitoring_notification_channel.operations_email[0].name],
     [],
   )
+}
+
+resource "terraform_data" "firestore_database_separation_guard" {
+  input = join(",", sort(tolist(local.firestore_database_allowlist_overlap)))
+
+  lifecycle {
+    precondition {
+      condition     = length(local.firestore_database_allowlist_overlap) == 0
+      error_message = "Authority and topology Firestore restore allowlists must be disjoint; remove overlapping database IDs before applying IAM grants."
+    }
+    precondition {
+      condition     = length(local.firestore_cross_environment_restore_overlap) == 0
+      error_message = "Firestore restore allowlists must not contain managed release-audit or canary database IDs; use an explicitly provisioned restore database instead."
+    }
+  }
 }
 
 resource "terraform_data" "launch_guard" {
@@ -532,6 +571,10 @@ resource "terraform_data" "launch_guard" {
     precondition {
       condition     = !(var.launch_mode || var.manage_production_dns_records) || var.accept_worker_authority_database_risk
       error_message = "launch_mode=true or manage_production_dns_records=true requires explicit accept_worker_authority_database_risk=true after the security owner reviews the database-scoped worker IAM boundary."
+    }
+    precondition {
+      condition     = !(var.launch_mode || var.manage_production_dns_records) || var.accept_projection_marker_writer_risk
+      error_message = "launch_mode=true or manage_production_dns_records=true requires explicit accept_projection_marker_writer_risk=true after the security owner reviews the topology marker-writer boundary, or a separately restricted attestation service/database."
     }
     precondition {
       condition = alltrue([
@@ -2052,6 +2095,21 @@ resource "google_service_account" "api_canary" {
   depends_on   = [google_project_service.required]
 }
 
+# A one-shot bootstrap identity initializes the authority store and writes the
+# topology generation attestation before API replicas are admitted. It is not
+# used by a Deployment and is never granted to the public API service account.
+resource "google_service_account" "bootstrap" {
+  account_id   = "meshr-bootstrap"
+  display_name = "Meshr one-shot production store bootstrap"
+  depends_on   = [google_project_service.required]
+}
+
+resource "google_service_account" "bootstrap_canary" {
+  account_id   = "meshr-bootstrap-canary"
+  display_name = "Meshr one-shot canary store bootstrap"
+  depends_on   = [google_project_service.required]
+}
+
 resource "google_service_account" "worker" {
   for_each     = local.worker_accounts
   account_id   = each.value.account_id
@@ -2487,6 +2545,28 @@ resource "google_project_iam_member" "api_topology_firestore" {
   }
 }
 
+resource "google_project_iam_member" "bootstrap_authority_firestore" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.bootstrap.email}"
+  condition {
+    title       = "production-bootstrap-authority-database"
+    description = "The one-shot production bootstrap may initialize only the configured authority Firestore database."
+    expression  = local.authority_firestore_iam_expression
+  }
+}
+
+resource "google_project_iam_member" "bootstrap_topology_firestore" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.bootstrap.email}"
+  condition {
+    title       = "production-bootstrap-topology-database"
+    description = "The one-shot production bootstrap may attest and initialize only the configured topology Firestore database."
+    expression  = local.topology_firestore_iam_expression
+  }
+}
+
 resource "google_project_iam_member" "api_canary_firestore" {
   project = var.project_id
   role    = "roles/datastore.user"
@@ -2494,7 +2574,7 @@ resource "google_project_iam_member" "api_canary_firestore" {
   condition {
     title       = "canary-firestore-database"
     description = "Canary API can access only the isolated canary Firestore database."
-    expression  = "resource.name == 'projects/${var.project_id}/databases/meshr-canary' || resource.name.startsWith('projects/${var.project_id}/databases/meshr-canary/documents/')"
+    expression  = "resource.name == 'projects/${var.project_id}/databases/meshr-canary'"
   }
 }
 
@@ -2505,6 +2585,28 @@ resource "google_project_iam_member" "api_canary_topology_firestore" {
   condition {
     title       = "canary-api-topology-database"
     description = "Canary API may read aggregate activity projections in the isolated canary topology database."
+    expression  = local.canary_topology_firestore_iam_expression
+  }
+}
+
+resource "google_project_iam_member" "bootstrap_canary_authority_firestore" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.bootstrap_canary.email}"
+  condition {
+    title       = "canary-bootstrap-authority-database"
+    description = "The one-shot canary bootstrap may initialize only the isolated canary authority Firestore database."
+    expression  = "resource.name == 'projects/${var.project_id}/databases/meshr-canary'"
+  }
+}
+
+resource "google_project_iam_member" "bootstrap_canary_topology_firestore" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.bootstrap_canary.email}"
+  condition {
+    title       = "canary-bootstrap-topology-database"
+    description = "The one-shot canary bootstrap may attest and initialize only the isolated canary topology database."
     expression  = local.canary_topology_firestore_iam_expression
   }
 }
@@ -2581,7 +2683,7 @@ resource "google_project_iam_member" "canary_worker_firestore" {
   condition {
     title       = "canary-firestore-database-${each.key}"
     description = "Canary event worker can access only the isolated canary Firestore database."
-    expression  = "resource.name == 'projects/${var.project_id}/databases/meshr-canary' || resource.name.startsWith('projects/${var.project_id}/databases/meshr-canary/documents/')"
+    expression  = "resource.name == 'projects/${var.project_id}/databases/meshr-canary'"
   }
 }
 
@@ -2676,7 +2778,7 @@ resource "google_project_iam_member" "ingest_canary_firestore" {
   condition {
     title       = "canary-ingest-firestore-database"
     description = "Canary ingest can access only the isolated canary Firestore database."
-    expression  = "resource.name == 'projects/${var.project_id}/databases/meshr-canary' || resource.name.startsWith('projects/${var.project_id}/databases/meshr-canary/documents/')"
+    expression  = "resource.name == 'projects/${var.project_id}/databases/meshr-canary'"
   }
 }
 
@@ -2737,6 +2839,18 @@ resource "google_service_account_iam_member" "api_canary_workload_identity" {
   service_account_id = google_service_account.api_canary.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[meshr-canary/meshr-api-canary]"
+}
+
+resource "google_service_account_iam_member" "bootstrap_workload_identity" {
+  service_account_id = google_service_account.bootstrap.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[meshr/meshr-bootstrap]"
+}
+
+resource "google_service_account_iam_member" "bootstrap_canary_workload_identity" {
+  service_account_id = google_service_account.bootstrap_canary.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[meshr-canary/meshr-bootstrap-canary]"
 }
 
 resource "google_service_account_iam_member" "canary_worker_workload_identity" {

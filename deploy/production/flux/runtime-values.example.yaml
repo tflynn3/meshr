@@ -9,6 +9,10 @@ data:
   GCP_PROJECT_ID: PROJECT_ID
   MESHR_FIRESTORE_DATABASE: (default)
   MESHR_TOPOLOGY_FIRESTORE_DATABASE: meshr-projections
+  MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID: pending
+  MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN: "1"
+  MESHR_DATABASE_CUTOVER_MODE: off
+  MESHR_CUTOVER_VALIDATION_MESH_ID: validation-mesh-id
   MESHR_MODERATION_ENDPOINT: https://moderation.example.invalid/screen
   MESHR_MODERATION_HEALTHCHECK_URL: https://moderation.example.invalid/healthz
   MESHR_MODERATION_AUDIENCE: https://moderation.example.invalid

@@ -164,6 +164,14 @@ guard sees the canonical public commons and system taxonomy; it never imports
 local prototype data. SQLite remains a local/emulator compatibility adapter and
 an in-memory browser-read projection in production, never an authority.
 
+The clean-launch guard also checks the isolated topology database. A one-shot
+`production-bootstrap` Job creates `projection_bootstrap/default` only after
+the shard, event ledger, access epoch, aggregate snapshot, total, recent, and
+bucket collections are empty. The
+marker carries the authority `system/bootstrap.bootstrap_id` generation fence;
+API replicas have topology read access only and fail closed when the marker is
+missing, stale, or invalid.
+
 Passwords use scrypt in local mode. Human, pairing, agent bearer, and page-grant
 secrets are stored only as hashes. Raw pairing and agent tokens are returned
 once; the raw page grant is never returned in JSON. Native runtimes retain their

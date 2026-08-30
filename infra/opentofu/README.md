@@ -34,17 +34,31 @@ The protected launch also requires `accept_worker_authority_database_risk=true`
 after the security owner signs the residual worker Firestore boundary in
 [`docs/IAM_MATRIX.md`](../../docs/IAM_MATRIX.md). Leave it false until that
 review is complete; the guard intentionally prevents an unreviewed public
-apply.
+apply. Because the projection bootstrap marker currently shares that
+worker-writable database, the launch additionally requires
+`accept_projection_marker_writer_risk=true` until the marker moves to a
+separately restricted attestation service/database.
 
 Set `alert_notification_email` for the operations owner on the protected
 launch apply. OpenTofu creates one Cloud Monitoring channel and routes the
 HTTP, authentication, topology, live-gateway, outbox, durable-store, and
 moderation alerts plus the billing budget notifications to it. Dry validation
 plans may leave it null. If a restore is cut over, first authorize the restored
-Firestore database with `additional_authority_database_names` and the restored
-topology database with `additional_topology_database_names`, then update the
-protected `MESHR_FIRESTORE_DATABASE` and `MESHR_TOPOLOGY_FIRESTORE_DATABASE`
-runtime values and roll the workloads. Set the protected
+Firestore database with `additional_authority_database_names` and provision a
+fresh empty topology database through `additional_topology_database_names`;
+never restore populated projection collections. Suspend Flux and fence and
+quiesce every API and event reader before restoring the authority. Record an
+external schema-2 cutover receipt that proves the writer fence happened before
+the restore, a fence-bound authority delta was copied with matching collection
+digests/counts, the bounded source delta was replayed, and the source and
+  target outbox high-watermarks agree. Include a unique `receipt_id`, a recent
+  `issued_at`, and the writer fence ID. The protected promotion workflow
+  verifies and atomically consumes the receipt in the isolated release-audit
+  database before switching authorities; an interrupted retry must obtain a
+  newly fenced receipt rather than replaying the old one. Only then update the
+  protected `MESHR_FIRESTORE_DATABASE` and `MESHR_TOPOLOGY_FIRESTORE_DATABASE`
+  runtime values, run the generation-fenced bootstrap Job, attest the marker, and
+  roll and resume the workloads. Set the protected
 `MESHR_AUDIT_FIRESTORE_DATABASE` value to `meshr-release-audit` for production
 and `meshr-canary-release-audit` for canary. Release service accounts access
 only those dedicated Firestore databases; Firestore IAM conditions are
@@ -191,6 +205,44 @@ canary rollouts, and probes the canary API/web health endpoints. Only after that
 protected gate does production update `meshr-production-*` ConfigMaps and the
 auditable digest file; a missing protected variable fails the promotion before a
 release can be advertised.
+
+The production and canary overlays also reconcile a one-shot
+`*-store-bootstrap` Job using the dedicated `meshr-bootstrap` or
+`meshr-bootstrap-canary` Workload Identity service account. It is the only
+intended marker writer and the only component that invokes the bootstrap
+helper; API replicas receive aggregate read access only. Firestore IAM
+conditions are database-scoped, however, so the topology materializer's
+database-scoped write grant could technically mutate the marker. Application
+code keeps that helper out of materializers and the generation fence makes an
+invalid marker or a changed authority generation fail readiness; a
+same-generation rewrite is not detectable by this marker alone. Treat
+marker-writer exclusivity as an application-enforced boundary until the
+attestation is moved to a separately restricted database or custom service.
+Keep a separate approved binding state
+in `MESHR_CANARY_PROTECTED_STATE_JSON` /
+`MESHR_PRODUCTION_PROTECTED_STATE_JSON` (with matching `*_PROTECTED_BINDINGS`)
+for non-normal cost-protection smoke so normal native acceptance cannot
+supersede the throttle fixture.
+
+Protected-mode CI keeps the current refreshed fixture as an AES-256-GCM
+envelope in the dedicated canary or production release-audit Firestore
+database. GitHub Actions
+`meshr-{canary,production}-protected-fixture-{pre,post}` artifacts contain the
+same envelope as bounded evidence only; they are not a recovery fallback or
+authority. The raw `state.json` is never uploaded. On a normal-to-protected
+transition the refreshed pre-rollout envelope is promoted with a generation
+compare-and-set before the runtime mode changes, so the superseded session can
+always be recovered; the post-smoke envelope is a separate generation promoted
+with a second compare-and-set. Runs that are already protected stage only the
+post-smoke generation. If smoke or the workflow fails, the last promoted
+pointer remains available for recovery. Set the matching
+`MESHR_CANARY_PROTECTED_STATE_KEY` or `MESHR_PRODUCTION_PROTECTED_STATE_KEY`
+repository secret to a randomly generated 32-byte key. Rotate it by returning
+the environment to `normal`, refreshing the approved secret, changing the key,
+and entering protected mode again; old artifacts are intentionally not
+decryptable with the new key. A later protected run reads only the current
+release-audit pointer and fails closed if an already-protected environment has
+no current envelope.
 
 The moderation adapter is a separately deployed, authenticated Cloud Run
 workload built from `deploy/images/moderation-adapter.Dockerfile`. CI builds,

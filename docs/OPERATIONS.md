@@ -265,13 +265,43 @@ Derived topology aggregates may remain only when they cannot reconstruct an
 expired body. To recover, pause promotion, restore Firestore to a new database,
 replay the event DLQ with `MESHR_REPLAY_ENVIRONMENT` set to the matching
 production/canary tuple and idempotent consumers, verify private-mesh isolation,
-then authorize the restored database in OpenTofu with
+then authorize the restored authority database and a newly provisioned empty
+topology database in OpenTofu with
 `additional_authority_database_names` and
 `additional_topology_database_names`, update the protected
 `MESHR_FIRESTORE_DATABASE` and `MESHR_TOPOLOGY_FIRESTORE_DATABASE` values,
-and keep `MESHR_AUDIT_FIRESTORE_DATABASE` pinned to its dedicated
+quiesce every API and event-plane reader before resuming Flux, and keep
+`MESHR_AUDIT_FIRESTORE_DATABASE` pinned to its dedicated
 release-audit database; then wait for Flux to roll every API/worker replica
 before running the smoke suite.
+The one-shot bootstrap Job requires the fresh topology database to be empty
+before it creates `projection_bootstrap/default`; the marker is fenced to the
+restored authority `system/bootstrap.bootstrap_id`. Never restore populated
+projection collections: a populated projection,
+missing marker, or generation mismatch is treated as stale and keeps the API
+out of Ready. The API service account cannot repair this marker; rerun the
+protected bootstrap Job after the restore is explicitly authorized.
+Protected cost-mode smoke uses a dedicated approved binding that is never
+reused by native Claude/OpenClaw acceptance. Store its mode-0600 state JSON in
+`MESHR_{CANARY,PRODUCTION}_PROTECTED_STATE_JSON` and its selector in
+`MESHR_{CANARY,PRODUCTION}_PROTECTED_BINDINGS`; the smoke heartbeats the
+session, renews only an existing predecessor, then proves a bounded concurrent
+burst with at least one accepted write, a typed `agent_rate_limited` response,
+`Retry-After`, and recovery. The refreshed state is encrypted with the matching
+`MESHR_{CANARY,PRODUCTION}_PROTECTED_STATE_KEY` secret and staged in the
+dedicated release-audit Firestore database; raw state is never uploaded.
+On a normal-to-protected transition, the refreshed pre-smoke successor is
+promoted before the runtime mode changes with an expected-generation
+compare-and-set, because the refresh supersedes the predecessor. After
+protected-mode smoke succeeds, a distinct post-smoke generation is promoted
+with a second compare-and-set. If a runner is interrupted, the last promoted
+pointer remains the recovery authority; a staged successor cannot replace it.
+GitHub Actions pre/post artifacts are bounded evidence only and are never a
+recovery fallback.
+Protected reruns read the canonical pointer first and fail closed if an
+already-protected environment has no current envelope. Retire a predecessor
+only after the workflow has completed its successful handoff and the operator
+has recorded the promotion receipt.
 The runtime database IDs are intentionally substituted through the protected
 Flux ConfigMap; the Gateway remains same-origin routing and is not the
 authority selector.

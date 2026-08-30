@@ -656,6 +656,95 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       60,
     );
   };
+  // During a Firestore database cutover the old and new stores must never
+  // receive user-visible writes that could be lost if the promotion rolls
+  // back. The promotion workflow temporarily permits only its private,
+  // owner-controlled validation mesh so release smoke can exercise the real
+  // write path while public agents remain read-only.
+  const assertDatabaseCutoverAllows = (meshId?: string): void => {
+    const mode = process.env.MESHR_DATABASE_CUTOVER_MODE?.trim().toLowerCase() || "off";
+    if (mode === "off" || mode === "normal") return;
+    if (mode !== "validation") {
+      throw new ApiError(503, "database_cutover_active", "Meshr is completing a database cutover; writes are temporarily paused.", 30);
+    }
+    const validationMeshId = process.env.MESHR_CUTOVER_VALIDATION_MESH_ID?.trim();
+    if (!validationMeshId || !meshId || meshId !== validationMeshId) {
+      throw new ApiError(503, "database_cutover_active", "Meshr is completing a database cutover; writes are temporarily paused.", 30);
+    }
+  };
+  const assertDatabaseCutoverRouteAllowed = (method: string, path: string): void => {
+    const mode = process.env.MESHR_DATABASE_CUTOVER_MODE?.trim().toLowerCase() || "off";
+    if (mode !== "off" && mode !== "normal" && mode !== "validation") {
+      throw new ApiError(503, "database_cutover_active", "Meshr is completing a database cutover; writes are temporarily paused.", 30);
+    }
+    if (mode !== "validation" || ["GET", "HEAD", "OPTIONS"].includes(method)) return;
+    // Existing agent heartbeats remain available so a reviewed validation
+    // session does not go offline during the gate. Human auth-state/session
+    // creation, logout, pairing, profile, membership, and governance writes
+    // stay fenced; the narrow agent/WebMCP validation routes below perform a
+    // mesh-level allowlist check after reading their request.
+    const alwaysAllowed = new Set([
+      "/v1/agent-sessions/heartbeat",
+    ]);
+    if (alwaysAllowed.has(path)) return;
+    const validationRoute = path === "/v1/agent/posts" ||
+      path === "/v1/webmcp/posts" ||
+      /^\/v1\/(agent|webmcp)\/posts\/[^/]+\/replies$/.test(path) ||
+      /^\/v1\/agent\/meshes\/[^/]+\/join$/.test(path) ||
+      /^\/v1\/agent\/topics\/[^/]+\/follow$/.test(path) ||
+      /^\/v1\/webmcp\/topics\/[^/]+\/follow$/.test(path) ||
+      // A reviewed validation binding may renew its existing session after
+      // the restored authority is serving. The endpoint-level scope check
+      // below rejects every pairing that is not joined to the private
+      // validation mesh; new session starts remain fenced.
+      /^\/v1\/pairings\/[^/]+\/challenges$/.test(path) ||
+      path === "/v1/agent-sessions/renew";
+    if (validationRoute) return;
+    throw new ApiError(
+      503,
+      "database_cutover_active",
+      "Meshr is completing a database cutover; writes are temporarily paused.",
+      30,
+    );
+  };
+  const assertDatabaseCutoverPairingScope = async (pairing: PairingRow): Promise<void> => {
+    const mode = process.env.MESHR_DATABASE_CUTOVER_MODE?.trim().toLowerCase() || "off";
+    if (mode !== "validation") return;
+    const validationMeshId = process.env.MESHR_CUTOVER_VALIDATION_MESH_ID?.trim();
+    if (!validationMeshId || !pairing.agent_id) {
+      throw new ApiError(503, "database_cutover_active", "Meshr is completing a database cutover; only the reviewed validation session may renew.", 30);
+    }
+    try {
+      let visibility: string | undefined;
+      let membership: { status: string } | null | undefined;
+      if (repository?.findMeshById && repository.findMeshAgentMembership) {
+        const [mesh, member] = await Promise.all([
+          repository.findMeshById(validationMeshId),
+          repository.findMeshAgentMembership(validationMeshId, pairing.agent_id),
+        ]);
+        visibility = mesh?.visibility;
+        membership = member;
+      } else {
+        const mesh = db.prepare("SELECT visibility FROM meshes WHERE id = ?").get(validationMeshId) as
+          | { visibility: string }
+          | undefined;
+        visibility = mesh?.visibility;
+        membership = db.prepare(
+          "SELECT 'joined' AS status FROM mesh_members WHERE mesh_id = ? AND agent_id = ? LIMIT 1",
+        ).get(validationMeshId, pairing.agent_id) as { status: string } | undefined;
+      }
+      if (visibility !== "private" || membership?.status !== "joined") {
+        throw new ApiError(503, "database_cutover_active", "Meshr is completing a database cutover; only the reviewed private validation session may renew.", 30);
+      }
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(
+        503,
+        "authorization_store_unavailable",
+        error instanceof Error ? error.message : "The validation-session authorization store is unavailable.",
+      );
+    }
+  };
   const durableWrite = async (
     label: string,
     operation: () => Promise<void>,
@@ -4572,13 +4661,28 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         requestHash: sha256(JSON.stringify(input.requestValue)),
       });
     } catch (error) {
-      if (error instanceof Error && error.message === "rate_limited") {
-        throw new ApiError(
-          429,
-          "global_rate_limited",
-          "Meshr is processing the maximum write rate. Retry after the indicated delay.",
-          1,
-        );
+      if (error instanceof Error) {
+        const quota = /^rate_limited:(agent|account|global):(\d+)$/.exec(error.message);
+        if (quota) {
+          const scope = quota[1]!;
+          const retryAfter = Math.max(1, Number(quota[2]));
+          throw new ApiError(
+            429,
+            `${scope}_rate_limited`,
+            "Meshr is processing the maximum write rate. Retry after the indicated delay.",
+            retryAfter,
+          );
+        }
+        // Keep accepting the legacy repository error while older workers roll
+        // through a deployment. New writes always use the typed scope above.
+        if (error.message === "rate_limited") {
+          throw new ApiError(
+            429,
+            "global_rate_limited",
+            "Meshr is processing the maximum write rate. Retry after the indicated delay.",
+            1,
+          );
+        }
       }
       if (error instanceof Error && error.message === "session_superseded") {
         throw new ApiError(401, "agent_authentication_failed", "This authority is no longer current.");
@@ -4643,6 +4747,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
   const route = async (request: IncomingMessage, url: URL): Promise<RouteResult> => {
     const method = request.method ?? "GET";
     const path = url.pathname;
+    assertDatabaseCutoverRouteAllowed(method, path);
 
     if (method === "GET" && path === "/healthz") {
       const migration = db
@@ -5591,9 +5696,20 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         }
       }
       const agentId = requiredString(input, "agentId", { max: 128 });
-      const agent = db
-        .prepare("SELECT * FROM agents WHERE id = ? AND owner_account_id = ?")
-        .get(agentId, human.accountId) as (AgentRow & { public_key_pem: string }) | undefined;
+      // WebMCP activation can land on any API replica after the browser's
+      // previous request. In production the local SQLite database is only a
+      // disposable projection, so an agent approved or connected on another
+      // replica may not exist here yet. Hydrate the canonical Firestore
+      // profile before checking ownership instead of turning a valid agent
+      // into a replica-local 404.
+      const agent = repository?.findAgentById
+        ? await hydrateDurableAgent(agentId)
+        : (db
+            .prepare("SELECT * FROM agents WHERE id = ? AND owner_account_id = ?")
+            .get(agentId, human.accountId) as AgentRow | undefined);
+      if (agent && agent.owner_account_id !== human.accountId) {
+        throw new ApiError(404, "agent_not_found", "Owned agent not found.");
+      }
       if (!agent) {
         throw new ApiError(404, "agent_not_found", "Owned agent not found.");
       }
@@ -9472,6 +9588,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         "Too many pairing challenges for this binding. Retry after the indicated delay.",
       );
       const pairing = await requirePairing(request, id);
+      await assertDatabaseCutoverPairingScope(pairing);
       if (pairing.status !== "approved" && pairing.status !== "claimed") {
         throw new ApiError(409, "pairing_not_approved", "Pairing has not been approved.");
       }
@@ -9695,6 +9812,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         pattern: /^[A-Za-z0-9_-]+$/,
       });
       const pairing = await requirePairing(request, pairingId);
+      await assertDatabaseCutoverPairingScope(pairing);
       if ((pairing.status !== "approved" && pairing.status !== "claimed") || !pairing.agent_id) {
         throw new ApiError(409, "pairing_not_approved", "Pairing has not been approved.");
       }
@@ -10020,6 +10138,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         pattern: /^[A-Za-z0-9_-]+$/,
       });
       const pairing = await requirePairing(request, pairingId);
+      await assertDatabaseCutoverPairingScope(pairing);
       if ((pairing.status !== "approved" && pairing.status !== "claimed") || !pairing.agent_id) {
         throw new ApiError(409, "pairing_not_approved", "Pairing has not been approved.");
       }
@@ -10755,6 +10874,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         const meshId = requiredString(input, "meshId", { max: 128 });
         const topicId = requiredString(input, "topicId", { max: 128 });
         const body = requiredString(input, "body", { max: 1_200 });
+        assertDatabaseCutoverAllows(meshId);
         await ensureMeshAccessAuthoritatively(principal.agentId, meshId);
         await ensureMeshMembershipAuthoritatively(principal.agentId, meshId);
         const topic = await topicForAgentRoute(principal.agentId, topicId);
@@ -10834,6 +10954,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             .get(parentId, database.now()) as { id: string; mesh_id: string; topic_id: string } | undefined;
         }
         if (!parent) throw new ApiError(404, "post_not_found", "Post not found.");
+        assertDatabaseCutoverAllows(parent.mesh_id);
         await ensureMeshAccessAuthoritatively(principal.agentId, parent.mesh_id);
         await ensureMeshMembershipAuthoritatively(principal.agentId, parent.mesh_id);
         const requestValue = { parentPostId: parentId, body };
@@ -10870,6 +10991,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         const key = requireIdempotencyKey(request);
         const topic = await webMcpTopicForAccess(principal, topicId);
         await ensureAttentionMeshAccessAuthoritatively(principal.agent, principal.agentId, topic.mesh_id);
+        assertDatabaseCutoverAllows(topic.mesh_id);
         await ensureMeshMembershipAuthoritatively(principal.agentId, topic.mesh_id);
         const followEventId = `follow_${sha256(`page:${principal.agentId}:${topicId}:${key}`).slice(0, 40)}`;
         const projectFollow = () => idempotent(
@@ -11117,6 +11239,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       }
 
       if (method === "PUT" && path === "/v1/agent/profile") {
+        assertDatabaseCutoverAllows();
         const profileInput = asObject(await readJson(request));
         if (profileInput.reload !== undefined && typeof profileInput.reload !== "boolean") {
           throw new ApiError(400, "invalid_profile", "reload must be a boolean.");
@@ -11284,6 +11407,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         const postId = decodeURIComponent(agentAppealMatch[1]);
         const post = await findPostForModeration(postId);
         if (!post) throw new ApiError(404, "post_not_found", "Post not found.");
+        assertDatabaseCutoverAllows(post.meshId);
         if (post.agentId !== principal.agentId) {
           throw new ApiError(403, "post_authorization_denied", "An agent can only appeal its own post.");
         }
@@ -11417,6 +11541,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       const agentJoinMatch = matchingPath(path, /^\/v1\/agent\/meshes\/([^/]+)\/join$/);
       if (method === "POST" && agentJoinMatch) {
         const meshId = decodeURIComponent(agentJoinMatch[1]);
+        assertDatabaseCutoverAllows(meshId);
         const key = requireIdempotencyKey(request);
         let invitationTokenHash: string | undefined;
         const contentLengthHeader = request.headers["content-length"];
@@ -11861,6 +11986,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         const meshId = requiredString(input, "meshId", { max: 128 });
         const topicId = requiredString(input, "topicId", { max: 128 });
         const body = requiredString(input, "body", { max: 1_200 });
+        assertDatabaseCutoverAllows(meshId);
         await ensureMeshAccessAuthoritatively(principal.agentId, meshId);
         await ensureMeshMembershipAuthoritatively(principal.agentId, meshId);
         const topic = await topicForAgentRoute(principal.agentId, topicId);
@@ -11933,6 +12059,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             .get(parentId) as { id: string; mesh_id: string; topic_id: string } | undefined;
         }
         if (!parent) throw new ApiError(404, "post_not_found", "Post not found.");
+        assertDatabaseCutoverAllows(parent.mesh_id);
         await ensureMeshAccessAuthoritatively(principal.agentId, parent.mesh_id);
         await ensureMeshMembershipAuthoritatively(principal.agentId, parent.mesh_id);
         const requestValue = { parentPostId: parentId, body };
@@ -11996,6 +12123,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           return { body: { topicId, following: false } };
         }
         await ensureAttentionMeshAccessAuthoritatively(actingAgent, principal.agentId, topic.mesh_id);
+        assertDatabaseCutoverAllows(topic.mesh_id);
         await ensureMeshMembershipAuthoritatively(principal.agentId, topic.mesh_id);
         const following = method === "PUT";
         const followOperation = following ? "topic.follow" : "topic.unfollow";

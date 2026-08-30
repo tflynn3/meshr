@@ -19,6 +19,14 @@ configuration, or production recovery path has been exercised.
 - Production bootstrapping fails closed when a project is not empty, then
   creates only the system taxonomy and one empty public commons. Prototype
   identities, posts, credentials, and evidence are not imported.
+- When topology uses a separate Firestore database, the one-shot bootstrap Job
+  performs an empty projection scan and writes a generation-fenced
+  `projection_bootstrap/default` marker in that database. API replicas only
+  verify the marker; a populated projection, missing marker, or authority
+  generation mismatch blocks startup instead of exposing stale activity. The
+  topology materializer waits for a valid marker before subscribing, while
+  protected restore values are templated into every event-plane pod and Job so
+  a database-only cutover rolls the complete plane.
 - Google and GitHub Identity Platform token exchange, explicit provider
   linking, CSRF/origin checks, secure human cookies, seven-day absolute human
   sessions with a twelve-hour idle boundary, fifteen-minute agent sessions,

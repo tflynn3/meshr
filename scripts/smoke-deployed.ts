@@ -5,6 +5,7 @@ import { dirname, resolve } from "node:path";
 import { WebSocket } from "ws";
 import { MeshrApi, MeshrApiError } from "../connector/api.ts";
 import { ConnectorStateStore } from "../connector/state.ts";
+import type { ConnectorBinding } from "../connector/types.ts";
 
 type Json = Record<string, unknown> | unknown[] | string | number | boolean | null;
 
@@ -209,6 +210,218 @@ function eventPostId(value: unknown): string | null {
   return typeof postId === "string" ? postId : null;
 }
 
+async function requireProtectedBinding(
+  stateFile: string,
+  selectorValue: string,
+  label: string,
+): Promise<{ store: ConnectorStateStore; binding: ConnectorBinding; selector: string }> {
+  const statePath = resolve(stateFile);
+  const store = new ConnectorStateStore(dirname(statePath), { useKeychain: false });
+  if (store.path !== statePath) throw new Error("MESHR_E2E_PROTECTED_STATE_FILE must point to a state.json file in a dedicated directory.");
+  const selector = selectorValue.split(",").map((value) => value.trim()).filter(Boolean)[0];
+  if (!selector) throw new Error("MESHR_E2E_PROTECTED_BINDING_SELECTOR must identify an approved binding.");
+  // Keeping selector logic in one place prevents a release gate from
+  // accidentally choosing the newest of two ambiguous bindings.
+  const state = await store.load();
+  const candidates = state.bindings.filter((binding) =>
+    binding.pairingId === selector ||
+    binding.bindingId === selector ||
+    binding.requestedProfile.handle === selector,
+  );
+  if (candidates.length !== 1) {
+    throw new Error(`Expected exactly one ${label} binding for ${selector}; found ${candidates.length}.`);
+  }
+  return { store, selector, binding: candidates[0]! };
+}
+
+/**
+ * A database cutover must never exercise the normal pairing/session-start
+ * path: those writes would create authority that a rollback could not carry
+ * back to the previous database. Use a reviewed, already-connected binding;
+ * the target may renew that existing binding after restore, and writes remain
+ * limited to the private release-validation mesh. This is intentionally
+ * separate from cost-protection smoke, whose fixture may also be renewed.
+ */
+async function assertCutoverValidationFlow(
+  stateFile: string,
+  selectorValue: string,
+  meshId: string,
+  topicId: string,
+): Promise<void> {
+  if (!meshId || meshId === "mesh-public" || !topicId) {
+    throw new Error("Database cutover validation requires a private mesh and topic.");
+  }
+  const { store, binding, selector } = await requireProtectedBinding(stateFile, selectorValue, "cutover validation");
+  if (binding.status !== "connected" || !binding.agentToken || !binding.sessionId) {
+    throw new Error(`Cutover validation binding ${selector} must be connected with an active session token; refresh the candidate-database fixture before promotion.`);
+  }
+  const api = new MeshrApi(binding.serverUrl);
+  const assertTokenHorizon = (minimumMs: number): void => {
+    const tokenExpiresAt = binding.agentTokenExpiresAt ? Date.parse(binding.agentTokenExpiresAt) : Number.NaN;
+    if (!Number.isFinite(tokenExpiresAt) || tokenExpiresAt <= Date.now() + minimumMs) {
+      throw new Error(`Cutover validation binding ${selector} expires too soon; refresh the candidate-database fixture immediately before promotion.`);
+    }
+  };
+  if (new URL(binding.serverUrl).origin !== baseOrigin) {
+    throw new Error(`Cutover validation binding ${selector} points at ${binding.serverUrl}, not the deployed origin.`);
+  }
+  // The restored authority may be reached after a long image rollout. Renew
+  // the reviewed session against the target authority when its bearer is near
+  // expiry (or when the first heartbeat proves the old token is stale). The
+  // validation-only challenge/renew routes are scoped server-side to this
+  // binding's joined private mesh; new session starts remain fenced.
+  const renewValidationSession = async (): Promise<void> => {
+    if (!binding.sessionId || !binding.pairingSecret || !binding.privateKeyPem) {
+      throw new Error(`Cutover validation binding ${selector} lacks the pairing credentials required for target-authority renewal.`);
+    }
+    const challenge = await api.createChallenge(binding, binding.sessionId);
+    const signature = sign(null, Buffer.from(challenge.message, "utf8"), binding.privateKeyPem).toString("base64url");
+    const renewed = await api.renewAgentSession({
+      binding,
+      challengeId: challenge.challengeId,
+      sessionId: binding.sessionId,
+      signature,
+    });
+    Object.assign(binding, {
+      status: "connected" as const,
+      agentToken: renewed.token,
+      agentTokenExpiresAt: renewed.expiresAt,
+      sessionId: renewed.sessionId,
+      bindingId: renewed.bindingId ?? binding.bindingId,
+      ...(renewed.agent?.id ? { agentId: renewed.agent.id } : {}),
+    });
+    await store.upsert(binding);
+  };
+  const tokenExpiresAt = binding.agentTokenExpiresAt ? Date.parse(binding.agentTokenExpiresAt) : Number.NaN;
+  if (!Number.isFinite(tokenExpiresAt) || tokenExpiresAt <= Date.now() + 120_000) {
+    try {
+      await renewValidationSession();
+    } catch (error) {
+      // Renewal is bounded by the server's two-minute early-renewal rule. If
+      // the session still has useful runway, heartbeat below remains the
+      // authoritative check; all other errors are surfaced.
+      if (!(error instanceof MeshrApiError) || error.code !== "renewal_too_early") throw error;
+    }
+  }
+  const agentAuthorization = () => ({ authorization: `Bearer ${binding.agentToken!}` });
+  let heartbeat = await request("/v1/agent-sessions/heartbeat", {
+    method: "POST",
+    headers: agentAuthorization(),
+  });
+  if (heartbeat.status === 401) {
+    await renewValidationSession();
+    heartbeat = await request("/v1/agent-sessions/heartbeat", {
+      method: "POST",
+      headers: agentAuthorization(),
+    });
+  }
+  expectStatus(heartbeat, 200, "cutover validation session heartbeat");
+  const heartbeatBody = objectBody(heartbeat.body, "cutover validation session heartbeat");
+  if (heartbeatBody.sessionId !== binding.sessionId || heartbeatBody.status !== "online") {
+    throw new Error("Cutover validation heartbeat did not confirm the reviewed target-authority session.");
+  }
+  if (typeof heartbeatBody.expiresAt === "string") binding.agentTokenExpiresAt = heartbeatBody.expiresAt;
+
+  // These two negative checks make the write fence observable: a release run
+  // cannot silently fall back to a public write or revoke an old-store session
+  // while the candidate database is being validated.
+  const publicFence = await request("/v1/agent/posts", {
+    method: "POST",
+    headers: { ...agentAuthorization(), "idempotency-key": `cutover-fence:${randomUUID()}` },
+    body: json({ meshId: "mesh-public", topicId, body: "cutover fence probe" }),
+  });
+  expectStatus(publicFence, 503, "cutover public-write fence");
+  const publicFenceBody = objectBody(publicFence.body, "cutover public-write fence");
+  if (!publicFenceBody.error || typeof publicFenceBody.error !== "object" || Array.isArray(publicFenceBody.error) ||
+      (publicFenceBody.error as Record<string, unknown>).code !== "database_cutover_active") {
+    throw new Error("Cutover public-write fence did not identify database_cutover_active.");
+  }
+  const logoutFence = await request("/v1/session", {
+    method: "DELETE",
+    headers: { "x-meshr-csrf": "cutover-fence" },
+  });
+  expectStatus(logoutFence, 503, "cutover logout fence");
+
+  let meshes = await request("/v1/agent/meshes", { headers: agentAuthorization() });
+  expectStatus(meshes, 200, "cutover validation mesh discovery");
+  let meshList = objectBody(meshes.body, "cutover validation mesh discovery").meshes;
+  if (!Array.isArray(meshList)) throw new Error("Cutover validation mesh discovery returned no mesh list.");
+  let mesh = meshList.find((candidate) =>
+    candidate && typeof candidate === "object" && !Array.isArray(candidate) &&
+    (candidate as Record<string, unknown>).id === meshId,
+  );
+  if (mesh && typeof mesh === "object" && !Array.isArray(mesh) &&
+      (mesh as Record<string, unknown>).joined !== true) {
+    const join = await request(`/v1/agent/meshes/${encodeURIComponent(meshId)}/join`, {
+      method: "POST",
+      headers: { ...agentAuthorization(), "idempotency-key": `cutover-validation:${randomUUID()}` },
+      body: json({}),
+    });
+    if (![200, 201].includes(join.status) || objectBody(join.body, "cutover validation mesh join").status !== "joined") {
+      throw new Error(`Cutover validation mesh ${meshId} did not admit the reviewed release agent.`);
+    }
+    meshes = await request("/v1/agent/meshes", { headers: agentAuthorization() });
+    expectStatus(meshes, 200, "cutover validation mesh rediscovery");
+    meshList = objectBody(meshes.body, "cutover validation mesh rediscovery").meshes;
+    if (!Array.isArray(meshList)) throw new Error("Cutover validation mesh rediscovery returned no mesh list.");
+    mesh = meshList.find((candidate) =>
+      candidate && typeof candidate === "object" && !Array.isArray(candidate) &&
+      (candidate as Record<string, unknown>).id === meshId,
+    );
+  }
+  if (!mesh || typeof mesh !== "object" || Array.isArray(mesh)) {
+    throw new Error(`Cutover validation agent is not a member of private mesh ${meshId}.`);
+  }
+  const meshRecord = mesh as Record<string, unknown>;
+  if (meshRecord.joined !== true || meshRecord.visibility !== "private") {
+    throw new Error("Cutover validation writes require a joined private validation mesh.");
+  }
+  const topics = await request(`/v1/agent/meshes/${encodeURIComponent(meshId)}/topics`, {
+    headers: agentAuthorization(),
+  });
+  expectStatus(topics, 200, "cutover validation topic discovery");
+  const topicList = objectBody(topics.body, "cutover validation topic discovery").topics;
+  if (!Array.isArray(topicList) || !topicList.some((candidate) =>
+    candidate && typeof candidate === "object" && !Array.isArray(candidate) &&
+    (candidate as Record<string, unknown>).id === topicId,
+  )) {
+    throw new Error(`Cutover validation topic ${topicId} was not found in private mesh ${meshId}.`);
+  }
+
+  const marker = `cutover-validation:${Date.now()}:${randomUUID().slice(0, 8)}`;
+  assertTokenHorizon(30_000);
+  const root = await request("/v1/agent/posts", {
+    method: "POST",
+    headers: { ...agentAuthorization(), "idempotency-key": `${marker}:root` },
+    body: json({ meshId, topicId, body: `${marker} root observation` }),
+  });
+  expectStatus(root, 201, "cutover validation root post");
+  const rootRecord = objectBody(objectBody(root.body, "cutover validation root post").post as Json, "cutover validation root post");
+  const rootId = String(rootRecord.id ?? "");
+  if (!rootId) throw new Error("Cutover validation root post omitted its ID.");
+  assertTokenHorizon(30_000);
+  const reply = await request(`/v1/agent/posts/${encodeURIComponent(rootId)}/replies`, {
+    method: "POST",
+    headers: { ...agentAuthorization(), "idempotency-key": `${marker}:reply` },
+    body: json({ body: `${marker} reply observation` }),
+  });
+  expectStatus(reply, 201, "cutover validation reply post");
+  const replyRecord = objectBody(objectBody(reply.body, "cutover validation reply post").post as Json, "cutover validation reply post");
+  const replyId = String(replyRecord.id ?? "");
+  if (!replyId) throw new Error("Cutover validation reply post omitted its ID.");
+  const readback = await request(`/v1/agent/topics/${encodeURIComponent(topicId)}/posts`, {
+    headers: agentAuthorization(),
+  });
+  expectStatus(readback, 200, "cutover validation post readback");
+  const posts = objectBody(readback.body, "cutover validation post readback").posts;
+  if (!Array.isArray(posts) ||
+      !posts.some((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate) && (candidate as Record<string, unknown>).id === rootId) ||
+      !posts.some((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate) && (candidate as Record<string, unknown>).id === replyId)) {
+    throw new Error("Cutover validation readback did not include both accepted writes.");
+  }
+  checks.push("database-cutover validation fence and private root/reply writes");
+}
+
 /**
  * Protected-mode smoke uses one already-approved binding from a CI secret to
  * prove the real session-start boundary. Pairing creation alone is not enough:
@@ -258,6 +471,219 @@ async function assertProtectedSessionStartBlocked(stateFile: string, selectorVal
   throw new Error("Protected mode allowed a new runtime session for an existing binding.");
 }
 
+/**
+ * Throttle mode keeps an already-running agent useful while reducing its
+ * write budget. Exercise the real native post route so a release cannot
+ * report throttle acceptance after checking only the pairing/session blocks
+ * shared with protect mode. A bounded concurrent burst must observe the
+ * documented typed 429 contract from the per-agent token bucket and recover
+ * after Retry-After.
+ */
+async function assertThrottleWriteLimit(
+  stateFile: string,
+  selectorValue: string,
+  meshId: string,
+  topicId: string,
+): Promise<void> {
+  const statePath = resolve(stateFile);
+  const store = new ConnectorStateStore(dirname(statePath), { useKeychain: false });
+  if (store.path !== statePath) throw new Error("MESHR_E2E_PROTECTED_STATE_FILE must point to a state.json file in a dedicated directory.");
+  const state = await store.load();
+  const selector = selectorValue.split(",").map((value) => value.trim()).filter(Boolean)[0];
+  if (!selector) throw new Error("MESHR_E2E_PROTECTED_BINDING_SELECTOR must identify an approved binding.");
+  const candidates = state.bindings.filter((binding) =>
+    binding.pairingId === selector || binding.bindingId === selector || binding.requestedProfile.handle === selector,
+  );
+  if (candidates.length !== 1) throw new Error(`Expected exactly one throttle smoke binding for ${selector}; found ${candidates.length}.`);
+  const binding = candidates[0]!;
+  if (new URL(binding.serverUrl).origin !== baseOrigin) {
+    throw new Error(`Throttle smoke binding ${selector} points at ${binding.serverUrl}, not the deployed origin.`);
+  }
+  const api = new MeshrApi(binding.serverUrl);
+  let agentToken = binding.agentToken;
+  // Leave enough lifetime for the bounded burst, the Retry-After recovery,
+  // and one network retry. A token that is technically valid but expires
+  // during this gate would make a quota failure indistinguishable from auth
+  // expiry and produce a flaky release result.
+  const tokenExpiresAt = binding.agentTokenExpiresAt ? Date.parse(binding.agentTokenExpiresAt) : Number.NaN;
+  if (agentToken && Number.isFinite(tokenExpiresAt) && tokenExpiresAt <= Date.now() + 120_000) {
+    agentToken = undefined;
+  }
+  // The state secret is a durable host fixture, but the bearer and session
+  // may have gone idle while a release waited for approval. Prove that the
+  // session is still alive before posting; only an expired-but-current
+  // predecessor may be renewed. A superseded predecessor must fail rather
+  // than silently creating a new session in protected mode.
+  let heartbeatError: unknown;
+  if (agentToken) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await api.heartbeatAgentSession({ ...binding, agentToken });
+        heartbeatError = undefined;
+        break;
+      } catch (error) {
+        heartbeatError = error;
+        const transient = !(error instanceof MeshrApiError) || error.status >= 500;
+        if (!transient || attempt === 1) break;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+  }
+  const heartbeatAllowsRenewal = heartbeatError instanceof MeshrApiError &&
+    heartbeatError.status === 401 &&
+    heartbeatError.code === "agent_authentication_failed";
+  if (heartbeatError && !heartbeatAllowsRenewal) {
+    throw new Error(`Throttle smoke heartbeat failed for ${selector}; refusing to create a new protected session: ${heartbeatError instanceof Error ? heartbeatError.message : String(heartbeatError)}`);
+  }
+  if (!agentToken || heartbeatAllowsRenewal) {
+    if (!binding.sessionId || !binding.pairingSecret || !binding.privateKeyPem) {
+      throw new Error(`Throttle smoke binding ${selector} must contain an active renewable session; refresh the protected native session state before running this gate.`);
+    }
+    try {
+      const challenge = await api.createChallenge(binding, binding.sessionId);
+      const signature = sign(null, Buffer.from(challenge.message, "utf8"), binding.privateKeyPem).toString("base64url");
+      const renewed = await api.renewAgentSession({
+        binding,
+        challengeId: challenge.challengeId,
+        sessionId: binding.sessionId,
+        signature,
+      });
+      agentToken = renewed.token;
+      Object.assign(binding, {
+        status: "connected" as const,
+        agentToken: renewed.token,
+        agentTokenExpiresAt: renewed.expiresAt,
+        sessionId: renewed.sessionId,
+        bindingId: renewed.bindingId ?? binding.bindingId,
+        ...(renewed.agent?.id ? { agentId: renewed.agent.id } : {}),
+      });
+      // Keep the runner-local copy coherent if a later check needs the same
+      // fixture. The protected repository secret itself is never rewritten.
+      await store.upsert(binding);
+    } catch (error) {
+      throw new Error(`Throttle smoke could not heartbeat or renew the existing session for ${selector}; keep a connected binding in the protected state secret: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (!agentToken) {
+    throw new Error(`Throttle smoke binding ${selector} must contain an active agentToken or a renewable sessionId; refresh the protected native session state before running this gate.`);
+  }
+  // The reduced durable bucket has five tokens and refills at 0.5/s. Let a
+  // prior release's fixture drain back to a full bucket before creating a
+  // bounded burst. The gate only requires observable contention and a typed
+  // agent quota response; it does not make the network latency of the first
+  // five requests part of the contract.
+  await new Promise((resolve) => setTimeout(resolve, 11_000));
+  const post = async (index: number): Promise<{ status: number; code?: string; retryAfter: number }> => {
+    const response = await fetch(`${base}/v1/agent/posts`, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        authorization: `Bearer ${agentToken}`,
+        "idempotency-key": `throttle-smoke:${randomUUID()}`,
+      },
+      body: JSON.stringify({
+        meshId,
+        topicId,
+        body: `Throttle-mode launch check ${index + 1}.`,
+      }),
+    });
+    const text = await response.text();
+    let body: Json = null;
+    if (text) {
+      try { body = JSON.parse(text) as Json; } catch { body = text; }
+    }
+    const error = body && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>).error
+      : undefined;
+    const code = error && typeof error === "object" && !Array.isArray(error)
+      ? (error as Record<string, unknown>).code
+      : undefined;
+    return {
+      status: response.status,
+      ...(typeof code === "string" ? { code } : {}),
+      retryAfter: Number(response.headers.get("retry-after") ?? "0"),
+    };
+  };
+  const burst = await Promise.all(
+    Array.from({ length: 12 }, (_, index) => post(index)),
+  );
+  const accepted = burst.filter((response) => response.status === 201);
+  const limited = burst.filter((response) => response.status === 429 && response.code === "agent_rate_limited");
+  const contention = burst.filter((response) =>
+    response.status === 429 &&
+    (response.code === "global_rate_limited" || response.code === "account_rate_limited"),
+  );
+  const unexpected = burst.filter((response) =>
+    response.status !== 201 &&
+    !(response.status === 429 &&
+      (response.code === "agent_rate_limited" || response.code === "global_rate_limited" || response.code === "account_rate_limited")),
+  );
+  if (unexpected.length > 0) {
+    const summary = unexpected.map((response) => `${response.status}/${response.code ?? "unknown"}`).join(", ");
+    throw new Error(`Throttle bounded burst returned unexpected responses: ${summary}.`);
+  }
+  // Shared account/global buckets can legitimately win the race before the
+  // per-agent bucket is exhausted. Continue with a bounded, Retry-After-aware
+  // probe until the same agent receives a typed agent quota response. This
+  // keeps the gate independent of how many other canary viewers happen to be
+  // online while still proving the agent-specific contract.
+  const probeDeadline = Date.now() + 45_000;
+  let probeIndex = burst.length;
+  while (limited.length < 1 && Date.now() < probeDeadline) {
+    const response = await post(probeIndex++);
+    if (response.status === 201) {
+      accepted.push(response);
+      continue;
+    }
+    if (response.status === 429 && response.code === "agent_rate_limited") {
+      limited.push(response);
+      continue;
+    }
+    if (response.status === 429 && (response.code === "global_rate_limited" || response.code === "account_rate_limited")) {
+      contention.push(response);
+      const sharedRetryAfter = Number.isFinite(response.retryAfter) && response.retryAfter > 0
+        ? response.retryAfter
+        : 1;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(10, sharedRetryAfter) * 1_000));
+      continue;
+    }
+    unexpected.push(response);
+  }
+  if (unexpected.length > 0) {
+    const summary = unexpected.map((response) => `${response.status}/${response.code ?? "unknown"}`).join(", ");
+    throw new Error(`Throttle bounded probe returned unexpected responses: ${summary}.`);
+  }
+  if (accepted.length < 1) {
+    throw new Error("Throttle bounded burst did not accept any writes; the dedicated fixture may be globally contended.");
+  }
+  if (limited.length < 1) {
+    throw new Error("Throttle bounded burst did not return a typed agent_rate_limited response within the bounded probe window; isolate the fixture quota or investigate shared contention.");
+  }
+  const retryAfter = Math.max(...limited.map((response) => response.retryAfter));
+  if (!Number.isFinite(retryAfter) || retryAfter < 1) {
+    throw new Error("Throttle mode returned agent_rate_limited without a positive Retry-After header.");
+  }
+  await new Promise((resolve) => setTimeout(resolve, Math.min(15, retryAfter) * 1_000 + 250));
+  const recoveryDeadline = Date.now() + 30_000;
+  let recovered = await post(12);
+  while (
+    recovered.status === 429 &&
+    (recovered.code === "global_rate_limited" || recovered.code === "account_rate_limited") &&
+    Date.now() < recoveryDeadline
+  ) {
+    const sharedRetryAfter = Number.isFinite(recovered.retryAfter) && recovered.retryAfter > 0
+      ? recovered.retryAfter
+      : 1;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(10, sharedRetryAfter) * 1_000));
+    recovered = await post(12);
+  }
+  if (recovered.status !== 201) {
+    throw new Error(`Throttle write recovery returned HTTP ${recovered.status} (${recovered.code ?? "unknown"}); expected 201 after Retry-After and bounded shared-contention retries.`);
+  }
+  checks.push(`throttle-mode bounded burst (${accepted.length} accepted, ${limited.length} agent-limited, ${contention.length} shared-contention) recovery`);
+}
+
 async function eventually<T>(
   label: string,
   operation: () => Promise<T>,
@@ -298,13 +724,53 @@ async function main(): Promise<void> {
   const staticIdToken = process.env.MESHR_E2E_SOCIAL_ID_TOKEN?.trim();
   const refreshToken = process.env.MESHR_E2E_SOCIAL_REFRESH_TOKEN?.trim();
   const identityApiKey = process.env.MESHR_E2E_IDENTITY_API_KEY?.trim();
-  const idToken = await resolveSocialIdToken(staticIdToken, refreshToken, identityApiKey);
   const email = process.env.MESHR_E2E_EMAIL?.trim();
   const password = process.env.MESHR_E2E_PASSWORD ?? "";
   const costProtectionMode = (process.env.MESHR_COST_PROTECTION_MODE?.trim().toLowerCase() || "normal");
   if (costProtectionMode !== "normal" && costProtectionMode !== "protect" && costProtectionMode !== "throttle") {
     throw new Error("MESHR_COST_PROTECTION_MODE must be normal, protect, or throttle when supplied.");
   }
+  const databaseCutoverMode = (process.env.MESHR_DATABASE_CUTOVER_MODE?.trim().toLowerCase() || "off");
+  if (databaseCutoverMode !== "off" && databaseCutoverMode !== "normal" && databaseCutoverMode !== "validation") {
+    throw new Error("MESHR_DATABASE_CUTOVER_MODE must be off, normal, or validation when supplied.");
+  }
+  if (databaseCutoverMode === "validation" && costProtectionMode !== "normal") {
+    throw new Error("Database cutover validation must run with MESHR_COST_PROTECTION_MODE=normal so its reviewed fixture remains unambiguous across authorities.");
+  }
+  // Release acceptance writes only to an isolated private validation mesh.
+  // Keep these values outside the human-login branch so a cutover can prove
+  // the candidate authority without creating a new browser session that a
+  // rollback could not reproduce in the previous database.
+  const validationMeshId = process.env.MESHR_RELEASE_VALIDATION_MESH_ID?.trim() || "mesh-public";
+  const validationTopicId = process.env.MESHR_RELEASE_VALIDATION_TOPIC_ID?.trim();
+  if (requireFull && (validationMeshId === "mesh-public" || !validationTopicId)) {
+    throw new Error(
+      "Full deployed E2E requires MESHR_RELEASE_VALIDATION_MESH_ID (private) and MESHR_RELEASE_VALIDATION_TOPIC_ID; release smoke must not write to mesh-public.",
+    );
+  }
+  if (databaseCutoverMode === "validation") {
+    if (!requireFull) {
+      throw new Error("Database cutover validation is only supported by the full deployed release gate.");
+    }
+    const protectedStateFile = process.env.MESHR_E2E_PROTECTED_STATE_FILE?.trim();
+    const protectedBindingSelector = process.env.MESHR_E2E_PROTECTED_BINDING_SELECTOR?.trim();
+    if (!protectedStateFile || !protectedBindingSelector || !validationTopicId) {
+      throw new Error("Database cutover validation requires a candidate-database protected state file, binding selector, private mesh, and topic.");
+    }
+    const cutoverMeshId = process.env.MESHR_CUTOVER_VALIDATION_MESH_ID?.trim() || validationMeshId;
+    if (cutoverMeshId !== validationMeshId) {
+      throw new Error("MESHR_CUTOVER_VALIDATION_MESH_ID must match MESHR_RELEASE_VALIDATION_MESH_ID during release validation.");
+    }
+    await assertCutoverValidationFlow(
+      protectedStateFile,
+      protectedBindingSelector,
+      cutoverMeshId,
+      validationTopicId,
+    );
+    console.log(JSON.stringify({ ok: true, fullAuth: false, checks, databaseCutover: "validated" }));
+    return;
+  }
+  const idToken = await resolveSocialIdToken(staticIdToken, refreshToken, identityApiKey);
   if ((!provider || !idToken) && (!email || !password)) {
     if (requireFull) {
       throw new Error("Full deployed E2E requires MESHR_E2E_SOCIAL_PROVIDER plus a static MESHR_E2E_SOCIAL_ID_TOKEN or the refresh-token/API-key pair, or MESHR_E2E_EMAIL + MESHR_E2E_PASSWORD.");
@@ -340,18 +806,6 @@ async function main(): Promise<void> {
   if (!csrfToken) throw new Error("session exchange did not return a CSRF token.");
   const me = await request("/v1/me");
   expectStatus(me, 200, "authenticated account read");
-
-  // Release acceptance writes only to an isolated private validation mesh.
-  // The public commons is for real agents and must never accumulate CI
-  // markers or implementation chatter. Local/manual smoke can continue to
-  // use the seeded commons when the full deployed gate is not requested.
-  const validationMeshId = process.env.MESHR_RELEASE_VALIDATION_MESH_ID?.trim() || "mesh-public";
-  const validationTopicId = process.env.MESHR_RELEASE_VALIDATION_TOPIC_ID?.trim();
-  if (requireFull && (validationMeshId === "mesh-public" || !validationTopicId)) {
-    throw new Error(
-      "Full deployed E2E requires MESHR_RELEASE_VALIDATION_MESH_ID (private) and MESHR_RELEASE_VALIDATION_TOPIC_ID; release smoke must not write to mesh-public.",
-    );
-  }
 
   // Reuse one owner-approved identity for repeated release checks so a daily
   // canary does not consume the account's 25-agent launch quota. Set a
@@ -406,8 +860,18 @@ async function main(): Promise<void> {
         throw new Error("Full protected-mode E2E requires MESHR_E2E_PROTECTED_STATE_FILE and MESHR_E2E_PROTECTED_BINDING_SELECTOR.");
       }
       await assertProtectedSessionStartBlocked(protectedStateFile, protectedBindingSelector);
+      if (costProtectionMode === "throttle") {
+        await assertThrottleWriteLimit(
+          protectedStateFile,
+          protectedBindingSelector,
+          validationMeshId,
+          validationTopicId!,
+        );
+      }
     }
-    checks.push("protected-mode read, session, and creation policy");
+    checks.push(costProtectionMode === "throttle"
+      ? "throttle-mode read, session, and creation policy"
+      : "protected-mode read, session, and creation policy");
     console.log(JSON.stringify({ ok: true, fullAuth: true, checks, protectedMode: costProtectionMode }));
     return;
   }

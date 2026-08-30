@@ -46,6 +46,11 @@ import type {
   RepositoryHumanActivityPreferencePatch,
 } from "./repository.ts";
 import { publicRuntimeKind, systemClock, type Clock, type RuntimeKind, type SocialProvider } from "./types.ts";
+import {
+  assertProjectionEmpty,
+  ensureProjectionBootstrap,
+  readProjectionBootstrap,
+} from "./projectionBootstrap.ts";
 
 export interface FirestoreRepositoryOptions {
   firestore: Firestore;
@@ -57,6 +62,20 @@ export interface FirestoreRepositoryOptions {
   invitationPepper?: string;
   /** Immediately previous pepper retained for direct repository callers during rotation. */
   invitationPepperPrevious?: string;
+  /**
+   * Only the one-shot production bootstrap identity may create or replace the
+   * projection attestation. API replicas remain read-only in production.
+   * Local/emulator repositories default to true so isolated fixtures can
+   * initialize themselves without a separate cloud job.
+   */
+  projectionBootstrapWriter?: boolean;
+  /**
+   * Force the one-shot bootstrap to rescan every topology collection before
+   * accepting the existing marker. Restore cutovers set this only when the
+   * authority or topology database changes; normal releases keep the
+   * populated projection online.
+   */
+  forceProjectionBootstrapScan?: boolean;
 }
 
 export interface RepositoryAccount {
@@ -146,6 +165,11 @@ function quotaShardFor(value: string, salt = "primary"): number {
   return digest.readUInt32BE(0) % GLOBAL_QUOTA_SHARDS;
 }
 
+function quotaRetryAfterSeconds(available: number, ratePerSecond: number): number {
+  if (!Number.isFinite(ratePerSecond) || ratePerSecond <= 0) return 1;
+  return Math.max(1, Math.ceil(Math.max(0, 1 - available) / ratePerSecond));
+}
+
 type AgentEventCursor = { createdAt: string; eventId: string };
 
 function encodeAgentEventCursor(cursor: AgentEventCursor): string {
@@ -233,6 +257,8 @@ export class FirestoreMeshrRepository implements MeshrRepository {
   private readonly prefix: string;
   private readonly invitationPepper: string;
   private readonly invitationPepperPrevious?: string;
+  private readonly projectionBootstrapWriter: boolean;
+  private readonly forceProjectionBootstrapScan: boolean;
   // Public topology is identical for every authenticated viewer. Posts keep a
   // short process-local cache, but the public-mesh snapshot is intentionally
   // uncached: a visibility change on another API replica must take effect
@@ -266,11 +292,14 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       "meshr-local-invitation-pepper";
     this.invitationPepperPrevious = options.invitationPepperPrevious?.trim() ||
       process.env.MESHR_INVITATION_PEPPER_PREVIOUS?.trim();
+    this.projectionBootstrapWriter = options.projectionBootstrapWriter !== false;
+    this.forceProjectionBootstrapScan = options.forceProjectionBootstrapScan === true;
   }
 
   async checkReady(): Promise<void> {
-    const [taxonomy] = await Promise.all([
+    const [taxonomy, bootstrap] = await Promise.all([
       this.doc("system", "taxonomy").get(),
+      this.doc("system", "bootstrap").get(),
       // A bounded projection read is intentionally valid when empty. It
       // verifies the handle, database selection, IAM grant, and network path
       // for the live topology instead of letting API pods report Ready while
@@ -281,6 +310,14 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         .get(),
     ]);
     if (!taxonomy.exists) throw new Error("system taxonomy is not initialized");
+    const authorityBootstrapId = bootstrap.get("bootstrap_id");
+    if (!bootstrap.exists || typeof authorityBootstrapId !== "string" || !authorityBootstrapId.trim()) {
+      throw new Error("production bootstrap is not initialized");
+    }
+    const projection = await readProjectionBootstrap(this.topologyFirestore, this.prefix);
+    if (!projection.exists || !projection.valid || projection.authorityBootstrapId !== authorityBootstrapId.trim()) {
+      throw new Error("topology projection bootstrap is not attested for this authority generation");
+    }
   }
 
   private collection(name: string): string {
@@ -5394,6 +5431,22 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     const now = this.now();
     const bootstrapRef = this.doc("system", "bootstrap");
     const bootstrap = await bootstrapRef.get();
+    const authorityBootstrapMissing = !bootstrap.exists;
+    const projectionBootstrap = await readProjectionBootstrap(
+      this.topologyFirestore,
+      this.prefix,
+    );
+    if (projectionBootstrap.exists && !projectionBootstrap.valid) {
+      throw new Error("topology_projection_bootstrap_invalid");
+    }
+    // The topology projection may live in a separate Firestore database. A
+    // launch marker in the authority database alone cannot prove that this
+    // aggregate store is clean: a stale projections database would otherwise
+    // pass bootstrap and immediately expose old activity to every viewer.
+    // Before creating the first authority generation, do an inexpensive
+    // preflight scan. The shared marker transaction repeats this scan after
+    // the authority transaction, closing the race with a concurrent worker.
+    if (authorityBootstrapMissing) await assertProjectionEmpty(this.topologyFirestore, this.prefix);
     if (!bootstrap.exists) {
       // A new production project may be initialized exactly once. If a
       // project already contains user data but has no launch marker, stop
@@ -5431,6 +5484,8 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         "topology_events",
         "topology_activity_totals",
         "topology_activity_buckets",
+        "topology_activity_recent",
+        "topology_activity_snapshots",
         "processed_events",
         "moderation_inbox",
         "moderation_dlq",
@@ -5505,6 +5560,14 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       ) {
         throw new Error("production_store_not_empty");
       }
+      if (!this.projectionBootstrapWriter) {
+        // Production API replicas intentionally cannot create the launch
+        // attestation. A one-shot bootstrap identity performs that operation
+        // before traffic is admitted; keeping this boundary here makes an API
+        // rollout fail closed instead of accidentally assuming ownership of
+        // the topology database.
+        throw new Error("production_bootstrap_required");
+      }
     }
     await this.firestore.runTransaction(async (transaction) => {
       const existingBootstrap = await transaction.get(bootstrapRef);
@@ -5561,9 +5624,55 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       transaction.create(bootstrapRef, {
         contract_version: MESHR_CONTRACT_MAJOR,
         key: "bootstrap",
+        bootstrap_id: randomUUID(),
         initialized_at: now,
         empty_launch: true,
       });
+    });
+
+    // A generation fence prevents a marker left by a previous empty launch
+    // from being mistaken for the marker belonging to this authority store.
+    // Older prototype markers did not carry a generation; derive a stable
+    // value from their immutable initialization timestamp once, then use the
+    // same value in every replica and in the projection attestation.
+    let currentBootstrap = await bootstrapRef.get();
+    if (!currentBootstrap.exists) throw new Error("production_bootstrap_missing");
+    const existingBootstrapId = currentBootstrap.get("bootstrap_id");
+    let authorityBootstrapId: string;
+    if (typeof existingBootstrapId === "string" && existingBootstrapId.trim()) {
+      authorityBootstrapId = existingBootstrapId.trim();
+    } else {
+      const initializedAt = currentBootstrap.get("initialized_at");
+      if (typeof initializedAt !== "string" || !initializedAt.trim()) {
+        throw new Error("production_bootstrap_generation_missing");
+      }
+      authorityBootstrapId = createHash("sha256")
+        .update(`meshr-bootstrap:v1:${initializedAt}`)
+        .digest("hex");
+      await this.firestore.runTransaction(async (transaction) => {
+        const existing = await transaction.get(bootstrapRef);
+        if (!existing.exists) throw new Error("production_bootstrap_missing");
+        const current = existing.get("bootstrap_id");
+        if (typeof current === "string" && current.trim()) return;
+        transaction.update(bootstrapRef, { bootstrap_id: authorityBootstrapId });
+      });
+      currentBootstrap = await bootstrapRef.get();
+      const persistedBootstrapId = currentBootstrap.get("bootstrap_id");
+      if (typeof persistedBootstrapId !== "string" || !persistedBootstrapId.trim()) {
+        throw new Error("production_bootstrap_generation_missing");
+      }
+      authorityBootstrapId = persistedBootstrapId.trim();
+    }
+
+    await ensureProjectionBootstrap(this.topologyFirestore, now, {
+      collectionPrefix: this.prefix,
+      expectedAuthorityBootstrapId: authorityBootstrapId,
+      // If this caller observed an absent authority marker at process start,
+      // always re-scan an existing projection marker inside the transaction.
+      // This is the first-launch race fence; an existing generation can use
+      // the marker as a stable readiness attestation.
+      forceScanExistingMarker: authorityBootstrapMissing || this.forceProjectionBootstrapScan,
+      createIfMissing: this.projectionBootstrapWriter,
     });
   }
 
@@ -6328,7 +6437,10 @@ export class FirestoreMeshrRepository implements MeshrRepository {
             elapsedSeconds * bucket.ratePerSecond,
         );
         availableQuotaTokens.push(available);
-        if (available < 1) throw new Error("rate_limited");
+        if (available < 1) {
+          const scope = bucket.key.startsWith("agent:") ? "agent" : "account";
+          throw new Error(`rate_limited:${scope}:${quotaRetryAfterSeconds(available, bucket.ratePerSecond)}`);
+        }
       }
       const readAvailableTokens = (
         bucket: { capacity: number; ratePerSecond: number },
@@ -6358,6 +6470,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       let selectedGlobalShard: number | undefined;
       let selectedGlobalPeakTokens = 0;
       let selectedGlobalSustainedTokens = 0;
+      let globalRetryAfter = 1;
       for (let candidateIndex = 0; candidateIndex < globalCandidates.length; candidateIndex += 1) {
         const shard = globalCandidates[candidateIndex]!;
         const peakBucket = {
@@ -6374,6 +6487,11 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         const sustainedSnapshot = await transaction.get(this.doc("quota_counters", sustainedBucket.key));
         const peakTokens = readAvailableTokens(peakBucket, peakSnapshot);
         const sustainedTokens = readAvailableTokens(sustainedBucket, sustainedSnapshot);
+        globalRetryAfter = Math.max(
+          globalRetryAfter,
+          quotaRetryAfterSeconds(peakTokens, peakBucket.ratePerSecond),
+          quotaRetryAfterSeconds(sustainedTokens, sustainedBucket.ratePerSecond),
+        );
         if (peakTokens >= 1 && sustainedTokens >= 1) {
           selectedGlobalShard = shard;
           selectedGlobalPeakTokens = peakTokens;
@@ -6381,7 +6499,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           break;
         }
       }
-      if (selectedGlobalShard === undefined) throw new Error("rate_limited");
+      if (selectedGlobalShard === undefined) throw new Error(`rate_limited:global:${globalRetryAfter}`);
       const selectedGlobalPeakBucket = {
         key: `global:${selectedGlobalShard}:peak`,
         ratePerSecond: globalPeakRate,

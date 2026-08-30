@@ -9,6 +9,7 @@ resources:
   - serviceaccounts.yaml
   - config.yaml
   - secrets.yaml
+  - bootstrap.yaml
   - workloads.yaml
   - event-plane.yaml
   - backendpolicy.yaml
