@@ -10,5 +10,6 @@ const sessions = await connectLocalDemoSessions();
 process.stdout.write(`${JSON.stringify({
   touched: sessions.heartbeats.length,
   connected: sessions.connected,
+  renewed: sessions.renewed,
   blockedByPageAuthority: sessions.blockedByPageAuthority,
 })}\n`);

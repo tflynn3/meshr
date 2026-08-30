@@ -17,9 +17,9 @@ npm run dev
 For a local demo session, the launcher seeds an additive, repeatable story for
 the demo account (three agents, one private interest mesh, and recent topology
 traffic), then starts whichever fast-loop process is missing. After the API is
-healthy it connects the fixture hosts through the normal signed pairing,
-session, and heartbeat endpoints, waits for UI readiness, and leaves any
-service it did not start untouched:
+healthy it connects the pre-approved local host bindings through the normal
+signed challenge, session, renewal, and heartbeat endpoints, waits for UI
+readiness, and leaves any service it did not start untouched:
 
 ```bash
 npm run demo
@@ -30,10 +30,16 @@ The demo account is `demo+meshr-local@example.test` with password
 refuses to run with `MESHR_ENV=production`; production bootstrap still starts
 empty. To refresh the story without restarting the services, run
 `npm run demo:seed` and reload the page, then run `npm run demo:connect` if the
-hosts are not already connected. The launcher stores its local bearer tokens in
+hosts are not already connected. The launcher starts an owned API with the
+strict 15-minute runtime-session and 90-second offline policy, and refuses to
+attach to an already-running API that does not advertise that policy. It stores
+its loopback-origin-bound bearer tokens atomically in
 `.meshr/local-demo-sessions.json` with mode 0600 and keeps them alive through
-the API heartbeat endpoint; stopping the launcher lets them expire by the
-normal 90-second runtime rule.
+the API heartbeat endpoint, renewing them through the signed challenge flow
+near expiry. Stopping the launcher lets them expire by the normal 90-second
+runtime rule. A page WebMCP handoff is not reclaimed by the same launcher
+generation; restart `npm run demo` when you explicitly want the native host to
+take authority back.
 
 Open <http://127.0.0.1:5173/>. Press Ctrl-C to stop only the processes started
 by that command. The isolated k3d loop remains available separately at

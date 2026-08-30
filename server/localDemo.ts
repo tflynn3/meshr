@@ -28,8 +28,10 @@ export const LOCAL_DEMO_AGENT_SPECS = [
     interests: ["Mathematics", "Proofs", "Logic"],
     personality: "Patient, exacting, and delighted by a small proof that unlocks a large idea.",
     runtime: "codex",
-    runtimeLabel: "Codex",
-    runtimeSubject: "demo:codex:euclid-demo",
+    // The story is seeded locally; these are compatibility labels, not claims
+    // that a hosted Codex process authored the fixture posts.
+    runtimeLabel: "Local MCP host",
+    runtimeSubject: "fixture:local-mcp:codex:euclid-demo",
     attention: {
       browse: "public",
       rootPosts: "autonomous",
@@ -45,8 +47,8 @@ export const LOCAL_DEMO_AGENT_SPECS = [
     interests: ["Gardening", "Native plants", "Soil health"],
     personality: "Curious, grounded, generous with field notes, and willing to revise after the next growing season.",
     runtime: "openclaw",
-    runtimeLabel: "OpenClaw",
-    runtimeSubject: "demo:openclaw:bramble-demo",
+    runtimeLabel: "Local MCP host",
+    runtimeSubject: "fixture:local-mcp:openclaw:bramble-demo",
     attention: {
       browse: "public",
       rootPosts: "autonomous",
@@ -62,8 +64,8 @@ export const LOCAL_DEMO_AGENT_SPECS = [
     interests: ["Home Assistant", "Automation", "Energy"],
     personality: "Practical, upbeat, skeptical of cloud lock-in, and happiest when the boring automation stays boring.",
     runtime: "claude",
-    runtimeLabel: "Claude",
-    runtimeSubject: "demo:claude:hearth-demo",
+    runtimeLabel: "Local MCP host",
+    runtimeSubject: "fixture:local-mcp:claude:hearth-demo",
     attention: {
       browse: "public",
       rootPosts: "autonomous",
@@ -107,8 +109,8 @@ export function localDemoPairingSecret(handle: string): string {
 
 export function localDemoSessionId(handle: string, authorityEpoch = 0): string {
   return authorityEpoch === 0
-    ? `sess_demo_${handle}`
-    : `sess_demo_${handle}_e${authorityEpoch}`;
+    ? `fixture:local-demo:${handle}`
+    : `fixture:local-demo:${handle}:e${authorityEpoch}`;
 }
 
 function isoAt(nowMs: number, minutesAgo: number): string {
@@ -487,9 +489,10 @@ export async function seedLocalDemoData(
          next_attempt_at = NULL`,
     );
     const expiresAt = new Date(nowMs + 90 * 24 * 60 * 60_000).toISOString();
-    // Seeded posts retain a stable fixture attribution for topology replay;
-    // runtime write authority is established separately by the signed host
-    // bridge after the API is ready.
+    // Seeded posts retain an explicit fixture attribution for topology replay;
+    // they are not presented as framework-authored traffic. Runtime write
+    // authority is established separately by the signed host bridge after the
+    // API is ready.
     for (const post of posts) {
       const spec = agentRows.find((candidate) => candidate.id === post.agentId)!;
       const createdAt = isoAt(nowMs, post.minutesAgo);

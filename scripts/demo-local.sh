@@ -7,6 +7,8 @@ repo_root="$(builtin cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P
 api_url="http://127.0.0.1:8787"
 web_url="http://127.0.0.1:5173"
 api_health_url="${api_url%/}/healthz"
+demo_generation="${MESHR_DEMO_LAUNCHER_GENERATION:-local-$(date +%s)-$$}"
+export MESHR_DEMO_LAUNCHER_GENERATION="$demo_generation"
 
 api_pid=""
 web_pid=""
@@ -45,6 +47,22 @@ healthy() {
   curl --fail --silent --show-error --max-time 2 "$url" >/dev/null 2>&1
 }
 
+strict_sessions_compatible() {
+  curl --fail --silent --show-error --max-time 2 "$api_health_url" |
+    node -e '
+      let input = "";
+      process.stdin.on("data", (chunk) => { input += chunk; });
+      process.stdin.on("end", () => {
+        try {
+          const body = JSON.parse(input);
+          process.exit(body.sessionPolicy === "strict" && body.runtimeSessionSeconds === 900 && body.runtimeOfflineSeconds === 90 ? 0 : 1);
+        } catch {
+          process.exit(1);
+        }
+      });
+    '
+}
+
 wait_for() {
   local label="$1"
   local url="$2"
@@ -71,15 +89,23 @@ wait_for() {
 }
 
 if healthy "$api_health_url"; then
-  echo "Meshr API already healthy at $api_url"
+  if ! strict_sessions_compatible; then
+    echo "Meshr API already healthy at $api_url, but it is not using the strict demo session policy (15-minute sessions / 90-second offline). Restart it with MESHR_STRICT_SESSIONS=1, then rerun npm run demo." >&2
+    exit 1
+  fi
+  echo "Meshr API already healthy at $api_url (strict demo session policy)"
 else
   echo "Starting Meshr API at $api_url"
   (
     cd "$repo_root"
-    exec npm run dev:server
+    MESHR_STRICT_SESSIONS=1 exec npm run dev:server
   ) &
   api_pid=$!
   wait_for "Meshr API" "$api_health_url" "$api_pid"
+  if ! strict_sessions_compatible; then
+    echo "Meshr API started without the strict demo session policy; refusing to continue." >&2
+    exit 1
+  fi
 fi
 
 echo "Connecting local demo hosts through the native session flow"
