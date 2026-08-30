@@ -9,6 +9,12 @@ import {
   TOPOLOGY_ACTIVITY_WINDOW_MINUTES,
 } from "./activityWindow.ts";
 import { readProjectionBootstrap } from "../server/projectionBootstrap.ts";
+import { type AuthorityCollection } from "../server/authorityCollections.ts";
+
+// Keep worker-owned durable state tied to the same authority inventory used by
+// cutover receipts and first-launch emptiness checks. A renamed or newly added
+// collection must update that inventory before this file can compile.
+const authorityCollection = <T extends AuthorityCollection>(name: T): T => name;
 
 const config = eventPlaneConfig();
 const firestore = createFirestore(config.projectId, config.databaseId);
@@ -840,7 +846,7 @@ async function processMessage(
       if (!/^[A-Za-z0-9._:-]{1,256}$/.test(eventId)) {
         throw new SyntaxError("invalid moderation screening job");
       }
-      const item = await firestore.collection("moderation_inbox").doc(eventId).get();
+      const item = await firestore.collection(authorityCollection("moderation_inbox")).doc(eventId).get();
       if (!item.exists) {
         // The source event may have expired or a previous worker may already
         // have resolved it. Acking a missing item keeps the screening queue
@@ -935,16 +941,16 @@ async function processMessage(
     const activityWithinRecentWindow = activityEligible &&
       isActivityWithinRecentWindow(activityBucketMs, Date.now());
     const liveAccessRef = consumer === "topology" && envelope.type === "live.access.changed"
-      ? store.collection("live_access_epochs").doc(envelope.agent_id ? `agent:${envelope.agent_id}` : "global")
+      ? store.collection(authorityCollection("live_access_epochs")).doc(envelope.agent_id ? `agent:${envelope.agent_id}` : "global")
       : undefined;
     const processed = store
-      .collection("processed_events")
+      .collection(authorityCollection("processed_events"))
       .doc(`${consumer}:${envelope.event_id}`);
     await store.runTransaction(async (transaction) => {
       const previous = await transaction.get(processed);
       if (previous.exists) return;
       const moderationPost = consumer === "moderation" && shouldQueueModeration && postId
-        ? await transaction.get(firestore.collection("posts").doc(postId))
+        ? await transaction.get(firestore.collection(authorityCollection("posts")).doc(postId))
         : undefined;
       const topologies = consumer === "topology"
         ? topologyMeshIds.map((meshId) => ({
@@ -958,7 +964,7 @@ async function processMessage(
       // socket on every post event.
       const accessEpoch =
         consumer === "topology" && envelope.mesh_id && envelope.type.startsWith("mesh.")
-          ? store.collection("mesh_access_epochs").doc(envelope.mesh_id)
+          ? store.collection(authorityCollection("mesh_access_epochs")).doc(envelope.mesh_id)
           : undefined;
       const currentTopologies = await Promise.all(
         topologies.map(({ ref }) => transaction.get(ref)),
@@ -1079,7 +1085,7 @@ async function processMessage(
               ? payload.caseId
               : postId;
           transaction.set(
-            store.collection("moderation_inbox").doc(envelope.event_id),
+            store.collection(authorityCollection("moderation_inbox")).doc(envelope.event_id),
             {
               contract_version: 1,
               event_id: envelope.event_id,
@@ -1118,7 +1124,7 @@ async function processMessage(
         }
       } else if (consumer === "audit") {
         transaction.set(
-          store.collection("event_audit").doc(envelope.event_id),
+          store.collection(authorityCollection("event_audit")).doc(envelope.event_id),
           {
             ...envelope,
             consumer,
@@ -1131,7 +1137,7 @@ async function processMessage(
         );
       } else {
         transaction.set(
-          store.collection("notification_outbox").doc(envelope.event_id),
+          store.collection(authorityCollection("notification_outbox")).doc(envelope.event_id),
           {
             contract_version: 1,
             event_id: envelope.event_id,
@@ -1395,7 +1401,7 @@ async function claimModerationItem(itemRef: any): Promise<ModerationClaim | null
         dead_lettered_at: nowIso,
       }, { merge: true });
       transaction.set(
-        firestore.collection("moderation_dlq").doc(item.id),
+        firestore.collection(authorityCollection("moderation_dlq")).doc(item.id),
         moderationDlqDocument(item, attempts, error, nowIso),
         { merge: true },
       );
@@ -1473,7 +1479,7 @@ async function recordModerationFailure(claim: ModerationClaim, error: unknown): 
         dead_lettered_at: failedAt,
       }, { merge: true });
       transaction.set(
-        firestore.collection("moderation_dlq").doc(claim.itemId),
+        firestore.collection(authorityCollection("moderation_dlq")).doc(claim.itemId),
         moderationDlqDocument(item, attempts, message, failedAt),
         { merge: true },
       );
@@ -1518,8 +1524,8 @@ async function applyModerationDecision(claim: ModerationClaim, decision: {
   await firestore.runTransaction(async (transaction) => {
     const current = await transaction.get(claim.itemRef);
     if (!current.exists || current.get("state") !== "queued" || current.get("lease_id") !== claim.leaseId) return;
-    const postRef = firestore.collection("posts").doc(claim.postId);
-    const moderationCaseRef = firestore.collection("moderation_cases").doc(claim.caseId);
+    const postRef = firestore.collection(authorityCollection("posts")).doc(claim.postId);
+    const moderationCaseRef = firestore.collection(authorityCollection("moderation_cases")).doc(claim.caseId);
     const [currentPost, moderationCase] = await Promise.all([
       transaction.get(postRef),
       transaction.get(moderationCaseRef),
@@ -1580,7 +1586,7 @@ async function applyModerationDecision(claim: ModerationClaim, decision: {
     // observation stream even when a mesh changes visibility while a provider
     // decision is in flight.
     const meshSnapshot = meshId
-      ? await transaction.get(firestore.collection("meshes").doc(meshId))
+      ? await transaction.get(firestore.collection(authorityCollection("meshes")).doc(meshId))
       : undefined;
     const observationScope = meshId == null
       ? "system"
@@ -1632,7 +1638,7 @@ async function applyModerationDecision(claim: ModerationClaim, decision: {
     // worker-local side effect. Emit the same outbox envelope consumed by
     // topology/live workers and an immutable one-year audit record in this
     // transaction, without copying the post body into either artifact.
-    transaction.create(firestore.collection("event_outbox").doc(eventId), {
+    transaction.create(firestore.collection(authorityCollection("event_outbox")).doc(eventId), {
       contract_version: 1,
       envelope,
       mesh_id: meshId,
@@ -1642,7 +1648,7 @@ async function applyModerationDecision(claim: ModerationClaim, decision: {
       attempts: 0,
       created_at: now,
     });
-    transaction.set(firestore.collection("event_outbox_ready").doc(eventId), {
+    transaction.set(firestore.collection(authorityCollection("event_outbox_ready")).doc(eventId), {
       contract_version: 1,
       event_id: eventId,
       mesh_id: meshId,
@@ -1653,7 +1659,7 @@ async function applyModerationDecision(claim: ModerationClaim, decision: {
       created_at: now,
       updated_at: now,
     }, { merge: true });
-    transaction.create(firestore.collection("audit_events").doc(auditId), {
+    transaction.create(firestore.collection(authorityCollection("audit_events")).doc(auditId), {
       contract_version: 1,
       audit_id: auditId,
       actor_type: "system",
@@ -1722,7 +1728,7 @@ async function processQueuedModerationItem(item: any): Promise<"done" | "retry">
   if (!claim) return "done";
   let providerFailure = false;
   try {
-    const post = await firestore.collection("posts").doc(claim.postId).get();
+    const post = await firestore.collection(authorityCollection("posts")).doc(claim.postId).get();
     if (!post.exists) {
       await applyModerationDecision(claim, { action: "allow", reason: "expired" });
       return "done";
@@ -1816,7 +1822,7 @@ async function screenQueuedModeration(): Promise<void> {
   moderationSweepRunning = true;
   try {
     const queued = await firestore
-      .collection("moderation_inbox")
+      .collection(authorityCollection("moderation_inbox"))
       .where("state", "==", "queued")
       .where("available_at", "<=", new Date().toISOString())
       .orderBy("available_at", "asc")

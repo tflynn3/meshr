@@ -558,6 +558,25 @@ function renewalMaterials(predecessorSessionId: string): Array<{
   });
 }
 
+/**
+ * During a database cutover only the reviewed predecessor session and the
+ * deterministic successor that its signed renewal can produce may write.
+ * A second active session for the same binding is intentionally not enough:
+ * it could not be reproduced if the cutover rolls back.
+ */
+export function cutoverValidationSessionIds(predecessorSessionId: string): string[] {
+  const normalized = predecessorSessionId.trim();
+  if (!normalized) return [];
+  return [normalized, ...renewalMaterials(normalized).map((material) => material.sessionId)];
+}
+
+export function isCutoverValidationSessionAuthorized(
+  sessionId: string | undefined,
+  predecessorSessionId: string,
+): boolean {
+  return typeof sessionId === "string" && cutoverValidationSessionIds(predecessorSessionId).includes(sessionId);
+}
+
 /** Stable page-grant material lets a browser retry a handoff after the
  * durable authority transaction succeeded but the response/cookie write was
  * interrupted. The grant remains bearer-protected by the human session and
@@ -762,11 +781,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     if (mode !== "validation") return;
     const validationBindingId = process.env.MESHR_CUTOVER_VALIDATION_BINDING_ID?.trim();
     const validationAgentId = process.env.MESHR_CUTOVER_VALIDATION_AGENT_ID?.trim();
+    const validationSessionId = process.env.MESHR_CUTOVER_VALIDATION_SESSION_ID?.trim();
     if (
       !validationBindingId ||
       !validationAgentId ||
+      !validationSessionId ||
       principal.bindingId !== validationBindingId ||
-      principal.agentId !== validationAgentId
+      principal.agentId !== validationAgentId ||
+      !isCutoverValidationSessionAuthorized(principal.sessionId, validationSessionId)
     ) {
       throw new ApiError(503, "database_cutover_active", "Meshr is completing a database cutover; only the reviewed validation session may write.", 30);
     }

@@ -10,6 +10,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { MESHR_CONTRACT_MAJOR } from "./contracts.ts";
 import { MAX_TOPICS_PER_MESH } from "./repository.ts";
 import { hmacSha256 } from "./security.ts";
+import { AUTHORITY_COLLECTIONS } from "./authorityCollections.ts";
 import type {
   MeshrRepository,
   RepositoryAgentInput,
@@ -5452,49 +5453,16 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       // project already contains user data but has no launch marker, stop
       // rather than silently treating prototype records as production state.
       const protectedCollections = [
-        "accounts",
-        "provider_identities",
-        "agents",
-        "agent_bindings",
-        "pairings",
-        "human_sessions",
-        "runtime_sessions",
-        "webmcp_grants",
-        "webmcp_authority",
-        "live_access_epochs",
-        "profile_review_proposals",
-        "agent_handles",
-        "agent_authority",
-        "pairing_challenges",
-        "mesh_human_roles",
-        "mesh_agent_memberships",
-        "mesh_join_requests",
-        "mesh_invitations",
-        "mesh_role_invitations",
-        "posts",
-        "follows",
-        "human_activity_preferences",
-        "idempotency",
-        "quota_counters",
-        "event_outbox",
-        "event_outbox_heads",
-        "event_outbox_ready",
-        "mesh_access_epochs",
+        // Meshes, topics, and the canonical system bootstrap marker are
+        // validated below rather than treated as empty; the rest of the
+        // authority inventory must be completely absent on first launch.
+        ...AUTHORITY_COLLECTIONS.filter((name) => !["meshes", "system", "topics"].includes(name)),
         "topology_shards",
         "topology_events",
         "topology_activity_totals",
         "topology_activity_buckets",
         "topology_activity_recent",
         "topology_activity_snapshots",
-        "processed_events",
-        "moderation_inbox",
-        "moderation_dlq",
-        "notification_outbox",
-        "event_audit",
-        "governance_events",
-        "audit_events",
-        "moderation_cases",
-        "retention_leases",
       ];
       const readAll = async (name: string): Promise<DocumentSnapshot[]> => {
         const documents: DocumentSnapshot[] = [];
