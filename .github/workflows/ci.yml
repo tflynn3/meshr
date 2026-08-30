@@ -2170,9 +2170,10 @@ jobs:
             kubectl -n flux-system patch kustomization meshr-canary \
               --type=merge --patch='{"spec":{"suspend":false}}'
           fi
-      # This is the irreversible cutover point. Keep it after reconciliation
-      # has been restored: any later failure must not roll the candidate back
-      # after public writes can reach it.
+      # This is the irreversible cutover point. Keep the protected-session
+      # successor canonical while writes are still fenced, then reopen only
+      # after that CAS succeeds. Any later failure must leave the candidate in
+      # an operator-led roll-forward state rather than an expired predecessor.
       - name: Refresh GCP credentials before reopening canary writes
         if: success() && env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1'
         id: canary-reopen-auth
@@ -2189,6 +2190,11 @@ jobs:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
           GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          GOOGLE_CLOUD_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          MESHR_AUDIT_FIRESTORE_DATABASE: ${{ vars.MESHR_AUDIT_FIRESTORE_DATABASE }}
+          MESHR_PROTECTED_FIXTURE_ENVIRONMENT: canary
+          MESHR_PROTECTED_FIXTURE_GENERATION: ${{ steps.canary-apply.outputs.protected_fixture_post_generation }}
+          MESHR_CANARY_PROTECTED_FIXTURE_PREVIOUS_GENERATION: ${{ env.MESHR_CANARY_PROTECTED_FIXTURE_PREVIOUS_GENERATION }}
         run: |
           set -euo pipefail
           token_file="$RUNNER_TEMP/meshr-gcp-access-token"
@@ -2199,11 +2205,15 @@ jobs:
             --access-token-file="$token_file"
           cluster_user="$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')"
           kubectl config set-credentials "$cluster_user" --token="$CLOUDSDK_AUTH_ACCESS_TOKEN" >/dev/null
-          # Set the irreversible commit marker before touching the runtime
-          # input. If the patch or rollout fails halfway through, rollback
-          # handlers must freeze for operator-led roll-forward rather than
-          # switching an authority that may already have accepted writes.
+          # Set the irreversible commit marker before touching either the
+          # protected pointer or runtime input. If either operation fails,
+          # rollback handlers must freeze for operator-led roll-forward rather
+          # than switching an authority that may already have accepted writes.
           printf 'MESHR_CANARY_CUTOVER_COMMIT_ATTEMPTED=true\n' >> "$GITHUB_ENV"
+          npm run protected:state:store -- promote \
+            --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Canary protected fixture generation is required}" \
+            --expected-generation "${MESHR_CANARY_PROTECTED_FIXTURE_PREVIOUS_GENERATION:?Canary cutover predecessor generation is required}"
+          printf 'MESHR_CANARY_CUTOVER_FIXTURE_PROMOTED=true\n' >> "$GITHUB_ENV"
           kubectl -n flux-system patch configmap meshr-canary-runtime-values \
             --type=merge \
             --patch='{"data":{"MESHR_DATABASE_CUTOVER_MODE":"off"}}'
@@ -2276,7 +2286,7 @@ jobs:
           curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
             "${MESHR_CANARY_URL%/}/v1/public/meshes" | jq -e '.meshes | type == "array"' >/dev/null
           printf 'MESHR_CANARY_CUTOVER_RECOVERY_CONFIRMED=true\n' >> "$GITHUB_ENV"
-      - name: Promote canary protected fixture after cutover recovery
+      - name: Verify canary protected fixture after cutover recovery
         if: success() && env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1' && env.MESHR_CANARY_CUTOVER_RECOVERY_CONFIRMED == 'true'
         env:
           GOOGLE_CLOUD_PROJECT: ${{ vars.GCP_PROJECT_ID }}
@@ -2284,11 +2294,35 @@ jobs:
           MESHR_PROTECTED_FIXTURE_ENVIRONMENT: canary
           MESHR_PROTECTED_FIXTURE_GENERATION: ${{ steps.canary-apply.outputs.protected_fixture_post_generation }}
           MESHR_CANARY_PROTECTED_FIXTURE_PREVIOUS_GENERATION: ${{ env.MESHR_CANARY_PROTECTED_FIXTURE_PREVIOUS_GENERATION }}
+          MESHR_PROTECTED_STATE_KEY: ${{ secrets.MESHR_CANARY_PROTECTED_STATE_KEY }}
+          MESHR_CANARY_PROTECTED_BINDINGS: ${{ vars.MESHR_CANARY_PROTECTED_BINDINGS }}
+          MESHR_CANARY_URL: ${{ vars.MESHR_CANARY_URL }}
         run: |
           set -euo pipefail
-          npm run protected:state:store -- promote \
-            --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Canary protected fixture generation is required}" \
-            --expected-generation "${MESHR_CANARY_PROTECTED_FIXTURE_PREVIOUS_GENERATION:?Canary cutover predecessor generation is required}"
+          canonical_dir="$RUNNER_TEMP/meshr-canary-protected-fixture-recovery"
+          canonical_envelope="$canonical_dir/current.enc"
+          canonical_generation="$canonical_dir/current-generation"
+          canonical_state="$canonical_dir/state.json"
+          umask 077
+          mkdir -p "$canonical_dir"
+          chmod 700 "$canonical_dir"
+          npm run protected:state:store -- get \
+            --output "$canonical_envelope" \
+            --generation-output "$canonical_generation"
+          actual_generation="$(tr -d '\r\n' < "$canonical_generation")"
+          test "$actual_generation" = "${MESHR_PROTECTED_FIXTURE_GENERATION:?Canary protected fixture generation is required}" || {
+            echo 'Canary protected fixture pointer did not advance to the committed successor.' >&2
+            exit 1
+          }
+          MESHR_PROTECTED_STATE_KEY="${MESHR_PROTECTED_STATE_KEY:?Canary protected fixture key is required}" \
+            npm run protected:state -- decrypt \
+              --input "$canonical_envelope" \
+              --output "$canonical_state"
+          MESHR_PROTECTED_STATE_KEY="$MESHR_PROTECTED_STATE_KEY" \
+            npm run verify:protected-runtime -- \
+              --state-file "$canonical_state" \
+              --selectors "${MESHR_CANARY_PROTECTED_BINDINGS:?Canary protected binding selector is required}" \
+              --server "${MESHR_CANARY_URL:?Canary origin is required}"
       - name: Mark canary cutover fixture handoff durable
         if: success() && env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1' && env.MESHR_CANARY_CUTOVER_RECOVERY_CONFIRMED == 'true'
         run: echo 'MESHR_CANARY_PROTECTED_FIXTURE_DURABLE=true' >> "$GITHUB_ENV"
@@ -4086,9 +4120,10 @@ jobs:
             kubectl -n flux-system patch kustomization meshr-production \
               --type=merge --patch='{"spec":{"suspend":false}}'
           fi
-      # This is the irreversible cutover point. Keep it after reconciliation
-      # has been restored: any later failure must not roll the candidate back
-      # after public writes can reach it.
+      # This is the irreversible cutover point. Keep the protected-session
+      # successor canonical while writes are still fenced, then reopen only
+      # after that CAS succeeds. Any later failure must leave the candidate in
+      # an operator-led roll-forward state rather than an expired predecessor.
       - name: Refresh GCP credentials before reopening production writes
         if: success() && env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1'
         id: production-reopen-auth
@@ -4105,6 +4140,11 @@ jobs:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
           GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          GOOGLE_CLOUD_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          MESHR_AUDIT_FIRESTORE_DATABASE: ${{ vars.MESHR_AUDIT_FIRESTORE_DATABASE }}
+          MESHR_PROTECTED_FIXTURE_ENVIRONMENT: production
+          MESHR_PROTECTED_FIXTURE_GENERATION: ${{ steps.production-apply.outputs.protected_fixture_post_generation }}
+          MESHR_PRODUCTION_PROTECTED_FIXTURE_PREVIOUS_GENERATION: ${{ env.MESHR_PRODUCTION_PROTECTED_FIXTURE_PREVIOUS_GENERATION }}
         run: |
           set -euo pipefail
           token_file="$RUNNER_TEMP/meshr-gcp-access-token"
@@ -4115,11 +4155,15 @@ jobs:
             --access-token-file="$token_file"
           cluster_user="$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')"
           kubectl config set-credentials "$cluster_user" --token="$CLOUDSDK_AUTH_ACCESS_TOKEN" >/dev/null
-          # Set the irreversible commit marker before touching the runtime
-          # input. If the patch or rollout fails halfway through, rollback
-          # handlers must freeze for operator-led roll-forward rather than
-          # switching an authority that may already have accepted writes.
+          # Set the irreversible commit marker before touching either the
+          # protected pointer or runtime input. If either operation fails,
+          # rollback handlers must freeze for operator-led roll-forward rather
+          # than switching an authority that may already have accepted writes.
           printf 'MESHR_PRODUCTION_CUTOVER_COMMIT_ATTEMPTED=true\n' >> "$GITHUB_ENV"
+          npm run protected:state:store -- promote \
+            --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Production protected fixture generation is required}" \
+            --expected-generation "${MESHR_PRODUCTION_PROTECTED_FIXTURE_PREVIOUS_GENERATION:?Production cutover predecessor generation is required}"
+          printf 'MESHR_PRODUCTION_CUTOVER_FIXTURE_PROMOTED=true\n' >> "$GITHUB_ENV"
           kubectl -n flux-system patch configmap meshr-production-runtime-values \
             --type=merge \
             --patch='{"data":{"MESHR_DATABASE_CUTOVER_MODE":"off"}}'
@@ -4192,7 +4236,7 @@ jobs:
           curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
             "${MESHR_PRODUCTION_URL%/}/v1/public/meshes" | jq -e '.meshes | type == "array"' >/dev/null
           printf 'MESHR_PRODUCTION_CUTOVER_RECOVERY_CONFIRMED=true\n' >> "$GITHUB_ENV"
-      - name: Promote production protected fixture after cutover recovery
+      - name: Verify production protected fixture after cutover recovery
         if: success() && env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1' && env.MESHR_PRODUCTION_CUTOVER_RECOVERY_CONFIRMED == 'true'
         env:
           GOOGLE_CLOUD_PROJECT: ${{ vars.GCP_PROJECT_ID }}
@@ -4200,11 +4244,35 @@ jobs:
           MESHR_PROTECTED_FIXTURE_ENVIRONMENT: production
           MESHR_PROTECTED_FIXTURE_GENERATION: ${{ steps.production-apply.outputs.protected_fixture_post_generation }}
           MESHR_PRODUCTION_PROTECTED_FIXTURE_PREVIOUS_GENERATION: ${{ env.MESHR_PRODUCTION_PROTECTED_FIXTURE_PREVIOUS_GENERATION }}
+          MESHR_PROTECTED_STATE_KEY: ${{ secrets.MESHR_PRODUCTION_PROTECTED_STATE_KEY }}
+          MESHR_PRODUCTION_PROTECTED_BINDINGS: ${{ vars.MESHR_PRODUCTION_PROTECTED_BINDINGS }}
+          MESHR_PRODUCTION_URL: ${{ vars.MESHR_PRODUCTION_URL }}
         run: |
           set -euo pipefail
-          npm run protected:state:store -- promote \
-            --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Production protected fixture generation is required}" \
-            --expected-generation "${MESHR_PRODUCTION_PROTECTED_FIXTURE_PREVIOUS_GENERATION:?Production cutover predecessor generation is required}"
+          canonical_dir="$RUNNER_TEMP/meshr-production-protected-fixture-recovery"
+          canonical_envelope="$canonical_dir/current.enc"
+          canonical_generation="$canonical_dir/current-generation"
+          canonical_state="$canonical_dir/state.json"
+          umask 077
+          mkdir -p "$canonical_dir"
+          chmod 700 "$canonical_dir"
+          npm run protected:state:store -- get \
+            --output "$canonical_envelope" \
+            --generation-output "$canonical_generation"
+          actual_generation="$(tr -d '\r\n' < "$canonical_generation")"
+          test "$actual_generation" = "${MESHR_PROTECTED_FIXTURE_GENERATION:?Production protected fixture generation is required}" || {
+            echo 'Production protected fixture pointer did not advance to the committed successor.' >&2
+            exit 1
+          }
+          MESHR_PROTECTED_STATE_KEY="${MESHR_PROTECTED_STATE_KEY:?Production protected fixture key is required}" \
+            npm run protected:state -- decrypt \
+              --input "$canonical_envelope" \
+              --output "$canonical_state"
+          MESHR_PROTECTED_STATE_KEY="$MESHR_PROTECTED_STATE_KEY" \
+            npm run verify:protected-runtime -- \
+              --state-file "$canonical_state" \
+              --selectors "${MESHR_PRODUCTION_PROTECTED_BINDINGS:?Production protected binding selector is required}" \
+              --server "${MESHR_PRODUCTION_URL:?Production origin is required}"
       - name: Mark production cutover fixture handoff durable
         if: success() && env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1' && env.MESHR_PRODUCTION_CUTOVER_RECOVERY_CONFIRMED == 'true'
         run: echo 'MESHR_PRODUCTION_PROTECTED_FIXTURE_DURABLE=true' >> "$GITHUB_ENV"
