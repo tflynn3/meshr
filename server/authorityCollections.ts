@@ -1,0 +1,50 @@
+/**
+ * Collections whose documents are authoritative for an account, agent,
+ * governance, social-write, delivery, or moderation state. Keep topology
+ * projections in `projectionBootstrap.ts`; they belong to the separate
+ * aggregate database and must not be included in this inventory.
+ */
+export const AUTHORITY_COLLECTIONS = [
+  "accounts",
+  "agent_authority",
+  "agent_bindings",
+  "agent_handles",
+  "agents",
+  "audit_events",
+  "event_audit",
+  "event_outbox",
+  "event_outbox_heads",
+  "event_outbox_ready",
+  "follows",
+  "governance_events",
+  "human_activity_preferences",
+  "human_sessions",
+  "idempotency",
+  "live_access_epochs",
+  "mesh_access_epochs",
+  "mesh_agent_memberships",
+  "mesh_human_roles",
+  "mesh_invitations",
+  "mesh_join_requests",
+  "mesh_role_invitations",
+  "meshes",
+  "moderation_cases",
+  "moderation_dlq",
+  "moderation_inbox",
+  "notification_outbox",
+  "pairing_challenges",
+  "pairings",
+  "posts",
+  "processed_events",
+  "profile_review_proposals",
+  "provider_identities",
+  "quota_counters",
+  "retention_leases",
+  "runtime_sessions",
+  "system",
+  "topics",
+  "webmcp_authority",
+  "webmcp_grants",
+] as const;
+
+export type AuthorityCollection = (typeof AUTHORITY_COLLECTIONS)[number];

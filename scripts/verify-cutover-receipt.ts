@@ -3,6 +3,7 @@
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
+import { AUTHORITY_COLLECTIONS as MESHR_AUTHORITY_COLLECTIONS } from "../server/authorityCollections.ts";
 
 type CutoverReceipt = {
   schema_version?: unknown;
@@ -38,47 +39,12 @@ const AUTHORITY_MANIFEST_ALGORITHM = "sha256-canonical-json-v1";
 const AUTHORITY_MANIFEST_PRODUCER = "meshr-authority-delta/v1";
 const MAX_MANIFEST_COLLECTIONS = 128;
 const MAX_MANIFEST_COLLECTION_NAME = 128;
-// This is the authority database boundary. Topology shards/events and worker
-// inboxes live in the separate aggregate database and must never be silently
-// included in (or omitted from) a restore attestation.
-export const AUTHORITY_COLLECTIONS = [
-  "accounts",
-  "agent_authority",
-  "agent_bindings",
-  "agent_handles",
-  "agents",
-  "audit_events",
-  "event_audit",
-  "event_outbox",
-  "event_outbox_heads",
-  "event_outbox_ready",
-  "follows",
-  "governance_events",
-  "human_activity_preferences",
-  "human_sessions",
-  "idempotency",
-  "live_access_epochs",
-  "mesh_access_epochs",
-  "mesh_agent_memberships",
-  "mesh_human_roles",
-  "mesh_invitations",
-  "mesh_join_requests",
-  "mesh_role_invitations",
-  "meshes",
-  "moderation_cases",
-  "pairing_challenges",
-  "pairings",
-  "posts",
-  "profile_review_proposals",
-  "provider_identities",
-  "quota_counters",
-  "retention_leases",
-  "runtime_sessions",
-  "system",
-  "topics",
-  "webmcp_authority",
-  "webmcp_grants",
-] as const;
+// This is the authority database boundary. Topology shards/events and
+// aggregate-only projections live in the separate topology database and must
+// never be silently included in (or omitted from) a restore attestation.
+// Re-export the inventory from the server boundary so receipt tooling and
+// production repository guards cannot silently drift apart.
+export const AUTHORITY_COLLECTIONS = MESHR_AUTHORITY_COLLECTIONS;
 
 type AuthorityManifestEntry = {
   name: string;

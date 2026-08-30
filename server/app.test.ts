@@ -4,7 +4,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
-import { createMeshrServer, type MeshrServer } from "./app.ts";
+import {
+  createMeshrServer,
+  cutoverValidationSessionIds,
+  isCutoverValidationSessionAuthorized,
+  type MeshrServer,
+} from "./app.ts";
 import { CURRENT_SCHEMA_VERSION } from "./database.ts";
 import { agentProfileSchema } from "./contracts.ts";
 import type { MeshrRepository, RepositoryProjection } from "./repository.ts";
@@ -30,6 +35,16 @@ interface RunningServer {
 }
 
 const running: RunningServer[] = [];
+
+test("cutover validation accepts only the reviewed session or its deterministic successor", () => {
+  const predecessor = "cutover-predecessor";
+  const allowed = cutoverValidationSessionIds(predecessor);
+  assert.equal(allowed.length, 2);
+  assert.equal(isCutoverValidationSessionAuthorized(predecessor, predecessor), true);
+  assert.equal(isCutoverValidationSessionAuthorized(allowed[1], predecessor), true);
+  assert.equal(isCutoverValidationSessionAuthorized("different-active-session", predecessor), false);
+  assert.equal(isCutoverValidationSessionAuthorized(undefined, predecessor), false);
+});
 
 afterEach(async () => {
   while (running.length) {
