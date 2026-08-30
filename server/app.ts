@@ -1040,6 +1040,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             } else {
               db.prepare("DELETE FROM mesh_members WHERE mesh_id = ?").run(meshId);
             }
+            if (membershipKeys.length) {
+              db.prepare(
+                `DELETE FROM mesh_agent_memberships
+                 WHERE mesh_id = ? AND (mesh_id || ':' || agent_id) NOT IN (${membershipKeys.map(() => "?").join(",")})`,
+              ).run(meshId, ...membershipKeys);
+            } else {
+              db.prepare("DELETE FROM mesh_agent_memberships WHERE mesh_id = ?").run(meshId);
+            }
           }
         }
         if (scope.agentId) {
@@ -1056,6 +1064,17 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             ).run(scope.agentId, ...joinedMembershipKeys);
           } else {
             db.prepare("DELETE FROM mesh_members WHERE agent_id = ?").run(scope.agentId);
+          }
+          const membershipKeys = projection.memberships
+            .filter((membership) => membership.agentId === scope.agentId)
+            .map((membership) => `${membership.meshId}:${membership.agentId}`);
+          if (membershipKeys.length) {
+            db.prepare(
+              `DELETE FROM mesh_agent_memberships
+               WHERE agent_id = ? AND (mesh_id || ':' || agent_id) NOT IN (${membershipKeys.map(() => "?").join(",")})`,
+            ).run(scope.agentId, ...membershipKeys);
+          } else {
+            db.prepare("DELETE FROM mesh_agent_memberships WHERE agent_id = ?").run(scope.agentId);
           }
         }
       } else {
@@ -1096,12 +1115,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       for (const mesh of projection.meshes) {
         db.prepare(
           `INSERT INTO meshes(
-             id, owner_account_id, name, description, visibility, join_policy, created_at
-           ) VALUES(?, ?, ?, ?, ?, ?, ?)
+             id, owner_account_id, name, description, visibility, join_policy,
+             lifecycle, created_at, updated_at
+           ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              owner_account_id = excluded.owner_account_id, name = excluded.name,
              description = excluded.description, visibility = excluded.visibility,
-             join_policy = excluded.join_policy`,
+             join_policy = excluded.join_policy, lifecycle = excluded.lifecycle,
+             updated_at = excluded.updated_at`,
         ).run(
           mesh.meshId,
           mesh.ownerAccountId,
@@ -1109,7 +1130,9 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           mesh.description,
           mesh.visibility,
           mesh.admission,
+          mesh.lifecycle,
           mesh.createdAt,
+          mesh.updatedAt,
         );
       }
       for (const agent of projection.agents) {
@@ -1171,6 +1194,26 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         ).run(role.meshId, role.accountId, role.role, role.createdAt, role.updatedAt);
       }
       for (const membership of projection.memberships) {
+        db.prepare(
+          `INSERT INTO mesh_agent_memberships(
+             mesh_id, agent_id, status, attention_policy_json,
+             admission_provenance, joined_at, updated_at
+           ) VALUES(?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(mesh_id, agent_id) DO UPDATE SET
+             status = excluded.status,
+             attention_policy_json = excluded.attention_policy_json,
+             admission_provenance = excluded.admission_provenance,
+             joined_at = excluded.joined_at,
+             updated_at = excluded.updated_at`,
+        ).run(
+          membership.meshId,
+          membership.agentId,
+          membership.status,
+          JSON.stringify(membership.attentionPolicy),
+          membership.admissionProvenance,
+          membership.joinedAt,
+          membership.updatedAt,
+        );
         if (membership.status === "joined") {
           db.prepare(
             `INSERT OR IGNORE INTO mesh_members(mesh_id, agent_id, joined_at)
@@ -1185,12 +1228,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         for (const post of projectionPosts) {
           db.prepare(
             `INSERT INTO posts(
-               id, mesh_id, topic_id, agent_id, parent_post_id, body, created_at,
+               id, mesh_id, topic_id, agent_id, session_id, parent_post_id, body, created_at,
                moderation_state, moderation_reason, expires_at
-             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                mesh_id = excluded.mesh_id, topic_id = excluded.topic_id,
-               agent_id = excluded.agent_id, parent_post_id = excluded.parent_post_id,
+               agent_id = excluded.agent_id, session_id = excluded.session_id,
+               parent_post_id = excluded.parent_post_id,
                body = excluded.body, created_at = excluded.created_at,
                moderation_state = excluded.moderation_state,
                moderation_reason = excluded.moderation_reason,
@@ -1200,6 +1244,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             post.meshId,
             post.topicId,
             post.agentId,
+            post.sessionId,
             post.parentPostId,
             post.body,
             post.createdAt,
@@ -2258,8 +2303,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     const tokenHash = sha256(token);
     let grant = db
       .prepare(
-         `SELECT token_hash, human_session_hash, agent_id, created_at,
-                expires_at, last_used_at, revoked_at, session_id, authority_epoch
+         `SELECT wg.token_hash, wg.human_session_hash, wg.agent_id, wg.created_at,
+                wg.expires_at, wg.last_used_at, wg.revoked_at, wg.session_id, wg.authority_epoch
          FROM webmcp_grants wg
          ${pageAuthorityJoin}
          WHERE wg.token_hash = ? AND wg.human_session_hash = ?
@@ -2352,11 +2397,35 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
                 durableGrant.sessionId,
                 durableGrant.lastUsedAt,
               );
+              if (webMcpTransfersSession) {
+                // The page grant and its agent fence can be hydrated on a
+                // different API replica after a transfer. Restore the
+                // human-scoped authority row as well, otherwise the joined
+                // grant query below (and every page tool) fails closed even
+                // though Firestore still holds a valid grant.
+                db.prepare(
+                  `INSERT INTO webmcp_authority(
+                     human_session_hash, epoch, grant_id, agent_id, session_id, updated_at, revoked_at
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(human_session_hash) DO UPDATE SET
+                     epoch = excluded.epoch, grant_id = excluded.grant_id,
+                     agent_id = excluded.agent_id, session_id = excluded.session_id,
+                     updated_at = excluded.updated_at, revoked_at = excluded.revoked_at`,
+                ).run(
+                  durableGrant.humanSessionHash,
+                  durableGrant.authorityEpoch,
+                  durableGrant.tokenHash,
+                  durableGrant.agentId,
+                  durableGrant.sessionId,
+                  durableGrant.lastUsedAt,
+                  durableGrant.revokedAt,
+                );
+              }
             });
               grant = db
                 .prepare(
-                  `SELECT token_hash, human_session_hash, agent_id, created_at,
-                          expires_at, last_used_at, revoked_at, session_id, authority_epoch
+                  `SELECT wg.token_hash, wg.human_session_hash, wg.agent_id, wg.created_at,
+                          wg.expires_at, wg.last_used_at, wg.revoked_at, wg.session_id, wg.authority_epoch
                    FROM webmcp_grants wg
                    ${pageAuthorityJoin}
                    WHERE wg.token_hash = ? AND wg.human_session_hash = ?
@@ -2487,8 +2556,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     });
     const grant = db
       .prepare(
-        `SELECT token_hash, human_session_hash, agent_id, created_at,
-                expires_at, last_used_at, revoked_at, session_id, authority_epoch
+        `SELECT wg.token_hash, wg.human_session_hash, wg.agent_id, wg.created_at,
+                wg.expires_at, wg.last_used_at, wg.revoked_at, wg.session_id, wg.authority_epoch
          FROM webmcp_grants wg
          ${pageAuthorityJoin}
          WHERE wg.token_hash = ? AND wg.human_session_hash = ?
@@ -3360,6 +3429,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         meshId: post.meshId,
         topicId: post.topicId,
         agentId: post.agentId,
+        sessionId: post.sessionId,
         parentPostId: post.parentPostId,
         body: post.body,
         createdAt: post.createdAt,
@@ -3937,6 +4007,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           meshId: post.meshId,
           topicId: post.topicId,
           agentId: post.agentId,
+          sessionId: post.sessionId,
           parentPostId: post.parentPostId,
           ...(includeBody ? { body: post.body } : {}),
           moderationState: post.moderationState,
@@ -3972,6 +4043,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       meshId: input.meshId,
       topicId: input.topicId,
       agentId: input.principal.agentId,
+      sessionId: input.principal.sessionId ?? "",
       parentPostId: input.parentPostId,
       body: input.body,
       createdAt,
@@ -3981,14 +4053,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     };
     db.prepare(
       `INSERT INTO posts(
-         id, mesh_id, topic_id, agent_id, parent_post_id, body, created_at,
+         id, mesh_id, topic_id, agent_id, session_id, parent_post_id, body, created_at,
          moderation_state, moderation_reason, expires_at
-       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       post.id,
       post.meshId,
       post.topicId,
       post.agentId,
+      post.sessionId,
       post.parentPostId,
       post.body,
       post.createdAt,
@@ -4029,6 +4102,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     meshId: string;
     topicId: string;
     agentId: string;
+    sessionId: string;
     parentPostId: string | null;
     body: string;
     createdAt: string;
@@ -4040,6 +4114,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     meshId: String(raw.mesh_id),
     topicId: String(raw.topic_id),
     agentId: String(raw.agent_id),
+    sessionId: String(raw.session_id ?? ""),
     parentPostId: raw.parent_post_id == null ? null : String(raw.parent_post_id),
     body: String(raw.body),
     createdAt: String(raw.created_at),
@@ -4112,14 +4187,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (existing) return;
       db.prepare(
         `INSERT INTO posts(
-           id, mesh_id, topic_id, agent_id, parent_post_id, body, created_at,
+           id, mesh_id, topic_id, agent_id, session_id, parent_post_id, body, created_at,
            moderation_state, moderation_reason, expires_at
-         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         post.id,
         post.meshId,
         post.topicId,
         post.agentId,
+        post.sessionId,
         post.parentPostId,
         post.body,
         post.createdAt,
@@ -6366,9 +6442,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         if (durableMeshDuplicate) return { id: meshId, topicId };
         db.prepare(
           `INSERT INTO meshes(
-             id, owner_account_id, name, description, visibility, join_policy, created_at
-           ) VALUES(?, ?, ?, ?, ?, ?, ?)`,
-        ).run(meshId, principal.accountId, name, description, visibility, joinPolicy, now);
+             id, owner_account_id, name, description, visibility, join_policy,
+             lifecycle, created_at, updated_at
+           ) VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+        ).run(meshId, principal.accountId, name, description, visibility, joinPolicy, now, now);
         db.prepare(
           `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
            VALUES(?, ?, 'owner', ?, ?)`,
@@ -6651,12 +6728,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       }
       database.transaction(() => {
         db.prepare(
-          `UPDATE meshes SET name = ?, description = ?, visibility = ?, join_policy = ? WHERE id = ?`,
+          `UPDATE meshes SET name = ?, description = ?, visibility = ?, join_policy = ?,
+                             lifecycle = ?, updated_at = ? WHERE id = ?`,
         ).run(
           committedMesh.name,
           committedMesh.description,
           committedMesh.visibility,
           committedMesh.admission,
+          committedMesh.lifecycle,
+          committedMesh.updatedAt,
           meshId,
         );
         emitAudit({
@@ -10579,6 +10659,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
               meshId: row.mesh_id,
               topicId: row.topic_id,
               agentId: row.agent_id,
+              sessionId: row.session_id,
               parentPostId: row.parent_post_id,
               body: row.body,
               createdAt: row.created_at,
@@ -11638,6 +11719,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           meshId: row.mesh_id,
           topicId: row.topic_id,
           agentId: row.agent_id,
+          sessionId: row.session_id,
           parentPostId: row.parent_post_id,
           body: row.body,
           createdAt: row.created_at,

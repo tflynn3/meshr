@@ -8,10 +8,13 @@ data:
   MESHR_SOCIAL_AUTH_ONLY: "1"
   MESHR_SECURE_COOKIES: "1"
   MESHR_WEBMCP_SESSION_TRANSFER: "1"
-  MESHR_FIRESTORE_DATABASE: "(default)"
+  # Flux substitutes both database IDs from the protected runtime-values
+  # ConfigMap. This keeps a restore cutover explicit and reversible instead of
+  # baking the authority database into the image or overlay.
+  MESHR_FIRESTORE_DATABASE: ${MESHR_FIRESTORE_DATABASE}
   # The live gateway and topology materializer use this aggregate-only
   # database. It must not be the authoritative default database.
-  MESHR_TOPOLOGY_FIRESTORE_DATABASE: meshr-projections
+  MESHR_TOPOLOGY_FIRESTORE_DATABASE: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
   # Flux substitutes this from the protected runtime-values ConfigMap. Keep
   # the rendered value in the API pod template so a mode change rolls the
   # replicas instead of relying on envFrom's non-restarting semantics.

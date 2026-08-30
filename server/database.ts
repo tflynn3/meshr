@@ -443,7 +443,49 @@ const MIGRATION_12 = `
     ON mesh_role_invitations(status, expires_at);
 `;
 
-export const CURRENT_SCHEMA_VERSION = 12;
+// Local projections retain the immutable runtime session that authored each
+// post.  Firestore has always carried this field; adding it here keeps the
+// SQLite conformance adapter and moderation lookups contract-compatible while
+// preserving older fixture databases with an explicit legacy-empty value.
+const MIGRATION_13 = `
+  ALTER TABLE posts ADD COLUMN session_id TEXT NOT NULL DEFAULT '';
+  CREATE INDEX IF NOT EXISTS posts_session_idx ON posts(session_id, created_at);
+  ALTER TABLE meshes ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'active'
+    CHECK(lifecycle IN ('active', 'archived'));
+  ALTER TABLE meshes ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
+  UPDATE meshes SET updated_at = created_at WHERE updated_at = '';
+  CREATE INDEX IF NOT EXISTS meshes_lifecycle_idx ON meshes(lifecycle, updated_at);
+`;
+
+// Keep the local conformance adapter's full membership history separate from
+// the legacy joined-only mesh_members projection. This lets pending/left/
+// removed states retain their attention policy, admission provenance, and
+// update timestamp without changing the many local read paths that use
+// mesh_members as the active-membership index.
+const MIGRATION_14 = `
+  CREATE TABLE IF NOT EXISTS mesh_agent_memberships (
+    mesh_id TEXT NOT NULL REFERENCES meshes(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('joined', 'pending', 'left', 'removed')),
+    attention_policy_json TEXT NOT NULL DEFAULT '{}',
+    admission_provenance TEXT NOT NULL CHECK(admission_provenance IN ('open', 'approval', 'invite')),
+    joined_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(mesh_id, agent_id)
+  ) WITHOUT ROWID, STRICT;
+  CREATE INDEX IF NOT EXISTS mesh_agent_memberships_status_idx
+    ON mesh_agent_memberships(mesh_id, status, updated_at);
+  CREATE INDEX IF NOT EXISTS mesh_agent_memberships_agent_idx
+    ON mesh_agent_memberships(agent_id, status, updated_at);
+  INSERT OR IGNORE INTO mesh_agent_memberships(
+    mesh_id, agent_id, status, attention_policy_json, admission_provenance,
+    joined_at, updated_at
+  )
+  SELECT mesh_id, agent_id, 'joined', '{}', 'open', joined_at, joined_at
+  FROM mesh_members;
+`;
+
+export const CURRENT_SCHEMA_VERSION = 14;
 
 export interface MeshrDatabaseOptions {
   path: string;
@@ -648,6 +690,30 @@ export class MeshrDatabase {
           .run(this.now());
       });
     }
+
+    const migration13 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 13")
+      .get() as { applied: number } | undefined;
+    if (!migration13) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_13);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(13, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration14 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 14")
+      .get() as { applied: number } | undefined;
+    if (!migration14) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_14);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(14, ?)")
+          .run(this.now());
+      });
+    }
   }
 
   private seedPublicCommons(): void {
@@ -656,13 +722,16 @@ export class MeshrDatabase {
       this.sqlite
         .prepare(
           `INSERT OR IGNORE INTO meshes(
-             id, owner_account_id, name, description, visibility, join_policy, created_at
-           ) VALUES(?, NULL, ?, ?, 'public', 'open', ?)`,
+             id, owner_account_id, name, description, visibility, join_policy,
+             lifecycle, created_at, updated_at
+           ) VALUES(?, NULL, ?, ?, 'public', 'open', ?, ?, ?)`,
         )
         .run(
           "mesh-public",
           "Public mesh",
           "The open commons for agent conversation.",
+          "active",
+          now,
           now,
         );
       const insertTopic = this.sqlite.prepare(

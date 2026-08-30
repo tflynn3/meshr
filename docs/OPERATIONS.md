@@ -57,6 +57,21 @@ The `npm` environment must use custom deployment policies containing only the
 automatic tag path and the manual release path; the preflight rejects a
 catch-all or unrestricted npm environment.
 
+The canary and production environments also require one dedicated, disposable
+Identity Platform test account each. Store the provider (`google` or `github`)
+as `MESHR_CANARY_E2E_SOCIAL_PROVIDER` / `MESHR_PRODUCTION_E2E_SOCIAL_PROVIDER`
+and a refresh-token/API-key pair as the matching protected credentials
+`MESHR_CANARY_E2E_SOCIAL_REFRESH_TOKEN` plus
+`MESHR_CANARY_E2E_IDENTITY_API_KEY` (and the equivalent production names).
+The smoke exchanges the refresh token for a fresh ID token immediately before
+the authenticated flow, so a long image rollout cannot consume an expired
+token. A static `MESHR_E2E_SOCIAL_ID_TOKEN` is accepted only for a manual local
+smoke. The release workflow passes credentials only to
+`npm run smoke:deployed`; the smoke reuses the `launch-smoke` agent handle,
+never logs credentials, and fails promotion if authenticated pairing, signed
+session claim, page WebMCP transfer, supersession, or revocation does not
+complete.
+
 ## Signals and alerts
 
 Every request, event, and runtime session carries a correlation ID. The API,
@@ -156,8 +171,11 @@ enable application protection mode in this order:
 2. Block new runtime-session starts and mesh creation.
 3. Reduce write and topology fan-out quotas while retaining idempotent retries.
 
-Record the operator and reason for each protection-mode transition in the
-immutable audit stream.
+The protected release workflow writes a durable `transition_requested` receipt
+before changing the runtime ConfigMap and a matching `transition_applied`
+receipt after the apply succeeds. Record the operator and reason for each
+protection-mode transition in the immutable audit stream; an interrupted run
+must be retried until both receipts exist.
 
 ## Retention and recovery
 
@@ -166,7 +184,14 @@ after 30 days. Governance and security audit events are retained for one year.
 Derived topology aggregates may remain only when they cannot reconstruct an
 expired body. To recover, pause promotion, restore Firestore to a new database,
 replay the event DLQ with idempotent consumers, verify private-mesh isolation,
-then switch the Gateway backend and run the smoke suite.
+then authorize the restored database in OpenTofu with
+`additional_authority_database_names` and
+`additional_topology_database_names`, update the protected
+`MESHR_FIRESTORE_DATABASE` and `MESHR_TOPOLOGY_FIRESTORE_DATABASE` values, and
+wait for Flux to roll every API/worker replica before running the smoke suite.
+The runtime database IDs are intentionally substituted through the protected
+Flux ConfigMap; the Gateway remains same-origin routing and is not the
+authority selector.
 
 ## Incident boundaries
 

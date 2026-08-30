@@ -525,41 +525,90 @@ export function App() {
       return;
     }
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(
-      `${protocol}//${window.location.host}/v1/live?meshId=${encodeURIComponent(meshId)}&contractVersion=1`,
-    );
     let active = true;
-    setLiveHealthy(false);
-    socket.onopen = () => {
-      if (active) setLiveHealthy(true);
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | undefined;
+    let stableOpenTimer: number | undefined;
+    let reconnectAttempt = 0;
+    const endpoint = `${protocol}//${window.location.host}/v1/live?meshId=${encodeURIComponent(meshId)}&contractVersion=1`;
+    let connect: () => void;
+    const scheduleReconnect = () => {
+      if (!active || reconnectTimer !== undefined) return;
+      // Recover quickly after a pod/gateway restart, then back off so a
+      // prolonged outage does not create a reconnect storm. HTTP polling
+      // remains the bounded snapshot fallback while the socket is down.
+      const baseDelay = Math.min(3_200, 250 * 2 ** Math.min(reconnectAttempt, 5));
+      // Spread viewers across the retry window. The cap keeps the worst-case
+      // delay under four seconds, leaving room for the TLS/WebSocket
+      // handshake while meeting the five-second recovery target.
+      const delay = Math.round(baseDelay * (0.75 + Math.random() * 0.5));
+      reconnectAttempt += 1;
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = undefined;
+        connect();
+      }, delay);
     };
-    socket.onmessage = (event) => {
+    connect = () => {
       if (!active) return;
-      setLiveHealthy(true);
-      try {
-        const message = JSON.parse(event.data) as {
-          activity?: PublicActivitySnapshot;
-        };
-        if (message.activity && Array.isArray(message.activity.meshes)) {
-          setPublicActivity(message.activity);
-          return;
+      setLiveHealthy(false);
+      const nextSocket = new WebSocket(endpoint);
+      socket = nextSocket;
+      nextSocket.onopen = () => {
+        if (!active || socket !== nextSocket) return;
+        setLiveHealthy(true);
+        void refreshPublicActivity();
+        if (stableOpenTimer !== undefined) window.clearTimeout(stableOpenTimer);
+        stableOpenTimer = window.setTimeout(() => {
+          stableOpenTimer = undefined;
+          if (active && socket === nextSocket && nextSocket.readyState === WebSocket.OPEN) {
+            reconnectAttempt = 0;
+          }
+        }, 3_000);
+      };
+      nextSocket.onmessage = (event) => {
+        if (!active || socket !== nextSocket) return;
+        setLiveHealthy(true);
+        try {
+          const message = JSON.parse(event.data) as {
+            activity?: PublicActivitySnapshot;
+          };
+          if (message.activity && Array.isArray(message.activity.meshes)) {
+            reconnectAttempt = 0;
+            if (stableOpenTimer !== undefined) {
+              window.clearTimeout(stableOpenTimer);
+              stableOpenTimer = undefined;
+            }
+            setPublicActivity(message.activity);
+            return;
+          }
+        } catch {
+          // Fall through to the coalesced HTTP snapshot recovery below.
         }
-      } catch {
-        // Fall through to the coalesced HTTP snapshot recovery below.
-      }
-      void refreshPublicActivity();
+        void refreshPublicActivity();
+      };
+      nextSocket.onerror = () => {
+        if (active && socket === nextSocket) setLiveHealthy(false);
+        nextSocket.close();
+      };
+      nextSocket.onclose = () => {
+        if (!active || socket !== nextSocket) return;
+        socket = null;
+        if (stableOpenTimer !== undefined) window.clearTimeout(stableOpenTimer);
+        stableOpenTimer = undefined;
+        setLiveHealthy(false);
+        scheduleReconnect();
+      };
     };
-    socket.onerror = () => {
-      if (active) setLiveHealthy(false);
-      socket.close();
-    };
-    socket.onclose = () => {
-      if (active) setLiveHealthy(false);
-    };
+    connect();
     return () => {
       active = false;
       setLiveHealthy(false);
-      socket.close();
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
+      if (stableOpenTimer !== undefined) window.clearTimeout(stableOpenTimer);
+      stableOpenTimer = undefined;
+      socket?.close();
+      socket = null;
     };
   }, [refreshPublicActivity, selectedMesh?.id]);
 

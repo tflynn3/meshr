@@ -408,6 +408,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with: {node-version: 24, cache: npm}
+      - name: Install release audit runtime
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Validate protected canary inputs
         env:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
@@ -416,10 +420,17 @@ jobs:
           GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
           GKE_LOCATION: ${{ vars.GKE_LOCATION }}
           MESHR_CANARY_URL: ${{ vars.MESHR_CANARY_URL }}
+          MESHR_FIRESTORE_DATABASE: ${{ vars.MESHR_FIRESTORE_DATABASE }}
+          MESHR_TOPOLOGY_FIRESTORE_DATABASE: ${{ vars.MESHR_TOPOLOGY_FIRESTORE_DATABASE }}
           MESHR_MODERATION_ENDPOINT: ${{ vars.MESHR_MODERATION_ENDPOINT }}
           MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
           MESHR_MODERATION_AUDIENCE: ${{ vars.MESHR_MODERATION_AUDIENCE }}
           MESHR_COST_PROTECTION_MODE: ${{ vars.MESHR_COST_PROTECTION_MODE }}
+          MESHR_COST_PROTECTION_OPERATOR: ${{ vars.MESHR_COST_PROTECTION_OPERATOR }}
+          MESHR_COST_PROTECTION_REASON: ${{ vars.MESHR_COST_PROTECTION_REASON }}
+          MESHR_CANARY_E2E_SOCIAL_PROVIDER: ${{ vars.MESHR_CANARY_E2E_SOCIAL_PROVIDER }}
+          MESHR_CANARY_E2E_IDENTITY_API_KEY: ${{ vars.MESHR_CANARY_E2E_IDENTITY_API_KEY }}
+          MESHR_CANARY_E2E_SOCIAL_REFRESH_TOKEN: ${{ secrets.MESHR_CANARY_E2E_SOCIAL_REFRESH_TOKEN }}
           MESHR_CANARY_RELEASE_APP_ID: ${{ vars.MESHR_CANARY_RELEASE_APP_ID }}
           MESHR_CANARY_RELEASE_APP_SLUG: ${{ vars.MESHR_CANARY_RELEASE_APP_SLUG }}
           MESHR_CANARY_RELEASE_APP_PRIVATE_KEY: ${{ secrets.MESHR_CANARY_RELEASE_APP_PRIVATE_KEY }}
@@ -431,10 +442,17 @@ jobs:
           : "${GKE_CLUSTER:?Set the protected GKE_CLUSTER repository variable before canary promotion}"
           : "${GKE_LOCATION:?Set the protected GKE_LOCATION repository variable before canary promotion}"
           : "${MESHR_CANARY_URL:?Set the protected MESHR_CANARY_URL repository variable before canary promotion}"
+          : "${MESHR_FIRESTORE_DATABASE:?Set the protected MESHR_FIRESTORE_DATABASE canary variable before canary promotion}"
+          : "${MESHR_TOPOLOGY_FIRESTORE_DATABASE:?Set the protected MESHR_TOPOLOGY_FIRESTORE_DATABASE canary variable before canary promotion}"
           : "${MESHR_MODERATION_ENDPOINT:?Set the protected MESHR_MODERATION_ENDPOINT canary variable before canary promotion}"
           : "${MESHR_MODERATION_HEALTHCHECK_URL:?Set the protected MESHR_MODERATION_HEALTHCHECK_URL canary variable before canary promotion}"
           : "${MESHR_MODERATION_AUDIENCE:?Set the protected MESHR_MODERATION_AUDIENCE canary variable before canary promotion}"
           : "${MESHR_COST_PROTECTION_MODE:?Set the protected MESHR_COST_PROTECTION_MODE canary variable before canary promotion}"
+          : "${MESHR_COST_PROTECTION_OPERATOR:?Set the protected MESHR_COST_PROTECTION_OPERATOR canary variable before canary promotion}"
+          : "${MESHR_COST_PROTECTION_REASON:?Set the protected MESHR_COST_PROTECTION_REASON canary variable before canary promotion}"
+          : "${MESHR_CANARY_E2E_SOCIAL_PROVIDER:?Set the protected MESHR_CANARY_E2E_SOCIAL_PROVIDER canary variable before canary promotion}"
+          : "${MESHR_CANARY_E2E_IDENTITY_API_KEY:?Set the protected MESHR_CANARY_E2E_IDENTITY_API_KEY canary variable before canary promotion}"
+          : "${MESHR_CANARY_E2E_SOCIAL_REFRESH_TOKEN:?Set the protected MESHR_CANARY_E2E_SOCIAL_REFRESH_TOKEN canary secret before canary promotion}"
           : "${MESHR_CANARY_RELEASE_APP_ID:?Set the protected MESHR_CANARY_RELEASE_APP_ID canary variable before canary promotion}"
           : "${MESHR_CANARY_RELEASE_APP_SLUG:?Set the protected MESHR_CANARY_RELEASE_APP_SLUG canary variable before canary promotion}"
           : "${MESHR_CANARY_RELEASE_APP_PRIVATE_KEY:?Set the protected MESHR_CANARY_RELEASE_APP_PRIVATE_KEY canary secret before canary promotion}"
@@ -778,7 +796,11 @@ jobs:
           MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
           MESHR_MODERATION_AUDIENCE: ${{ vars.MESHR_MODERATION_AUDIENCE }}
           MESHR_COST_PROTECTION_MODE: ${{ vars.MESHR_COST_PROTECTION_MODE }}
+          MESHR_COST_PROTECTION_OPERATOR: ${{ vars.MESHR_COST_PROTECTION_OPERATOR }}
+          MESHR_COST_PROTECTION_REASON: ${{ vars.MESHR_COST_PROTECTION_REASON }}
           MESHR_CANARY_URL: ${{ vars.MESHR_CANARY_URL }}
+          MESHR_FIRESTORE_DATABASE: ${{ vars.MESHR_FIRESTORE_DATABASE }}
+          MESHR_TOPOLOGY_FIRESTORE_DATABASE: ${{ vars.MESHR_TOPOLOGY_FIRESTORE_DATABASE }}
           API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ steps.resolve.outputs.api }}
           EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ steps.resolve.outputs.event_plane }}
           MODERATION_ADAPTER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/moderation-adapter@${{ steps.resolve.outputs.moderation_adapter }}
@@ -788,6 +810,8 @@ jobs:
           : "${GCP_PROJECT_ID:?Set the protected GCP_PROJECT_ID repository variable}"
           : "${GKE_CLUSTER:?Set the protected GKE_CLUSTER repository variable}"
           : "${GKE_LOCATION:?Set the protected GKE_LOCATION repository variable}"
+          : "${MESHR_FIRESTORE_DATABASE:?Set the protected MESHR_FIRESTORE_DATABASE canary variable}"
+          : "${MESHR_TOPOLOGY_FIRESTORE_DATABASE:?Set the protected MESHR_TOPOLOGY_FIRESTORE_DATABASE canary variable}"
           : "${MESHR_MODERATION_ENDPOINT:?Set the protected MESHR_MODERATION_ENDPOINT repository variable to the approved Model Armor/Sensitive Data Protection adapter}"
           : "${MESHR_MODERATION_HEALTHCHECK_URL:?Set the protected MESHR_MODERATION_HEALTHCHECK_URL canary variable to the provider health endpoint}"
           : "${MESHR_MODERATION_AUDIENCE:?Set the protected MESHR_MODERATION_AUDIENCE canary variable for the IAM-protected adapter}"
@@ -821,21 +845,40 @@ jobs:
             --from-literal="MODERATION_ADAPTER_IMAGE=$MODERATION_ADAPTER_IMAGE" \
             --from-literal="WEB_IMAGE=$WEB_IMAGE" \
             --dry-run=client -o yaml | kubectl apply -f -
+          previous_mode="$(kubectl -n flux-system get configmap meshr-canary-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_MODE}' 2>/dev/null || true)"
           if [ -z "$MESHR_COST_PROTECTION_MODE" ]; then
             MESHR_COST_PROTECTION_MODE="$(kubectl -n flux-system get configmap meshr-canary-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_MODE}' 2>/dev/null || true)"
           fi
           : "${MESHR_COST_PROTECTION_MODE:?Set MESHR_COST_PROTECTION_MODE or bootstrap meshr-canary-runtime-values before canary promotion}"
+          if [ -z "$previous_mode" ]; then previous_mode="$MESHR_COST_PROTECTION_MODE"; fi
           case "$MESHR_COST_PROTECTION_MODE" in
             normal|protect|throttle) ;;
             *) echo "MESHR_COST_PROTECTION_MODE must be normal, protect, or throttle" >&2; exit 1 ;;
           esac
+          cost_transition_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [ "$previous_mode" != "$MESHR_COST_PROTECTION_MODE" ]; then
+            MESHR_COST_PROTECTION_PREVIOUS_MODE="$previous_mode" \
+            MESHR_COST_PROTECTION_TRANSITION_ID="$cost_transition_id" \
+            MESHR_COST_PROTECTION_PHASE=requested \
+            GOOGLE_CLOUD_PROJECT="$GCP_PROJECT_ID" \
+            npm run audit:cost-protection
+          fi
           kubectl -n flux-system create configmap meshr-canary-runtime-values \
             --from-literal="GCP_PROJECT_ID=$GCP_PROJECT_ID" \
+            --from-literal="MESHR_FIRESTORE_DATABASE=$MESHR_FIRESTORE_DATABASE" \
+            --from-literal="MESHR_TOPOLOGY_FIRESTORE_DATABASE=$MESHR_TOPOLOGY_FIRESTORE_DATABASE" \
             --from-literal="MESHR_MODERATION_ENDPOINT=$MESHR_MODERATION_ENDPOINT" \
             --from-literal="MESHR_MODERATION_HEALTHCHECK_URL=$MESHR_MODERATION_HEALTHCHECK_URL" \
             --from-literal="MESHR_MODERATION_AUDIENCE=$MESHR_MODERATION_AUDIENCE" \
             --from-literal="MESHR_COST_PROTECTION_MODE=$MESHR_COST_PROTECTION_MODE" \
             --dry-run=client -o yaml | kubectl apply -f -
+          if [ "$previous_mode" != "$MESHR_COST_PROTECTION_MODE" ]; then
+            MESHR_COST_PROTECTION_PREVIOUS_MODE="$previous_mode" \
+            MESHR_COST_PROTECTION_TRANSITION_ID="$cost_transition_id" \
+            MESHR_COST_PROTECTION_PHASE=applied \
+            GOOGLE_CLOUD_PROJECT="$GCP_PROJECT_ID" \
+            npm run audit:cost-protection
+          fi
           reconcile_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           kubectl -n flux-system annotate kustomization meshr-canary \
             "reconcile.fluxcd.io/requestedAt=$reconcile_at" --overwrite
@@ -1072,6 +1115,15 @@ jobs:
               sleep 2
             done
           done
+      - name: Run authenticated canary pairing and WebMCP smoke
+        if: success()
+        env:
+          MESHR_DEPLOYED_URL: ${{ vars.MESHR_CANARY_URL }}
+          MESHR_REQUIRE_DEPLOYED_E2E: "1"
+          MESHR_E2E_SOCIAL_PROVIDER: ${{ vars.MESHR_CANARY_E2E_SOCIAL_PROVIDER }}
+          MESHR_E2E_IDENTITY_API_KEY: ${{ vars.MESHR_CANARY_E2E_IDENTITY_API_KEY }}
+          MESHR_E2E_SOCIAL_REFRESH_TOKEN: ${{ secrets.MESHR_CANARY_E2E_SOCIAL_REFRESH_TOKEN }}
+        run: npm run smoke:deployed
       - name: Refresh GCP credentials before restoring canary
         if: success()
         id: canary-restore-auth
@@ -1175,6 +1227,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with: {node-version: 24, cache: npm}
+      - name: Install release audit runtime
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Validate protected production inputs
         env:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
@@ -1183,10 +1239,17 @@ jobs:
           GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
           GKE_LOCATION: ${{ vars.GKE_LOCATION }}
           MESHR_PRODUCTION_URL: ${{ vars.MESHR_PRODUCTION_URL }}
+          MESHR_FIRESTORE_DATABASE: ${{ vars.MESHR_FIRESTORE_DATABASE }}
+          MESHR_TOPOLOGY_FIRESTORE_DATABASE: ${{ vars.MESHR_TOPOLOGY_FIRESTORE_DATABASE }}
           MESHR_MODERATION_ENDPOINT: ${{ vars.MESHR_MODERATION_ENDPOINT }}
           MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
           MESHR_MODERATION_AUDIENCE: ${{ vars.MESHR_MODERATION_AUDIENCE }}
           MESHR_COST_PROTECTION_MODE: ${{ vars.MESHR_COST_PROTECTION_MODE }}
+          MESHR_COST_PROTECTION_OPERATOR: ${{ vars.MESHR_COST_PROTECTION_OPERATOR }}
+          MESHR_COST_PROTECTION_REASON: ${{ vars.MESHR_COST_PROTECTION_REASON }}
+          MESHR_PRODUCTION_E2E_SOCIAL_PROVIDER: ${{ vars.MESHR_PRODUCTION_E2E_SOCIAL_PROVIDER }}
+          MESHR_PRODUCTION_E2E_IDENTITY_API_KEY: ${{ vars.MESHR_PRODUCTION_E2E_IDENTITY_API_KEY }}
+          MESHR_PRODUCTION_E2E_SOCIAL_REFRESH_TOKEN: ${{ secrets.MESHR_PRODUCTION_E2E_SOCIAL_REFRESH_TOKEN }}
           MESHR_PRODUCTION_RELEASE_APP_ID: ${{ vars.MESHR_PRODUCTION_RELEASE_APP_ID }}
           MESHR_PRODUCTION_RELEASE_APP_SLUG: ${{ vars.MESHR_PRODUCTION_RELEASE_APP_SLUG }}
           MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY: ${{ secrets.MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY }}
@@ -1198,10 +1261,17 @@ jobs:
           : "${GKE_CLUSTER:?Set the protected GKE_CLUSTER repository variable before production promotion}"
           : "${GKE_LOCATION:?Set the protected GKE_LOCATION repository variable before production promotion}"
           : "${MESHR_PRODUCTION_URL:?Set the protected MESHR_PRODUCTION_URL production variable before production promotion}"
+          : "${MESHR_FIRESTORE_DATABASE:?Set the protected MESHR_FIRESTORE_DATABASE production variable before production promotion}"
+          : "${MESHR_TOPOLOGY_FIRESTORE_DATABASE:?Set the protected MESHR_TOPOLOGY_FIRESTORE_DATABASE production variable before production promotion}"
           : "${MESHR_MODERATION_ENDPOINT:?Set the protected MESHR_MODERATION_ENDPOINT production variable before production promotion}"
           : "${MESHR_MODERATION_HEALTHCHECK_URL:?Set the protected MESHR_MODERATION_HEALTHCHECK_URL production variable before production promotion}"
           : "${MESHR_MODERATION_AUDIENCE:?Set the protected MESHR_MODERATION_AUDIENCE production variable before production promotion}"
           : "${MESHR_COST_PROTECTION_MODE:?Set the protected MESHR_COST_PROTECTION_MODE production variable before production promotion}"
+          : "${MESHR_COST_PROTECTION_OPERATOR:?Set the protected MESHR_COST_PROTECTION_OPERATOR production variable before production promotion}"
+          : "${MESHR_COST_PROTECTION_REASON:?Set the protected MESHR_COST_PROTECTION_REASON production variable before production promotion}"
+          : "${MESHR_PRODUCTION_E2E_SOCIAL_PROVIDER:?Set the protected MESHR_PRODUCTION_E2E_SOCIAL_PROVIDER production variable before production promotion}"
+          : "${MESHR_PRODUCTION_E2E_IDENTITY_API_KEY:?Set the protected MESHR_PRODUCTION_E2E_IDENTITY_API_KEY production variable before production promotion}"
+          : "${MESHR_PRODUCTION_E2E_SOCIAL_REFRESH_TOKEN:?Set the protected MESHR_PRODUCTION_E2E_SOCIAL_REFRESH_TOKEN production secret before production promotion}"
           : "${MESHR_PRODUCTION_RELEASE_APP_ID:?Set the protected MESHR_PRODUCTION_RELEASE_APP_ID production variable before production promotion}"
           : "${MESHR_PRODUCTION_RELEASE_APP_SLUG:?Set the protected MESHR_PRODUCTION_RELEASE_APP_SLUG production variable before production promotion}"
           : "${MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY:?Set the protected MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY production secret before production promotion}"
@@ -1493,7 +1563,11 @@ jobs:
           MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
           MESHR_MODERATION_AUDIENCE: ${{ vars.MESHR_MODERATION_AUDIENCE }}
           MESHR_COST_PROTECTION_MODE: ${{ vars.MESHR_COST_PROTECTION_MODE }}
+          MESHR_COST_PROTECTION_OPERATOR: ${{ vars.MESHR_COST_PROTECTION_OPERATOR }}
+          MESHR_COST_PROTECTION_REASON: ${{ vars.MESHR_COST_PROTECTION_REASON }}
           MESHR_PRODUCTION_URL: ${{ vars.MESHR_PRODUCTION_URL }}
+          MESHR_FIRESTORE_DATABASE: ${{ vars.MESHR_FIRESTORE_DATABASE }}
+          MESHR_TOPOLOGY_FIRESTORE_DATABASE: ${{ vars.MESHR_TOPOLOGY_FIRESTORE_DATABASE }}
           API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ needs.canary.outputs.api_digest }}
           EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ needs.canary.outputs.event_plane_digest }}
           MODERATION_ADAPTER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/moderation-adapter@${{ needs.canary.outputs.moderation_adapter_digest }}
@@ -1503,6 +1577,8 @@ jobs:
           : "${GCP_PROJECT_ID:?Set the protected GCP_PROJECT_ID repository variable}"
           : "${GKE_CLUSTER:?Set the protected GKE_CLUSTER repository variable}"
           : "${GKE_LOCATION:?Set the protected GKE_LOCATION repository variable}"
+          : "${MESHR_FIRESTORE_DATABASE:?Set the protected MESHR_FIRESTORE_DATABASE production variable}"
+          : "${MESHR_TOPOLOGY_FIRESTORE_DATABASE:?Set the protected MESHR_TOPOLOGY_FIRESTORE_DATABASE production variable}"
           : "${MESHR_MODERATION_ENDPOINT:?Set the protected MESHR_MODERATION_ENDPOINT repository variable to the approved Model Armor/Sensitive Data Protection adapter}"
           : "${MESHR_MODERATION_HEALTHCHECK_URL:?Set the protected MESHR_MODERATION_HEALTHCHECK_URL production variable to the provider health endpoint}"
           : "${MESHR_MODERATION_AUDIENCE:?Set the protected MESHR_MODERATION_AUDIENCE production variable for the IAM-protected adapter}"
@@ -1537,22 +1613,43 @@ jobs:
             --from-literal="MODERATION_ADAPTER_IMAGE=$MODERATION_ADAPTER_IMAGE" \
             --from-literal="WEB_IMAGE=$WEB_IMAGE" \
             --dry-run=client -o yaml | kubectl apply -f -
-          current_mode="$(kubectl -n flux-system get configmap meshr-production-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_MODE}' 2>/dev/null || true)"
+          previous_mode="$(kubectl -n flux-system get configmap meshr-production-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_MODE}' 2>/dev/null || true)"
+          current_mode="$previous_mode"
           if [ -n "$MESHR_COST_PROTECTION_MODE" ]; then
             current_mode="$MESHR_COST_PROTECTION_MODE"
           fi
           : "${current_mode:?Set MESHR_COST_PROTECTION_MODE or bootstrap meshr-production-runtime-values before production promotion}"
+          if [ -z "$previous_mode" ]; then previous_mode="$current_mode"; fi
           case "$current_mode" in
             normal|protect|throttle) ;;
             *) echo "MESHR_COST_PROTECTION_MODE must be normal, protect, or throttle" >&2; exit 1 ;;
           esac
+          cost_transition_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [ "$previous_mode" != "$current_mode" ]; then
+            MESHR_COST_PROTECTION_MODE="$current_mode" \
+            MESHR_COST_PROTECTION_PREVIOUS_MODE="$previous_mode" \
+            MESHR_COST_PROTECTION_TRANSITION_ID="$cost_transition_id" \
+            MESHR_COST_PROTECTION_PHASE=requested \
+            GOOGLE_CLOUD_PROJECT="$GCP_PROJECT_ID" \
+            npm run audit:cost-protection
+          fi
           kubectl -n flux-system create configmap meshr-production-runtime-values \
             --from-literal="GCP_PROJECT_ID=$GCP_PROJECT_ID" \
+            --from-literal="MESHR_FIRESTORE_DATABASE=$MESHR_FIRESTORE_DATABASE" \
+            --from-literal="MESHR_TOPOLOGY_FIRESTORE_DATABASE=$MESHR_TOPOLOGY_FIRESTORE_DATABASE" \
             --from-literal="MESHR_MODERATION_ENDPOINT=$MESHR_MODERATION_ENDPOINT" \
             --from-literal="MESHR_MODERATION_HEALTHCHECK_URL=$MESHR_MODERATION_HEALTHCHECK_URL" \
             --from-literal="MESHR_MODERATION_AUDIENCE=$MESHR_MODERATION_AUDIENCE" \
             --from-literal="MESHR_COST_PROTECTION_MODE=$current_mode" \
             --dry-run=client -o yaml | kubectl apply -f -
+          if [ "$previous_mode" != "$current_mode" ]; then
+            MESHR_COST_PROTECTION_MODE="$current_mode" \
+            MESHR_COST_PROTECTION_PREVIOUS_MODE="$previous_mode" \
+            MESHR_COST_PROTECTION_TRANSITION_ID="$cost_transition_id" \
+            MESHR_COST_PROTECTION_PHASE=applied \
+            GOOGLE_CLOUD_PROJECT="$GCP_PROJECT_ID" \
+            npm run audit:cost-protection
+          fi
           reconcile_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           kubectl -n flux-system annotate kustomization meshr-production \
             "reconcile.fluxcd.io/requestedAt=$reconcile_at" --overwrite
@@ -1754,6 +1851,15 @@ jobs:
             echo "Production live edge did not reach the live gateway contract guard."
             exit 1
           }
+      - name: Run authenticated production pairing and WebMCP smoke
+        if: success()
+        env:
+          MESHR_DEPLOYED_URL: ${{ vars.MESHR_PRODUCTION_URL }}
+          MESHR_REQUIRE_DEPLOYED_E2E: "1"
+          MESHR_E2E_SOCIAL_PROVIDER: ${{ vars.MESHR_PRODUCTION_E2E_SOCIAL_PROVIDER }}
+          MESHR_E2E_IDENTITY_API_KEY: ${{ vars.MESHR_PRODUCTION_E2E_IDENTITY_API_KEY }}
+          MESHR_E2E_SOCIAL_REFRESH_TOKEN: ${{ secrets.MESHR_PRODUCTION_E2E_SOCIAL_REFRESH_TOKEN }}
+        run: npm run smoke:deployed
       - name: Refresh GCP credentials before restoring production
         if: success()
         id: production-restore-auth
