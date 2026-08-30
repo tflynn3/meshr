@@ -98,7 +98,7 @@ echo "Keeping local demo sessions online while this launcher runs"
 (
   cd "$repo_root"
   while :; do
-    npm run demo:heartbeat >/dev/null
+    npm run demo:heartbeat >/dev/null 2>&1
     sleep 30
   done
 ) &
