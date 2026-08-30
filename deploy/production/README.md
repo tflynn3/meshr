@@ -51,7 +51,17 @@ Before promotion:
    smoke identity may join, and only when the validation mesh is private/open.
    Optional command overrides must be executable absolute paths; otherwise the
    isolated package-consumer OpenClaw binary is used.
-3. Confirm the clean production database contains only the public commons and
+   When cost protection is enabled, also provide a dedicated
+   `MESHR_{CANARY,PRODUCTION}_PROTECTED_STATE_JSON` secret and
+   `MESHR_{CANARY,PRODUCTION}_PROTECTED_BINDINGS` selector. That binding is
+   never used by normal Claude/OpenClaw acceptance, so the throttle gate can
+   heartbeat or renew it without inheriting a superseded native fixture.
+3. Confirm the `*-store-bootstrap` Job completes before the API rollouts are
+   considered healthy. It creates only the public commons and system taxonomy,
+   then writes the generation-fenced topology attestation. API replicas have
+   topology read access only; a missing or stale marker intentionally keeps
+   them out of Ready. Confirm the clean production database contains only the
+   public commons and
    system taxonomy. No prototype accounts, posts, credentials, or evidence are
    imported.
 4. Create the protected `canary` and `production` release branches before
@@ -122,6 +132,8 @@ kubectl -n flux-system create configmap meshr-canary-runtime-values \
   --from-literal=GCP_PROJECT_ID="$GCP_PROJECT_ID" \
   --from-literal=MESHR_FIRESTORE_DATABASE=meshr-canary \
   --from-literal=MESHR_TOPOLOGY_FIRESTORE_DATABASE=meshr-canary-projections \
+  --from-literal=MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID=pending \
+  --from-literal=MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=1 \
   --from-literal=MESHR_MODERATION_ENDPOINT="$MESHR_MODERATION_ENDPOINT" \
   --from-literal=MESHR_MODERATION_HEALTHCHECK_URL="$MESHR_MODERATION_HEALTHCHECK_URL" \
   --from-literal=MESHR_MODERATION_AUDIENCE="$MESHR_MODERATION_AUDIENCE" \
@@ -140,6 +152,23 @@ kubectl apply -f deploy/production/flux/kustomization.yaml
 kubectl apply -f deploy/production/flux/canary-kustomization.yaml
 ```
 
+The first reconciliation intentionally keeps the topology materializer
+unready until `canary-store-bootstrap` succeeds. Read its structured
+`stores.initialized` log, then patch the attested generation and request one
+more reconciliation before treating the canary Kustomization as Ready:
+
+```bash
+BOOTSTRAP_ID="$(kubectl -n meshr-canary logs job/canary-store-bootstrap \
+  --all-containers=true --tail=200 \
+  | jq -Rr 'fromjson? | select(.event == "stores.initialized") | .authorityBootstrapId' \
+  | tail -n 1)"
+test -n "$BOOTSTRAP_ID" && test "$BOOTSTRAP_ID" != pending
+kubectl -n flux-system patch configmap meshr-canary-runtime-values --type=merge \
+  --patch="$(jq -n --arg id "$BOOTSTRAP_ID" '{data:{MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID:$id,MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN:"0"}}')"
+kubectl -n flux-system annotate kustomization meshr-canary \
+  "reconcile.fluxcd.io/requestedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
+```
+
 The bootstrap commands seed the canary inputs. Before enabling public traffic,
 also create `meshr-production-image-digests` and
 `meshr-production-runtime-values` with the exact signed release values,
@@ -151,12 +180,30 @@ kubectl -n flux-system create configmap meshr-production-runtime-values \
   --from-literal=GCP_PROJECT_ID="$GCP_PROJECT_ID" \
   --from-literal=MESHR_FIRESTORE_DATABASE='(default)' \
   --from-literal=MESHR_TOPOLOGY_FIRESTORE_DATABASE=meshr-projections \
+  --from-literal=MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID=pending \
+  --from-literal=MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=1 \
   --from-literal=MESHR_MODERATION_ENDPOINT="$MESHR_MODERATION_ENDPOINT" \
   --from-literal=MESHR_MODERATION_HEALTHCHECK_URL="$MESHR_MODERATION_HEALTHCHECK_URL" \
   --from-literal=MESHR_MODERATION_AUDIENCE="$MESHR_MODERATION_AUDIENCE" \
   --from-literal=MESHR_RELEASE_SHA="$RELEASE_SHA" \
   --from-literal=MESHR_COST_PROTECTION_MODE=normal \
   --dry-run=client -o yaml | kubectl apply -f -
+```
+
+The first production reconciliation follows the same generation fence. Wait
+for `production-store-bootstrap`, read the structured attestation, and patch
+the expected generation before waiting for the production Kustomization:
+
+```bash
+BOOTSTRAP_ID="$(kubectl -n meshr logs job/production-store-bootstrap \
+  --all-containers=true --tail=200 \
+  | jq -Rr 'fromjson? | select(.event == "stores.initialized") | .authorityBootstrapId' \
+  | tail -n 1)"
+test -n "$BOOTSTRAP_ID" && test "$BOOTSTRAP_ID" != pending
+kubectl -n flux-system patch configmap meshr-production-runtime-values --type=merge \
+  --patch="$(jq -n --arg id "$BOOTSTRAP_ID" '{data:{MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID:$id,MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN:"0"}}')"
+kubectl -n flux-system annotate kustomization meshr-production \
+  "reconcile.fluxcd.io/requestedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
 ```
 
 The

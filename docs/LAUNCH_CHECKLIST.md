@@ -25,8 +25,14 @@ Those files are not substitutes for the managed-project readbacks listed below.
 - [ ] If the read-only preflight reports `bypassActorsReadable: false`, an
       administrator has separately verified that each release ruleset names
       only its matching GitHub App as an `always` bypass actor.
-- [ ] Production starts with only system taxonomy and the empty global public
-      commons.
+- [ ] The protected `production-store-bootstrap` Job starts with only system
+      taxonomy and the empty global public commons, and writes a
+      generation-fenced `projection_bootstrap/default` marker after verifying
+      the isolated topology database is empty. The topology materializer does
+      not consume events until that marker exists. API replicas remain topology
+      read-only and report Ready only when the marker matches the authority
+      bootstrap generation. A restore cutover changes the database values in
+      every pod and Job template so Flux rolls the complete event plane.
 - [ ] Google and GitHub Identity Platform login, explicit linking, CSRF,
       cookie lifetime, logout, and expired-session behavior pass.
 - [ ] Pairing stores an Ed25519 key in the OS keychain (0600 fallback warning),
@@ -34,6 +40,10 @@ Those files are not substitutes for the managed-project readbacks listed below.
 - [ ] Security owner signs the residual worker Firestore database-scope
       acceptance in `IAM_MATRIX.md`; protected OpenTofu sets
       `accept_worker_authority_database_risk=true` only after that review.
+- [ ] If the topology marker remains in the worker-writable projection database,
+      the security owner signs that residual marker-writer acceptance and
+      protected OpenTofu sets `accept_projection_marker_writer_risk=true`; a
+      separately restricted attestation service/database removes this gate.
 - [ ] Native Claude and OpenClaw root/reply E2E pass. Codex remains Beta until
       its direct native read/write flow passes. Ollama is tested only through a
       documented MCP-capable host.
@@ -55,9 +65,25 @@ Those files are not substitutes for the managed-project readbacks listed below.
       500 viewers; p95 and error targets recorded.
 - [ ] Pod/gateway/Firestore interruption chaos tests and quarterly restore drill
       pass.
+- [ ] Any authority-database cutover has a protected, redacted schema-2 receipt
+      proving quiesced writer fencing before restore, complete fence-bound
+      authority-delta copy with matching collection digests/counts, bounded
+      replay ordering, and equal source/target outbox high-watermarks. The
+      receipt has a unique `receipt_id` and recent `issued_at`; the workflow
+      passes `npm run verify:cutover-receipt` and atomically consumes it in the
+      isolated release-audit database before runtime values switch. A retry
+      after rollback uses a newly fenced receipt.
 - [ ] Dependency/container scan, SBOM, signatures, CSP/CSRF/origin checks,
       authorization fuzzing, and external pairing/WebMCP penetration review
       pass.
 - [ ] Cost-model rehearsal and 95% protection-mode exercise pass; the current
       $233.89 planning envelope remains below the $250 alert target, pending
-      admitted-Pod and Cloud Billing readback.
+      admitted-Pod and Cloud Billing readback. Throttle mode must also show an
+      accepted native write followed by a 429 with `Retry-After`. Keep a
+      dedicated protected-mode binding state/selector separate from the
+      Claude/OpenClaw acceptance fixtures so normal-mode session refreshes
+      cannot supersede the throttle witness. Set the matching 32-byte
+      `MESHR_{CANARY,PRODUCTION}_PROTECTED_STATE_KEY`, verify encrypted
+      pre/post fixture artifacts are retained as evidence, verify the canonical
+      encrypted envelope survives a workflow retry, and schedule a reseed
+      before the artifact 90-day retention window expires.

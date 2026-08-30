@@ -25,6 +25,18 @@ spec:
           env:
             - name: MESHR_PORT
               value: "8787"
+            # Keep the selected databases in the pod template so a protected
+            # restore rolls every replica even when the image is unchanged.
+            - name: MESHR_FIRESTORE_DATABASE
+              value: ${MESHR_FIRESTORE_DATABASE}
+            - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
+              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
+            - name: MESHR_DATABASE_CUTOVER_MODE
+              value: ${MESHR_DATABASE_CUTOVER_MODE}
+            - name: MESHR_CUTOVER_VALIDATION_MESH_ID
+              value: ${MESHR_CUTOVER_VALIDATION_MESH_ID}
+            - name: MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID
+              value: ${MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID}
             - name: MESHR_IDENTITY_API_KEY_FILE
               value: /var/run/secrets/meshr/identity-api-key
             - name: MESHR_INTERNAL_TOKEN_FILE
@@ -141,6 +153,10 @@ spec:
           env:
             - name: MESHR_INTERNAL_TOKEN_FILE
               value: /var/run/secrets/meshr/internal-token
+            - name: MESHR_FIRESTORE_DATABASE
+              value: ${MESHR_FIRESTORE_DATABASE}
+            - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
+              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
@@ -193,6 +209,13 @@ spec:
           image: ${EVENT_PLANE_IMAGE}
           args: ["materializer", "topology"]
           envFrom: [{configMapRef: {name: meshr-runtime}}]
+          env:
+            - name: MESHR_FIRESTORE_DATABASE
+              value: ${MESHR_FIRESTORE_DATABASE}
+            - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
+              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
+            - name: MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID
+              value: ${MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
@@ -240,6 +263,10 @@ spec:
           # Keep endpoint rotation in the pod template so Flux rolls existing
           # workers instead of leaving them on a retired screening adapter.
           env:
+            - name: MESHR_FIRESTORE_DATABASE
+              value: ${MESHR_FIRESTORE_DATABASE}
+            - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
+              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
             - name: MESHR_MODERATION_ENDPOINT
               value: ${MESHR_MODERATION_ENDPOINT}
             - name: MESHR_MODERATION_HEALTHCHECK_URL
@@ -288,6 +315,10 @@ spec:
           args: ["materializer", "moderation-screening"]
           envFrom: [{configMapRef: {name: meshr-runtime}}]
           env:
+            - name: MESHR_FIRESTORE_DATABASE
+              value: ${MESHR_FIRESTORE_DATABASE}
+            - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
+              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
             - name: MESHR_MODERATION_ENDPOINT
               value: ${MESHR_MODERATION_ENDPOINT}
             - name: MESHR_MODERATION_HEALTHCHECK_URL
@@ -363,6 +394,11 @@ spec:
           image: ${EVENT_PLANE_IMAGE}
           args: ["materializer", "audit"]
           envFrom: [{configMapRef: {name: meshr-runtime}}]
+          env:
+            - name: MESHR_FIRESTORE_DATABASE
+              value: ${MESHR_FIRESTORE_DATABASE}
+            - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
+              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
@@ -400,6 +436,11 @@ spec:
           image: ${EVENT_PLANE_IMAGE}
           args: ["materializer", "notifications"]
           envFrom: [{configMapRef: {name: meshr-runtime}}]
+          env:
+            - name: MESHR_FIRESTORE_DATABASE
+              value: ${MESHR_FIRESTORE_DATABASE}
+            - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
+              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
@@ -439,6 +480,10 @@ spec:
           envFrom: [{configMapRef: {name: meshr-runtime}}]
           env:
             - {name: MESHR_PORT, value: "8080"}
+            - name: MESHR_FIRESTORE_DATABASE
+              value: ${MESHR_FIRESTORE_DATABASE}
+            - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
+              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
             - name: MESHR_INTERNAL_TOKEN_FILE
               value: /var/run/secrets/meshr/internal-token
             # Explicitly templated so cost-protection changes roll the live

@@ -14,4 +14,8 @@ COPY --from=build /app/dist/event-plane.mjs ./dist/event-plane.mjs
 USER 65532:65532
 ENV NODE_ENV=production MESHR_HOST=0.0.0.0 MESHR_PORT=8080
 EXPOSE 8080
-CMD ["dist/event-plane.mjs"]
+# Keep the bundle in the entrypoint. Kubernetes `args` then selects a service
+# (ingest, materializer, live-gateway, or production-bootstrap) without
+# replacing the JavaScript program with the selector itself.
+ENTRYPOINT ["/nodejs/bin/node", "dist/event-plane.mjs"]
+CMD ["ingest"]

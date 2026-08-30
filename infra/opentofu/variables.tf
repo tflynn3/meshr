@@ -15,6 +15,12 @@ variable "accept_worker_authority_database_risk" {
   default     = false
 }
 
+variable "accept_projection_marker_writer_risk" {
+  type        = bool
+  description = "Explicit security-owner acceptance that the topology materializer has database-scoped write access and could technically mutate the projection bootstrap marker. Required for launch_mode=true or production DNS management until the marker is moved to a separately restricted attestation service/database."
+  default     = false
+}
+
 variable "region" {
   type        = string
   description = "Single regional launch location."

@@ -69,7 +69,8 @@ test("Firestore API renewal recovery survives a fresh replica", {
       "idempotency", "quota_counters", "posts", "follows", "mesh_invitations",
       "mesh_role_invitations", "moderation_cases", "topology_activity_totals",
       "topology_activity_buckets", "topology_activity_recent", "topology_activity_snapshots",
-      "processed_events", "topology_shards", "topology_events",
+      "projection_bootstrap",
+      "processed_events", "topology_shards", "topology_events", "mesh_access_epochs", "live_access_epochs",
     ];
     for (const name of names) {
       const collection = firestore.collection(`${prefix}_${name}`);
@@ -275,6 +276,43 @@ test("Firestore API renewal recovery survives a fresh replica", {
     assert.equal(recoveredPageAuthority?.agent_id, agentId);
     assert.match(recoveredPageAuthority?.grant_id ?? "", /^[a-f0-9]{64}$/);
     assert.match(recoveredPageAuthority?.session_id ?? "", /^page_/);
+
+    // Activation itself may also land on a replica with no local profile
+    // projection. The durable grant is the retry/recovery source of truth, so
+    // a fresh third replica must hydrate the owned agent before returning the
+    // deterministic handoff rather than responding with a replica-local 404.
+    const thirdDirectory = mkdtempSync(join(tmpdir(), "meshr-firestore-recovery-"));
+    directories.push(thirdDirectory);
+    const thirdApp = createMeshrServer({
+      dbPath: join(thirdDirectory, "meshr.db"),
+      repository,
+      invitationPepper,
+      secureCookies: false,
+      webMcpTransfersSession: true,
+    });
+    apps.push(thirdApp);
+    const third = await thirdApp.listen();
+    const thirdLocalAgent = thirdApp.database.sqlite
+      .prepare("SELECT id FROM agents WHERE id = ?")
+      .get(agentId) as { id: string } | undefined;
+    assert.equal(thirdLocalAgent, undefined);
+    const reactivated = await requestJson(third.baseUrl, "/v1/webmcp/session", {
+      method: "POST",
+      cookie,
+      csrf,
+      body: { agentId },
+    });
+    assert.equal(reactivated.response.status, 200);
+    assert.equal(reactivated.json.enabled, true);
+    assert.equal(reactivated.json.agent.id, agentId);
+    const reactivatedCookie = (reactivated.response.headers.get("set-cookie") ?? "").split(";", 1)[0];
+    assert.match(reactivatedCookie, /^meshr_webmcp=/);
+    const reactivatedProfile = await requestJson(third.baseUrl, "/v1/webmcp/profile", {
+      cookie: `${cookie}; ${reactivatedCookie}`,
+      webMcpAgent: agentId,
+    });
+    assert.equal(reactivatedProfile.response.status, 200);
+    assert.equal(reactivatedProfile.json.agent.id, agentId);
   } finally {
     await cleanup();
   }

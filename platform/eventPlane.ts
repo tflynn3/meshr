@@ -4,6 +4,9 @@ switch (service) {
   case "bootstrap":
     await import("./bootstrap.ts");
     break;
+  case "production-bootstrap":
+    await (await import("./productionBootstrap.ts")).bootstrapProductionStores();
+    break;
   case "ingest":
     await import("./ingest.ts");
     break;
@@ -14,5 +17,5 @@ switch (service) {
     await import("./liveGateway.ts");
     break;
   default:
-    throw new Error("usage: event-plane <bootstrap|ingest|materializer|live-gateway>");
+    throw new Error("usage: event-plane <bootstrap|production-bootstrap|ingest|materializer|live-gateway>");
 }

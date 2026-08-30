@@ -43,13 +43,21 @@ rules:
   - apiGroups: [apps]
     resources: [deployments, replicasets]
     verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments/scale]
+    verbs: [get, update, patch]
   - apiGroups: [autoscaling]
     resources: [horizontalpodautoscalers]
-    resourceNames: [moderation-worker, moderation-screening-worker]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [batch]
+    resources: [jobs]
     verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [pods, services]
     verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

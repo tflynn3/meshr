@@ -23,6 +23,12 @@ spec:
           envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
           env:
             - {name: MESHR_PORT, value: "8787"}
+            # Keep the selected databases in the pod template so a protected
+            # restore rolls every replica even when the image is unchanged.
+            - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
+            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
+            - {name: MESHR_DATABASE_CUTOVER_MODE, value: "${MESHR_DATABASE_CUTOVER_MODE}"}
+            - {name: MESHR_CUTOVER_VALIDATION_MESH_ID, value: "${MESHR_CUTOVER_VALIDATION_MESH_ID}"}
             - {name: MESHR_IDENTITY_API_KEY_FILE, value: /var/run/secrets/meshr/identity-api-key}
             - {name: MESHR_INTERNAL_TOKEN_FILE, value: /var/run/secrets/meshr/internal-token}
             - {name: MESHR_RENEWAL_RECOVERY_SECRET_FILE, value: /var/run/secrets/meshr/renewal-recovery}
@@ -119,6 +125,8 @@ spec:
           envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
           env:
             - {name: MESHR_PORT, value: "8080"}
+            - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
+            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
             - {name: MESHR_INTERNAL_TOKEN_FILE, value: /var/run/secrets/meshr/internal-token}
             - {name: MESHR_COST_PROTECTION_MODE, value: "${MESHR_COST_PROTECTION_MODE}"}
           ports: [{name: http, containerPort: 8080}]

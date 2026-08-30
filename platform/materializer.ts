@@ -8,6 +8,7 @@ import {
   isActivityWithinRecentWindow,
   TOPOLOGY_ACTIVITY_WINDOW_MINUTES,
 } from "./activityWindow.ts";
+import { readProjectionBootstrap } from "../server/projectionBootstrap.ts";
 
 const config = eventPlaneConfig();
 const firestore = createFirestore(config.projectId, config.databaseId);
@@ -55,6 +56,14 @@ const activeSubscriptions = selectedSubscriptions.map(([consumer, name]) => ({
     flowControl: { maxMessages: consumer === "topology" ? 50 : 25 },
   }),
 }));
+const productionTopologyConsumer =
+  requestedConsumer === "topology" && process.env.MESHR_ENV?.trim().toLowerCase() === "production";
+const expectedAuthorityBootstrapId = process.env.MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID?.trim();
+// A bootstrap Job attests that every aggregate collection in the selected
+// topology database is empty (or belongs to the current authority generation)
+// before any worker is allowed to consume queued events. Local emulators do
+// not create this marker, so the gate is intentionally production-only.
+let topologyBootstrapReady = !productionTopologyConsumer;
 
 const moderationEndpoint = process.env.MESHR_MODERATION_ENDPOINT?.trim();
 const moderationToken = process.env.MESHR_MODERATION_TOKEN?.trim();
@@ -1826,39 +1835,94 @@ async function screenQueuedModeration(): Promise<void> {
   }
 }
 
-for (const { consumer, subscription } of activeSubscriptions) {
-  subscription.on("message", (message) => enqueueMessage(consumer, message));
-  subscription.on("error", (error) => console.error(`${consumer} subscription error`, error));
+async function waitForProductionTopologyBootstrap(): Promise<void> {
+  if (!productionTopologyConsumer) return;
+  let delayMs = 1_000;
+  for (;;) {
+    try {
+      const projection = await readProjectionBootstrap(topologyFirestore);
+      if (projection.exists && projection.valid && expectedAuthorityBootstrapId &&
+          projection.authorityBootstrapId === expectedAuthorityBootstrapId) {
+        topologyBootstrapReady = true;
+        console.log(JSON.stringify({
+          component: "meshr-materializer",
+          event: "topology.bootstrap_attested",
+          authorityBootstrapId: projection.authorityBootstrapId,
+        }));
+        return;
+      }
+      console.error(JSON.stringify({
+        component: "meshr-materializer",
+          event: "topology.bootstrap_pending",
+        reason: !expectedAuthorityBootstrapId
+          ? "expected_generation_missing"
+          : !projection.exists
+          ? "marker_missing"
+          : !projection.valid
+          ? "invalid_marker"
+          : "authority_generation_mismatch",
+        expectedAuthorityBootstrapId,
+        observedAuthorityBootstrapId: projection.authorityBootstrapId,
+      }));
+    } catch (error) {
+      // Readiness stays false while IAM, Firestore, or the one-shot bootstrap
+      // Job is unavailable. Keep the process alive so Kubernetes liveness does
+      // not turn a recoverable dependency outage into a restart loop.
+      console.error(JSON.stringify({
+        component: "meshr-materializer",
+        event: "topology.bootstrap_check_failed",
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    delayMs = Math.min(10_000, delayMs * 2);
+  }
 }
 
-if ((requestedConsumer === "moderation" || requestedConsumer === "moderation-screening") && moderationEndpoint && moderationSweepFallback) {
-  moderationSweepTimer = setInterval(() => {
-    void screenQueuedModeration().catch((error: unknown) =>
-      console.error("moderation screening failed", error),
-    );
-  }, 2_000);
-  moderationSweepTimer.unref();
-}
+async function startSubscriptions(): Promise<void> {
+  await waitForProductionTopologyBootstrap();
+  for (const { consumer, subscription } of activeSubscriptions) {
+    subscription.on("message", (message) => enqueueMessage(consumer, message));
+    subscription.on("error", (error) => console.error(`${consumer} subscription error`, error));
+  }
 
-if (activeSubscriptions.some(({ consumer }) => consumer === "topology")) {
-  // Keep the rolling read model fresh without coupling it to viewer traffic.
-  // The timer is unref'd so a local test/process can still shut down cleanly.
-  void compactExpiredActivityBuckets().catch((error: unknown) =>
-    console.error("activity compaction failed", error),
-  );
-  activityCompactionTimer = setInterval(() => {
+  if ((requestedConsumer === "moderation" || requestedConsumer === "moderation-screening") && moderationEndpoint && moderationSweepFallback) {
+    moderationSweepTimer = setInterval(() => {
+      void screenQueuedModeration().catch((error: unknown) =>
+        console.error("moderation screening failed", error),
+      );
+    }, 2_000);
+    moderationSweepTimer.unref();
+  }
+
+  if (activeSubscriptions.some(({ consumer }) => consumer === "topology")) {
+    // Keep the rolling read model fresh without coupling it to viewer traffic.
+    // The timer is unref'd so a local test/process can still shut down cleanly.
     void compactExpiredActivityBuckets().catch((error: unknown) =>
       console.error("activity compaction failed", error),
     );
-  }, 10_000);
-  activityCompactionTimer.unref();
-  activitySnapshotTimer = setInterval(() => {
-    void flushActivitySnapshots().catch((error: unknown) =>
-      console.error("activity snapshot flush failed", error),
-    );
-  }, 1_000);
-  activitySnapshotTimer.unref();
+    activityCompactionTimer = setInterval(() => {
+      void compactExpiredActivityBuckets().catch((error: unknown) =>
+        console.error("activity compaction failed", error),
+      );
+    }, 10_000);
+    activityCompactionTimer.unref();
+    activitySnapshotTimer = setInterval(() => {
+      void flushActivitySnapshots().catch((error: unknown) =>
+        console.error("activity snapshot flush failed", error),
+      );
+    }, 1_000);
+    activitySnapshotTimer.unref();
+  }
 }
+
+void startSubscriptions().catch((error: unknown) => {
+  console.error(JSON.stringify({
+    component: "meshr-materializer",
+    event: "subscriptions.start_failed",
+    error: error instanceof Error ? error.message : String(error),
+  }));
+});
 
 const server = createServer((request, response) => {
   if (request.method === "GET" && request.url === "/healthz") {
@@ -1873,6 +1937,15 @@ const server = createServer((request, response) => {
     return;
   }
   if (request.method === "GET" && request.url === "/readyz") {
+    if (productionTopologyConsumer && !topologyBootstrapReady) {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        ok: false,
+        service: "topology-materializer",
+        error: "topology_bootstrap_pending",
+      }));
+      return;
+    }
     if ((requestedConsumer === "moderation" || requestedConsumer === "moderation-screening") && moderationRequired && !moderationEndpoint) {
       response.writeHead(503, { "content-type": "application/json" });
       response.end(JSON.stringify({

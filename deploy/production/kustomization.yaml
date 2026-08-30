@@ -6,6 +6,7 @@ resources:
   - serviceaccounts.yaml
   - config.yaml
   - secrets.yaml
+  - bootstrap.yaml
   - workloads.yaml
   - gateway.yaml
   - backendpolicy.yaml

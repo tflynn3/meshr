@@ -4,7 +4,10 @@ import { createMeshrServer } from "./app.ts";
 import { createIdentityPlatformVerifier } from "./identity.ts";
 import { startSqliteOutboxPublisher } from "./outboxPublisher.ts";
 import { productionSettings, assertProductionSettings } from "./production.ts";
-import { createFirestore } from "../platform/googleClients.ts";
+import {
+  assertSeparatedProductionDatabases,
+  createFirestore,
+} from "../platform/googleClients.ts";
 import { FirestoreMeshrRepository } from "./firestoreRepository.ts";
 import { loadRuntimeSecrets } from "../platform/runtimeSecrets.ts";
 
@@ -22,20 +25,27 @@ if (!Number.isSafeInteger(rawPort) || rawPort < 1 || rawPort > 65_535) {
   throw new Error("MESHR_PORT must be an integer from 1 to 65535.");
 }
 
+const authorityDatabaseId = process.env.MESHR_FIRESTORE_DATABASE?.trim() || "(default)";
+const topologyDatabaseId = process.env.MESHR_TOPOLOGY_FIRESTORE_DATABASE?.trim() || authorityDatabaseId;
+assertSeparatedProductionDatabases(authorityDatabaseId, topologyDatabaseId, settings.environment);
 const firestore =
   settings.environment === "production" && settings.identityProjectId
-    ? createFirestore(settings.identityProjectId, process.env.MESHR_FIRESTORE_DATABASE)
+    ? createFirestore(
+        settings.identityProjectId,
+        authorityDatabaseId,
+      )
     : undefined;
 const topologyFirestore = firestore && settings.identityProjectId
   ? createFirestore(
       settings.identityProjectId,
-      process.env.MESHR_TOPOLOGY_FIRESTORE_DATABASE || process.env.MESHR_FIRESTORE_DATABASE,
+      topologyDatabaseId,
     )
   : undefined;
 const repository = firestore
   ? new FirestoreMeshrRepository({
       firestore,
       topologyFirestore,
+      projectionBootstrapWriter: settings.environment !== "production",
       invitationPepper: settings.invitationPepper,
       invitationPepperPrevious: settings.invitationPepperPrevious,
     })

@@ -175,6 +175,13 @@ npm run test:event-plane
 Without those variables the test is intentionally skipped; the ordinary
 `npm test` suite remains hermetic and does not claim event-plane coverage.
 
+The event-plane image keeps `dist/event-plane.mjs` in its immutable
+entrypoint and treats the container arguments as a service selector. This is
+important for Kubernetes Jobs and Deployments: `args: ["ingest"]`,
+`["materializer", "topology"]`, or `["production-bootstrap"]` cannot replace
+the Node program with the selector. The Bazel development image uses the same
+contract, and `deploy/local/workloads.yaml` therefore passes selectors only.
+
 ## Routes and ports
 
 Everything public is same-origin at `http://localhost:8080`:
