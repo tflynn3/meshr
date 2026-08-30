@@ -55,7 +55,10 @@ afterEach(async () => {
   }
 });
 
-async function start(options: { moderationAuthorityToken?: string } = {}): Promise<RunningServer> {
+async function start(options: {
+  moderationAuthorityToken?: string;
+  internalToken?: string;
+} = {}): Promise<RunningServer> {
   const directory = mkdtempSync(join(tmpdir(), "meshr-server-test-"));
   const clock = new TestClock();
   const app = createMeshrServer({ dbPath: join(directory, "meshr.db"), clock, ...options });
@@ -156,6 +159,110 @@ test("automated moderation authority routes require the service token", async ()
   });
   assert.equal(candidate.response.status, 200);
   assert.deepEqual(candidate.json, { eventId: "evt_test", exists: false });
+});
+
+test("outbox broker requires its service token and fences lease completion", async () => {
+  const { app, baseUrl } = await start({ internalToken: "internal-outbox-test-token" });
+  const auth = "Bearer internal-outbox-test-token";
+  const envelope = {
+    event_id: "evt_outbox_test_0001",
+    schema_version: 1,
+    mesh_id: "mesh-public",
+    agent_id: "agent-outbox-test",
+    session_id: null,
+    runtime_kind: "local",
+    type: "local.smoke",
+    occurred_at: "2026-08-27T18:00:00.000Z",
+    payload: { topic_id: "topic-small-discoveries", source: "broker-test" },
+  };
+
+  const unauthorized = await requestJson(baseUrl, "/internal/v1/outbox/claim", {
+    method: "POST",
+    body: { maxEvents: 10, leaseSeconds: 30 },
+  });
+  assert.equal(unauthorized.response.status, 401);
+
+  const accepted = await requestJson(baseUrl, "/internal/v1/outbox/events", {
+    method: "POST",
+    authorization: auth,
+    body: envelope,
+  });
+  assert.equal(accepted.response.status, 202);
+  assert.equal(accepted.json.duplicate, false);
+  const duplicate = await requestJson(baseUrl, "/internal/v1/outbox/events", {
+    method: "POST",
+    authorization: auth,
+    body: envelope,
+  });
+  assert.equal(duplicate.response.status, 200);
+  assert.equal(duplicate.json.duplicate, true);
+
+  const claimed = await requestJson(baseUrl, "/internal/v1/outbox/claim", {
+    method: "POST",
+    authorization: auth,
+    body: { maxEvents: 10, leaseSeconds: 30 },
+  });
+  assert.equal(claimed.response.status, 200);
+  assert.equal(claimed.json.claims.length, 1);
+  assert.equal(claimed.json.claims[0].eventId, envelope.event_id);
+  assert.deepEqual(claimed.json.claims[0].envelope.payload, envelope.payload);
+
+  const leasedAgain = await requestJson(baseUrl, "/internal/v1/outbox/claim", {
+    method: "POST",
+    authorization: auth,
+    body: { maxEvents: 10, leaseSeconds: 30 },
+  });
+  assert.deepEqual(leasedAgain.json.claims, []);
+
+  const stale = await requestJson(baseUrl, "/internal/v1/outbox/complete", {
+    method: "POST",
+    authorization: auth,
+    body: {
+      results: [{
+        eventId: envelope.event_id,
+        leaseId: "wrong-lease",
+        outcome: "published",
+        messageId: "pubsub-wrong",
+      }],
+    },
+  });
+  assert.deepEqual(stale.json, { completed: [], stale: [envelope.event_id] });
+
+  const leaseId = claimed.json.claims[0].leaseId as string;
+  const completed = await requestJson(baseUrl, "/internal/v1/outbox/complete", {
+    method: "POST",
+    authorization: auth,
+    body: {
+      results: [{
+        eventId: envelope.event_id,
+        leaseId,
+        outcome: "published",
+        messageId: "pubsub-1",
+      }],
+    },
+  });
+  assert.deepEqual(completed.json, { completed: [envelope.event_id], stale: [] });
+  const replay = await requestJson(baseUrl, "/internal/v1/outbox/complete", {
+    method: "POST",
+    authorization: auth,
+    body: {
+      results: [{
+        eventId: envelope.event_id,
+        leaseId,
+        outcome: "published",
+        messageId: "pubsub-1",
+      }],
+    },
+  });
+  assert.deepEqual(replay.json, completed.json);
+  const row = app.database.sqlite.prepare(
+    "SELECT status, completed_lease_id, pubsub_message_id FROM outbox_events WHERE event_id = ?",
+  ).get(envelope.event_id) as Record<string, unknown>;
+  assert.deepEqual({ ...row }, {
+    status: "published",
+    completed_lease_id: leaseId,
+    pubsub_message_id: "pubsub-1",
+  });
 });
 
 test("automated moderation decisions are idempotent and revision fenced", async () => {

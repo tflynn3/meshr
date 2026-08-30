@@ -9,10 +9,10 @@ needed by a workload.
 
 | Workload / KSA | Google service account | Allowed data plane | Explicitly excluded |
 | --- | --- | --- | --- |
-| API (`meshr-api`) | `meshr-api` | Authority Firestore read/write; topology Firestore aggregate read; Identity Platform verification; API-only Secret Manager values plus the dedicated moderation-authority token | Pub/Sub publish/subscribe, moderation provider APIs, audit-only CI paths, all topology writes |
+| API (`meshr-api`) | `meshr-api` | Authority Firestore read/write including the lease-fenced outbox broker; topology Firestore aggregate read; Identity Platform verification; API-only Secret Manager values plus the internal delivery and dedicated moderation-authority tokens | Pub/Sub publish/subscribe, moderation provider APIs, audit-only CI paths, all topology writes |
 | One-shot store bootstrap (`meshr-bootstrap`) | `meshr-bootstrap` | Authority Firestore initialization and topology `projection_bootstrap/default` attestation during an explicit bootstrap Job | Runtime API traffic, Pub/Sub, moderation provider APIs, continued intended bootstrap operations after the Job completes |
 | Live gateway (`meshr-live-gateway`) | `meshr-live-gateway` | Aggregate topology Firestore read; internal API authorization call | Authority Firestore, posts, accounts, sessions, moderation, audit, Pub/Sub publish, all Secret Manager values |
-| Ingest (`meshr-ingest`) | `meshr-ingest` | Authority Firestore outbox read/update; publish to the matching `mesh-events` topic; topic metadata read; internal token | Browser credentials, topology database, moderation provider |
+| Ingest (`meshr-ingest`) | `meshr-ingest` | Claim and complete lease-fenced outbox batches through the token-authenticated API broker; publish to the matching `mesh-events` topic; topic metadata read; internal token | Firestore, browser credentials, topology database, moderation provider |
 | Topology materializer (`meshr-topology-materializer`) | `meshr-topology` | Subscribe to the topology event subscription; aggregate topology database read/write; bounded event trace | Authority account/session data, moderation provider, Secret Manager |
 | Moderation intake (`meshr-moderation-worker`) | `meshr-moderation` | Subscribe to moderation events; write the dedicated moderation queue; publish screening jobs | Authority Firestore, post mutation, moderation authority token, provider APIs, topology projection |
 | Moderation screening (`meshr-moderation-screening-worker`) | `meshr-moderation-screening` | Read/lease the dedicated moderation queue; invoke only the matching adapter; dedicated token-authenticated, revision-fenced decision route; ADC/ID-token adapter auth | Authority Firestore and direct post mutation, Model Armor and DLP directly, topology projection, arbitrary Cloud Run |
@@ -48,40 +48,22 @@ collection-path condition—is the isolation boundary. Promotion remains
 protected by the GitHub environment and branch ruleset in addition to these
 cloud bindings.
 
-## Residual authority-database boundary
+## Authority-database boundary
 
-The ingest service still requires the production authority database for outbox
-publication and remains database-scoped because Firestore predefined roles
-cannot express a collection/document-path IAM condition. Moderation inbox
-leases and dead letters now live in the dedicated moderation database, and the
-screening worker has no authority-database grant; all post/case decisions cross
-the API's revision-fenced route. Audit and notification workers remain isolated
-in their dedicated databases.
-
-### Launch security acceptance
-
-The ingest service requires authority Firestore access for outbox publication;
-Google predefined roles cannot express a collection/document-path IAM
-condition, so that grant remains database-scoped. Moderation queue leases and
-dead letters are isolated in their own database, while screening decisions
-cross the narrow internal authority route and are revision-fenced in the API
-transaction. Audit and notification state are separate databases as well.
-
-`accept_worker_authority_database_risk` must be set explicitly for a protected
-OpenTofu launch. That acceptance records the remaining ingest boundary and
-requires the following compensating controls: distinct workload identities
-and namespaced NetworkPolicies, repository authorization tests for every worker
-operation, immutable event IDs and audit history, no user credentials in
-workers, and monitoring/alerting for unexpected collection access.
+No delivery worker receives authority-Firestore IAM. The API repository leases
+a bounded, ordered outbox prefix and accepts only matching lease completions;
+ingest can publish only the returned envelopes. Moderation queue, audit, and
+notification state remain isolated in dedicated databases, and screening
+decisions cross the API's revision-fenced route.
 
 ## Secrets and rotation
 
-Secret Manager stores the Identity Platform browser key, the ingest-only
-internal service token, the dedicated moderation-authority token, renewal-
+Secret Manager stores the Identity Platform browser key, the API/ingest outbox
+broker token, the dedicated moderation-authority token, renewal-
 recovery primary/previous keys, invitation-pepper primary/previous keys, and
 separate canary values. The GKE Secret Manager CSI provider mounts only the
-paths each KSA needs; the API and screening worker receive the moderation token,
-while only ingest receives the general internal token.
+paths each KSA needs; only API and ingest receive the outbox token, while only
+API and the screening worker receive the moderation-authority token.
 
 Rotate recovery and invitation keys in two complete rollouts: populate the
 `*-previous` version with the new value, roll all replicas to `{old,new}`, then
@@ -98,8 +80,7 @@ Before launch, inspect the rendered bindings and prove all of the following:
    KSA can impersonate another GSA.
 2. The live gateway can read only aggregate projections; a private-mesh or
    account document read is denied by both repository authorization and its
-   topology-database IAM grant. Worker database-wide authority grants and the
-   residual collection-isolation decision are reviewed separately.
+   topology-database IAM grant. Ingest has no Firestore grant.
 3. The moderation screening worker can invoke only its matching adapter and
    call the API's moderation authority route, while the adapter alone can call
    Model Armor and Sensitive Data Protection; intake cannot hold that token.

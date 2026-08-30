@@ -31,7 +31,6 @@ data:
   GOOGLE_CLOUD_PROJECT: ${GCP_PROJECT_ID}
   MESHR_IDENTITY_PROJECT_ID: ${GCP_PROJECT_ID}
   MESHR_IDENTITY_AUTH_DOMAIN: ${GCP_PROJECT_ID}.firebaseapp.com
-  MESHR_EVENT_INGEST_URL: http://ingest-canary.meshr-canary.svc.cluster.local:8080
   MESHR_EVENTS_TOPIC: mesh-events-canary
   MESHR_TOPOLOGY_SUBSCRIPTION: topology-materializer-canary
   MESHR_MODERATION_SUBSCRIPTION: moderation-worker-canary

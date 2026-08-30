@@ -79,7 +79,7 @@ the demo launcher.
 `deploy/local` starts Firestore and Pub/Sub emulators in k3d. Local SQLite is
 only a fixture/read projection. Production requires `MESHR_ENV=production`,
 `MESHR_STORAGE=firestore`, social Identity Platform auth, secure cookies, and a
-configured event ingest token; startup fails closed when any of these are
+configured internal outbox-broker token; startup fails closed when any of these are
 missing.
 
 ## Production foundation

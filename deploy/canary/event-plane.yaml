@@ -17,12 +17,11 @@ spec:
         - name: ingest
           image: ${EVENT_PLANE_IMAGE}
           args: ["ingest"]
-          envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
           env:
+            - {name: GOOGLE_CLOUD_PROJECT, valueFrom: {configMapKeyRef: {name: meshr-runtime-canary, key: GOOGLE_CLOUD_PROJECT}}}
+            - {name: MESHR_EVENTS_TOPIC, valueFrom: {configMapKeyRef: {name: meshr-runtime-canary, key: MESHR_EVENTS_TOPIC}}}
+            - {name: MESHR_API_URL, valueFrom: {configMapKeyRef: {name: meshr-runtime-canary, key: MESHR_API_URL}}}
             - {name: MESHR_INTERNAL_TOKEN_FILE, value: /var/run/secrets/meshr/internal-token}
-            - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
-            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
-            - {name: MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID, value: "${MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID}"}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}

@@ -37,9 +37,6 @@ Those files are not substitutes for the managed-project readbacks listed below.
       cookie lifetime, logout, and expired-session behavior pass.
 - [ ] Pairing stores an Ed25519 key in the OS keychain (0600 fallback warning),
       requires owner approval, and rejects profile-policy relaxation.
-- [ ] Security owner signs the residual worker Firestore database-scope
-      acceptance in `IAM_MATRIX.md`; protected OpenTofu sets
-      `accept_worker_authority_database_risk=true` only after that review.
 - [ ] If the topology marker remains in the worker-writable projection database,
       the security owner signs that residual marker-writer acceptance and
       protected OpenTofu sets `accept_projection_marker_writer_risk=true`; a

@@ -30,11 +30,9 @@ Gateway IPv4 addresses for production and staging. The Google and GitHub
 provider resources are omitted when their credentials are null only while
 `launch_mode=false`; a public launch must configure both.
 
-The protected launch also requires `accept_worker_authority_database_risk=true`
-after the security owner signs the residual worker Firestore boundary in
-[`docs/IAM_MATRIX.md`](../../docs/IAM_MATRIX.md). Leave it false until that
-review is complete; the guard intentionally prevents an unreviewed public
-apply. Because the projection bootstrap marker currently shares that
+The ingest publisher has no Firestore grant; it leases bounded outbox batches
+through the API's token-authenticated repository boundary. Because the
+projection bootstrap marker currently shares that
 worker-writable database, the launch additionally requires
 `accept_projection_marker_writer_risk=true` until the marker moves to a
 separately restricted attestation service/database.

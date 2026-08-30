@@ -7,6 +7,7 @@ import { Firestore } from "@google-cloud/firestore";
 import { PubSub } from "@google-cloud/pubsub";
 import { test } from "node:test";
 import { FirestoreMeshrRepository } from "../server/firestoreRepository.ts";
+import { createMeshrServer, type MeshrServer } from "../server/app.ts";
 
 const enabled = Boolean(
   process.env.FIRESTORE_EMULATOR_HOST && process.env.PUBSUB_EMULATOR_HOST,
@@ -126,6 +127,7 @@ test("Firestore outbox reaches Pub/Sub materializer with duplicate, reorder, and
     worker: undefined as Worker | undefined,
     ingest: undefined as Worker | undefined,
   };
+  let authorityApi: MeshrServer | undefined;
 
   try {
     await pubsub.createTopic(topicName);
@@ -141,6 +143,13 @@ test("Firestore outbox reaches Pub/Sub materializer with duplicate, reorder, and
       clock: { now: () => new Date(currentMs) },
     });
     await repository.ensureEmptyProduction();
+    authorityApi = createMeshrServer({
+      dbPath: ":memory:",
+      seed: false,
+      repository,
+      internalToken: `${suffix}:internal-token`,
+    });
+    const authorityAddress = await authorityApi.listen();
 
     const account = await repository.createSocialAccount({
       provider: "google",
@@ -255,6 +264,7 @@ test("Firestore outbox reaches Pub/Sub materializer with duplicate, reorder, and
       MESHR_HOST: "127.0.0.1",
       MESHR_CONSUMER: "topology",
       MESHR_PORT: String(materializerPort),
+      MESHR_API_URL: authorityAddress.baseUrl,
     };
     materializer.worker = startWorker("platform/materializer.ts", [], workerEnv);
     materializer.ingest = startWorker("platform/ingest.ts", [], {
@@ -390,6 +400,7 @@ test("Firestore outbox reaches Pub/Sub materializer with duplicate, reorder, and
   } finally {
     await stopWorker(materializer.ingest);
     await stopWorker(materializer.worker);
+    await authorityApi?.close();
     await Promise.all([pubsub.close(), firestore.terminate()]);
   }
 });

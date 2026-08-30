@@ -131,7 +131,7 @@ to host its Kubernetes nodes; it is not used to construct Meshr images.
 | Control API | Existing Meshr Node API with SQLite adapter | One local API replica in k3d; Firestore is exercised by the separate emulator gates, not used as the local control-plane authority |
 | Firestore | Official Firestore emulator | Event outbox, processed-event ledger, topology snapshots, and repository/API recovery tests; not a managed Firestore availability test |
 | Pub/Sub | Official Pub/Sub emulator | Ordered `mesh-events` topic and topology consumer subscription |
-| Agent ingest | `platform/ingest.ts` | Authenticated local endpoint with durable outbox retry |
+| Agent ingest | `platform/ingest.ts` | Firestore-free Pub/Sub publisher using API-issued, lease-fenced batches; authenticated local injection forwards to the API |
 | Topology materializer | `platform/materializer.ts` | At-least-once consumer with Firestore deduplication |
 | Topology stream | `platform/liveGateway.ts` | Firestore watch, WebSocket heartbeat, initial snapshot and updates |
 | Identity Platform | Development verifier and local account/session implementation | Functional local substitute; deployed token exchange uses Google Cloud Identity Platform |
@@ -144,7 +144,8 @@ The honest storage boundary matters: in production, Firestore is authoritative
 for identities, sessions, bindings, meshes, memberships, posts, idempotency,
 moderation, governance audit, and authoritative outbox state. Production worker
 delivery traces and notification outbox state live in dedicated Firestore
-databases. The API keeps a disposable in-memory SQLite
+databases. Ingest has no Firestore authority; claim/complete operations cross
+the token-authenticated API repository boundary. The API keeps a disposable in-memory SQLite
 projection for cursors and low-latency aggregate reads; it is populated from
 Firestore on demand and lost on every process restart. The local stack itself
 uses the SQLite adapter for fast fixtures and the Firestore/Pub/Sub emulators
@@ -194,7 +195,9 @@ Everything public is same-origin at `http://localhost:8080`:
 - `/v1/live/snapshots/:meshId` reads the current materialized snapshot.
 - `/__local/ingest/v1/events` is a local-only event injection route used by
   the smoke test. It is protected by the development-only internal token and
-  must not appear in a production overlay.
+  forwards to the API's authoritative outbox route; ingest never persists or
+  publishes the caller envelope directly. It must not appear in a production
+  overlay.
 
 Firestore and Pub/Sub emulator ports are cluster-internal. Use port-forwarding
 only for diagnosis:
@@ -221,9 +224,11 @@ The local traffic plane uses a closed version-1 envelope:
 }
 ```
 
-Ingest first creates `event_outbox/{event_id}` in Firestore, then publishes to
-Pub/Sub and marks it published. A crash between publish and status update may
-republish, by design. The materializer creates `processed_events/{event_id}` in
+The API first creates `event_outbox/{event_id}`, then leases an ordered prefix
+to ingest. Ingest publishes that returned envelope to Pub/Sub and completes the
+opaque lease through the API. It has no Firestore credential. A crash between
+publish and completion may republish, by design. The materializer creates
+`processed_events/{event_id}` in
 the same Firestore transaction that advances `topology_snapshots/{mesh_id}`;
 duplicates therefore do not advance the snapshot twice. `received_at` is
 receipt metadata and is excluded from the event-identity comparison, so a

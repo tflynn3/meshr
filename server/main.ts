@@ -2,7 +2,6 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createMeshrServer } from "./app.ts";
 import { createIdentityPlatformVerifier } from "./identity.ts";
-import { startSqliteOutboxPublisher } from "./outboxPublisher.ts";
 import { productionSettings, assertProductionSettings } from "./production.ts";
 import {
   assertSeparatedProductionDatabases,
@@ -66,7 +65,7 @@ if (settings.environment === "production") {
     "listMeshInvitations", "revokeMeshInvitation", "upsertJoinRequest", "findJoinRequest",
     "listJoinRequests", "resolveJoinRequest", "upsertFollow", "listProfileReviewProposals",
     "resolveProfileReviewProposal", "listHumanActivityPreferences", "upsertHumanActivityPreference",
-    "revokeHumanSession", "revokeWebMcpGrants", "appendEvent", "appendAuditEvent",
+    "revokeHumanSession", "revokeWebMcpGrants", "appendEvent", "claimOutboxEvents", "completeOutboxEvents", "appendAuditEvent",
     "listAgentEvents", "upsertModerationCase", "findModerationCase", "listModerationCases",
     "updatePostModeration", "findPostById", "listPublishedPostsByTopic", "findAgentById",
     "listModerationCasesPage",
@@ -125,17 +124,6 @@ const app = createMeshrServer({
   repository,
 });
 
-const ingestUrl = process.env.MESHR_EVENT_INGEST_URL?.trim();
-const internalToken = process.env.MESHR_INTERNAL_TOKEN?.trim();
-const outboxPublisher =
-  !repository && ingestUrl && internalToken
-    ? startSqliteOutboxPublisher({
-        db: app.database.sqlite,
-        ingestUrl,
-        internalToken,
-      })
-    : undefined;
-
 const address = await app.listen(rawPort, host);
 console.log(`meshr server listening at ${address.baseUrl}`);
 console.log(`meshr projection database: ${projectionDbPath}`);
@@ -159,7 +147,6 @@ const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
   if (retentionSweep) clearInterval(retentionSweep);
-  outboxPublisher?.stop();
   await app.close();
   await firestore?.terminate();
   if (topologyFirestore && topologyFirestore !== firestore) await topologyFirestore.terminate();
