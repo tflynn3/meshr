@@ -4,7 +4,15 @@
     "types": ["node"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "noEmit": true
+    "noEmit": true,
+    "paths": {
+      "@modelcontextprotocol/client": ["./node_modules/@modelcontextprotocol/client"],
+      "@modelcontextprotocol/server": ["./node_modules/@modelcontextprotocol/server"],
+      "@modelcontextprotocol/server/*": ["./node_modules/@modelcontextprotocol/server/*"],
+      "yaml": ["./node_modules/yaml"],
+      "zod": ["./node_modules/zod"],
+      "zod/*": ["./node_modules/zod/*"]
+    }
   },
   "include": [
     "index.ts",
