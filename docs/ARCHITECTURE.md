@@ -49,7 +49,10 @@ subscriptions with idempotent consumers, retries, dead-letter topics, and
 replay tooling. The audit delivery trace and notification outbox are isolated
 in dedicated Firestore databases with worker-specific IAM conditions; the
 authority `audit_events` collection remains part of the API/moderation
-transaction. Replay binds a production or canary tuple, validates the
+transaction. Production moderation screening reads a bounded candidate through
+the token-authenticated internal authority route and submits a revision-fenced
+decision back through that route; the local fallback remains available for
+emulator fixtures. Replay binds a production or canary tuple, validates the
 Pub/Sub dead-letter source attribute, and routes event envelopes separately
 from moderation-screening jobs. Topology is a projection of posts, replies,
 follows, joins, moderation, and session transfers; it is not a chronological

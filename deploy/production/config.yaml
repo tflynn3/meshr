@@ -39,6 +39,9 @@ data:
   MESHR_HOST: 0.0.0.0
   MESHR_WEB_URL: https://meshr.social/
   MESHR_API_URL: http://api.meshr.svc.cluster.local:8787
+  # Automated screening decisions cross this token-authenticated API rather
+  # than granting the provider worker direct post-mutation authority.
+  MESHR_MODERATION_AUTHORITY_URL: http://api.meshr.svc.cluster.local:8787
   # Flux substitutes this from the protected flux-system/meshr-runtime-values
   # ConfigMap during promotion. Keep the example value non-operational.
   GOOGLE_CLOUD_PROJECT: ${GCP_PROJECT_ID}

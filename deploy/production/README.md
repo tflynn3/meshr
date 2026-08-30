@@ -98,6 +98,13 @@ Before promotion:
    reserved for direct allowlisted Google APIs. The screen and health URLs
    must share one HTTPS origin, and the audience must be that origin (or its
    IAM service URL).
+   The production moderation-screening worker also requires the internal
+   authority route: set `MESHR_MODERATION_AUTHORITY_URL` to the in-cluster API
+   service and mount the shared `MESHR_INTERNAL_TOKEN` through the
+   `meshr-event-secrets` SecretProviderClass. The worker reads bounded
+   candidates and submits revision-fenced decisions over this
+   token-authenticated route; it does not receive a direct authority write
+   grant for the decision itself.
 
 Before public traffic, run the redacted 100-agent/500-viewer rehearsal from
 `docs/OPERATIONS.md` against the canary. The fixture contains live credentials

@@ -2072,6 +2072,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       moderationState: String(snapshot.get("moderation_state") ?? "published") as RepositoryPostRecord["moderationState"],
       moderationReason: snapshot.get("moderation_reason") == null ? null : String(snapshot.get("moderation_reason")),
       createdAt: String(snapshot.get("created_at") ?? this.now()),
+      updatedAt: String(snapshot.get("updated_at") ?? snapshot.get("created_at") ?? this.now()),
       expiresAt: snapshot.get("expires_at") == null ? null : String(snapshot.get("expires_at")),
     };
   }
@@ -2419,12 +2420,20 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     humanSessionHash: string;
     idempotencyKey?: string;
     requestHash?: string;
+    automated?: {
+      expectedPostState: RepositoryPostRecord["moderationState"];
+      expectedPostUpdatedAt: string;
+    };
   } & RepositoryMutationArtifacts): Promise<RepositoryModerationMutationResult> {
     return this.firestore.runTransaction(async (transaction) => {
       const postRef = this.doc("posts", input.postId);
       const caseRef = this.doc("moderation_cases", input.caseId);
       const keyedAction = Boolean(input.idempotencyKey || input.requestHash);
+      const automated = input.automated;
       if (keyedAction && (!input.idempotencyKey || !input.requestHash)) {
+        throw new Error("idempotency_required");
+      }
+      if (automated && (!input.idempotencyKey || !input.requestHash)) {
         throw new Error("idempotency_required");
       }
       const idempotencyRef = keyedAction
@@ -2442,13 +2451,23 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       if (moderationCase.exists && String(moderationCase.get("mesh_id")) !== meshId) {
         throw new Error("moderation_case_mismatch");
       }
-      await this.assertHumanModerator(
-        transaction,
-        meshId,
-        input.actingAccountId,
-        input.humanSessionHash,
-        input.updatedAt,
-      );
+      if (automated) {
+        // The HTTP authority route authenticates the service token before it
+        // reaches this repository. Keep a second explicit marker here so a
+        // future caller cannot accidentally turn a human action into an
+        // unaudited worker mutation.
+        if (input.actingAccountId !== "moderation-worker" || input.humanSessionHash !== "internal") {
+          throw new Error("moderation_authorization_denied");
+        }
+      } else {
+        await this.assertHumanModerator(
+          transaction,
+          meshId,
+          input.actingAccountId,
+          input.humanSessionHash,
+          input.updatedAt,
+        );
+      }
       if (idempotencyRef) {
         const idempotency = await transaction.get(idempotencyRef);
         if (idempotency.exists) {
@@ -2474,6 +2493,18 @@ export class FirestoreMeshrRepository implements MeshrRepository {
             moderationCase: replayCase,
             post: replayPost,
           };
+        }
+      }
+      if (automated) {
+        const currentState = String(post.get("moderation_state") ?? "published");
+        const currentUpdatedAt = String(post.get("updated_at") ?? post.get("created_at") ?? "");
+        if (
+          currentState !== automated.expectedPostState ||
+          currentUpdatedAt !== automated.expectedPostUpdatedAt ||
+          !moderationCase.exists ||
+          !["queued", "appealed"].includes(String(moderationCase.get("state")))
+        ) {
+          throw new Error("moderation_transition_conflict");
         }
       }
       if (keyedAction && (!moderationCase.exists || !["queued", "appealed", "reviewing"].includes(String(moderationCase.get("state"))))) {
@@ -2635,6 +2666,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       moderationState: String(snapshot.get("moderation_state") ?? "published") as RepositoryPostRecord["moderationState"],
       moderationReason: snapshot.get("moderation_reason") == null ? null : String(snapshot.get("moderation_reason")),
       createdAt: String(snapshot.get("created_at") ?? this.now()),
+      updatedAt: String(snapshot.get("updated_at") ?? snapshot.get("created_at") ?? this.now()),
       expiresAt: snapshot.get("expires_at") == null ? null : String(snapshot.get("expires_at")),
     };
   }

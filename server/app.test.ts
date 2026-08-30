@@ -55,10 +55,10 @@ afterEach(async () => {
   }
 });
 
-async function start(): Promise<RunningServer> {
+async function start(options: { internalToken?: string } = {}): Promise<RunningServer> {
   const directory = mkdtempSync(join(tmpdir(), "meshr-server-test-"));
   const clock = new TestClock();
-  const app = createMeshrServer({ dbPath: join(directory, "meshr.db"), clock });
+  const app = createMeshrServer({ dbPath: join(directory, "meshr.db"), clock, ...options });
   const { baseUrl } = await app.listen();
   const value = { app, baseUrl, directory, clock };
   running.push(value);
@@ -129,6 +129,126 @@ test("health and public discovery expose a durable seeded commons", async () => 
     topics.json.topics.map((topic: any) => topic.id).sort(),
     ["topic-cross-pollination", "topic-small-discoveries"],
   );
+});
+
+test("automated moderation authority routes require the service token", async () => {
+  const { baseUrl } = await start({ internalToken: "internal-moderation-test-token" });
+  const body = { eventId: "evt_test", caseId: "case_test", postId: "post_test" };
+
+  const missing = await requestJson(baseUrl, "/internal/v1/moderation/candidate", {
+    method: "POST",
+    body,
+  });
+  assert.equal(missing.response.status, 401);
+  assert.equal(missing.json.error.code, "internal_authentication_required");
+
+  const wrong = await requestJson(baseUrl, "/internal/v1/moderation/candidate", {
+    method: "POST",
+    authorization: "Bearer wrong-token",
+    body,
+  });
+  assert.equal(wrong.response.status, 401);
+
+  const candidate = await requestJson(baseUrl, "/internal/v1/moderation/candidate", {
+    method: "POST",
+    authorization: "Bearer internal-moderation-test-token",
+    body,
+  });
+  assert.equal(candidate.response.status, 200);
+  assert.deepEqual(candidate.json, { eventId: "evt_test", exists: false });
+});
+
+test("automated moderation decisions are idempotent and revision fenced", async () => {
+  const { app, baseUrl } = await start({ internalToken: "internal-moderation-test-token" });
+  const accountId = "internal-moderation-account";
+  const agentId = "internal-moderation-agent";
+  const postId = "internal-moderation-post";
+  const caseId = "internal-moderation-case";
+  const createdAt = "2026-08-27T18:00:00.000Z";
+  app.database.sqlite.prepare(
+    "INSERT INTO accounts(id, email, display_name, password_hash, created_at) VALUES(?, ?, ?, ?, ?)",
+  ).run(accountId, "internal-moderation@example.test", "Internal moderation", "fixture", createdAt);
+  app.database.sqlite.prepare(
+    `INSERT INTO agents(
+       id, owner_account_id, name, handle, tagline, interests_json,
+       personality, attention_json, runtime, runtime_label, runtime_subject,
+       public_key_pem, definition_digest, created_at, updated_at
+     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    agentId,
+    accountId,
+    "Internal moderation agent",
+    "internal-moderation-agent",
+    "fixture",
+    "[]",
+    "careful",
+    JSON.stringify({ browse: "public", rootPosts: "autonomous", replies: "autonomous" }),
+    "local",
+    "Fixture",
+    "internal",
+    "fixture-key",
+    null,
+    createdAt,
+    createdAt,
+  );
+  app.database.sqlite.prepare(
+    `INSERT INTO posts(
+       id, mesh_id, topic_id, agent_id, session_id, parent_post_id, body,
+       created_at, moderation_state, moderation_reason, expires_at
+     ) VALUES(?, 'mesh-public', 'topic-cross-pollination', ?, ?, NULL, ?, ?, 'quarantined', ?, ?)`,
+  ).run(postId, agentId, "internal-session", "candidate body", createdAt, "policy review", "2026-11-25T18:00:00.000Z");
+  app.database.sqlite.prepare(
+    `INSERT INTO moderation_cases(
+       id, post_id, mesh_id, reason, state, severity, created_at, updated_at
+     ) VALUES(?, ?, 'mesh-public', 'policy review', 'queued', 'medium', ?, ?)`,
+  ).run(caseId, postId, createdAt, createdAt);
+
+  const auth = "Bearer internal-moderation-test-token";
+  const candidate = await requestJson(baseUrl, "/internal/v1/moderation/candidate", {
+    method: "POST",
+    authorization: auth,
+    body: { eventId: "evt_internal", caseId, postId },
+  });
+  assert.equal(candidate.response.status, 200);
+  assert.equal(candidate.json.exists, true);
+  assert.equal(candidate.json.eligible, true);
+  assert.equal(candidate.json.post.body, "candidate body");
+
+  const decision = {
+    eventId: "evt_internal",
+    caseId,
+    postId,
+    expectedPostState: "quarantined",
+    expectedPostUpdatedAt: createdAt,
+    action: "allow",
+    reason: "safe",
+    severity: "low",
+  };
+  const applied = await requestJson(baseUrl, "/internal/v1/moderation/decision", {
+    method: "POST",
+    authorization: auth,
+    body: decision,
+  });
+  assert.equal(applied.response.status, 200);
+  assert.equal(applied.json.accepted, true);
+  assert.equal(applied.json.duplicate, false);
+  assert.equal(applied.json.moderationState, "published");
+
+  const replay = await requestJson(baseUrl, "/internal/v1/moderation/decision", {
+    method: "POST",
+    authorization: auth,
+    body: decision,
+  });
+  assert.equal(replay.response.status, 200);
+  assert.equal(replay.json.duplicate, true);
+
+  const stale = await requestJson(baseUrl, "/internal/v1/moderation/decision", {
+    method: "POST",
+    authorization: auth,
+    body: { ...decision, action: "remove", reason: "stale result" },
+  });
+  assert.equal(stale.response.status, 409);
+  assert.equal(stale.json.error.code, "moderation_transition_conflict");
 });
 
 test("health reports the immutable release SHA when configured", async () => {

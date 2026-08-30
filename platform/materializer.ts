@@ -9,6 +9,7 @@ import {
   TOPOLOGY_ACTIVITY_WINDOW_MINUTES,
 } from "./activityWindow.ts";
 import { readProjectionBootstrap } from "../server/projectionBootstrap.ts";
+import { loadRuntimeSecrets } from "./runtimeSecrets.ts";
 import {
   type AuthorityCollection,
   type WorkerCollection,
@@ -20,6 +21,7 @@ import {
 const authorityCollection = <T extends AuthorityCollection>(name: T): T => name;
 const workerCollection = <T extends WorkerCollection>(name: T): T => name;
 
+loadRuntimeSecrets();
 const config = eventPlaneConfig();
 const firestore = createFirestore(config.projectId, config.databaseId);
 const topologyFirestore = config.topologyDatabaseId === config.databaseId
@@ -102,6 +104,26 @@ const moderationRequired = process.env.MESHR_MODERATION_REQUIRED === "1";
 // transient publish outage.
 const moderationSweepFallback = process.env.MESHR_MODERATION_SWEEP_FALLBACK?.trim() !== "0";
 const moderationHealthcheckUrl = process.env.MESHR_MODERATION_HEALTHCHECK_URL?.trim();
+const moderationAuthorityUrl = process.env.MESHR_MODERATION_AUTHORITY_URL?.trim() || "";
+const moderationAuthorityToken = process.env.MESHR_INTERNAL_TOKEN?.trim() || "";
+const moderationAuthorityApiEnabled = Boolean(moderationAuthorityUrl && moderationAuthorityToken);
+const productionModerationScreening = requestedConsumer === "moderation-screening" &&
+  process.env.MESHR_ENV?.trim().toLowerCase() === "production";
+if (moderationAuthorityUrl) {
+  try {
+    const authorityUrl = new URL(moderationAuthorityUrl);
+    if ((authorityUrl.protocol !== "http:" && authorityUrl.protocol !== "https:") || authorityUrl.username || authorityUrl.password) {
+      throw new Error("MESHR_MODERATION_AUTHORITY_URL must be an http(s) URL without credentials.");
+    }
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : "MESHR_MODERATION_AUTHORITY_URL is invalid.");
+  }
+}
+if (productionModerationScreening && !moderationAuthorityApiEnabled) {
+  throw new Error(
+    "MESHR_MODERATION_AUTHORITY_URL and MESHR_INTERNAL_TOKEN are required for the production moderation screening worker.",
+  );
+}
 if (moderationAuth !== "none" && moderationAuth !== "static" && moderationAuth !== "adc") {
   throw new Error("MESHR_MODERATION_AUTH must be none, static, or adc.");
 }
@@ -1537,6 +1559,199 @@ async function recordModerationFailure(claim: ModerationClaim, error: unknown): 
   return retryScheduled;
 }
 
+type ModerationCandidate = {
+  eventId: string;
+  exists: boolean;
+  eligible?: boolean;
+  post?: {
+    postId: string;
+    meshId: string;
+    topicId: string;
+    agentId: string;
+    parentPostId: string | null;
+    moderationState: "published" | "quarantined" | "removed" | "redacted";
+    moderationReason: string | null;
+    createdAt: string;
+    updatedAt: string;
+    expiresAt: string | null;
+    body?: string;
+  };
+  case?: {
+    caseId: string;
+    postId: string;
+    meshId: string;
+    state: "queued" | "reviewing" | "resolved" | "appealed";
+    severity: "low" | "medium" | "high" | "critical";
+    reason: string;
+    resolution: string | null;
+    updatedAt: string;
+  };
+};
+
+function moderationAuthorityEndpoint(pathname: string): string {
+  const url = new URL(moderationAuthorityUrl);
+  url.pathname = pathname;
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+async function fetchModerationCandidate(claim: ModerationClaim): Promise<ModerationCandidate> {
+  const response = await fetch(moderationAuthorityEndpoint("/internal/v1/moderation/candidate"), {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      authorization: `Bearer ${moderationAuthorityToken}`,
+      "x-meshr-contract-version": "1",
+    },
+    body: JSON.stringify({
+      eventId: claim.itemId,
+      caseId: claim.caseId,
+      postId: claim.postId,
+    }),
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) throw new Error(`moderation authority candidate returned HTTP ${response.status}`);
+  const raw = await response.json() as Record<string, unknown>;
+  if (raw.eventId !== claim.itemId || typeof raw.exists !== "boolean") {
+    throw new Error("moderation authority returned an invalid candidate");
+  }
+  if (!raw.exists) return { eventId: claim.itemId, exists: false };
+  const rawPost = raw.post && typeof raw.post === "object" && !Array.isArray(raw.post)
+    ? raw.post as Record<string, unknown>
+    : undefined;
+  const rawCase = raw.case && typeof raw.case === "object" && !Array.isArray(raw.case)
+    ? raw.case as Record<string, unknown>
+    : undefined;
+  if (!rawPost || !rawCase || typeof raw.eligible !== "boolean") {
+    throw new Error("moderation authority returned an incomplete candidate");
+  }
+  const postState = rawPost.moderationState;
+  const caseState = rawCase.state;
+  if ((postState !== "published" && postState !== "quarantined" && postState !== "removed" && postState !== "redacted") ||
+      (caseState !== "queued" && caseState !== "reviewing" && caseState !== "resolved" && caseState !== "appealed")) {
+    throw new Error("moderation authority returned an invalid candidate state");
+  }
+  const severity = rawCase.severity;
+  if (severity !== "low" && severity !== "medium" && severity !== "high" && severity !== "critical") {
+    throw new Error("moderation authority returned an invalid candidate severity");
+  }
+  const post: ModerationCandidate["post"] = {
+    postId: String(rawPost.postId ?? ""),
+    meshId: String(rawPost.meshId ?? ""),
+    topicId: String(rawPost.topicId ?? ""),
+    agentId: String(rawPost.agentId ?? ""),
+    parentPostId: rawPost.parentPostId == null ? null : String(rawPost.parentPostId),
+    moderationState: postState,
+    moderationReason: rawPost.moderationReason == null ? null : String(rawPost.moderationReason),
+    createdAt: String(rawPost.createdAt ?? ""),
+    updatedAt: String(rawPost.updatedAt ?? ""),
+    expiresAt: rawPost.expiresAt == null ? null : String(rawPost.expiresAt),
+    ...(typeof rawPost.body === "string" ? { body: rawPost.body } : {}),
+  };
+  const moderationCase: NonNullable<ModerationCandidate["case"]> = {
+    caseId: String(rawCase.caseId ?? ""),
+    postId: String(rawCase.postId ?? ""),
+    meshId: String(rawCase.meshId ?? ""),
+    state: caseState,
+    severity,
+    reason: String(rawCase.reason ?? ""),
+    resolution: rawCase.resolution == null ? null : String(rawCase.resolution),
+    updatedAt: String(rawCase.updatedAt ?? ""),
+  };
+  if (post.postId !== claim.postId || moderationCase.caseId !== claim.caseId ||
+      moderationCase.postId !== claim.postId || moderationCase.meshId !== post.meshId ||
+      !post.meshId || !post.topicId || !post.agentId || !post.updatedAt) {
+    throw new Error("moderation authority returned a mismatched candidate");
+  }
+  return {
+    eventId: claim.itemId,
+    exists: true,
+    eligible: raw.eligible,
+    post,
+    case: moderationCase,
+  };
+}
+
+async function finalizeModerationClaim(
+  claim: ModerationClaim,
+  input: {
+    state: "resolved" | "superseded";
+    resolution: string;
+    reason?: string;
+    severity?: string;
+  },
+): Promise<void> {
+  const now = new Date().toISOString();
+  await firestore.runTransaction(async (transaction) => {
+    const current = await transaction.get(claim.itemRef);
+    if (!current.exists || String(current.get("state")) !== "queued" || current.get("lease_id") !== claim.leaseId) return;
+    transaction.set(claim.itemRef, {
+      state: input.state,
+      resolution: input.resolution,
+      ...(input.reason ? { reason: input.reason } : {}),
+      ...(input.severity ? { severity: input.severity } : {}),
+      resolved_at: now,
+      lease_id: null,
+      lease_until: null,
+      available_at: null,
+      next_attempt_at: null,
+      last_error: null,
+    }, { merge: true });
+  });
+}
+
+async function applyModerationDecisionViaAuthority(
+  claim: ModerationClaim,
+  candidate: ModerationCandidate,
+  decision: {
+    action: "allow" | "quarantine" | "redact" | "remove";
+    reason?: string;
+    severity?: string;
+  },
+): Promise<"accepted" | "conflict"> {
+  if (!candidate.post || !candidate.case) throw new Error("moderation authority candidate is incomplete");
+  const expectedPostState = candidate.post.moderationState;
+  const expectedPostUpdatedAt = candidate.post.updatedAt;
+  const response = await fetch(moderationAuthorityEndpoint("/internal/v1/moderation/decision"), {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      authorization: `Bearer ${moderationAuthorityToken}`,
+      "x-meshr-contract-version": "1",
+    },
+    body: JSON.stringify({
+      eventId: claim.itemId,
+      caseId: claim.caseId,
+      postId: claim.postId,
+      expectedPostState,
+      expectedPostUpdatedAt,
+      action: decision.action,
+      reason: decision.reason,
+      severity: decision.severity,
+    }),
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (response.status === 409) {
+    let code = "";
+    try {
+      const body = await response.json() as { error?: { code?: unknown } };
+      code = typeof body.error?.code === "string" ? body.error.code : "";
+    } catch {
+      // Treat an unparseable conflict as a retryable authority failure.
+    }
+    if (code === "moderation_transition_conflict") return "conflict";
+  }
+  if (!response.ok) throw new Error(`moderation authority decision returned HTTP ${response.status}`);
+  const raw = await response.json() as Record<string, unknown>;
+  if (raw.accepted !== true || raw.postId !== claim.postId || raw.caseId !== claim.caseId) {
+    throw new Error("moderation authority returned an invalid decision");
+  }
+  return "accepted";
+}
+
 async function applyModerationDecision(claim: ModerationClaim, decision: {
   action: "allow" | "quarantine" | "redact" | "remove";
   reason?: string;
@@ -1749,11 +1964,56 @@ async function processQueuedModerationItem(item: any): Promise<"done" | "retry">
   }
   if (!claim) return "done";
   let providerFailure = false;
+  let authorityFailure = false;
   try {
-    const post = await firestore.collection(authorityCollection("posts")).doc(claim.postId).get();
-    if (!post.exists) {
-      await applyModerationDecision(claim, { action: "allow", reason: "expired" });
-      return "done";
+    let candidate: ModerationCandidate | undefined;
+    let postForProvider: {
+      postId: string;
+      meshId: string;
+      agentId: string;
+      body: string;
+    };
+    if (moderationAuthorityApiEnabled) {
+      authorityFailure = true;
+      candidate = await fetchModerationCandidate(claim);
+      authorityFailure = false;
+      if (!candidate.exists) {
+        await finalizeModerationClaim(claim, { state: "resolved", resolution: "expired" });
+        return "done";
+      }
+      if (!candidate.eligible || typeof candidate.post?.body !== "string") {
+        const resolvedByReplay = candidate.case?.state === "resolved";
+        await finalizeModerationClaim(claim, resolvedByReplay
+          ? {
+              state: "resolved",
+              resolution: candidate.case?.resolution ?? "resolved",
+              reason: "authority_decision_already_applied",
+            }
+          : {
+              state: "superseded",
+              resolution: "human_override",
+              reason: "moderation_case_no_longer_eligible",
+            });
+        return "done";
+      }
+      postForProvider = {
+        postId: candidate.post.postId,
+        meshId: candidate.post.meshId,
+        agentId: candidate.post.agentId,
+        body: candidate.post.body,
+      };
+    } else {
+      const post = await firestore.collection(authorityCollection("posts")).doc(claim.postId).get();
+      if (!post.exists) {
+        await applyModerationDecision(claim, { action: "allow", reason: "expired" });
+        return "done";
+      }
+      postForProvider = {
+        postId: claim.postId,
+        meshId: String(post.get("mesh_id") ?? ""),
+        agentId: String(post.get("agent_id") ?? ""),
+        body: String(post.get("body") ?? ""),
+      };
     }
     let decision: {
       action: "allow" | "quarantine" | "redact" | "remove";
@@ -1772,10 +2032,10 @@ async function processQueuedModerationItem(item: any): Promise<"done" | "retry">
         method: "POST",
         headers,
         body: JSON.stringify({
-          postId: claim.postId,
-          meshId: post.get("mesh_id"),
-          agentId: post.get("agent_id"),
-          text: post.get("body"),
+          postId: postForProvider.postId,
+          meshId: postForProvider.meshId,
+          agentId: postForProvider.agentId,
+          text: postForProvider.body,
         }),
         signal: AbortSignal.timeout(5_000),
       });
@@ -1798,11 +2058,31 @@ async function processQueuedModerationItem(item: any): Promise<"done" | "retry">
       providerFailure = true;
       throw error;
     }
-    await applyModerationDecision(claim, {
-      action: decision.action,
-      reason: decision.reason,
-      severity: decision.severity,
-    });
+    if (moderationAuthorityApiEnabled && candidate) {
+      authorityFailure = true;
+      const result = await applyModerationDecisionViaAuthority(claim, candidate, decision);
+      authorityFailure = false;
+      if (result === "conflict") {
+        await finalizeModerationClaim(claim, {
+          state: "superseded",
+          resolution: "human_override",
+          reason: "moderation_transition_conflict",
+        });
+      } else {
+        await finalizeModerationClaim(claim, {
+          state: "resolved",
+          resolution: decision.action,
+          reason: decision.reason,
+          severity: decision.severity,
+        });
+      }
+    } else {
+      await applyModerationDecision(claim, {
+        action: decision.action,
+        reason: decision.reason,
+        severity: decision.severity,
+      });
+    }
     return "done";
   } catch (error) {
     // A provider or transaction failure belongs to this item only. Persist a
@@ -1815,7 +2095,7 @@ async function processQueuedModerationItem(item: any): Promise<"done" | "retry">
       item_id: claim.itemId,
       post_id: claim.postId,
       case_id: claim.caseId,
-      error_class: providerFailure ? "moderation_provider" : "firestore",
+      error_class: providerFailure ? "moderation_provider" : authorityFailure ? "moderation_authority" : "firestore",
       error: moderationErrorMessage(error),
     }));
     try {
@@ -1980,6 +2260,15 @@ const server = createServer((request, response) => {
         ok: false,
         service: "topology-materializer",
         error: "moderation_provider_unconfigured",
+      }));
+      return;
+    }
+    if (productionModerationScreening && !moderationAuthorityApiEnabled) {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        ok: false,
+        service: "topology-materializer",
+        error: "moderation_authority_unconfigured",
       }));
       return;
     }

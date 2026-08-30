@@ -209,6 +209,7 @@ export class SqliteMeshrRepository implements MeshrRepository {
       moderationState: row.moderation_state,
       moderationReason: row.moderation_reason,
       createdAt: row.created_at,
+      updatedAt: row.created_at,
       expiresAt: row.expires_at,
     } : null;
   }
@@ -2942,6 +2943,10 @@ export class SqliteMeshrRepository implements MeshrRepository {
     humanSessionHash: string;
     idempotencyKey?: string;
     requestHash?: string;
+    automated?: {
+      expectedPostState: RepositoryPostRecord["moderationState"];
+      expectedPostUpdatedAt: string;
+    };
   } & RepositoryMutationArtifacts): Promise<RepositoryModerationMutationResult> {
     return this.database.transaction(() => {
       const post = this.postRecord(input.postId);
@@ -2950,35 +2955,52 @@ export class SqliteMeshrRepository implements MeshrRepository {
       if (currentCase && (currentCase.postId !== input.postId || currentCase.meshId !== post.meshId)) {
         throw new Error("moderation_case_mismatch");
       }
-      this.assertHumanModerator(
-        post.meshId,
-        input.actingAccountId,
-        input.humanSessionHash,
-        input.updatedAt,
-      );
+      if (input.automated) {
+        if (input.actingAccountId !== "moderation-worker" || input.humanSessionHash !== "internal") {
+          throw new Error("moderation_authorization_denied");
+        }
+      } else {
+        this.assertHumanModerator(
+          post.meshId,
+          input.actingAccountId,
+          input.humanSessionHash,
+          input.updatedAt,
+        );
+      }
 
       const keyedAction = Boolean(input.idempotencyKey || input.requestHash);
       if (keyedAction) {
         if (!input.idempotencyKey || !input.requestHash) throw new Error("idempotency_required");
-        const existing = this.db.prepare(
-          `SELECT request_hash, response_json, expires_at
-           FROM human_idempotency_records
-           WHERE account_id = ? AND operation = 'moderation.action' AND idempotency_key = ?`,
-        ).get(input.actingAccountId, input.idempotencyKey) as {
+        const existing = input.automated
+          ? this.db.prepare(
+              `SELECT request_hash, response_json, expires_at
+               FROM automated_idempotency_records
+               WHERE operation = 'moderation.action' AND idempotency_key = ?`,
+            ).get(input.idempotencyKey)
+          : this.db.prepare(
+              `SELECT request_hash, response_json, expires_at
+               FROM human_idempotency_records
+               WHERE account_id = ? AND operation = 'moderation.action' AND idempotency_key = ?`,
+            ).get(input.actingAccountId, input.idempotencyKey) as {
           request_hash: string;
           response_json: string;
           expires_at: string;
         } | undefined;
-        if (existing) {
-          if (!constantTimeStringEqual(existing.request_hash, input.requestHash)) {
+        const typedExisting = existing as {
+          request_hash: string;
+          response_json: string;
+          expires_at: string;
+        } | undefined;
+        if (typedExisting) {
+          if (!constantTimeStringEqual(typedExisting.request_hash, input.requestHash)) {
             throw new Error("idempotency_conflict");
           }
-          if (Date.parse(existing.expires_at) <= Date.parse(input.updatedAt)) {
+          if (Date.parse(typedExisting.expires_at) <= Date.parse(input.updatedAt)) {
             throw new Error("idempotency_expired");
           }
           let reference: Record<string, unknown> = {};
           try {
-            reference = JSON.parse(existing.response_json) as Record<string, unknown>;
+            reference = JSON.parse(typedExisting.response_json) as Record<string, unknown>;
           } catch {
             throw new Error("idempotency_expired");
           }
@@ -2991,6 +3013,14 @@ export class SqliteMeshrRepository implements MeshrRepository {
           if (!replayCase || !replayPost) throw new Error("idempotency_expired");
           this.assertModerationReplayMatches(reference, replayCase, replayPost);
           return { duplicate: true, moderationCase: replayCase, post: replayPost };
+        }
+        if (input.automated && (
+          post.moderationState !== input.automated.expectedPostState ||
+          post.updatedAt !== input.automated.expectedPostUpdatedAt ||
+          !currentCase ||
+          !["queued", "appealed"].includes(currentCase.state)
+        )) {
+          throw new Error("moderation_transition_conflict");
         }
         if (!currentCase || !["queued", "appealed", "reviewing"].includes(currentCase.state)) {
           throw new Error("moderation_transition_conflict");
@@ -3107,19 +3137,34 @@ export class SqliteMeshrRepository implements MeshrRepository {
       }
       this.writeMutationArtifacts(artifacts);
       if (keyedAction) {
-        this.db.prepare(
-          `INSERT INTO human_idempotency_records(
-             account_id, operation, idempotency_key, request_hash,
-             response_status, response_json, created_at, expires_at
-           ) VALUES(?, 'moderation.action', ?, ?, 200, ?, ?, ?)`,
-        ).run(
-          input.actingAccountId,
-          input.idempotencyKey!,
-          input.requestHash!,
-          this.moderationIdempotencyResponse(nextCase, updatedPost),
-          input.updatedAt,
-          this.moderationIdempotencyExpiry(input.updatedAt, updatedPost.expiresAt),
-        );
+        if (input.automated) {
+          this.db.prepare(
+            `INSERT INTO automated_idempotency_records(
+               operation, idempotency_key, request_hash,
+               response_status, response_json, created_at, expires_at
+             ) VALUES('moderation.action', ?, ?, 200, ?, ?, ?)`,
+          ).run(
+            input.idempotencyKey!,
+            input.requestHash!,
+            this.moderationIdempotencyResponse(nextCase, updatedPost),
+            input.updatedAt,
+            this.moderationIdempotencyExpiry(input.updatedAt, updatedPost.expiresAt),
+          );
+        } else {
+          this.db.prepare(
+            `INSERT INTO human_idempotency_records(
+               account_id, operation, idempotency_key, request_hash,
+               response_status, response_json, created_at, expires_at
+             ) VALUES(?, 'moderation.action', ?, ?, 200, ?, ?, ?)`,
+          ).run(
+            input.actingAccountId,
+            input.idempotencyKey!,
+            input.requestHash!,
+            this.moderationIdempotencyResponse(nextCase, updatedPost),
+            input.updatedAt,
+            this.moderationIdempotencyExpiry(input.updatedAt, updatedPost.expiresAt),
+          );
+        }
       }
       return { duplicate: false, moderationCase: nextCase, post: updatedPost };
     });
@@ -3154,6 +3199,7 @@ export class SqliteMeshrRepository implements MeshrRepository {
       moderationState: row.moderation_state,
       moderationReason: row.moderation_reason,
       createdAt: row.created_at,
+      updatedAt: row.created_at,
       expiresAt: row.expires_at,
     } : null;
   }
@@ -4190,6 +4236,9 @@ export class SqliteMeshrRepository implements MeshrRepository {
     ).run().changes);
     removed += Number(this.db.prepare(
       `DELETE FROM human_idempotency_records WHERE expires_at <= ?`,
+    ).run(now).changes);
+    removed += Number(this.db.prepare(
+      `DELETE FROM automated_idempotency_records WHERE expires_at <= ?`,
     ).run(now).changes);
     return removed;
   }

@@ -220,6 +220,8 @@ export interface MeshrServerOptions {
   invitationPepper?: string;
   /** Immediately previous invitation pepper retained during rotation. */
   invitationPepperPrevious?: string;
+  /** Shared service token for narrow event-worker authority calls. */
+  internalToken?: string;
 }
 
 export interface MeshrServer {
@@ -654,6 +656,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     "meshr-local-invitation-pepper";
   const invitationPepperPrevious = options.invitationPepperPrevious?.trim() ||
     process.env.MESHR_INVITATION_PEPPER_PREVIOUS?.trim();
+  const internalToken = options.internalToken?.trim() || process.env.MESHR_INTERNAL_TOKEN?.trim() || "";
   // The SQLite adapter remains the isolated/local authority. Production
   // always injects Firestore and is blocked at startup if its role-invitation
   // methods are missing.
@@ -999,6 +1002,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           ? `${label}: ${error.message}`
           : `${label}: durable store unavailable.`,
       );
+    }
+  };
+  const requireInternalAuthority = (request: IncomingMessage): void => {
+    const authorization = request.headers.authorization;
+    const supplied = typeof authorization === "string"
+      ? authorization.replace(/^Bearer\s+/i, "").trim()
+      : "";
+    if (!internalToken || !supplied || !constantTimeStringEqual(supplied, internalToken)) {
+      throw new ApiError(401, "internal_authentication_required", "A Meshr service token is required.");
     }
   };
   const mapRoleInvitationError = (error: unknown): never => {
@@ -4846,6 +4858,216 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           error instanceof Error ? error.message : "The Meshr dependencies are unavailable.",
         );
       }
+    }
+
+    // Automated screening is an event-worker capability, not a second
+    // public moderation API. Keep the decision write behind a short-lived
+    // service-token boundary and require the repository to compare the post
+    // revision inside its transaction. This prevents a provider response
+    // prepared for an older post or case from undoing a human decision.
+    if (path === "/internal/v1/moderation/candidate" || path === "/internal/v1/moderation/decision") {
+      if (method !== "POST") throw new ApiError(404, "not_found", "Route not found.");
+      requireInternalAuthority(request);
+      const input = asObject(await readJson(request), "internal moderation request");
+      const allowedFields = path.endsWith("/candidate")
+        ? new Set(["eventId", "caseId", "postId"])
+        : new Set([
+            "eventId",
+            "caseId",
+            "postId",
+            "expectedPostState",
+            "expectedPostUpdatedAt",
+            "action",
+            "reason",
+            "severity",
+          ]);
+      for (const field of Object.keys(input)) {
+        if (!allowedFields.has(field)) {
+          throw new ApiError(400, "invalid_request", `${field} is not allowed.`);
+        }
+      }
+      const idPattern = /^[A-Za-z0-9._:-]{1,256}$/;
+      const eventId = requiredString(input, "eventId", { max: 256, pattern: idPattern });
+      const caseId = requiredString(input, "caseId", { max: 256, pattern: idPattern });
+      const postId = requiredString(input, "postId", { max: 256, pattern: idPattern });
+
+      if (path.endsWith("/candidate")) {
+        if (!roleInvitationStore.findPostById || !roleInvitationStore.findModerationCase) {
+          throw new ApiError(503, "moderation_store_unavailable", "The moderation authority is unavailable.");
+        }
+        const [post, moderationCase] = await Promise.all([
+          findPostForModeration(postId),
+          findModerationCaseForRoute(caseId),
+        ]);
+        const nowMs = Date.parse(database.now());
+        const postExpired = Boolean(
+          post?.expiresAt && Number.isFinite(Date.parse(post.expiresAt)) && Date.parse(post.expiresAt) <= nowMs,
+        );
+        const matches = Boolean(
+          post && moderationCase &&
+          post.postId === postId &&
+          moderationCase.caseId === caseId &&
+          moderationCase.postId === postId &&
+          moderationCase.meshId === post.meshId,
+        );
+        if (!matches || postExpired) {
+          return { body: { eventId, exists: false } };
+        }
+        const eligible = moderationCase!.state === "queued" || moderationCase!.state === "appealed";
+        return {
+          body: {
+            eventId,
+            exists: true,
+            eligible,
+            post: {
+              postId: post!.postId,
+              meshId: post!.meshId,
+              topicId: post!.topicId,
+              agentId: post!.agentId,
+              parentPostId: post!.parentPostId,
+              moderationState: post!.moderationState,
+              moderationReason: post!.moderationReason,
+              createdAt: post!.createdAt,
+              updatedAt: post!.updatedAt ?? post!.createdAt,
+              expiresAt: post!.expiresAt,
+              ...(eligible ? { body: post!.body } : {}),
+            },
+            case: {
+              caseId: moderationCase!.caseId,
+              postId: moderationCase!.postId,
+              meshId: moderationCase!.meshId,
+              state: moderationCase!.state,
+              severity: moderationCase!.severity,
+              reason: moderationCase!.reason,
+              resolution: moderationCase!.resolution,
+              updatedAt: moderationCase!.updatedAt,
+            },
+          },
+        };
+      }
+
+      if (!roleInvitationStore.findPostById || !roleInvitationStore.findModerationCase || !roleInvitationStore.updatePostModeration) {
+        throw new ApiError(503, "moderation_store_unavailable", "The moderation authority is unavailable.");
+      }
+      const expectedPostState = input.expectedPostState;
+      if (expectedPostState !== "published" && expectedPostState !== "quarantined" &&
+          expectedPostState !== "removed" && expectedPostState !== "redacted") {
+        throw new ApiError(400, "invalid_moderation_state", "expectedPostState is invalid.");
+      }
+      const expectedPostUpdatedAt = requiredString(input, "expectedPostUpdatedAt", { max: 64 });
+      if (!Number.isFinite(Date.parse(expectedPostUpdatedAt))) {
+        throw new ApiError(400, "invalid_request", "expectedPostUpdatedAt must be an ISO timestamp.");
+      }
+      const action = input.action;
+      if (action !== "allow" && action !== "quarantine" && action !== "redact" && action !== "remove") {
+        throw new ApiError(400, "invalid_moderation_action", "action must be allow, quarantine, redact, or remove.");
+      }
+      const reason = optionalString(input, "reason", 200) ?? "automated_moderation";
+      const severity = input.severity === undefined ? "low" : input.severity;
+      if (severity !== "low" && severity !== "medium" && severity !== "high" && severity !== "critical") {
+        throw new ApiError(400, "invalid_moderation_severity", "severity must be low, medium, high, or critical.");
+      }
+      const [post, moderationCase] = await Promise.all([
+        findPostForModeration(postId),
+        findModerationCaseForRoute(caseId),
+      ]);
+      if (!post || post.postId !== postId) throw new ApiError(404, "post_not_found", "Post not found.");
+      if (!moderationCase || moderationCase.caseId !== caseId || moderationCase.postId !== postId || moderationCase.meshId !== post.meshId) {
+        throw new ApiError(404, "moderation_case_not_found", "Moderation case not found.");
+      }
+      const mesh = await findMeshForModeration(post.meshId);
+      if (!mesh) throw new ApiError(404, "mesh_not_found", "Mesh not found.");
+      const parentPost = post.parentPostId ? await findPostForModeration(post.parentPostId) : null;
+      const now = database.now();
+      const nextPostState = action === "allow"
+        ? "published"
+        : action === "quarantine"
+          ? "quarantined"
+          : action === "redact"
+            ? "redacted"
+            : "removed";
+      const decisionHash = sha256(JSON.stringify({
+        eventId,
+        caseId,
+        postId,
+        expectedPostState,
+        expectedPostUpdatedAt,
+        action,
+        reason,
+        severity,
+      }));
+      const moderationEvent: RepositoryEventInput = {
+        eventId: `evt_moderation_screened_${decisionHash.slice(0, 40)}`,
+        type: "moderation.screened",
+        meshId: post.meshId,
+        topicId: post.topicId,
+        agentId: post.agentId,
+        sessionId: post.sessionId || null,
+        runtimeKind: null,
+        payload: {
+          eventId,
+          caseId,
+          postId,
+          action,
+          state: nextPostState,
+          moderation_state: nextPostState,
+          previous_moderation_state: post.moderationState,
+          original_event_type: post.parentPostId ? "reply.created" : "post.created",
+          topic_id: post.topicId,
+          parent_post_id: post.parentPostId,
+          parent_agent_id: parentPost?.agentId ?? null,
+          parent_created_at: parentPost?.createdAt ?? null,
+          reason,
+          severity,
+        },
+        occurredAt: now,
+        observationScope: mesh.visibility === "public" ? "public" : "private",
+      };
+      const moderationAudit: RepositoryAuditInput = {
+        auditId: `audit_moderation_screened_${decisionHash.slice(0, 40)}`,
+        actorType: "system",
+        actorId: "moderation-worker",
+        sessionId: null,
+        action: "moderation.screened",
+        resourceType: "post",
+        resourceId: postId,
+        data: { eventId, caseId, postId, meshId: post.meshId, action, reason, severity },
+        createdAt: now,
+      };
+      const mutation = await durableWrite<RepositoryModerationMutationResult>(
+        "automated moderation decision",
+        () => roleInvitationStore.updatePostModeration!({
+          caseId,
+          postId,
+          state: nextPostState,
+          reason,
+          body: action === "redact" ? "[Content redacted by automated moderation]" : undefined,
+          caseState: "resolved",
+          resolution: action,
+          updatedAt: now,
+          actingAccountId: "moderation-worker",
+          humanSessionHash: "internal",
+          idempotencyKey: `auto_${decisionHash.slice(0, 64)}`,
+          requestHash: decisionHash,
+          automated: { expectedPostState, expectedPostUpdatedAt },
+          event: moderationEvent,
+          audit: moderationAudit,
+        }),
+        { allowLocal: true },
+      );
+      if (!mutation?.moderationCase || !mutation.post) {
+        throw new ApiError(503, "moderation_store_unavailable", "The moderation authority did not return the committed decision.");
+      }
+      return {
+        body: {
+          accepted: true,
+          duplicate: mutation.duplicate,
+          eventId,
+          caseId: mutation.moderationCase.caseId,
+          postId: mutation.post.postId,
+          moderationState: mutation.post.moderationState,
+        },
+      };
     }
 
     if (method === "GET" && path === "/v1/config/auth") {

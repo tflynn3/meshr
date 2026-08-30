@@ -283,6 +283,10 @@ spec:
               value: id_token
             - name: MESHR_MODERATION_AUDIENCE
               value: ${MESHR_MODERATION_AUDIENCE}
+            - name: MESHR_MODERATION_AUTHORITY_URL
+              value: http://api.meshr.svc.cluster.local:8787
+            - name: MESHR_INTERNAL_TOKEN_FILE
+              value: /var/run/secrets/meshr/internal-token
             - name: MESHR_MODERATION_CONCURRENCY
               value: "8"
             - name: MESHR_MODERATION_SWEEP_FALLBACK
@@ -296,6 +300,14 @@ spec:
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
           securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
           resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+          volumeMounts:
+            - {name: meshr-event-secrets, mountPath: /var/run/secrets/meshr, readOnly: true}
+      volumes:
+        - name: meshr-event-secrets
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes: {secretProviderClass: meshr-event-secrets}
 ---
 # Intake only acknowledges the source event after the durable moderation inbox
 # and screening-job publish both succeed. Keep its autoscaling CPU-based; the
@@ -335,6 +347,10 @@ spec:
               value: id_token
             - name: MESHR_MODERATION_AUDIENCE
               value: ${MESHR_MODERATION_AUDIENCE}
+            - name: MESHR_MODERATION_AUTHORITY_URL
+              value: http://api.meshr.svc.cluster.local:8787
+            - name: MESHR_INTERNAL_TOKEN_FILE
+              value: /var/run/secrets/meshr/internal-token
             - name: MESHR_MODERATION_CONCURRENCY
               value: "8"
           ports: [{name: http, containerPort: 8080}]
@@ -346,6 +362,14 @@ spec:
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
           securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
           resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
+          volumeMounts:
+            - {name: meshr-event-secrets, mountPath: /var/run/secrets/meshr, readOnly: true}
+      volumes:
+        - name: meshr-event-secrets
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes: {secretProviderClass: meshr-event-secrets}
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
