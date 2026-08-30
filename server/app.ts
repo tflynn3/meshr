@@ -9801,7 +9801,17 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           }
           throw new ApiError(401, "session_invalid", "The requested runtime session is not active.");
         }
-        if (!recoverySuccessorId && !expiredPredecessorRecovery && active && activeExpiresAtMs !== undefined) {
+        // The release cutover flow renews its one reviewed validation binding
+        // immediately before the irreversible pointer promotion. The scope
+        // check above has already constrained this request to the exact
+        // binding/agent/predecessor/private mesh, so permitting that one
+        // signed renewal early gives the subsequent bounded rollout a full
+        // fifteen-minute session horizon without relaxing normal runtime
+        // renewal policy. Every other active session still observes the
+        // two-minute renewal window.
+        const allowEarlyValidationRenewal =
+          process.env.MESHR_DATABASE_CUTOVER_MODE?.trim().toLowerCase() === "validation";
+        if (!allowEarlyValidationRenewal && !recoverySuccessorId && !expiredPredecessorRecovery && active && activeExpiresAtMs !== undefined) {
           const remainingSeconds = Math.ceil(
             (activeExpiresAtMs - database.clock.now().getTime()) / 1_000,
           );

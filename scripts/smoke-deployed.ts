@@ -292,17 +292,13 @@ async function assertCutoverValidationFlow(
     });
     await store.upsert(binding);
   };
-  const tokenExpiresAt = binding.agentTokenExpiresAt ? Date.parse(binding.agentTokenExpiresAt) : Number.NaN;
-  if (!Number.isFinite(tokenExpiresAt) || tokenExpiresAt <= Date.now() + 120_000) {
-    try {
-      await renewValidationSession();
-    } catch (error) {
-      // Renewal is bounded by the server's two-minute early-renewal rule. If
-      // the session still has useful runway, heartbeat below remains the
-      // authoritative check; all other errors are surfaced.
-      if (!(error instanceof MeshrApiError) || error.code !== "renewal_too_early") throw error;
-    }
-  }
+  // Cutover validation is the one release path that renews before the normal
+  // two-minute window. The server scopes this exception to the exact reviewed
+  // predecessor binding/private mesh, and the fresh successor is encrypted
+  // and promoted before writes reopen. That leaves the bounded rollout with
+  // the full fifteen-minute session lifetime instead of gambling on how long
+  // the candidate pods take to reconcile.
+  await renewValidationSession();
   const agentAuthorization = () => ({ authorization: `Bearer ${binding.agentToken!}` });
   let heartbeat = await request("/v1/agent-sessions/heartbeat", {
     method: "POST",

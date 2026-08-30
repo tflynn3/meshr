@@ -2214,6 +2214,13 @@ jobs:
             --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Canary protected fixture generation is required}" \
             --expected-generation "${MESHR_CANARY_PROTECTED_FIXTURE_PREVIOUS_GENERATION:?Canary cutover predecessor generation is required}"
           printf 'MESHR_CANARY_CUTOVER_FIXTURE_PROMOTED=true\n' >> "$GITHUB_ENV"
+          # The reviewed session was renewed while the candidate was fenced.
+          # Keep this reopen path bounded so the fifteen-minute runtime
+          # session cannot expire between the CAS and the canonical
+          # post-reopen profile/heartbeat check. A timeout leaves the pointer
+          # on the verified successor and the failure handler freezes for
+          # operator-led roll-forward.
+          cutover_deadline=$((SECONDS + 720))
           kubectl -n flux-system patch configmap meshr-canary-runtime-values \
             --type=merge \
             --patch='{"data":{"MESHR_DATABASE_CUTOVER_MODE":"off"}}'
@@ -2223,14 +2230,19 @@ jobs:
           for attempt in $(seq 1 120); do
             mode="$(kubectl -n meshr-canary get deployment api-canary -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="MESHR_DATABASE_CUTOVER_MODE")].value}' 2>/dev/null || true)"
             if [ "$mode" = off ]; then break; fi
-            if [ "$attempt" -eq 120 ]; then
+            if [ "$attempt" -eq 120 ] || [ "$SECONDS" -ge "$cutover_deadline" ]; then
               kubectl -n meshr-canary get deployment api-canary -o yaml
-              echo 'Canary API replicas did not receive the reopened write mode.' >&2
+              echo 'Canary API replicas did not receive the reopened write mode before the protected-session deadline.' >&2
               exit 1
             fi
             sleep 5
           done
-          kubectl -n meshr-canary rollout status deployment/api-canary --timeout=10m
+          remaining_seconds=$((cutover_deadline - SECONDS))
+          if [ "$remaining_seconds" -le 0 ]; then
+            echo 'Canary cutover rollout exceeded the protected-session deadline.' >&2
+            exit 1
+          fi
+          kubectl -n meshr-canary rollout status deployment/api-canary --timeout="${remaining_seconds}s"
           printf 'MESHR_CANARY_WRITE_REOPENED=true\n' >> "$GITHUB_ENV"
       - name: Refresh GCP credentials before restoring canary suspension
         if: success() && env.MESHR_CANARY_SUSPEND_RESTORE_PENDING == 'true'
@@ -4164,6 +4176,11 @@ jobs:
             --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Production protected fixture generation is required}" \
             --expected-generation "${MESHR_PRODUCTION_PROTECTED_FIXTURE_PREVIOUS_GENERATION:?Production cutover predecessor generation is required}"
           printf 'MESHR_PRODUCTION_CUTOVER_FIXTURE_PROMOTED=true\n' >> "$GITHUB_ENV"
+          # Bound the irreversible reopen path below the fifteen-minute
+          # runtime-session lifetime. If rollout cannot finish in time, the
+          # candidate remains in the operator-led frozen state instead of
+          # reopening with an unverifiable protected fixture.
+          cutover_deadline=$((SECONDS + 720))
           kubectl -n flux-system patch configmap meshr-production-runtime-values \
             --type=merge \
             --patch='{"data":{"MESHR_DATABASE_CUTOVER_MODE":"off"}}'
@@ -4173,14 +4190,19 @@ jobs:
           for attempt in $(seq 1 120); do
             mode="$(kubectl -n meshr get deployment api -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="MESHR_DATABASE_CUTOVER_MODE")].value}' 2>/dev/null || true)"
             if [ "$mode" = off ]; then break; fi
-            if [ "$attempt" -eq 120 ]; then
+            if [ "$attempt" -eq 120 ] || [ "$SECONDS" -ge "$cutover_deadline" ]; then
               kubectl -n meshr get deployment api -o yaml
-              echo 'Production API replicas did not receive the reopened write mode.' >&2
+              echo 'Production API replicas did not receive the reopened write mode before the protected-session deadline.' >&2
               exit 1
             fi
             sleep 5
           done
-          kubectl -n meshr rollout status deployment/api --timeout=10m
+          remaining_seconds=$((cutover_deadline - SECONDS))
+          if [ "$remaining_seconds" -le 0 ]; then
+            echo 'Production cutover rollout exceeded the protected-session deadline.' >&2
+            exit 1
+          fi
+          kubectl -n meshr rollout status deployment/api --timeout="${remaining_seconds}s"
           printf 'MESHR_PRODUCTION_WRITE_REOPENED=true\n' >> "$GITHUB_ENV"
       - name: Refresh GCP credentials before restoring production suspension
         if: success() && env.MESHR_PRODUCTION_SUSPEND_RESTORE_PENDING == 'true'
