@@ -159,6 +159,10 @@ async function main(): Promise<void> {
   const email = process.env.MESHR_E2E_EMAIL?.trim();
   const password = process.env.MESHR_E2E_PASSWORD ?? "";
   const requireFull = process.env.MESHR_REQUIRE_DEPLOYED_E2E === "1";
+  const costProtectionMode = (process.env.MESHR_COST_PROTECTION_MODE?.trim().toLowerCase() || "normal");
+  if (costProtectionMode !== "normal" && costProtectionMode !== "protect" && costProtectionMode !== "throttle") {
+    throw new Error("MESHR_COST_PROTECTION_MODE must be normal, protect, or throttle when supplied.");
+  }
   if ((!provider || !idToken) && (!email || !password)) {
     if (requireFull) {
       throw new Error("Full deployed E2E requires MESHR_E2E_SOCIAL_PROVIDER plus a static MESHR_E2E_SOCIAL_ID_TOKEN or the refresh-token/API-key pair, or MESHR_E2E_EMAIL + MESHR_E2E_PASSWORD.");
@@ -212,6 +216,24 @@ async function main(): Promise<void> {
   };
   const keyPair = generateKeyPairSync("ed25519");
   const publicKey = keyPair.publicKey.export({ type: "spki", format: "pem" }).toString();
+  if (costProtectionMode !== "normal") {
+    // Protection mode deliberately blocks new pairings/session starts while
+    // preserving login, reads, owner controls, and moderation. The release
+    // smoke must assert that safety behavior instead of trying to create a
+    // disposable identity that the server is required to reject.
+    const blockedPairing = await request("/v1/pairings", {
+      method: "POST",
+      body: json({ runtime: "local", label: "protected-mode smoke", externalSubject: `smoke:${handle}`, publicKey, profile }),
+    });
+    expectStatus(blockedPairing, 503, "cost-protection pairing block");
+    if (!blockedPairing.body || typeof blockedPairing.body !== "object" || Array.isArray(blockedPairing.body) ||
+        !blockedPairing.body.error || typeof blockedPairing.body.error !== "object" || Array.isArray(blockedPairing.body.error) ||
+        blockedPairing.body.error.code !== "cost_protection_active") {
+      throw new Error("protected-mode pairing response did not identify cost_protection_active.");
+    }
+    console.log(JSON.stringify({ ok: true, fullAuth: true, checks, protectedMode: costProtectionMode }));
+    return;
+  }
   const pairing = await request("/v1/pairings", {
     method: "POST",
     body: json({ runtime: "local", label: "deployed smoke", externalSubject: `smoke:${handle}`, publicKey, profile }),
@@ -263,7 +285,9 @@ async function main(): Promise<void> {
   // Exercise a real page-tool endpoint, not only the grant metadata route.
   // This catches a cross-replica hydration regression where the grant exists
   // but the page authority fence was not restored on the receiving replica.
-  const pageTool = await request("/v1/webmcp/profile");
+  const pageTool = await request("/v1/webmcp/profile", {
+    headers: { "x-meshr-webmcp-agent": agentId },
+  });
   expectStatus(pageTool, 200, "page WebMCP profile tool");
   const staleHeartbeat = await request("/v1/agent-sessions/heartbeat", {
     method: "POST",
@@ -275,7 +299,9 @@ async function main(): Promise<void> {
     headers: { "x-meshr-csrf": csrfToken },
   });
   expectStatus(revoked, 200, "page WebMCP revocation");
-  const revokedTool = await request("/v1/webmcp/profile");
+  const revokedTool = await request("/v1/webmcp/profile", {
+    headers: { "x-meshr-webmcp-agent": agentId },
+  });
   expectStatus(revokedTool, 401, "page WebMCP revocation enforcement");
   console.log(JSON.stringify({ ok: true, fullAuth: true, checks, agentId }));
 }

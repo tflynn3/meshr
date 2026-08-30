@@ -76,15 +76,23 @@ complete.
 
 Every request, event, and runtime session carries a correlation ID. The API,
 ingest worker, topology materializer, and live gateway emit structured JSON
-events (`http.request`, `event.accepted`, `topology.snapshot.flushed`, and
-`live.connection`) with request/event/session identifiers. HTTP trace context
-is preserved when a caller supplies `traceparent`; configure the sampled
-OpenTelemetry exporter in the deployment before public traffic. OpenTofu
-provisions Cloud Logging metrics for request volume, p95 latency, errors,
-authentication failures, and topology propagation lag. Alert on API write p95
-over 750 ms, topology propagation p95 over two seconds, reconnect recovery over
-five seconds, authentication failures, moderation latency, WebSocket counts,
-Pub/Sub backlog age, dead-letter volume, Firestore errors, and projected spend.
+events (`http.request`, `event.accepted`, `topology.snapshot.flushed`,
+`live.connection`, `live.connection.gauge`, and `live.connection_ready`) with
+request/event/session identifiers. The moderation adapter emits bounded
+request latency without bodies or provider responses, and workers emit
+`materialization.failed` plus `moderation.dlq` records with only bounded
+references. HTTP trace context is preserved when a caller supplies
+`traceparent`; configure the sampled OpenTelemetry exporter in the deployment
+before public traffic. OpenTofu provisions Cloud Logging metrics for request
+volume, p95 latency, errors, authentication failures, topology propagation lag,
+moderation latency, moderation DLQ volume, worker Firestore failures, active
+WebSocket connections, and server-side snapshot readiness. The
+`live.connection_ready` timing does not include client outage detection or
+backoff; the distributed load rehearsal is authoritative for the end-to-end
+reconnect objective. Alert on API write p95 over 750 ms, topology propagation
+p95 over two seconds, snapshot readiness over five seconds, authentication
+failures, moderation latency, WebSocket capacity, Pub/Sub backlog age and
+dead-letter volume, worker Firestore errors, and projected spend.
 
 Agent activity reads start from a bounded newest page and then advance with an
 opaque cursor. Public browse selects only `observation_scope=public` rows;
@@ -171,11 +179,14 @@ enable application protection mode in this order:
 2. Block new runtime-session starts and mesh creation.
 3. Reduce write and topology fan-out quotas while retaining idempotent retries.
 
-The protected release workflow writes a durable `transition_requested` receipt
-before changing the runtime ConfigMap and a matching `transition_applied`
-receipt after the apply succeeds. Record the operator and reason for each
-protection-mode transition in the immutable audit stream; an interrupted run
-must be retried until both receipts exist.
+The protected release workflow writes a durable
+`cost_protection.transition_requested` receipt before changing the runtime
+ConfigMap and a matching `cost_protection.transition_applied` receipt after
+the apply succeeds. The ConfigMap carries the transition ID, target, previous
+mode, and `requested`/`applied` phase so a workflow retry can finish the same
+receipt instead of creating an untracked second transition. Record the operator
+and reason for each protection-mode transition in the immutable audit stream;
+an interrupted run must be retried until both receipts exist.
 
 ## Retention and recovery
 

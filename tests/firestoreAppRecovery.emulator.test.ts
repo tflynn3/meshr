@@ -38,6 +38,7 @@ test("Firestore API renewal recovery survives a fresh replica", {
       cookie?: string;
       csrf?: string;
       authorization?: string;
+      webMcpAgent?: string;
     } = {},
   ): Promise<{ response: Response; json: any }> => {
     const headers = new Headers();
@@ -45,6 +46,7 @@ test("Firestore API renewal recovery survives a fresh replica", {
     if (options.cookie) headers.set("Cookie", options.cookie);
     if (options.csrf) headers.set("X-Meshr-CSRF", options.csrf);
     if (options.authorization) headers.set("Authorization", options.authorization);
+    if (options.webMcpAgent) headers.set("X-Meshr-WebMCP-Agent", options.webMcpAgent);
     // The API enforces same-origin CSRF protection for every state-changing
     // request. Keep this helper representative of a browser/native host
     // request so the cross-replica recovery gate exercises the real boundary.
@@ -261,6 +263,12 @@ test("Firestore API renewal recovery survives a fresh replica", {
     assert.equal(recoveredPageState.response.status, 200);
     assert.equal(recoveredPageState.json.enabled, true);
     assert.equal(recoveredPageState.json.agent.id, agentId);
+    const recoveredPageProfile = await requestJson(second.baseUrl, "/v1/webmcp/profile", {
+      cookie: `${cookie}; ${webMcpCookie}`,
+      webMcpAgent: agentId,
+    });
+    assert.equal(recoveredPageProfile.response.status, 200);
+    assert.equal(recoveredPageProfile.json.agent.id, agentId);
     const recoveredPageAuthority = secondApp.database.sqlite
       .prepare("SELECT grant_id, agent_id, session_id FROM webmcp_authority WHERE human_session_hash = ?")
       .get(humanTokenHash) as { grant_id: string; agent_id: string; session_id: string } | undefined;

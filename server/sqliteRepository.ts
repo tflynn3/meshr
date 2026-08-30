@@ -874,31 +874,55 @@ export class SqliteMeshrRepository implements MeshrRepository {
   }
 
   async upsertMesh(input: RepositoryMeshInput & RepositoryMutationArtifacts): Promise<void> {
-    if (input.actingAccountId) {
-      this.assertHumanSession(input.actingAccountId, input.humanSessionHash, input.updatedAt);
-      const existing = this.db.prepare("SELECT 1 FROM meshes WHERE id = ?").get(input.meshId);
-      if (existing) this.assertHumanGovernance(
+    this.database.transaction(() => {
+      const existing = this.db.prepare(
+        "SELECT created_at FROM meshes WHERE id = ?",
+      ).get(input.meshId) as { created_at: string } | undefined;
+      if (input.actingAccountId) {
+        this.assertHumanSession(input.actingAccountId, input.humanSessionHash, input.updatedAt);
+        if (!input.ownerAccountId || (!existing && input.actingAccountId !== input.ownerAccountId)) {
+          throw new Error("mesh_governance_denied");
+        }
+        if (existing) this.assertHumanGovernance(
+          input.meshId,
+          input.actingAccountId,
+          input.humanSessionHash,
+          ["owner"],
+          input.updatedAt,
+        );
+      }
+      if (!existing && input.ownerAccountId) {
+        const ownedMeshes = this.db.prepare(
+          "SELECT COUNT(*) AS count FROM meshes WHERE owner_account_id = ?",
+        ).get(input.ownerAccountId) as { count: number };
+        if (ownedMeshes.count >= 10) throw new Error("mesh_limit_reached");
+      }
+      this.db.prepare(
+        `INSERT INTO meshes(
+           id, owner_account_id, name, description, visibility, join_policy,
+           lifecycle, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           owner_account_id = excluded.owner_account_id,
+           name = excluded.name,
+           description = excluded.description,
+           visibility = excluded.visibility,
+           join_policy = excluded.join_policy,
+           lifecycle = excluded.lifecycle,
+           updated_at = excluded.updated_at`,
+      ).run(
         input.meshId,
-        input.actingAccountId,
-        input.humanSessionHash,
-        ["owner"],
+        input.ownerAccountId,
+        input.name,
+        input.description,
+        input.visibility,
+        input.admission,
+        input.lifecycle,
+        existing?.created_at ?? input.createdAt,
         input.updatedAt,
       );
-      else if (input.actingAccountId !== input.ownerAccountId) throw new Error("mesh_governance_denied");
-    }
-    this.db.prepare(
-      `UPDATE meshes SET owner_account_id = ?, name = ?, description = ?, visibility = ?,
-                         join_policy = ?, lifecycle = ?, updated_at = ? WHERE id = ?`,
-    ).run(
-      input.ownerAccountId,
-      input.name,
-      input.description,
-      input.visibility,
-      input.admission,
-      input.lifecycle,
-      input.updatedAt,
-      input.meshId,
-    );
+      this.writeMutationArtifacts(input);
+    });
   }
 
   async updateMeshGovernance(
@@ -1353,6 +1377,7 @@ export class SqliteMeshrRepository implements MeshrRepository {
       const mesh = this.db
         .prepare("SELECT owner_account_id FROM meshes WHERE id = ?")
         .get(input.meshId) as { owner_account_id: string | null } | undefined;
+      if (!mesh) throw new Error("mesh_not_found");
       if (input.role === "owner" && existing?.role !== "owner") {
         if (!existing) throw new Error("owner_transfer_requires_member");
         const owned = this.db
@@ -1391,6 +1416,7 @@ export class SqliteMeshrRepository implements MeshrRepository {
          VALUES(?, ?, ?, ?, ?)
          ON CONFLICT(mesh_id, account_id) DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at`,
       ).run(input.meshId, input.accountId, input.role, input.createdAt, input.updatedAt);
+      this.writeMutationArtifacts(input);
     });
   }
 
@@ -2118,20 +2144,55 @@ export class SqliteMeshrRepository implements MeshrRepository {
     actingAccountId?: string;
     humanSessionHash?: string;
   } & RepositoryMutationArtifacts): Promise<void> {
-    this.db.prepare(
-      `INSERT INTO mesh_join_requests(
-         id, mesh_id, agent_id, requested_by_account_id, status, created_at, resolved_at
-       ) VALUES(?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET status = excluded.status, resolved_at = excluded.resolved_at`,
-    ).run(
-      input.requestId,
-      input.meshId,
-      input.agentId,
-      input.requestedByAccountId,
-      input.status,
-      input.createdAt,
-      input.resolvedAt,
-    );
+    this.database.transaction(() => {
+      const mesh = this.db.prepare(
+        "SELECT lifecycle FROM meshes WHERE id = ?",
+      ).get(input.meshId) as { lifecycle: RepositoryMeshInput["lifecycle"] } | undefined;
+      if (!mesh) throw new Error("mesh_not_found");
+      const agent = this.db.prepare(
+        "SELECT owner_account_id FROM agents WHERE id = ?",
+      ).get(input.agentId) as { owner_account_id: string } | undefined;
+      if (!agent || agent.owner_account_id !== input.requestedByAccountId) {
+        throw new Error("agent_access_denied");
+      }
+      if (input.actingAccountId) {
+        this.assertHumanGovernance(
+          input.meshId,
+          input.actingAccountId,
+          input.humanSessionHash,
+          ["owner", "steward"],
+          // Authorization is evaluated at commit time. The request's
+          // client-supplied creation timestamp must not resurrect an expired
+          // human session in the local conformance adapter.
+          this.now(),
+        );
+      } else if (input.status !== "pending") {
+        // A native agent may only create/retain its own pending request. Any
+        // resolution is a human governance mutation and must carry the
+        // authenticated owner/steward session above.
+        throw new Error("mesh_governance_denied");
+      }
+      const existing = this.db.prepare(
+        "SELECT created_at FROM mesh_join_requests WHERE id = ?",
+      ).get(input.requestId) as { created_at: string } | undefined;
+      this.db.prepare(
+        `INSERT INTO mesh_join_requests(
+           id, mesh_id, agent_id, requested_by_account_id, status, created_at, resolved_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           status = excluded.status,
+           resolved_at = excluded.resolved_at`,
+      ).run(
+        input.requestId,
+        input.meshId,
+        input.agentId,
+        input.requestedByAccountId,
+        input.status,
+        existing?.created_at ?? input.createdAt,
+        input.resolvedAt,
+      );
+      this.writeMutationArtifacts(input);
+    });
   }
 
   async findJoinRequest(requestId: string): Promise<RepositoryJoinRequest | null> {
@@ -2417,7 +2478,10 @@ export class SqliteMeshrRepository implements MeshrRepository {
       );
     };
     if (!input.actingAccountId && !input.humanSessionHash && !input.actingAgentId) {
-      write();
+      this.database.transaction(() => {
+        write();
+        this.writeMutationArtifacts(input);
+      });
       return;
     }
     this.database.transaction(() => {
@@ -2605,9 +2669,14 @@ export class SqliteMeshrRepository implements MeshrRepository {
         | { mesh_id: string }
         | undefined;
       if (!post) throw new Error("post_not_found");
-      const existing = this.db.prepare("SELECT created_at, severity FROM moderation_cases WHERE id = ?").get(input.caseId) as
-        | { created_at: string; severity: RepositoryModerationCase["severity"] }
+      const existing = this.db.prepare(
+        "SELECT post_id, mesh_id, created_at, severity FROM moderation_cases WHERE id = ?",
+      ).get(input.caseId) as
+        | { post_id: string; mesh_id: string; created_at: string; severity: RepositoryModerationCase["severity"] }
         | undefined;
+      if (existing && (existing.post_id !== input.postId || existing.mesh_id !== post.mesh_id)) {
+        throw new Error("moderation_case_mismatch");
+      }
       this.assertHumanModerator(
         post.mesh_id,
         input.actingAccountId,
@@ -2643,6 +2712,7 @@ export class SqliteMeshrRepository implements MeshrRepository {
         input.caseState === "resolved" ? input.updatedAt : null,
         input.resolution,
       );
+      this.writeMutationArtifacts(input);
     });
   }
 
