@@ -162,7 +162,7 @@ test("automated moderation authority routes require the service token", async ()
 });
 
 test("outbox broker requires its service token and fences lease completion", async () => {
-  const { app, baseUrl } = await start({ internalToken: "internal-outbox-test-token" });
+  const { app, baseUrl, clock } = await start({ internalToken: "internal-outbox-test-token" });
   const auth = "Bearer internal-outbox-test-token";
   const envelope = {
     event_id: "evt_outbox_test_0001",
@@ -182,6 +182,12 @@ test("outbox broker requires its service token and fences lease completion", asy
   });
   assert.equal(unauthorized.response.status, 401);
 
+  const healthUnauthorized = await requestJson(baseUrl, "/internal/v1/outbox/health", {
+    method: "POST",
+    body: {},
+  });
+  assert.equal(healthUnauthorized.response.status, 401);
+
   const accepted = await requestJson(baseUrl, "/internal/v1/outbox/events", {
     method: "POST",
     authorization: auth,
@@ -196,6 +202,27 @@ test("outbox broker requires its service token and fences lease completion", asy
   });
   assert.equal(duplicate.response.status, 200);
   assert.equal(duplicate.json.duplicate, true);
+
+  const pendingHealth = await requestJson(baseUrl, "/internal/v1/outbox/health", {
+    method: "POST",
+    authorization: auth,
+    body: {},
+  });
+  assert.equal(pendingHealth.response.status, 200);
+  assert.deepEqual(pendingHealth.json, {
+    oldestPendingAt: envelope.occurred_at,
+    oldestPendingAgeMs: 0,
+  });
+  clock.advance(45_000);
+  const agedHealth = await requestJson(baseUrl, "/internal/v1/outbox/health", {
+    method: "POST",
+    authorization: auth,
+    body: {},
+  });
+  assert.deepEqual(agedHealth.json, {
+    oldestPendingAt: envelope.occurred_at,
+    oldestPendingAgeMs: 45_000,
+  });
 
   const claimed = await requestJson(baseUrl, "/internal/v1/outbox/claim", {
     method: "POST",
@@ -242,6 +269,15 @@ test("outbox broker requires its service token and fences lease completion", asy
     },
   });
   assert.deepEqual(completed.json, { completed: [envelope.event_id], stale: [] });
+  const drainedHealth = await requestJson(baseUrl, "/internal/v1/outbox/health", {
+    method: "POST",
+    authorization: auth,
+    body: {},
+  });
+  assert.deepEqual(drainedHealth.json, {
+    oldestPendingAt: null,
+    oldestPendingAgeMs: 0,
+  });
   const replay = await requestJson(baseUrl, "/internal/v1/outbox/complete", {
     method: "POST",
     authorization: auth,

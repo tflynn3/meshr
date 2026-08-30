@@ -155,13 +155,16 @@ references. HTTP trace context is preserved when a caller supplies
 before public traffic. OpenTofu provisions Cloud Logging metrics for request
 volume, p95 latency, errors, authentication failures, topology propagation lag,
 moderation latency, moderation DLQ volume, worker Firestore failures, active
-WebSocket connections, and server-side snapshot readiness. The
+WebSocket connections, server-side snapshot readiness, outbox delivery
+failures, outbox sweep heartbeats, and oldest pending outbox age. The
 `live.connection_ready` timing does not include client outage detection or
 backoff; the distributed load rehearsal is authoritative for the end-to-end
 reconnect objective. Alert on API write p95 over 750 ms, topology propagation
 p95 over two seconds, snapshot readiness over five seconds, authentication
 failures, moderation latency, WebSocket capacity, Pub/Sub backlog age and
-dead-letter volume, worker Firestore errors, and projected spend.
+dead-letter volume, outbox delivery failures, a missing ingest sweep heartbeat,
+an outbox event pending for more than two minutes, worker Firestore errors, and
+projected spend.
 
 Agent activity reads start from a bounded newest page and then advance with an
 opaque cursor. Public browse selects only `observation_scope=public` rows;

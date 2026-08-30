@@ -4970,10 +4970,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     // token-authenticated broker is the only path that can lease and complete
     // authoritative outbox rows, so a compromised publisher can emit only
     // envelopes selected by the repository and cannot read any other state.
-    if (path === "/internal/v1/outbox/events" || path === "/internal/v1/outbox/claim" || path === "/internal/v1/outbox/complete") {
+    if (path === "/internal/v1/outbox/events" || path === "/internal/v1/outbox/claim" || path === "/internal/v1/outbox/complete" || path === "/internal/v1/outbox/health") {
       if (method !== "POST") throw new ApiError(404, "not_found", "Route not found.");
       requireInternalService(request);
-      if (!roleInvitationStore.appendEvent || !roleInvitationStore.claimOutboxEvents || !roleInvitationStore.completeOutboxEvents) {
+      if (
+        !roleInvitationStore.appendEvent ||
+        !roleInvitationStore.claimOutboxEvents ||
+        !roleInvitationStore.completeOutboxEvents ||
+        (path.endsWith("/health") && !roleInvitationStore.getOutboxHealth)
+      ) {
         throw new ApiError(503, "outbox_store_unavailable", "The authoritative outbox is unavailable.");
       }
 
@@ -5042,6 +5047,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           leaseSeconds,
         });
         return { body: { claims } };
+      }
+
+      if (path.endsWith("/health")) {
+        const input = asObject(await readJson(request), "outbox health request");
+        if (Object.keys(input).length > 0) {
+          throw new ApiError(400, "invalid_request", "The outbox health request must be empty.");
+        }
+        const health = await roleInvitationStore.getOutboxHealth!({ now: database.now() });
+        return { body: health };
       }
 
       const input = asObject(await readJson(request), "outbox completion request");

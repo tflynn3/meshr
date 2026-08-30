@@ -129,6 +129,9 @@ test("outbox failure telemetry matches the ingest publisher contract", () => {
   assert.ok(metric, "the outbox failure metric must remain explicit");
   assert.match(ingest, /event: "outbox_batch_completed"/);
   assert.match(ingest, /event: "outbox_sweep_failed"/);
+  assert.match(ingest, /outbox\/health/);
+  assert.match(ingest, /event: "outbox_sweep_heartbeat"/);
+  assert.match(ingest, /oldest_pending_age_ms/);
   assert.match(ingest, /function reportSweepFailure\(/);
   assert.match(ingest, /function startSweep\(/);
   assert.doesNotMatch(ingest, /sweep\(\)\.catch\(\(\) => undefined\)/);
@@ -136,4 +139,10 @@ test("outbox failure telemetry matches the ingest publisher contract", () => {
   assert.match(metric, /jsonPayload\.failed>0/);
   assert.match(metric, /jsonPayload\.event=\\"outbox_sweep_failed\\"/);
   assert.doesNotMatch(metric, /outbox_batch_publish_failed|outbox_async_publish_failed/);
+  assert.match(tofu, /resource "google_logging_metric" "outbox_sweep_heartbeat_count"/);
+  assert.match(tofu, /resource "google_logging_metric" "outbox_pending_age_ms"/);
+  assert.match(tofu, /resource "google_logging_metric" "outbox_pending_stall_count"/);
+  assert.match(tofu, /resource "google_monitoring_alert_policy" "outbox_pending_stall"/);
+  assert.match(tofu, /resource "google_monitoring_alert_policy" "outbox_heartbeat_missing"/);
+  assert.match(tofu, /condition_absent/);
 });

@@ -38,6 +38,7 @@ import type {
   RepositoryOutboxClaim,
   RepositoryOutboxCompletion,
   RepositoryOutboxCompletionResult,
+  RepositoryOutboxHealth,
   RepositoryAuditInput,
   RepositoryMutationArtifacts,
   RepositoryModerationCase,
@@ -2045,6 +2046,30 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       this.queueOutboxReady(transaction, input.eventId, input.meshId, input.occurredAt);
       return { duplicate: false };
     });
+  }
+
+  async getOutboxHealth(input: { now: string }): Promise<RepositoryOutboxHealth> {
+    const nowMs = Date.parse(input.now);
+    if (!Number.isFinite(nowMs)) throw new Error("invalid_outbox_health_time");
+    const snapshot = await this.firestore
+      .collection(this.collection("event_outbox"))
+      .where("status", "in", ["pending", "failed", "processing"])
+      .orderBy("created_at", "asc")
+      .limit(1)
+      .get();
+    const rawCreatedAt = snapshot.docs[0]?.get("created_at");
+    const oldestPendingAt = typeof rawCreatedAt === "string"
+      ? rawCreatedAt
+      : rawCreatedAt instanceof Timestamp
+        ? rawCreatedAt.toDate().toISOString()
+        : null;
+    const oldestPendingMs = oldestPendingAt ? Date.parse(oldestPendingAt) : NaN;
+    return {
+      oldestPendingAt,
+      oldestPendingAgeMs: Number.isFinite(oldestPendingMs)
+        ? Math.max(0, nowMs - oldestPendingMs)
+        : 0,
+    };
   }
 
   async claimOutboxEvents(input: {

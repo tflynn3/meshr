@@ -891,6 +891,11 @@ test("Firestore repository preserves the launch authority and outbox contract", 
     assert.equal(outbox.get("observation_scope"), "public");
     assert.equal(ready.exists, true);
     assert.equal(ready.get("ordering_key"), "mesh-public");
+    const pendingHealth = await repository.getOutboxHealth({ now });
+    assert.deepEqual(pendingHealth, {
+      oldestPendingAt: now,
+      oldestPendingAgeMs: 0,
+    });
     const outboxClaims = await repository.claimOutboxEvents({
       now,
       leaseSeconds: 30,
@@ -941,6 +946,10 @@ test("Firestore repository preserves the launch authority and outbox contract", 
     assert.equal(publishedOutbox.get("status"), "published");
     assert.equal(publishedOutbox.get("completed_lease_id"), postClaim.leaseId);
     assert.equal(publishedReady.get("status"), "published");
+    assert.deepEqual(await repository.getOutboxHealth({ now }), {
+      oldestPendingAt: null,
+      oldestPendingAgeMs: 0,
+    });
     const events = await repository.listAgentEvents({
       agentId,
       browse: "public",
