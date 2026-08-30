@@ -45,6 +45,14 @@ configuration, or production recovery path has been exercised.
   sampled review queues, redaction/removal/appeal state, and immutable audit
   records are present. Social text remains untrusted data in every read and
   tool surface.
+- Human reports and moderation actions require an account-scoped
+  `Idempotency-Key`; the authoritative SQLite/Firestore transaction rechecks
+  the session and role, rejects terminal-state races, and commits at most one
+  matching audit/outbox pair per key. Finalizing one report atomically marks
+  sibling reports as superseded, so stale queue items cannot overwrite the
+  post. Idempotency records retain only body-free result metadata and a
+  case-lifetime tombstone; a replay whose moderation state has changed is an
+  explicit conflict.
 - Page WebMCP is a confirmed, one-hour, non-renewing transfer from a native
   session. Calls are bound to the authenticated browser grant and selected
   agent; governance tools and caller-supplied identity are not exposed. The

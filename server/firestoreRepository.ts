@@ -9,7 +9,7 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import { MESHR_CONTRACT_MAJOR } from "./contracts.ts";
 import { MAX_TOPICS_PER_MESH } from "./repository.ts";
-import { hmacSha256 } from "./security.ts";
+import { constantTimeStringEqual, hmacSha256 } from "./security.ts";
 import { AUTHORITY_COLLECTIONS } from "./authorityCollections.ts";
 import type {
   MeshrRepository,
@@ -39,6 +39,7 @@ import type {
   RepositoryMutationArtifacts,
   RepositoryModerationCase,
   RepositoryModerationCasesPage,
+  RepositoryModerationMutationResult,
   RepositoryJoinRequest,
   RepositoryMeshInvitation,
   RepositoryMeshRoleInvitation,
@@ -2059,6 +2060,98 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     };
   }
 
+  private postFromSnapshot(snapshot: DocumentSnapshot): RepositoryPostRecord {
+    return {
+      postId: String(snapshot.get("post_id") ?? snapshot.id),
+      meshId: String(snapshot.get("mesh_id")),
+      topicId: String(snapshot.get("topic_id")),
+      agentId: String(snapshot.get("agent_id")),
+      sessionId: String(snapshot.get("session_id") ?? ""),
+      parentPostId: snapshot.get("parent_post_id") == null ? null : String(snapshot.get("parent_post_id")),
+      body: String(snapshot.get("body") ?? ""),
+      moderationState: String(snapshot.get("moderation_state") ?? "published") as RepositoryPostRecord["moderationState"],
+      moderationReason: snapshot.get("moderation_reason") == null ? null : String(snapshot.get("moderation_reason")),
+      createdAt: String(snapshot.get("created_at") ?? this.now()),
+      expiresAt: snapshot.get("expires_at") == null ? null : String(snapshot.get("expires_at")),
+    };
+  }
+
+  private moderationArtifacts(
+    event: RepositoryEventInput | undefined,
+    audit: RepositoryAuditInput | undefined,
+    post: RepositoryPostRecord,
+    nextPostState: RepositoryPostRecord["moderationState"],
+    parent: RepositoryPostRecord | null,
+  ): RepositoryMutationArtifacts {
+    const payload = event?.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
+      ? event.payload as Record<string, unknown>
+      : {};
+    const data = audit?.data && typeof audit.data === "object" && !Array.isArray(audit.data)
+      ? audit.data as Record<string, unknown>
+      : {};
+    return {
+      event: event ? {
+        ...event,
+        meshId: post.meshId,
+        topicId: post.topicId,
+        agentId: post.agentId,
+        payload: {
+          ...payload,
+          state: nextPostState,
+          moderation_state: nextPostState,
+          previous_moderation_state: post.moderationState,
+          original_event_type: post.parentPostId ? "reply.created" : "post.created",
+          topic_id: post.topicId,
+          parent_post_id: post.parentPostId,
+          parent_agent_id: parent?.agentId ?? null,
+          parent_created_at: parent?.createdAt ?? null,
+        },
+      } : undefined,
+      audit: audit ? {
+        ...audit,
+        data: {
+          ...data,
+          meshId: post.meshId,
+          postId: post.postId,
+          previous_moderation_state: post.moderationState,
+        },
+      } : undefined,
+    };
+  }
+
+  private moderationIdempotencyResponse(
+    moderationCase: RepositoryModerationCase,
+    post: RepositoryPostRecord,
+  ): Record<string, unknown> {
+    return {
+      caseId: moderationCase.caseId,
+      postId: post.postId,
+      caseReason: moderationCase.reason,
+      caseState: moderationCase.state,
+      caseResolution: moderationCase.resolution,
+      postModerationState: post.moderationState,
+      postModerationReason: post.moderationReason,
+      bodyDigest: createHash("sha256").update(post.body).digest("hex"),
+    };
+  }
+
+  private assertModerationReplayMatches(
+    reference: Record<string, unknown>,
+    moderationCase: RepositoryModerationCase,
+    post: RepositoryPostRecord,
+  ): void {
+    if (
+      (reference.caseReason !== undefined && reference.caseReason !== moderationCase.reason) ||
+      (reference.caseState !== undefined && reference.caseState !== moderationCase.state) ||
+      (reference.caseResolution !== undefined && reference.caseResolution !== moderationCase.resolution) ||
+      (reference.postModerationState !== undefined && reference.postModerationState !== post.moderationState) ||
+      (reference.postModerationReason !== undefined && reference.postModerationReason !== post.moderationReason) ||
+      (reference.bodyDigest !== undefined && reference.bodyDigest !== createHash("sha256").update(post.body).digest("hex"))
+    ) {
+      throw new Error("idempotency_replay_superseded");
+    }
+  }
+
   async upsertModerationCase(input: RepositoryModerationCase & {
     actingAccountId?: string;
     humanSessionHash?: string;
@@ -2067,8 +2160,9 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     agentAuthorityEpoch?: number;
     idempotencyKey?: string;
     requestHash?: string;
-  } & RepositoryMutationArtifacts): Promise<void> {
-    const data = {
+    idempotencyOperation?: "moderation.report" | "moderation.action";
+  } & RepositoryMutationArtifacts): Promise<RepositoryModerationMutationResult> {
+    const baseData = {
       contract_version: MESHR_CONTRACT_MAJOR,
       case_id: input.caseId,
       post_id: input.postId,
@@ -2082,40 +2176,32 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       resolved_at: input.resolvedAt,
       retention_at: moderationRetentionTimestamp(input.createdAt),
     };
-    await this.firestore.runTransaction(async (transaction) => {
+    return this.firestore.runTransaction(async (transaction) => {
       const agentAppeal = input.actingAgentId !== undefined;
-      const postRef = agentAppeal ? this.doc("posts", input.postId) : undefined;
-      const authorityRef = agentAppeal ? this.authorityRef(input.actingAgentId!) : undefined;
-      const sessionRef = agentAppeal && input.agentSessionId
-        ? this.doc("runtime_sessions", input.agentSessionId)
-        : undefined;
-      const idempotencyRef = agentAppeal && input.idempotencyKey
-        ? this.doc("idempotency", `${input.actingAgentId}:post.appeal:${input.idempotencyKey}`)
-        : undefined;
-      const [post, authority, runtimeSession, idempotency] = await Promise.all([
-        postRef ? transaction.get(postRef) : Promise.resolve(undefined),
-        authorityRef ? transaction.get(authorityRef) : Promise.resolve(undefined),
-        sessionRef ? transaction.get(sessionRef) : Promise.resolve(undefined),
-        idempotencyRef ? transaction.get(idempotencyRef) : Promise.resolve(undefined),
-      ]);
-      if (input.actingAccountId || input.humanSessionHash) {
-        await this.assertHumanModerator(
-          transaction,
-          input.meshId,
-          input.actingAccountId,
-          input.humanSessionHash,
-        );
-      }
       if (agentAppeal) {
+        const postRef = this.doc("posts", input.postId);
+        const authorityRef = this.authorityRef(input.actingAgentId!);
+        const sessionRef = input.agentSessionId
+          ? this.doc("runtime_sessions", input.agentSessionId)
+          : undefined;
+        const idempotencyRef = input.idempotencyKey
+          ? this.doc("idempotency", `${input.actingAgentId}:post.appeal:${input.idempotencyKey}`)
+          : undefined;
+        const [post, authority, runtimeSession, idempotency] = await Promise.all([
+          transaction.get(postRef),
+          transaction.get(authorityRef),
+          sessionRef ? transaction.get(sessionRef) : Promise.resolve(undefined),
+          idempotencyRef ? transaction.get(idempotencyRef) : Promise.resolve(undefined),
+        ]);
         const nowMs = Date.parse(input.updatedAt);
         if (
-          !post?.exists ||
+          !post.exists ||
           post.get("agent_id") !== input.actingAgentId ||
           post.get("mesh_id") !== input.meshId ||
           post.get("moderation_state") === "published"
         ) throw new Error("post_authorization_denied");
         if (
-          !authority?.exists ||
+          !authority.exists ||
           authority.get("authority_kind") !== "native" ||
           authority.get("session_id") !== input.agentSessionId ||
           Number(authority.get("epoch") ?? -1) !== Number(input.agentAuthorityEpoch ?? -2)
@@ -2127,29 +2213,157 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           Date.parse(String(runtimeSession.get("expires_at") ?? "")) <= nowMs ||
           Date.parse(String(runtimeSession.get("last_seen_at") ?? "")) < nowMs - 90_000
         ) throw new Error("session_invalid");
+        if (!input.idempotencyKey || !input.requestHash) throw new Error("idempotency_required");
         if (idempotency?.exists) {
-          if (idempotency.get("request_hash") !== input.requestHash) {
+          if (!constantTimeStringEqual(String(idempotency.get("request_hash") ?? ""), input.requestHash)) {
             throw new Error("idempotency_conflict");
           }
-          return;
+          return { duplicate: true };
         }
+        transaction.set(this.doc("moderation_cases", input.caseId), baseData, { merge: true });
+        this.writeMutationArtifacts(transaction, input);
+        if (idempotencyRef) {
+          const expiresAt = new Date(
+            Date.parse(input.updatedAt) + IDEMPOTENCY_RETENTION_SECONDS * 1_000,
+          ).toISOString();
+          transaction.create(idempotencyRef, {
+            contract_version: MESHR_CONTRACT_MAJOR,
+            request_hash: input.requestHash,
+            response_status: 202,
+            response_body: { caseId: input.caseId, postId: input.postId, reason: input.reason },
+            created_at: input.updatedAt,
+            expires_at: expiresAt,
+            expires_at_ttl: ttlTimestamp(expiresAt),
+          });
+        }
+        return { duplicate: false };
       }
-      transaction.set(this.doc("moderation_cases", input.caseId), data, { merge: true });
-      this.writeMutationArtifacts(transaction, input);
-      if (idempotencyRef && input.requestHash) {
-        const expiresAt = new Date(
+
+      if (input.actingAccountId || input.humanSessionHash) {
+        await this.assertHumanModerator(
+          transaction,
+          input.meshId,
+          input.actingAccountId,
+          input.humanSessionHash,
+          input.updatedAt,
+        );
+      }
+      const postRef = this.doc("posts", input.postId);
+      const caseRef = this.doc("moderation_cases", input.caseId);
+      const humanOperation = input.idempotencyOperation ?? "moderation.action";
+      const humanIdempotent = Boolean(input.actingAccountId && (input.idempotencyKey || input.requestHash));
+      const keyedAction = humanIdempotent && humanOperation === "moderation.action";
+      if (humanIdempotent && (!input.idempotencyKey || !input.requestHash || !input.actingAccountId)) {
+        throw new Error("idempotency_required");
+      }
+      const idempotencyRef = humanIdempotent
+        ? this.doc("idempotency", `${input.actingAccountId}:${humanOperation}:${input.idempotencyKey}`)
+        : undefined;
+      const [post, currentCase, idempotency] = await Promise.all([
+        transaction.get(postRef),
+        transaction.get(caseRef),
+        idempotencyRef ? transaction.get(idempotencyRef) : Promise.resolve(undefined),
+      ]);
+      if (currentCase?.exists && (
+        String(currentCase.get("post_id")) !== input.postId ||
+        String(currentCase.get("mesh_id")) !== input.meshId
+      )) throw new Error("moderation_case_mismatch");
+      if (idempotency?.exists) {
+        if (!constantTimeStringEqual(String(idempotency.get("request_hash") ?? ""), input.requestHash ?? "")) {
+          throw new Error("idempotency_conflict");
+        }
+        if (Date.parse(String(idempotency.get("expires_at") ?? "")) <= Date.parse(input.updatedAt)) {
+          throw new Error("idempotency_expired");
+        }
+        if (!post.exists) throw new Error("idempotency_expired");
+        const replayPost = this.postFromSnapshot(post);
+        const replayCase = currentCase?.exists ? this.moderationCaseFromSnapshot(currentCase) : null;
+        if (!replayCase) throw new Error("idempotency_expired");
+        const replayReference = idempotency.get("response_body");
+        if (replayReference && typeof replayReference === "object" && !Array.isArray(replayReference)) {
+          this.assertModerationReplayMatches(
+            replayReference as Record<string, unknown>,
+            replayCase,
+            replayPost,
+          );
+        }
+        return { duplicate: true, moderationCase: replayCase, post: replayPost };
+      }
+      // Internal queue fixtures and legacy moderation workers may create a
+      // case before the retained post projection arrives. Public HTTP
+      // report/action mutations are keyed, so they remain post-bound; keep
+      // the unkeyed repository path compatible with those queue writers.
+      if (!post.exists && !humanIdempotent) {
+        transaction.set(caseRef, baseData, { merge: true });
+        this.writeMutationArtifacts(transaction, input);
+        return { duplicate: false };
+      }
+      if (!post.exists || String(post.get("mesh_id")) !== input.meshId) throw new Error("post_not_found");
+      if (keyedAction && (!currentCase?.exists || !["queued", "appealed"].includes(String(currentCase.get("state"))))) {
+        throw new Error("moderation_transition_conflict");
+      }
+      const currentPost = this.postFromSnapshot(post);
+      const parent = currentPost.parentPostId
+        ? await transaction.get(this.doc("posts", currentPost.parentPostId))
+        : null;
+      const parentRecord = parent?.exists ? this.postFromSnapshot(parent) : null;
+      const authoritativeCase: RepositoryModerationCase = currentCase?.exists
+        ? {
+            ...this.moderationCaseFromSnapshot(currentCase),
+            reason: input.reason,
+            ...(keyedAction
+              ? { state: "reviewing" as const, resolution: null, resolvedAt: null }
+              : { state: input.state, resolution: input.resolution, resolvedAt: input.resolvedAt }),
+            updatedAt: input.updatedAt,
+          }
+        : { ...input, ...(keyedAction ? { state: "reviewing" as const, resolution: null, resolvedAt: null } : {}) };
+      const data = {
+        ...baseData,
+        post_id: authoritativeCase.postId,
+        mesh_id: authoritativeCase.meshId,
+        reason: authoritativeCase.reason,
+        state: authoritativeCase.state,
+        severity: authoritativeCase.severity,
+        resolution: authoritativeCase.resolution,
+        created_at: authoritativeCase.createdAt,
+        updated_at: authoritativeCase.updatedAt,
+        resolved_at: authoritativeCase.resolvedAt,
+        retention_at: moderationRetentionTimestamp(authoritativeCase.createdAt),
+      };
+      transaction.set(caseRef, data, { merge: true });
+      this.writeMutationArtifacts(transaction, this.moderationArtifacts(
+        input.event,
+        input.audit,
+        currentPost,
+        currentPost.moderationState,
+        parentRecord,
+      ));
+      if (humanIdempotent && idempotencyRef) {
+        // Keep the idempotency tombstone for the whole moderation-case
+        // retention window. The post body may expire first, but the key must
+        // remain long enough to prevent a deterministic retry from colliding
+        // with immutable audit/outbox artifacts or reopening a terminal case.
+        const expiry = new Date(
           Date.parse(input.updatedAt) + IDEMPOTENCY_RETENTION_SECONDS * 1_000,
         ).toISOString();
         transaction.create(idempotencyRef, {
           contract_version: MESHR_CONTRACT_MAJOR,
           request_hash: input.requestHash,
-          response_status: 202,
-          response_body: { caseId: input.caseId, postId: input.postId, reason: input.reason },
+          response_status: keyedAction ? 200 : 202,
+          response_body: this.moderationIdempotencyResponse(
+            authoritativeCase,
+            currentPost,
+          ),
           created_at: input.updatedAt,
-          expires_at: expiresAt,
-          expires_at_ttl: ttlTimestamp(expiresAt),
+          expires_at: expiry,
+          expires_at_ttl: ttlTimestamp(expiry),
         });
       }
+      return {
+        duplicate: false,
+        moderationCase: authoritativeCase,
+        post: currentPost,
+      };
     });
   }
 
@@ -2203,10 +2417,19 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     updatedAt: string;
     actingAccountId: string;
     humanSessionHash: string;
-  } & RepositoryMutationArtifacts): Promise<void> {
-    await this.firestore.runTransaction(async (transaction) => {
+    idempotencyKey?: string;
+    requestHash?: string;
+  } & RepositoryMutationArtifacts): Promise<RepositoryModerationMutationResult> {
+    return this.firestore.runTransaction(async (transaction) => {
       const postRef = this.doc("posts", input.postId);
       const caseRef = this.doc("moderation_cases", input.caseId);
+      const keyedAction = Boolean(input.idempotencyKey || input.requestHash);
+      if (keyedAction && (!input.idempotencyKey || !input.requestHash)) {
+        throw new Error("idempotency_required");
+      }
+      const idempotencyRef = keyedAction
+        ? this.doc("idempotency", `${input.actingAccountId}:moderation.action:${input.idempotencyKey}`)
+        : undefined;
       const [post, moderationCase] = await Promise.all([
         transaction.get(postRef),
         transaction.get(caseRef),
@@ -2226,6 +2449,56 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         input.humanSessionHash,
         input.updatedAt,
       );
+      if (idempotencyRef) {
+        const idempotency = await transaction.get(idempotencyRef);
+        if (idempotency.exists) {
+          if (!constantTimeStringEqual(String(idempotency.get("request_hash") ?? ""), input.requestHash ?? "")) {
+            throw new Error("idempotency_conflict");
+          }
+          if (Date.parse(String(idempotency.get("expires_at") ?? "")) <= Date.parse(input.updatedAt)) {
+            throw new Error("idempotency_expired");
+          }
+          if (!moderationCase.exists) throw new Error("idempotency_expired");
+          const replayCase = this.moderationCaseFromSnapshot(moderationCase);
+          const replayPost = this.postFromSnapshot(post);
+          const replayReference = idempotency.get("response_body");
+          if (replayReference && typeof replayReference === "object" && !Array.isArray(replayReference)) {
+            this.assertModerationReplayMatches(
+              replayReference as Record<string, unknown>,
+              replayCase,
+              replayPost,
+            );
+          }
+          return {
+            duplicate: true,
+            moderationCase: replayCase,
+            post: replayPost,
+          };
+        }
+      }
+      if (keyedAction && (!moderationCase.exists || !["queued", "appealed", "reviewing"].includes(String(moderationCase.get("state"))))) {
+        throw new Error("moderation_transition_conflict");
+      }
+      if (keyedAction && input.caseState !== "resolved") throw new Error("moderation_transition_conflict");
+      const currentPost = this.postFromSnapshot(post);
+      const activeSiblingQuery = keyedAction && input.caseState === "resolved"
+        ? this.firestore
+            .collection(this.collection("moderation_cases"))
+            .where("post_id", "==", input.postId)
+        : null;
+      const activeSiblingSnapshot = activeSiblingQuery
+        ? await transaction.get(activeSiblingQuery)
+        : null;
+      const supersededSiblings = activeSiblingSnapshot
+        ? activeSiblingSnapshot.docs.filter((document) =>
+            document.id !== input.caseId &&
+            ["queued", "reviewing", "appealed"].includes(String(document.get("state"))),
+          )
+        : [];
+      const parent = currentPost.parentPostId
+        ? await transaction.get(this.doc("posts", currentPost.parentPostId))
+        : null;
+      const parentRecord = parent?.exists ? this.postFromSnapshot(parent) : null;
       const postUpdate: Record<string, unknown> = {
         moderation_state: input.state,
         moderation_reason: input.reason,
@@ -2233,29 +2506,118 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       };
       if (input.body !== undefined) postUpdate.body = input.body;
       transaction.update(postRef, postUpdate);
+      const currentCase = moderationCase.exists ? this.moderationCaseFromSnapshot(moderationCase) : null;
+      const nextCase: RepositoryModerationCase = {
+        ...(currentCase ?? {
+          caseId: input.caseId,
+          postId: input.postId,
+          meshId,
+          reason: input.reason ?? "policy_review",
+          state: "queued" as const,
+          severity: "low" as const,
+          resolution: null,
+          createdAt: input.updatedAt,
+          updatedAt: input.updatedAt,
+          resolvedAt: null,
+        }),
+        reason: input.reason ?? currentCase?.reason ?? "policy_review",
+        state: input.caseState,
+        resolution: input.resolution,
+        updatedAt: input.updatedAt,
+        resolvedAt: input.caseState === "resolved" ? input.updatedAt : null,
+      };
       const caseData = {
         contract_version: MESHR_CONTRACT_MAJOR,
         case_id: input.caseId,
         post_id: input.postId,
         mesh_id: meshId,
-        reason: input.reason ?? "policy_review",
-        state: input.caseState,
-        severity: String(moderationCase.exists ? moderationCase.get("severity") ?? "low" : "low"),
-        resolution: input.resolution,
-        created_at: moderationCase.exists
-          ? moderationCase.get("created_at")
-          : input.updatedAt,
-        updated_at: input.updatedAt,
-        resolved_at: input.caseState === "resolved" ? input.updatedAt : null,
+        reason: nextCase.reason,
+        state: nextCase.state,
+        severity: nextCase.severity,
+        resolution: nextCase.resolution,
+        created_at: nextCase.createdAt,
+        updated_at: nextCase.updatedAt,
+        resolved_at: nextCase.resolvedAt,
         retention_at: moderationRetentionTimestamp(
-          moderationCase.exists
-            ? String(moderationCase.get("created_at") ?? input.updatedAt)
-            : input.updatedAt,
+          nextCase.createdAt,
         ),
       };
       if (moderationCase.exists) transaction.set(caseRef, caseData, { merge: true });
       else transaction.create(caseRef, caseData);
-      this.writeMutationArtifacts(transaction, input);
+      for (const sibling of supersededSiblings) {
+        transaction.update(sibling.ref, {
+          state: "resolved",
+          resolution: "superseded",
+          resolved_at: input.updatedAt,
+          updated_at: input.updatedAt,
+        });
+      }
+      const artifacts = this.moderationArtifacts(
+        input.event,
+        input.audit,
+        currentPost,
+        input.state,
+        parentRecord,
+      );
+      if (supersededSiblings.length > 0) {
+        const supersededCaseIds = supersededSiblings.slice(0, 64).map((document) => document.id);
+        if (artifacts.event) {
+          const payload = artifacts.event.payload && typeof artifacts.event.payload === "object" && !Array.isArray(artifacts.event.payload)
+            ? artifacts.event.payload as Record<string, unknown>
+            : {};
+          artifacts.event = {
+            ...artifacts.event,
+            payload: {
+              ...payload,
+              superseded_case_count: supersededSiblings.length,
+              superseded_case_ids: supersededCaseIds,
+            },
+          };
+        }
+        if (artifacts.audit) {
+          const data = artifacts.audit.data && typeof artifacts.audit.data === "object" && !Array.isArray(artifacts.audit.data)
+            ? artifacts.audit.data as Record<string, unknown>
+            : {};
+          artifacts.audit = {
+            ...artifacts.audit,
+            data: {
+              ...data,
+              superseded_case_count: supersededSiblings.length,
+              superseded_case_ids: supersededCaseIds,
+            },
+          };
+        }
+      }
+      this.writeMutationArtifacts(transaction, artifacts);
+      if (idempotencyRef) {
+        const expiry = new Date(
+          Date.parse(input.updatedAt) + IDEMPOTENCY_RETENTION_SECONDS * 1_000,
+        ).toISOString();
+        transaction.create(idempotencyRef, {
+          contract_version: MESHR_CONTRACT_MAJOR,
+          request_hash: input.requestHash,
+          response_status: 200,
+          response_body: this.moderationIdempotencyResponse(nextCase, {
+            ...currentPost,
+            body: input.body ?? currentPost.body,
+            moderationState: input.state,
+            moderationReason: input.reason,
+          }),
+          created_at: input.updatedAt,
+          expires_at: expiry,
+          expires_at_ttl: ttlTimestamp(expiry),
+        });
+      }
+      return {
+        duplicate: false,
+        moderationCase: nextCase,
+        post: {
+          ...currentPost,
+          body: input.body ?? currentPost.body,
+          moderationState: input.state,
+          moderationReason: input.reason,
+        },
+      };
     });
   }
 

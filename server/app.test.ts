@@ -243,10 +243,20 @@ test("moderation reports are limited to mesh owners and stewards", async () => {
     method: "POST",
     cookie: owner.cookie,
     csrf: owner.csrf,
+    idempotencyKey: "moderation-report-owner-1",
     body: { reason: "Owner review" },
   });
   assert.equal(ownerReport.response.status, 202);
   assert.equal(ownerReport.json.state, "queued");
+  const ownerReportRetry = await requestJson(baseUrl, `/v1/posts/${publicPostId}/report`, {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "moderation-report-owner-1",
+    body: { reason: "Owner review" },
+  });
+  assert.equal(ownerReportRetry.response.status, 202);
+  assert.deepEqual(ownerReportRetry.json, ownerReport.json);
 
   const steward = await register("moderation-steward@example.test", "Moderation Steward");
   app.database.sqlite.prepare(
@@ -257,9 +267,118 @@ test("moderation reports are limited to mesh owners and stewards", async () => {
     method: "POST",
     cookie: steward.cookie,
     csrf: steward.csrf,
+    idempotencyKey: "moderation-report-steward-1",
     body: { reason: "Steward review" },
   });
   assert.equal(stewardReport.response.status, 202);
+
+  // An omitted reason is part of the idempotency intent, not a snapshot of a
+  // mutable queue field. If another reviewer changes the case before retry,
+  // the same key is rejected as a superseded replay instead of being applied
+  // with a different request hash or silently returning a different result.
+  const omittedReasonReview = await requestJson(baseUrl, `/v1/meshes/${publicMeshId}/moderation/${stewardReport.json.id as string}`, {
+    method: "POST",
+    cookie: steward.cookie,
+    csrf: steward.csrf,
+    idempotencyKey: "moderation-action-review-omitted-1",
+    body: { action: "start_review" },
+  });
+  assert.equal(omittedReasonReview.response.status, 200);
+  app.database.sqlite.prepare("UPDATE moderation_cases SET reason = ? WHERE id = ?")
+    .run("Changed by another reviewer", stewardReport.json.id as string);
+  const omittedReasonReplay = await requestJson(baseUrl, `/v1/meshes/${publicMeshId}/moderation/${stewardReport.json.id as string}`, {
+    method: "POST",
+    cookie: steward.cookie,
+    csrf: steward.csrf,
+    idempotencyKey: "moderation-action-review-omitted-1",
+    body: { action: "start_review" },
+  });
+  assert.equal(omittedReasonReplay.response.status, 409);
+  assert.equal(omittedReasonReplay.json.error.code, "idempotency_replay_superseded");
+
+  const moderationCaseId = ownerReport.json.id as string;
+  const missingModerationKey = await requestJson(baseUrl, `/v1/meshes/${publicMeshId}/moderation/${moderationCaseId}`, {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    body: { action: "start_review" },
+  });
+  assert.equal(missingModerationKey.response.status, 400);
+  assert.equal(missingModerationKey.json.error.code, "idempotency_key_required");
+
+  const startReview = await requestJson(baseUrl, `/v1/meshes/${publicMeshId}/moderation/${moderationCaseId}`, {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "moderation-action-review-1",
+    body: { action: "start_review", reason: "Owner review" },
+  });
+  assert.equal(startReview.response.status, 200);
+  assert.equal(startReview.json.state, "reviewing");
+  const startReviewRetry = await requestJson(baseUrl, `/v1/meshes/${publicMeshId}/moderation/${moderationCaseId}`, {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "moderation-action-review-1",
+    body: { action: "start_review", reason: "Owner review" },
+  });
+  assert.equal(startReviewRetry.response.status, 200);
+  assert.deepEqual(startReviewRetry.json, startReview.json);
+
+  const conflictingRetry = await requestJson(baseUrl, `/v1/meshes/${publicMeshId}/moderation/${moderationCaseId}`, {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "moderation-action-review-1",
+    body: { action: "publish", reason: "Owner review" },
+  });
+  assert.equal(conflictingRetry.response.status, 409);
+  assert.equal(conflictingRetry.json.error.code, "idempotency_conflict");
+
+  const resolveModeration = await requestJson(baseUrl, `/v1/meshes/${publicMeshId}/moderation/${moderationCaseId}`, {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "moderation-action-resolve-1",
+    body: { action: "publish", reason: "Approved by owner" },
+  });
+  assert.equal(resolveModeration.response.status, 200);
+  assert.equal(resolveModeration.json.state, "resolved");
+  assert.equal(resolveModeration.json.post.moderationState, "published");
+  const stewardCaseId = stewardReport.json.id as string;
+  assert.equal(
+    app.database.sqlite.prepare("SELECT state, resolution FROM moderation_cases WHERE id = ?")
+      .get(stewardCaseId)?.resolution,
+    "superseded",
+  );
+  const staleSiblingAction = await requestJson(baseUrl, `/v1/meshes/${publicMeshId}/moderation/${stewardCaseId}`, {
+    method: "POST",
+    cookie: steward.cookie,
+    csrf: steward.csrf,
+    idempotencyKey: "moderation-action-stale-sibling-1",
+    body: { action: "quarantine", reason: "A stale sibling decision" },
+  });
+  assert.equal(staleSiblingAction.response.status, 409);
+  assert.equal(staleSiblingAction.json.error.code, "moderation_transition_conflict");
+  const terminalConflict = await requestJson(baseUrl, `/v1/meshes/${publicMeshId}/moderation/${moderationCaseId}`, {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "moderation-action-resolve-2",
+    body: { action: "quarantine", reason: "A stale decision" },
+  });
+  assert.equal(terminalConflict.response.status, 409);
+  assert.equal(terminalConflict.json.error.code, "moderation_transition_conflict");
+  assert.equal(
+    app.database.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE resource_id = ?")
+      .get(moderationCaseId)?.count,
+    2,
+  );
+  assert.equal(
+    app.database.sqlite.prepare("SELECT COUNT(*) AS count FROM outbox_events WHERE type IN ('moderation.start_review', 'moderation.publish')")
+      .get()?.count,
+    3,
+  );
 
   const outsider = await register("moderation-outsider@example.test", "Public Reader");
   const outsiderReport = await requestJson(baseUrl, `/v1/posts/${publicPostId}/report`, {

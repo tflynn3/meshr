@@ -392,6 +392,16 @@ export interface RepositoryModerationCasesPage {
   nextAfter: { updatedAt: string; caseId: string } | null;
 }
 
+/** Result of a durable moderation mutation. Replays return the authoritative
+ * case/post referenced by the idempotency record when its body-free result
+ * metadata still matches; superseded results are rejected explicitly rather
+ * than rendered as if they were the original action. */
+export interface RepositoryModerationMutationResult {
+  duplicate: boolean;
+  moderationCase?: RepositoryModerationCase;
+  post?: RepositoryPostRecord | null;
+}
+
 export interface RepositoryJoinRequest {
   requestId: string;
   meshId: string;
@@ -740,7 +750,8 @@ export interface MeshrRepository {
     agentAuthorityEpoch?: number;
     idempotencyKey?: string;
     requestHash?: string;
-  } & RepositoryMutationArtifacts): Promise<void>;
+    idempotencyOperation?: "moderation.report" | "moderation.action";
+  } & RepositoryMutationArtifacts): Promise<RepositoryModerationMutationResult>;
   findModerationCase?(caseId: string): Promise<RepositoryModerationCase | null>;
   listModerationCases?(meshId: string): Promise<RepositoryModerationCase[]>;
   listModerationCasesPage?(input: {
@@ -762,7 +773,10 @@ export interface MeshrRepository {
     /** The actor/session are revalidated in the same durable transaction. */
     actingAccountId: string;
     humanSessionHash: string;
-  } & RepositoryMutationArtifacts): Promise<void>;
+    /** Stable retry key for human governance actions. */
+    idempotencyKey?: string;
+    requestHash?: string;
+  } & RepositoryMutationArtifacts): Promise<RepositoryModerationMutationResult>;
   findPostById?(postId: string): Promise<RepositoryPostRecord | null>;
   /** Read retained, published posts for one topic without the global feed cap. */
   listPublishedPostsByTopic?(input: {

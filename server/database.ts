@@ -485,7 +485,28 @@ const MIGRATION_14 = `
   FROM mesh_members;
 `;
 
-export const CURRENT_SCHEMA_VERSION = 14;
+// Human governance mutations need the same replay protection as agent writes,
+// but the original idempotency table is intentionally scoped to agent
+// identities and has a foreign key to `agents`. Keep a separate account-scoped
+// table so a retried moderation action can replay without weakening that
+// invariant or storing human keys alongside agent keys.
+const MIGRATION_15 = `
+  CREATE TABLE IF NOT EXISTS human_idempotency_records (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    operation TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    response_status INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY(account_id, operation, idempotency_key)
+  ) WITHOUT ROWID, STRICT;
+  CREATE INDEX IF NOT EXISTS human_idempotency_expiry_idx
+    ON human_idempotency_records(expires_at);
+`;
+
+export const CURRENT_SCHEMA_VERSION = 15;
 
 export interface MeshrDatabaseOptions {
   path: string;
@@ -711,6 +732,18 @@ export class MeshrDatabase {
         this.sqlite.exec(MIGRATION_14);
         this.sqlite
           .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(14, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration15 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 15")
+      .get() as { applied: number } | undefined;
+    if (!migration15) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_15);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(15, ?)")
           .run(this.now());
       });
     }
