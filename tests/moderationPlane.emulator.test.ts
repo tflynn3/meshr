@@ -243,7 +243,6 @@ test("moderation worker readiness and provider decisions are durable and replaya
       MESHR_MODERATION_SWEEP_FALLBACK: "0",
     });
     await waitForReady(`http://127.0.0.1:${workerPort}/readyz`, moderation, "moderation worker");
-    assert.ok(healthCalls >= 1);
 
     screening = startWorker("platform/materializer.ts", {
       ...commonEnv,
@@ -261,6 +260,9 @@ test("moderation worker readiness and provider decisions are durable and replaya
       screening,
       "moderation screening worker",
     );
+    // Provider readiness is owned by the screening worker. Intake only
+    // persists queue state and deliberately has no adapter credentials.
+    assert.ok(healthCalls >= 1);
 
     ingest = startWorker("platform/ingest.ts", {
       ...commonEnv,
