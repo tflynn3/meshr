@@ -170,6 +170,10 @@ smoke() {
   # a transient 504 is not mistaken for event-plane loss.
   wait_http http://localhost:8080/healthz
   wait_http http://localhost:8080/
+  # The ingest process has a dependency-aware readiness endpoint. Waiting on
+  # it through the same ingress closes the gap between a ready HTTP listener
+  # and a Firestore/Pub/Sub client that can actually accept an event.
+  wait_json "${MESHR_LOCAL_URL:-http://localhost:8080}/__local/ingest/readyz"
   wait_json "${MESHR_LOCAL_URL:-http://localhost:8080}/v1/live/snapshots/mesh-public"
   (
     cd "$repo_root"
