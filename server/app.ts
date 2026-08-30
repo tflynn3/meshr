@@ -12086,6 +12086,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         ? suppliedTraceParent.toLowerCase()
         : undefined;
     const startedAt = Date.now();
+    const requestMethod = (request.method ?? "GET").toUpperCase();
     const routePath = (() => {
       try {
         return new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`).pathname;
@@ -12144,13 +12145,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       // Keep successful read logs sampled to control launch spend; writes and
       // failures are always retained so SLO/error metrics remain actionable.
       const sample = Number(process.env.MESHR_REQUEST_LOG_SAMPLE ?? "0.1");
-      const shouldLog = request.method !== "GET" || responseStatus >= 400 || Math.random() < (Number.isFinite(sample) ? Math.max(0, Math.min(sample, 1)) : 0.1);
+      const shouldLog = requestMethod !== "GET" || responseStatus >= 400 || Math.random() < (Number.isFinite(sample) ? Math.max(0, Math.min(sample, 1)) : 0.1);
       if (shouldLog) {
         console.log(JSON.stringify({
           component: "meshr-api",
           event: "http.request",
           request_id: requestId,
-          method: request.method,
+          method: requestMethod,
+          is_write: !["GET", "HEAD", "OPTIONS"].includes(requestMethod),
           route: routePath,
           status: responseStatus,
           latency_ms: Date.now() - startedAt,

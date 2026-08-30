@@ -444,6 +444,14 @@ jobs:
           : "${MESHR_CANARY_URL:?Set the protected MESHR_CANARY_URL repository variable before canary promotion}"
           : "${MESHR_FIRESTORE_DATABASE:?Set the protected MESHR_FIRESTORE_DATABASE canary variable before canary promotion}"
           : "${MESHR_TOPOLOGY_FIRESTORE_DATABASE:?Set the protected MESHR_TOPOLOGY_FIRESTORE_DATABASE canary variable before canary promotion}"
+          test "$MESHR_FIRESTORE_DATABASE" = "meshr-canary" || {
+            echo "MESHR_FIRESTORE_DATABASE must be exactly meshr-canary for the isolated canary IAM boundary." >&2
+            exit 1
+          }
+          test "$MESHR_TOPOLOGY_FIRESTORE_DATABASE" = "meshr-canary-projections" || {
+            echo "MESHR_TOPOLOGY_FIRESTORE_DATABASE must be exactly meshr-canary-projections for the isolated canary IAM boundary." >&2
+            exit 1
+          }
           : "${MESHR_MODERATION_ENDPOINT:?Set the protected MESHR_MODERATION_ENDPOINT canary variable before canary promotion}"
           : "${MESHR_MODERATION_HEALTHCHECK_URL:?Set the protected MESHR_MODERATION_HEALTHCHECK_URL canary variable before canary promotion}"
           : "${MESHR_MODERATION_AUDIENCE:?Set the protected MESHR_MODERATION_AUDIENCE canary variable before canary promotion}"
@@ -787,6 +795,7 @@ jobs:
           token_format: access_token
           access_token_lifetime: 3600s
       - name: Apply the protected Flux promotion inputs
+        id: canary-apply
         env:
           CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.canary-apply-auth.outputs.access_token }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
@@ -846,6 +855,10 @@ jobs:
             --from-literal="WEB_IMAGE=$WEB_IMAGE" \
             --dry-run=client -o yaml | kubectl apply -f -
           previous_mode="$(kubectl -n flux-system get configmap meshr-canary-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_MODE}' 2>/dev/null || true)"
+          stored_transition_id="$(kubectl -n flux-system get configmap meshr-canary-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_TRANSITION_ID}' 2>/dev/null || true)"
+          stored_transition_phase="$(kubectl -n flux-system get configmap meshr-canary-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_TRANSITION_PHASE}' 2>/dev/null || true)"
+          stored_transition_previous_mode="$(kubectl -n flux-system get configmap meshr-canary-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_TRANSITION_PREVIOUS_MODE}' 2>/dev/null || true)"
+          stored_transition_mode="$(kubectl -n flux-system get configmap meshr-canary-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_TRANSITION_MODE}' 2>/dev/null || true)"
           if [ -z "$MESHR_COST_PROTECTION_MODE" ]; then
             MESHR_COST_PROTECTION_MODE="$(kubectl -n flux-system get configmap meshr-canary-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_MODE}' 2>/dev/null || true)"
           fi
@@ -855,8 +868,49 @@ jobs:
             normal|protect|throttle) ;;
             *) echo "MESHR_COST_PROTECTION_MODE must be normal, protect, or throttle" >&2; exit 1 ;;
           esac
-          cost_transition_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          if [ "$previous_mode" != "$MESHR_COST_PROTECTION_MODE" ]; then
+          # Carry the mode actually resolved from the protected runtime
+          # ConfigMap into the authenticated smoke step below. This keeps a
+          # blank repository variable from making protected canary smoke look
+          # like normal mode.
+          printf 'MESHR_RESOLVED_COST_PROTECTION_MODE=%s\n' "$MESHR_COST_PROTECTION_MODE" >> "$GITHUB_ENV"
+          printf 'cost_protection_mode=%s\n' "$MESHR_COST_PROTECTION_MODE" >> "$GITHUB_OUTPUT"
+          transition_required=false
+          if [ -n "$stored_transition_id" ] && [ "$stored_transition_phase" = "requested" ]; then
+            : "${stored_transition_previous_mode:?A pending cost-protection transition is missing its previous mode; repair the ConfigMap before retrying}"
+            : "${stored_transition_mode:?A pending cost-protection transition is missing its target mode; repair the ConfigMap before retrying}"
+            test "$stored_transition_mode" = "$MESHR_COST_PROTECTION_MODE" || {
+              echo "A pending canary cost-protection transition targets $stored_transition_mode, not the requested $MESHR_COST_PROTECTION_MODE; finish or explicitly repair it before starting another transition." >&2
+              exit 1
+            }
+            previous_mode="$stored_transition_previous_mode"
+            cost_transition_id="$stored_transition_id"
+            transition_required=true
+          elif [ -n "$stored_transition_id" ] && [ "$stored_transition_phase" != "applied" ]; then
+            echo "Unknown canary cost-protection transition phase: $stored_transition_phase" >&2
+            exit 1
+          else
+            # The run id is stable across a workflow retry. A retry can
+            # therefore finish the same audit receipt even after the
+            # ConfigMap apply succeeded and the first job attempt failed.
+            cost_transition_id="canary-${GITHUB_RUN_ID}"
+            if [ "$previous_mode" != "$MESHR_COST_PROTECTION_MODE" ]; then
+              transition_required=true
+            fi
+          fi
+          transition_id_to_store="$stored_transition_id"
+          transition_phase_to_store="$stored_transition_phase"
+          transition_previous_mode_to_store="$stored_transition_previous_mode"
+          transition_mode_to_store="$stored_transition_mode"
+          if [ "$transition_required" = true ]; then
+            # Always refresh the marker payload for a new transition. An
+            # already-applied receipt may describe an older mode change.
+            # Pending retries intentionally reuse the same values, so this is
+            # also safe when recovering after the first ConfigMap apply.
+            transition_previous_mode_to_store="$previous_mode"
+            transition_mode_to_store="$MESHR_COST_PROTECTION_MODE"
+            transition_id_to_store="$cost_transition_id"
+            transition_phase_to_store=requested
+            MESHR_COST_PROTECTION_MODE="$MESHR_COST_PROTECTION_MODE" \
             MESHR_COST_PROTECTION_PREVIOUS_MODE="$previous_mode" \
             MESHR_COST_PROTECTION_TRANSITION_ID="$cost_transition_id" \
             MESHR_COST_PROTECTION_PHASE=requested \
@@ -871,13 +925,34 @@ jobs:
             --from-literal="MESHR_MODERATION_HEALTHCHECK_URL=$MESHR_MODERATION_HEALTHCHECK_URL" \
             --from-literal="MESHR_MODERATION_AUDIENCE=$MESHR_MODERATION_AUDIENCE" \
             --from-literal="MESHR_COST_PROTECTION_MODE=$MESHR_COST_PROTECTION_MODE" \
+            --from-literal="MESHR_COST_PROTECTION_TRANSITION_ID=$transition_id_to_store" \
+            --from-literal="MESHR_COST_PROTECTION_TRANSITION_PHASE=$transition_phase_to_store" \
+            --from-literal="MESHR_COST_PROTECTION_TRANSITION_PREVIOUS_MODE=$transition_previous_mode_to_store" \
+            --from-literal="MESHR_COST_PROTECTION_TRANSITION_MODE=$transition_mode_to_store" \
             --dry-run=client -o yaml | kubectl apply -f -
-          if [ "$previous_mode" != "$MESHR_COST_PROTECTION_MODE" ]; then
+          if [ "$transition_required" = true ]; then
             MESHR_COST_PROTECTION_PREVIOUS_MODE="$previous_mode" \
             MESHR_COST_PROTECTION_TRANSITION_ID="$cost_transition_id" \
             MESHR_COST_PROTECTION_PHASE=applied \
             GOOGLE_CLOUD_PROJECT="$GCP_PROJECT_ID" \
             npm run audit:cost-protection
+            # Mark the receipt complete only after the applied audit is
+            # durable. If this write fails, a retry sees phase=requested and
+            # idempotently records the applied receipt before trying again.
+            transition_phase_to_store=applied
+            kubectl -n flux-system create configmap meshr-canary-runtime-values \
+              --from-literal="GCP_PROJECT_ID=$GCP_PROJECT_ID" \
+              --from-literal="MESHR_FIRESTORE_DATABASE=$MESHR_FIRESTORE_DATABASE" \
+              --from-literal="MESHR_TOPOLOGY_FIRESTORE_DATABASE=$MESHR_TOPOLOGY_FIRESTORE_DATABASE" \
+              --from-literal="MESHR_MODERATION_ENDPOINT=$MESHR_MODERATION_ENDPOINT" \
+              --from-literal="MESHR_MODERATION_HEALTHCHECK_URL=$MESHR_MODERATION_HEALTHCHECK_URL" \
+              --from-literal="MESHR_MODERATION_AUDIENCE=$MESHR_MODERATION_AUDIENCE" \
+              --from-literal="MESHR_COST_PROTECTION_MODE=$MESHR_COST_PROTECTION_MODE" \
+              --from-literal="MESHR_COST_PROTECTION_TRANSITION_ID=$transition_id_to_store" \
+              --from-literal="MESHR_COST_PROTECTION_TRANSITION_PHASE=$transition_phase_to_store" \
+              --from-literal="MESHR_COST_PROTECTION_TRANSITION_PREVIOUS_MODE=$transition_previous_mode_to_store" \
+              --from-literal="MESHR_COST_PROTECTION_TRANSITION_MODE=$transition_mode_to_store" \
+              --dry-run=client -o yaml | kubectl apply -f -
           fi
           reconcile_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           kubectl -n flux-system annotate kustomization meshr-canary \
@@ -1120,6 +1195,7 @@ jobs:
         env:
           MESHR_DEPLOYED_URL: ${{ vars.MESHR_CANARY_URL }}
           MESHR_REQUIRE_DEPLOYED_E2E: "1"
+          MESHR_COST_PROTECTION_MODE: ${{ steps.canary-apply.outputs.cost_protection_mode }}
           MESHR_E2E_SOCIAL_PROVIDER: ${{ vars.MESHR_CANARY_E2E_SOCIAL_PROVIDER }}
           MESHR_E2E_IDENTITY_API_KEY: ${{ vars.MESHR_CANARY_E2E_IDENTITY_API_KEY }}
           MESHR_E2E_SOCIAL_REFRESH_TOKEN: ${{ secrets.MESHR_CANARY_E2E_SOCIAL_REFRESH_TOKEN }}
@@ -1554,6 +1630,7 @@ jobs:
           token_format: access_token
           access_token_lifetime: 3600s
       - name: Apply the protected Flux promotion inputs
+        id: production-apply
         env:
           CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.production-apply-auth.outputs.access_token }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
@@ -1614,6 +1691,10 @@ jobs:
             --from-literal="WEB_IMAGE=$WEB_IMAGE" \
             --dry-run=client -o yaml | kubectl apply -f -
           previous_mode="$(kubectl -n flux-system get configmap meshr-production-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_MODE}' 2>/dev/null || true)"
+          stored_transition_id="$(kubectl -n flux-system get configmap meshr-production-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_TRANSITION_ID}' 2>/dev/null || true)"
+          stored_transition_phase="$(kubectl -n flux-system get configmap meshr-production-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_TRANSITION_PHASE}' 2>/dev/null || true)"
+          stored_transition_previous_mode="$(kubectl -n flux-system get configmap meshr-production-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_TRANSITION_PREVIOUS_MODE}' 2>/dev/null || true)"
+          stored_transition_mode="$(kubectl -n flux-system get configmap meshr-production-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_TRANSITION_MODE}' 2>/dev/null || true)"
           current_mode="$previous_mode"
           if [ -n "$MESHR_COST_PROTECTION_MODE" ]; then
             current_mode="$MESHR_COST_PROTECTION_MODE"
@@ -1624,8 +1705,48 @@ jobs:
             normal|protect|throttle) ;;
             *) echo "MESHR_COST_PROTECTION_MODE must be normal, protect, or throttle" >&2; exit 1 ;;
           esac
-          cost_transition_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          if [ "$previous_mode" != "$current_mode" ]; then
+          # Carry the mode actually resolved from the protected runtime
+          # ConfigMap into the authenticated smoke step below. This keeps a
+          # blank repository variable from making protected production smoke
+          # look like normal mode.
+          printf 'MESHR_RESOLVED_COST_PROTECTION_MODE=%s\n' "$current_mode" >> "$GITHUB_ENV"
+          printf 'cost_protection_mode=%s\n' "$current_mode" >> "$GITHUB_OUTPUT"
+          transition_required=false
+          if [ -n "$stored_transition_id" ] && [ "$stored_transition_phase" = "requested" ]; then
+            : "${stored_transition_previous_mode:?A pending cost-protection transition is missing its previous mode; repair the ConfigMap before retrying}"
+            : "${stored_transition_mode:?A pending cost-protection transition is missing its target mode; repair the ConfigMap before retrying}"
+            test "$stored_transition_mode" = "$current_mode" || {
+              echo "A pending production cost-protection transition targets $stored_transition_mode, not the requested $current_mode; finish or explicitly repair it before starting another transition." >&2
+              exit 1
+            }
+            previous_mode="$stored_transition_previous_mode"
+            cost_transition_id="$stored_transition_id"
+            transition_required=true
+          elif [ -n "$stored_transition_id" ] && [ "$stored_transition_phase" != "applied" ]; then
+            echo "Unknown production cost-protection transition phase: $stored_transition_phase" >&2
+            exit 1
+          else
+            # The run id is stable across a workflow retry. A retry can
+            # therefore finish the same audit receipt even after the
+            # ConfigMap apply succeeded and the first job attempt failed.
+            cost_transition_id="production-${GITHUB_RUN_ID}"
+            if [ "$previous_mode" != "$current_mode" ]; then
+              transition_required=true
+            fi
+          fi
+          transition_id_to_store="$stored_transition_id"
+          transition_phase_to_store="$stored_transition_phase"
+          transition_previous_mode_to_store="$stored_transition_previous_mode"
+          transition_mode_to_store="$stored_transition_mode"
+          if [ "$transition_required" = true ]; then
+            # Always refresh the marker payload for a new transition. An
+            # already-applied receipt may describe an older mode change.
+            # Pending retries intentionally reuse the same values, so this is
+            # also safe when recovering after the first ConfigMap apply.
+            transition_previous_mode_to_store="$previous_mode"
+            transition_mode_to_store="$current_mode"
+            transition_id_to_store="$cost_transition_id"
+            transition_phase_to_store=requested
             MESHR_COST_PROTECTION_MODE="$current_mode" \
             MESHR_COST_PROTECTION_PREVIOUS_MODE="$previous_mode" \
             MESHR_COST_PROTECTION_TRANSITION_ID="$cost_transition_id" \
@@ -1641,14 +1762,35 @@ jobs:
             --from-literal="MESHR_MODERATION_HEALTHCHECK_URL=$MESHR_MODERATION_HEALTHCHECK_URL" \
             --from-literal="MESHR_MODERATION_AUDIENCE=$MESHR_MODERATION_AUDIENCE" \
             --from-literal="MESHR_COST_PROTECTION_MODE=$current_mode" \
+            --from-literal="MESHR_COST_PROTECTION_TRANSITION_ID=$transition_id_to_store" \
+            --from-literal="MESHR_COST_PROTECTION_TRANSITION_PHASE=$transition_phase_to_store" \
+            --from-literal="MESHR_COST_PROTECTION_TRANSITION_PREVIOUS_MODE=$transition_previous_mode_to_store" \
+            --from-literal="MESHR_COST_PROTECTION_TRANSITION_MODE=$transition_mode_to_store" \
             --dry-run=client -o yaml | kubectl apply -f -
-          if [ "$previous_mode" != "$current_mode" ]; then
+          if [ "$transition_required" = true ]; then
             MESHR_COST_PROTECTION_MODE="$current_mode" \
             MESHR_COST_PROTECTION_PREVIOUS_MODE="$previous_mode" \
             MESHR_COST_PROTECTION_TRANSITION_ID="$cost_transition_id" \
             MESHR_COST_PROTECTION_PHASE=applied \
             GOOGLE_CLOUD_PROJECT="$GCP_PROJECT_ID" \
             npm run audit:cost-protection
+            # Mark the receipt complete only after the applied audit is
+            # durable. If this write fails, a retry sees phase=requested and
+            # idempotently records the applied receipt before trying again.
+            transition_phase_to_store=applied
+            kubectl -n flux-system create configmap meshr-production-runtime-values \
+              --from-literal="GCP_PROJECT_ID=$GCP_PROJECT_ID" \
+              --from-literal="MESHR_FIRESTORE_DATABASE=$MESHR_FIRESTORE_DATABASE" \
+              --from-literal="MESHR_TOPOLOGY_FIRESTORE_DATABASE=$MESHR_TOPOLOGY_FIRESTORE_DATABASE" \
+              --from-literal="MESHR_MODERATION_ENDPOINT=$MESHR_MODERATION_ENDPOINT" \
+              --from-literal="MESHR_MODERATION_HEALTHCHECK_URL=$MESHR_MODERATION_HEALTHCHECK_URL" \
+              --from-literal="MESHR_MODERATION_AUDIENCE=$MESHR_MODERATION_AUDIENCE" \
+              --from-literal="MESHR_COST_PROTECTION_MODE=$current_mode" \
+              --from-literal="MESHR_COST_PROTECTION_TRANSITION_ID=$transition_id_to_store" \
+              --from-literal="MESHR_COST_PROTECTION_TRANSITION_PHASE=$transition_phase_to_store" \
+              --from-literal="MESHR_COST_PROTECTION_TRANSITION_PREVIOUS_MODE=$transition_previous_mode_to_store" \
+              --from-literal="MESHR_COST_PROTECTION_TRANSITION_MODE=$transition_mode_to_store" \
+              --dry-run=client -o yaml | kubectl apply -f -
           fi
           reconcile_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           kubectl -n flux-system annotate kustomization meshr-production \
@@ -1856,6 +1998,7 @@ jobs:
         env:
           MESHR_DEPLOYED_URL: ${{ vars.MESHR_PRODUCTION_URL }}
           MESHR_REQUIRE_DEPLOYED_E2E: "1"
+          MESHR_COST_PROTECTION_MODE: ${{ steps.production-apply.outputs.cost_protection_mode }}
           MESHR_E2E_SOCIAL_PROVIDER: ${{ vars.MESHR_PRODUCTION_E2E_SOCIAL_PROVIDER }}
           MESHR_E2E_IDENTITY_API_KEY: ${{ vars.MESHR_PRODUCTION_E2E_IDENTITY_API_KEY }}
           MESHR_E2E_SOCIAL_REFRESH_TOKEN: ${{ secrets.MESHR_PRODUCTION_E2E_SOCIAL_REFRESH_TOKEN }}

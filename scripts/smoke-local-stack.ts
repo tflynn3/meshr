@@ -46,6 +46,13 @@ async function connectWebSocketWithRetry(url: URL): Promise<WebSocket> {
   // proves recovery rather than racing endpoint propagation.
   for (let attempt = 0; attempt < 60; attempt += 1) {
     const candidate = new WebSocket(url);
+    // Register the frame handler before waiting for `open`. The gateway can
+    // send the initial snapshot immediately after the upgrade, so attaching
+    // the handler only after this helper resolves would lose that first frame
+    // during a fast post-rollout reconnect.
+    candidate.on("message", (data) => {
+      messages.push(JSON.parse(data.toString()) as Record<string, unknown>);
+    });
     const opened = await new Promise<boolean>((resolve) => {
       let settled = false;
       const finish = (value: boolean) => {
@@ -73,9 +80,6 @@ async function connectWebSocketWithRetry(url: URL): Promise<WebSocket> {
 }
 
 const socket = await connectWebSocketWithRetry(websocketUrl);
-socket.on("message", (data) => {
-  messages.push(JSON.parse(data.toString()) as Record<string, unknown>);
-});
 
 const initial = await new Promise<Record<string, unknown>>((resolve, reject) => {
   const timeout = setTimeout(() => reject(new Error("initial WebSocket snapshot timed out")), 10_000);

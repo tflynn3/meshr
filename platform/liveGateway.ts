@@ -88,6 +88,7 @@ const fanoutMinimumIntervalMs = fanoutRefreshDelayMs;
 interface ClientState {
   meshId: string;
   agentId?: string;
+  openedAt: number;
   alive: boolean;
   cursor: number;
   principal: "human" | "agent" | "anonymous";
@@ -205,6 +206,20 @@ function removeClient(socket: WebSocket): void {
     action: "closed",
     mesh_id: state.meshId,
     clients: clients.size,
+    connection_duration_ms: Math.max(0, Date.now() - state.openedAt),
+  }));
+}
+
+function logConnectionGauge(): void {
+  // A sampled count event is cheaper and more useful than deriving active
+  // WebSocket count from a high-volume open/close delta stream. Cloud
+  // Monitoring turns the extracted values into a distribution for capacity
+  // alerts.
+  console.log(JSON.stringify({
+    component: "meshr-live-gateway",
+    event: "live.connection.gauge",
+    active_connections: clients.size,
+    pending_connections: pendingConnectionCount,
   }));
 }
 
@@ -617,6 +632,7 @@ const server = createServer(async (request, response) => {
 const sockets = new WebSocketServer({ noServer: true, maxPayload: maxFrameBytes });
 server.on("upgrade", async (request, socket, head) => {
   let reservation: ConnectionReservation | undefined;
+  const openedAt = Date.now();
   try {
     if (!originAllowed(request)) {
       socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
@@ -656,6 +672,7 @@ server.on("upgrade", async (request, socket, head) => {
       const state: ClientState = {
         meshId,
         agentId: access.agentId,
+        openedAt,
         alive: true,
         cursor: access.cursor,
         principal: access.principal,
@@ -699,7 +716,7 @@ server.on("upgrade", async (request, socket, head) => {
               authorization: state.authorization,
             })
           : null;
-        send(websocket, {
+        const sent = send(websocket, {
           contract_version: MESHR_CONTRACT_VERSION,
           type: "topology.snapshot",
           mesh_id: meshId,
@@ -707,6 +724,18 @@ server.on("upgrade", async (request, socket, head) => {
           snapshot,
           ...(activity ? { activity } : {}),
         });
+        if (sent) {
+          console.log(JSON.stringify({
+            component: "meshr-live-gateway",
+            event: "live.connection_ready",
+            mesh_id: meshId,
+            principal: state.principal,
+            // This is server-side upgrade-to-snapshot readiness. Client
+            // reconnect recovery, including outage detection and backoff, is
+            // measured by the distributed load rehearsal instead.
+            snapshot_ready_ms: Math.max(0, Date.now() - state.openedAt),
+          }));
+        }
       } catch {
         websocket.close(1013, "live snapshot unavailable");
         removeClient(websocket);
@@ -872,6 +901,9 @@ const heartbeat = setInterval(() => {
 }, 20_000);
 heartbeat.unref();
 
+const connectionGauge = setInterval(logConnectionGauge, 30_000);
+connectionGauge.unref();
+
 server.listen(port, host, () =>
   console.log(`live gateway listening on ${host}:${port} (auth=${!allowAnonymousLocal})`),
 );
@@ -879,6 +911,7 @@ server.listen(port, host, () =>
 async function shutdown(): Promise<void> {
   clearInterval(authorizationRecheck);
   clearInterval(heartbeat);
+  clearInterval(connectionGauge);
   for (const timer of pendingMeshRefreshes.values()) clearTimeout(timer);
   pendingMeshRefreshes.clear();
   for (const stop of topologyWatchers.values()) stop();

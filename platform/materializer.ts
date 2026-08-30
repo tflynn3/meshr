@@ -823,6 +823,7 @@ async function processMessage(
   consumer: Consumer,
   message: { data: Buffer; id: string; ack(): void; nack(): void },
 ): Promise<boolean> {
+  let materializationCommitted = false;
   try {
     if (consumer === "moderation-screening") {
       const job = JSON.parse(message.data.toString("utf8")) as Record<string, unknown>;
@@ -1137,6 +1138,7 @@ async function processMessage(
         );
       }
     });
+    materializationCommitted = true;
     if (moderationScreeningJob) {
       // Publish only after the inbox transaction commits. If this publish
       // fails, the source event remains unacked and is retried; the inbox
@@ -1157,7 +1159,6 @@ async function processMessage(
     message.ack();
     return true;
   } catch (error) {
-    console.error(`${consumer} materialization failed`, error);
     // Malformed messages cannot succeed on a retry and should proceed to the
     // subscription dead-letter policy. Transient Firestore/provider errors
     // stay unacked so the per-key queue can retry this predecessor locally;
@@ -1165,8 +1166,22 @@ async function processMessage(
     const errorName = error && typeof error === "object" && "name" in error
       ? String((error as { name?: unknown }).name)
       : "";
-    if (error instanceof SyntaxError || errorName === "ZodError") message.nack();
-    return error instanceof SyntaxError || errorName === "ZodError";
+    const validationError = error instanceof SyntaxError || errorName === "ZodError";
+    const errorClass = validationError
+      ? "validation"
+      : materializationCommitted
+        ? "pubsub"
+        : "firestore";
+    console.error(JSON.stringify({
+      component: "meshr-materializer",
+      event: "materialization.failed",
+      consumer,
+      message_id: message.id,
+      error_class: errorClass,
+      error: (error instanceof Error ? error.message : String(error)).slice(0, 500),
+    }));
+    if (validationError) message.nack();
+    return validationError;
   }
 }
 
@@ -1340,7 +1355,11 @@ async function claimModerationItem(itemRef: any): Promise<ModerationClaim | null
   const now = new Date();
   const nowIso = now.toISOString();
   const nowMs = now.getTime();
-  return firestore.runTransaction(async (transaction) => {
+  let deadLettered: { itemId: string; postId: string | null; caseId: string | null; attempts: number; error: string } | undefined;
+  const claim = await firestore.runTransaction(async (transaction) => {
+    // Firestore may replay the callback on contention. Do not leak a
+    // side-effect marker from an abandoned attempt into the final log.
+    deadLettered = undefined;
     const item = await transaction.get(itemRef);
     if (!item.exists || String(item.get("state")) !== "queued") return null;
     const nextAttemptAt = parseModerationTime(item.get("next_attempt_at"));
@@ -1371,6 +1390,13 @@ async function claimModerationItem(itemRef: any): Promise<ModerationClaim | null
         moderationDlqDocument(item, attempts, error, nowIso),
         { merge: true },
       );
+      deadLettered = {
+        itemId: item.id,
+        postId: postId || null,
+        caseId: caseId || null,
+        attempts,
+        error,
+      };
       return null;
     }
     const leaseId = randomUUID();
@@ -1395,13 +1421,27 @@ async function claimModerationItem(itemRef: any): Promise<ModerationClaim | null
       caseId,
     } satisfies ModerationClaim;
   });
+  if (deadLettered) {
+    console.error(JSON.stringify({
+      component: "meshr-materializer",
+      event: "moderation.dlq",
+      consumer: "moderation-screening",
+      ...deadLettered,
+    }));
+  }
+  return claim;
 }
 
 async function recordModerationFailure(claim: ModerationClaim, error: unknown): Promise<boolean> {
   const failedAt = new Date().toISOString();
   const message = moderationErrorMessage(error);
   let retryScheduled = false;
+  let deadLettered = false;
   await firestore.runTransaction(async (transaction) => {
+    // The callback can be retried; the values below must describe the
+    // committed attempt rather than a transaction that was discarded.
+    retryScheduled = false;
+    deadLettered = false;
     const item = await transaction.get(claim.itemRef);
     if (!item.exists || String(item.get("state")) !== "queued" || item.get("lease_id") !== claim.leaseId) {
       return;
@@ -1428,6 +1468,7 @@ async function recordModerationFailure(claim: ModerationClaim, error: unknown): 
         moderationDlqDocument(item, attempts, message, failedAt),
         { merge: true },
       );
+      deadLettered = true;
       return;
     }
     const retrySeconds = Math.min(
@@ -1444,6 +1485,18 @@ async function recordModerationFailure(claim: ModerationClaim, error: unknown): 
       last_error: message,
     }, { merge: true });
   });
+  if (deadLettered) {
+    console.error(JSON.stringify({
+      component: "meshr-materializer",
+      event: "moderation.dlq",
+      consumer: "moderation-screening",
+      item_id: claim.itemId,
+      post_id: claim.postId,
+      case_id: claim.caseId,
+      attempts: claim.attempt,
+      error: message,
+    }));
+  }
   return retryScheduled;
 }
 
@@ -1647,59 +1700,101 @@ async function processQueuedModerationItem(item: any): Promise<"done" | "retry">
   try {
     claim = await claimModerationItem(item.ref);
   } catch (error) {
-    console.error("moderation item claim failed", error);
+    console.error(JSON.stringify({
+      component: "meshr-materializer",
+      event: "materialization.failed",
+      consumer: "moderation-screening",
+      item_id: item.id,
+      error_class: "firestore",
+      error: moderationErrorMessage(error),
+    }));
     return "retry";
   }
   if (!claim) return "done";
+  let providerFailure = false;
   try {
     const post = await firestore.collection("posts").doc(claim.postId).get();
     if (!post.exists) {
       await applyModerationDecision(claim, { action: "allow", reason: "expired" });
       return "done";
     }
-    const headers = new Headers({
-      accept: "application/json",
-      "content-type": "application/json",
-      "x-meshr-contract-version": "1",
-    });
-    const authorization = await moderationAuthorization();
-    if (authorization) headers.set("authorization", `Bearer ${authorization}`);
-    const response = await fetch(moderationEndpoint!, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        postId: claim.postId,
-        meshId: post.get("mesh_id"),
-        agentId: post.get("agent_id"),
-        text: post.get("body"),
-      }),
-      signal: AbortSignal.timeout(5_000),
-    });
-    if (!response.ok) throw new Error(`moderation provider returned HTTP ${response.status}`);
-    const decision = (await response.json()) as {
-      action?: unknown;
-      reason?: unknown;
-      severity?: unknown;
+    let decision: {
+      action: "allow" | "quarantine" | "redact" | "remove";
+      reason?: string;
+      severity?: string;
     };
-    if (decision.action !== "allow" && decision.action !== "quarantine" &&
-        decision.action !== "redact" && decision.action !== "remove") {
-      throw new Error("moderation provider returned an invalid action");
+    try {
+      const headers = new Headers({
+        accept: "application/json",
+        "content-type": "application/json",
+        "x-meshr-contract-version": "1",
+      });
+      const authorization = await moderationAuthorization();
+      if (authorization) headers.set("authorization", `Bearer ${authorization}`);
+      const response = await fetch(moderationEndpoint!, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          postId: claim.postId,
+          meshId: post.get("mesh_id"),
+          agentId: post.get("agent_id"),
+          text: post.get("body"),
+        }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!response.ok) throw new Error(`moderation provider returned HTTP ${response.status}`);
+      const rawDecision = (await response.json()) as {
+        action?: unknown;
+        reason?: unknown;
+        severity?: unknown;
+      };
+      if (rawDecision.action !== "allow" && rawDecision.action !== "quarantine" &&
+          rawDecision.action !== "redact" && rawDecision.action !== "remove") {
+        throw new Error("moderation provider returned an invalid action");
+      }
+      decision = {
+        action: rawDecision.action,
+        reason: typeof rawDecision.reason === "string" ? rawDecision.reason : undefined,
+        severity: typeof rawDecision.severity === "string" ? rawDecision.severity : undefined,
+      };
+    } catch (error) {
+      providerFailure = true;
+      throw error;
     }
     await applyModerationDecision(claim, {
       action: decision.action,
-      reason: typeof decision.reason === "string" ? decision.reason : undefined,
-      severity: typeof decision.severity === "string" ? decision.severity : undefined,
+      reason: decision.reason,
+      severity: decision.severity,
     });
     return "done";
   } catch (error) {
     // A provider or transaction failure belongs to this item only. Persist a
     // bounded retry/backoff (or DLQ record) and continue the sweep so one
     // poison post cannot starve later moderation cases.
+    console.error(JSON.stringify({
+      component: "meshr-materializer",
+      event: "materialization.failed",
+      consumer: "moderation-screening",
+      item_id: claim.itemId,
+      post_id: claim.postId,
+      case_id: claim.caseId,
+      error_class: providerFailure ? "moderation_provider" : "firestore",
+      error: moderationErrorMessage(error),
+    }));
     try {
       const retryScheduled = await recordModerationFailure(claim, error);
       return retryScheduled ? "retry" : "done";
     } catch (recordError) {
-      console.error("moderation failure bookkeeping failed", recordError);
+      console.error(JSON.stringify({
+        component: "meshr-materializer",
+        event: "materialization.failed",
+        consumer: "moderation-screening",
+        item_id: claim.itemId,
+        post_id: claim.postId,
+        case_id: claim.caseId,
+        error_class: "firestore",
+        error: moderationErrorMessage(recordError),
+      }));
       return "retry";
     }
   }

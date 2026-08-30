@@ -3081,6 +3081,22 @@ resource "google_logging_metric" "http_request_latency" {
   }
 }
 
+resource "google_logging_metric" "http_write_request_latency" {
+  name   = "meshr_http_write_request_latency_ms"
+  filter = "jsonPayload.component=\"meshr-api\" AND jsonPayload.event=\"http.request\" AND jsonPayload.is_write=true AND jsonPayload.latency_ms:*"
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "DISTRIBUTION"
+    unit        = "ms"
+  }
+  value_extractor = "EXTRACT(jsonPayload.latency_ms)"
+  bucket_options {
+    explicit_buckets {
+      bounds = [50, 100, 250, 500, 750, 1000, 2000, 5000, 10000]
+    }
+  }
+}
+
 resource "google_logging_metric" "http_error_count" {
   name   = "meshr_http_error_count"
   filter = "jsonPayload.component=\"meshr-api\" AND jsonPayload.event=\"http.request\" AND jsonPayload.status>=400"
@@ -3157,6 +3173,77 @@ resource "google_logging_metric" "moderation_failure_count" {
   }
 }
 
+resource "google_logging_metric" "moderation_request_latency" {
+  name   = "meshr_moderation_request_latency_ms"
+  filter = "jsonPayload.component=\"meshr-moderation-adapter\" AND jsonPayload.event=\"moderation.adapter_request\" AND jsonPayload.latency_ms:*"
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "DISTRIBUTION"
+    unit        = "ms"
+  }
+  value_extractor = "EXTRACT(jsonPayload.latency_ms)"
+  bucket_options {
+    explicit_buckets {
+      bounds = [50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000]
+    }
+  }
+}
+
+resource "google_logging_metric" "moderation_dlq_count" {
+  name   = "meshr_moderation_dlq_count"
+  filter = "jsonPayload.component=\"meshr-materializer\" AND jsonPayload.event=\"moderation.dlq\""
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_logging_metric" "worker_firestore_error_count" {
+  name   = "meshr_worker_firestore_error_count"
+  filter = "jsonPayload.component=\"meshr-materializer\" AND jsonPayload.event=\"materialization.failed\" AND jsonPayload.error_class=\"firestore\""
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_logging_metric" "live_active_connections" {
+  name   = "meshr_live_active_connections"
+  filter = "jsonPayload.component=\"meshr-live-gateway\" AND jsonPayload.event=\"live.connection.gauge\" AND jsonPayload.active_connections:*"
+  metric_descriptor {
+    # Extracted log values are represented as a distribution. A sampled
+    # connection count is then aligned as a percentile for capacity alerts;
+    # using GAUGE/INT64 with value_extractor is rejected by Cloud Logging.
+    metric_kind = "DELTA"
+    value_type  = "DISTRIBUTION"
+    unit        = "1"
+  }
+  value_extractor = "EXTRACT(jsonPayload.active_connections)"
+  bucket_options {
+    explicit_buckets {
+      bounds = [0, 50, 100, 200, 300, 400, 450, 500, 750, 1000]
+    }
+  }
+}
+
+resource "google_logging_metric" "live_snapshot_ready_latency" {
+  name   = "meshr_live_snapshot_ready_latency_ms"
+  filter = "jsonPayload.component=\"meshr-live-gateway\" AND jsonPayload.event=\"live.connection_ready\" AND jsonPayload.snapshot_ready_ms:*"
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "DISTRIBUTION"
+    unit        = "ms"
+  }
+  value_extractor = "EXTRACT(jsonPayload.snapshot_ready_ms)"
+  bucket_options {
+    explicit_buckets {
+      bounds = [100, 250, 500, 1000, 2000, 5000, 10000, 30000]
+    }
+  }
+}
+
 # Every launch alert must have an explicit human destination. Keeping the
 # channel optional for dry validation plans makes CI useful without provider
 # credentials, while launch_mode=true requires the routed channel through the
@@ -3171,14 +3258,14 @@ resource "google_monitoring_notification_channel" "operations_email" {
 }
 
 resource "google_monitoring_alert_policy" "http_latency" {
-  display_name          = "Meshr API request p95 latency"
+  display_name          = "Meshr API write p95 latency"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
   depends_on            = [google_project_service.required]
   conditions {
-    display_name = "request latency above launch target"
+    display_name = "write latency above launch target"
     condition_threshold {
-      filter          = "metric.type=\"logging.googleapis.com/user/meshr_http_request_latency_ms\" resource.type=\"k8s_container\""
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_http_write_request_latency_ms\" resource.type=\"k8s_container\""
       comparison      = "COMPARISON_GT"
       threshold_value = 750
       duration        = "300s"
@@ -3281,7 +3368,7 @@ resource "google_monitoring_alert_policy" "outbox_failures" {
       filter          = "metric.type=\"logging.googleapis.com/user/meshr_outbox_failure_count\" resource.type=\"k8s_container\""
       comparison      = "COMPARISON_GT"
       threshold_value = 0
-      duration        = "300s"
+      duration        = "0s"
       aggregations {
         alignment_period   = "60s"
         per_series_aligner = "ALIGN_RATE"
@@ -3301,7 +3388,7 @@ resource "google_monitoring_alert_policy" "store_unavailable" {
       filter          = "metric.type=\"logging.googleapis.com/user/meshr_store_unavailable_count\" resource.type=\"k8s_container\""
       comparison      = "COMPARISON_GT"
       threshold_value = 0
-      duration        = "300s"
+      duration        = "0s"
       aggregations {
         alignment_period   = "60s"
         per_series_aligner = "ALIGN_RATE"
@@ -3324,7 +3411,130 @@ resource "google_monitoring_alert_policy" "moderation_failures" {
       filter          = "metric.type=\"logging.googleapis.com/user/meshr_moderation_failure_count\" resource.type=\"cloud_run_revision\""
       comparison      = "COMPARISON_GT"
       threshold_value = 0
+      duration        = "0s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "moderation_latency" {
+  display_name          = "Meshr moderation provider p95 latency"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
+  conditions {
+    display_name = "moderation p95 above two seconds"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_moderation_request_latency_ms\" resource.type=\"cloud_run_revision\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 2000
       duration        = "300s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_PERCENTILE_95"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "moderation_dlq" {
+  display_name          = "Meshr moderation dead-letter volume"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
+  conditions {
+    display_name = "moderation items dead-lettered"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_moderation_dlq_count\" resource.type=\"k8s_container\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      # A DLQ item is an incident even when it is isolated. One aligned
+      # sample is enough to page; requiring a sustained window would miss
+      # sparse dead letters entirely.
+      duration = "0s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "worker_firestore_errors" {
+  display_name          = "Meshr worker Firestore errors"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
+  conditions {
+    display_name = "worker Firestore failures present"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_worker_firestore_error_count\" resource.type=\"k8s_container\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "0s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "live_active_connections" {
+  display_name          = "Meshr live gateway connection capacity"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
+  conditions {
+    display_name = "active WebSocket connections near per-pod ceiling"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_live_active_connections\" resource.type=\"k8s_container\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 450
+      duration        = "300s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_PERCENTILE_95"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "live_snapshot_ready" {
+  display_name          = "Meshr live snapshot readiness"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
+  conditions {
+    display_name = "snapshot readiness p95 above five seconds"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_live_snapshot_ready_latency_ms\" resource.type=\"k8s_container\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 5000
+      duration        = "300s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_PERCENTILE_95"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "pubsub_dead_letters" {
+  display_name          = "Meshr Pub/Sub dead-letter volume"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
+  conditions {
+    display_name = "messages routed to a dead-letter topic"
+    condition_threshold {
+      filter          = "resource.type=\"pubsub_subscription\" metric.type=\"pubsub.googleapis.com/subscription/dead_letter_message_count\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "0s"
       aggregations {
         alignment_period   = "60s"
         per_series_aligner = "ALIGN_RATE"

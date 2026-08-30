@@ -19,13 +19,14 @@ function json(response: ServerResponse, status: number, value: unknown): void {
   response.end(JSON.stringify(value));
 }
 
-function logRequest(path: string, status: number): void {
+function logRequest(path: string, status: number, startedAt: number): void {
   // Never log request bodies, provider tokens, or provider responses.
   console.log(JSON.stringify({
     component: "meshr-moderation-adapter",
     event: "moderation.adapter_request",
     path,
     status,
+    latency_ms: Math.max(0, Date.now() - startedAt),
   }));
 }
 
@@ -70,12 +71,13 @@ function screenRequest(value: unknown): ModerationScreenRequest {
 export function createModerationAdapterServer(options: ModerationAdapterOptions): Server {
   const maxBodyBytes = Math.max(2_048, Math.min(64 * 1024, Math.trunc(options.maxBodyBytes ?? 16 * 1024)));
   return createServer(async (request, response) => {
+    const startedAt = Date.now();
     const path = (request.url ?? "").split("?", 1)[0] || "/";
     const suppliedContractVersion = request.headers["x-meshr-contract-version"];
     if (suppliedContractVersion !== undefined &&
         (typeof suppliedContractVersion !== "string" ||
           suppliedContractVersion.trim() !== MESHR_CONTRACT_MAJOR)) {
-      logRequest(path, 426);
+      logRequest(path, 426, startedAt);
       json(response, 426, {
         error: {
           code: "incompatible_contract",
@@ -86,41 +88,41 @@ export function createModerationAdapterServer(options: ModerationAdapterOptions)
     }
     if (request.method === "GET" && (path === "/healthz" || path === "/readyz")) {
       if (!authorized(request, options)) {
-        logRequest(path, 401);
+        logRequest(path, 401, startedAt);
         json(response, 401, { error: { code: "authentication_required" } });
         return;
       }
       try {
         await options.provider.health();
-        logRequest(path, 200);
+        logRequest(path, 200, startedAt);
         json(response, 200, { ok: true, service: "meshr-moderation-adapter" });
       } catch {
-        logRequest(path, 503);
+        logRequest(path, 503, startedAt);
         json(response, 503, { error: { code: "provider_unavailable" } });
       }
       return;
     }
     if (request.method !== "POST" || path !== "/screen") {
-      logRequest(path, 404);
+      logRequest(path, 404, startedAt);
       json(response, 404, { error: { code: "not_found" } });
       return;
     }
     if (!authorized(request, options)) {
-      logRequest(path, 401);
+      logRequest(path, 401, startedAt);
       json(response, 401, { error: { code: "authentication_required" } });
       return;
     }
     try {
       const input = screenRequest(await readBody(request, maxBodyBytes));
       const decision = await options.provider.screen(input);
-      logRequest(path, 200);
+      logRequest(path, 200, startedAt);
       json(response, 200, decision);
     } catch (error) {
       const code = error instanceof Error && ["request_too_large", "request_body_required", "request_json_invalid", "request_invalid", "text_invalid"].includes(error.message)
         ? error.message
         : "provider_unavailable";
       const status = code === "provider_unavailable" ? 503 : 400;
-      logRequest(path, status);
+      logRequest(path, status, startedAt);
       json(response, status, { error: { code } });
     }
   });
