@@ -24,7 +24,9 @@ const topic = pubsub.topic(config.topicName, { messageOrdering: true });
 const claimUrl = new URL("/internal/v1/outbox/claim", apiUrl).toString();
 const completeUrl = new URL("/internal/v1/outbox/complete", apiUrl).toString();
 const eventUrl = new URL("/internal/v1/outbox/events", apiUrl).toString();
+const healthUrl = new URL("/internal/v1/outbox/health", apiUrl).toString();
 const apiReadyUrl = new URL("/readyz", apiUrl).toString();
+const OUTBOX_HEARTBEAT_INTERVAL_MS = 30_000;
 
 interface OutboxClaim {
   eventId: string;
@@ -40,6 +42,11 @@ interface OutboxCompletion {
   outcome: "published" | "failed";
   messageId?: string;
   error?: string;
+}
+
+interface OutboxHealth {
+  oldestPendingAt: string | null;
+  oldestPendingAgeMs: number;
 }
 
 function json(response: ServerResponse, status: number, body: unknown): void {
@@ -120,6 +127,18 @@ function parseClaims(payload: Record<string, unknown>): OutboxClaim[] {
   });
 }
 
+function parseOutboxHealth(payload: Record<string, unknown>): OutboxHealth {
+  const oldestPendingAt = payload.oldestPendingAt;
+  const oldestPendingAgeMs = payload.oldestPendingAgeMs;
+  if (
+    (oldestPendingAt !== null && typeof oldestPendingAt !== "string") ||
+    typeof oldestPendingAgeMs !== "number" ||
+    !Number.isSafeInteger(oldestPendingAgeMs) ||
+    oldestPendingAgeMs < 0
+  ) throw new Error("authority_api_invalid_outbox_health");
+  return { oldestPendingAt, oldestPendingAgeMs };
+}
+
 async function publishClaims(claims: OutboxClaim[]): Promise<OutboxCompletion[]> {
   const groups = new Map<string, OutboxClaim[]>();
   for (const claim of claims) {
@@ -160,6 +179,28 @@ async function publishClaims(claims: OutboxClaim[]): Promise<OutboxCompletion[]>
 }
 
 let sweepInProgress = false;
+let lastHeartbeatAt = 0;
+
+async function emitSweepHeartbeat(input: {
+  claimed: number;
+  published: number;
+  failed: number;
+}): Promise<void> {
+  const now = Date.now();
+  if (now - lastHeartbeatAt < OUTBOX_HEARTBEAT_INTERVAL_MS) return;
+  const health = parseOutboxHealth(await apiRequest(healthUrl, {}));
+  lastHeartbeatAt = now;
+  console.log(JSON.stringify({
+    component: "meshr-ingest",
+    event: "outbox_sweep_heartbeat",
+    claimed: input.claimed,
+    published: input.published,
+    failed: input.failed,
+    oldest_pending_at: health.oldestPendingAt,
+    oldest_pending_age_ms: health.oldestPendingAgeMs,
+  }));
+}
+
 async function sweep(): Promise<void> {
   if (sweepInProgress) return;
   sweepInProgress = true;
@@ -168,17 +209,23 @@ async function sweep(): Promise<void> {
       maxEvents: MAX_PUBLISH_BATCH,
       leaseSeconds: PUBLISH_LEASE_SECONDS,
     }));
-    if (!claims.length) return;
-    const results = await publishClaims(claims);
-    await apiRequest(completeUrl, { results });
-    const failures = results.filter((result) => result.outcome === "failed");
-    console.log(JSON.stringify({
-      component: "meshr-ingest",
-      event: "outbox_batch_completed",
-      claimed: claims.length,
-      published: results.length - failures.length,
-      failed: failures.length,
-    }));
+    let published = 0;
+    let failed = 0;
+    if (claims.length) {
+      const results = await publishClaims(claims);
+      await apiRequest(completeUrl, { results });
+      const failures = results.filter((result) => result.outcome === "failed");
+      published = results.length - failures.length;
+      failed = failures.length;
+      console.log(JSON.stringify({
+        component: "meshr-ingest",
+        event: "outbox_batch_completed",
+        claimed: claims.length,
+        published,
+        failed,
+      }));
+    }
+    await emitSweepHeartbeat({ claimed: claims.length, published, failed });
   } finally {
     sweepInProgress = false;
   }

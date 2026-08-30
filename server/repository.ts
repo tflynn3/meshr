@@ -374,6 +374,16 @@ export interface RepositoryOutboxCompletionResult {
   stale: string[];
 }
 
+/**
+ * Operational view of the durable delivery queue. This is intentionally
+ * limited to age metadata: delivery workers do not receive a broad database
+ * read API, while operators still need to detect a pre-publish stall.
+ */
+export interface RepositoryOutboxHealth {
+  oldestPendingAt: string | null;
+  oldestPendingAgeMs: number;
+}
+
 export interface RepositoryAuditInput {
   auditId: string;
   actorType: "human" | "agent" | "system";
@@ -772,6 +782,8 @@ export interface MeshrRepository {
     completedAt: string;
     results: RepositoryOutboxCompletion[];
   }): Promise<RepositoryOutboxCompletionResult>;
+  /** Returns bounded age telemetry for pending, failed, or leased events. */
+  getOutboxHealth?(input: { now: string }): Promise<RepositoryOutboxHealth>;
   appendAuditEvent?(input: RepositoryAuditInput): Promise<void>;
   /** Read the durable cross-replica event stream with an opaque cursor. */
   listAgentEvents?(input: {

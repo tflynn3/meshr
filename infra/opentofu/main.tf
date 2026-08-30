@@ -3720,6 +3720,42 @@ resource "google_logging_metric" "outbox_failure_count" {
   }
 }
 
+resource "google_logging_metric" "outbox_sweep_heartbeat_count" {
+  name   = "meshr_outbox_sweep_heartbeat_count"
+  filter = "jsonPayload.component=\"meshr-ingest\" AND jsonPayload.event=\"outbox_sweep_heartbeat\""
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_logging_metric" "outbox_pending_age_ms" {
+  name   = "meshr_outbox_pending_age_ms"
+  filter = "jsonPayload.component=\"meshr-ingest\" AND jsonPayload.event=\"outbox_sweep_heartbeat\" AND jsonPayload.oldest_pending_age_ms:*"
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "DISTRIBUTION"
+    unit        = "ms"
+  }
+  value_extractor = "EXTRACT(jsonPayload.oldest_pending_age_ms)"
+  bucket_options {
+    explicit_buckets {
+      bounds = [0, 1000, 5000, 15000, 30000, 60000, 120000, 300000, 900000, 3600000]
+    }
+  }
+}
+
+resource "google_logging_metric" "outbox_pending_stall_count" {
+  name   = "meshr_outbox_pending_stall_count"
+  filter = "jsonPayload.component=\"meshr-ingest\" AND jsonPayload.event=\"outbox_sweep_heartbeat\" AND jsonPayload.oldest_pending_age_ms>=120000"
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
 resource "google_logging_metric" "store_unavailable_count" {
   name   = "meshr_store_unavailable_count"
   filter = "jsonPayload.component=\"meshr-api\" AND jsonPayload.event=\"http.request\" AND (jsonPayload.error_code=\"authorization_store_unavailable\" OR jsonPayload.error_code=\"projection_unavailable\" OR jsonPayload.error_code=\"activity_store_unavailable\")"
@@ -3936,6 +3972,44 @@ resource "google_monitoring_alert_policy" "outbox_failures" {
       comparison      = "COMPARISON_GT"
       threshold_value = 0
       duration        = "0s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "outbox_pending_stall" {
+  display_name          = "Meshr outbox pending stall"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
+  conditions {
+    display_name = "oldest outbox event exceeds two minutes"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_outbox_pending_stall_count\" resource.type=\"k8s_container\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "0s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "outbox_heartbeat_missing" {
+  display_name          = "Meshr outbox sweep heartbeat missing"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
+  conditions {
+    display_name = "no ingest sweep heartbeat"
+    condition_absent {
+      filter   = "metric.type=\"logging.googleapis.com/user/meshr_outbox_sweep_heartbeat_count\" resource.type=\"k8s_container\""
+      duration = "180s"
       aggregations {
         alignment_period   = "60s"
         per_series_aligner = "ALIGN_RATE"

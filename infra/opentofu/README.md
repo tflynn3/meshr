@@ -39,9 +39,10 @@ separately restricted attestation service/database.
 
 Set `alert_notification_email` for the operations owner on the protected
 launch apply. OpenTofu creates one Cloud Monitoring channel and routes the
-HTTP, authentication, topology, live-gateway, outbox, durable-store, and
-moderation alerts plus the billing budget notifications to it. Dry validation
-plans may leave it null. If a restore is cut over, first authorize the restored
+HTTP, authentication, topology, live-gateway, outbox delivery, outbox
+heartbeat/stall, durable-store, and moderation alerts plus the billing budget
+notifications to it. Dry validation plans may leave it null. If a restore is
+cut over, first authorize the restored
 Firestore database with `additional_authority_database_names` and provision a
 fresh empty topology database through `additional_topology_database_names`;
 never restore populated projection collections. Suspend Flux and fence and

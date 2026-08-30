@@ -35,6 +35,7 @@ import type {
   RepositoryOutboxClaim,
   RepositoryOutboxCompletion,
   RepositoryOutboxCompletionResult,
+  RepositoryOutboxHealth,
   RepositoryAuditInput,
 } from "./repository.ts";
 import type { Clock, RuntimeKind, SocialProvider } from "./types.ts";
@@ -4269,6 +4270,26 @@ export class SqliteMeshrRepository implements MeshrRepository {
       );
       return { duplicate: false };
     });
+  }
+
+  async getOutboxHealth(input: { now: string }): Promise<RepositoryOutboxHealth> {
+    const nowMs = Date.parse(input.now);
+    if (!Number.isFinite(nowMs)) throw new Error("invalid_outbox_health_time");
+    const row = this.db.prepare(
+      `SELECT created_at
+       FROM outbox_events
+       WHERE status IN ('pending', 'failed')
+       ORDER BY created_at ASC, event_id ASC
+       LIMIT 1`,
+    ).get() as { created_at?: unknown } | undefined;
+    const oldestPendingAt = typeof row?.created_at === "string" ? row.created_at : null;
+    const oldestPendingMs = oldestPendingAt ? Date.parse(oldestPendingAt) : NaN;
+    return {
+      oldestPendingAt,
+      oldestPendingAgeMs: Number.isFinite(oldestPendingMs)
+        ? Math.max(0, nowMs - oldestPendingMs)
+        : 0,
+    };
   }
 
   async claimOutboxEvents(input: {
