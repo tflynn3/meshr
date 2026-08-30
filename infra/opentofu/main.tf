@@ -3708,8 +3708,11 @@ resource "google_logging_metric" "live_disconnect_count" {
 }
 
 resource "google_logging_metric" "outbox_failure_count" {
-  name   = "meshr_outbox_failure_count"
-  filter = "jsonPayload.component=\"meshr-ingest\" AND (jsonPayload.event=\"outbox_batch_publish_failed\" OR jsonPayload.event=\"outbox_async_publish_failed\")"
+  name = "meshr_outbox_failure_count"
+  # The ingest publisher emits one completion record for each claimed batch
+  # and a sweep-failed record when the authority or Pub/Sub boundary cannot be
+  # reached. Count only failed completions so healthy batches do not page.
+  filter = "jsonPayload.component=\"meshr-ingest\" AND ((jsonPayload.event=\"outbox_batch_completed\" AND jsonPayload.failed>0) OR jsonPayload.event=\"outbox_sweep_failed\")"
   metric_descriptor {
     metric_kind = "DELTA"
     value_type  = "INT64"
