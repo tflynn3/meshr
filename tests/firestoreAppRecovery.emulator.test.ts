@@ -13,7 +13,7 @@ import { FirestoreMeshrRepository } from "../server/firestoreRepository.ts";
  * conformance test. It proves the API behavior that a two-replica deployment
  * relies on: the second replica may have an empty SQLite projection after the
  * first replica committed a renewal, but it can still recover the durable
- * deterministic successor from Firestore.
+ * durable successor from Firestore.
  */
 test("Firestore API renewal recovery survives a fresh replica", {
   skip: !process.env.FIRESTORE_EMULATOR_HOST,
@@ -259,11 +259,16 @@ test("Firestore API renewal recovery survives a fresh replica", {
     const webMcpCookie = (transfer.response.headers.get("set-cookie") ?? "").split(";", 1)[0];
     assert.match(webMcpCookie, /^meshr_webmcp=/);
     const recoveredPageState = await requestJson(second.baseUrl, "/v1/webmcp/session", {
-      cookie: `${cookie}; ${webMcpCookie}`,
+      method: "POST",
+      cookie,
+      csrf,
+      body: { agentId },
     });
     assert.equal(recoveredPageState.response.status, 200);
     assert.equal(recoveredPageState.json.enabled, true);
     assert.equal(recoveredPageState.json.agent.id, agentId);
+    const recoveredPageCookie = (recoveredPageState.response.headers.get("set-cookie") ?? "").split(";", 1)[0];
+    assert.equal(recoveredPageCookie, webMcpCookie);
     const recoveredPageProfile = await requestJson(second.baseUrl, "/v1/webmcp/profile", {
       cookie: `${cookie}; ${webMcpCookie}`,
       webMcpAgent: agentId,
@@ -280,7 +285,7 @@ test("Firestore API renewal recovery survives a fresh replica", {
     // Activation itself may also land on a replica with no local profile
     // projection. The durable grant is the retry/recovery source of truth, so
     // a fresh third replica must hydrate the owned agent before returning the
-    // deterministic handoff rather than responding with a replica-local 404.
+    // already-committed handoff rather than responding with a replica-local 404.
     const thirdDirectory = mkdtempSync(join(tmpdir(), "meshr-firestore-recovery-"));
     directories.push(thirdDirectory);
     const thirdApp = createMeshrServer({

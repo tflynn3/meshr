@@ -5306,6 +5306,32 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     };
   }
 
+  async findActiveWebMcpGrant(
+    humanSessionHash: string,
+    agentId: string,
+  ): Promise<RepositoryWebMcpGrant | null> {
+    // Use the existing human-session/revocation index, then validate the
+    // selected agent and its authority fence through the canonical lookup.
+    // Revoked grants are retained for audit, so filtering them in the query
+    // keeps response-loss recovery bounded without introducing a second
+    // long-lived token or a broad collection scan.
+    const snapshots = await this.firestore
+      .collection(this.collection("webmcp_grants"))
+      .where("human_session_hash", "==", humanSessionHash)
+      .where("revoked_at", "==", null)
+      .get();
+    const candidates = snapshots.docs
+      .filter((document) => document.get("agent_id") === agentId)
+      .sort((left, right) =>
+        String(right.get("created_at") ?? "").localeCompare(String(left.get("created_at") ?? "")),
+      );
+    for (const candidate of candidates) {
+      const grant = await this.findWebMcpGrant(candidate.id, humanSessionHash);
+      if (grant?.agentId === agentId) return grant;
+    }
+    return null;
+  }
+
   async loadProjection(input: {
     accountId?: string;
     agentId?: string;
@@ -6436,17 +6462,12 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     grantId: string;
     humanSessionHash: string;
     expiresAt: string;
-    sessionId?: string;
+    sessionId: string;
     event?: RepositoryEventInput;
     audit?: RepositoryAuditInput;
   }): Promise<{ authorityEpoch: number; sessionId: string }> {
     const now = this.now();
-    const sessionId = input.sessionId ??
-      "page_" +
-        createHash("sha256")
-          .update(input.agentId + ":" + input.grantId + ":" + now)
-          .digest("hex")
-          .slice(0, 24);
+    const sessionId = input.sessionId;
     return this.firestore.runTransaction(async (transaction) => {
       const humanSessionRef = this.doc("human_sessions", input.humanSessionHash);
       const agentRef = this.doc("agents", input.agentId);

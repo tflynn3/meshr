@@ -582,19 +582,105 @@ export function isCutoverValidationSessionAuthorized(
   return typeof sessionId === "string" && cutoverValidationSessionIds(predecessorSessionId).includes(sessionId);
 }
 
-/** Stable page-grant material lets a browser retry a handoff after the
- * durable authority transaction succeeded but the response/cookie write was
- * interrupted. The grant remains bearer-protected by the human session and
- * its one-hour expiry/revocation checks; only the server can derive the
- * plaintext from the HttpOnly session hash.
+function webMcpRecoverySecrets(): string[] {
+  const configured = [
+    process.env.MESHR_RENEWAL_RECOVERY_SECRET?.trim(),
+    process.env.MESHR_RENEWAL_RECOVERY_SECRET_PREVIOUS?.trim(),
+  ].filter((value): value is string => Boolean(value));
+  return configured.length
+    ? [...new Set(configured)]
+    : [
+        // Tests and local fixtures do not mount Secret Manager. Production
+        // startup validation requires the real secret, so this fallback is
+        // never accepted by a production process.
+        "meshr-local-webmcp-recovery-v2",
+      ];
+}
+
+/**
+ * Derive page-grant material from a fresh transfer session id. The session id
+ * is generated for every activation, so a copied bearer can never become
+ * valid again after revoke -> native reconnect -> reactivation. HMAC keeps
+ * the material unreconstructible to read-only database/projection workers
+ * that can see the human, agent, and transfer-session identifiers. Recovery
+ * after a lost response remains possible because the active durable grant
+ * stores the transfer session id while the plaintext stays only in the
+ * HttpOnly cookie.
  */
-function webMcpMaterial(humanSessionHash: string, agentId: string): {
+function webMcpMaterial(
+  humanSessionHash: string,
+  agentId: string,
+  transferSessionId: string,
+  recoverySecret: string,
+): {
+  token: string;
+  tokenHash: string;
+} {
+  const digest = hmacSha256(
+    `meshr-webmcp:v2:${humanSessionHash}:${agentId}:${transferSessionId}`,
+    recoverySecret,
+  );
+  const token = Buffer.from(digest, "hex").toString("base64url");
+  return { token, tokenHash: sha256(token) };
+}
+
+/**
+ * Compatibility material for grants created before per-activation rotation.
+ * Production starts empty, but retaining this reader lets a local projection
+ * recover an in-flight old grant once without allowing future activations to
+ * reuse its bearer.
+ */
+function legacyWebMcpMaterial(humanSessionHash: string, agentId: string): {
   token: string;
   tokenHash: string;
 } {
   const digest = sha256(`meshr-webmcp:v1:${humanSessionHash}:${agentId}`);
   const token = Buffer.from(digest, "hex").toString("base64url");
   return { token, tokenHash: sha256(token) };
+}
+
+type ActiveWebMcpGrantMaterial = {
+  tokenHash: string;
+  humanSessionHash: string;
+  agentId: string;
+  sessionId: string;
+  createdAt: string;
+};
+
+/**
+ * Reissue only the currently active grant. Current and previous API-only
+ * recovery secrets support a bounded secret rotation window; the legacy v1
+ * derivation is accepted only for a grant that is still within its original
+ * one-hour lifetime.
+ */
+function webMcpTokenForActiveGrant(
+  grant: ActiveWebMcpGrantMaterial,
+  recoverySecrets: string[],
+  now: string,
+): string | null {
+  for (const recoverySecret of recoverySecrets) {
+    const material = webMcpMaterial(
+      grant.humanSessionHash,
+      grant.agentId,
+      grant.sessionId,
+      recoverySecret,
+    );
+    if (constantTimeStringEqual(material.tokenHash, grant.tokenHash)) return material.token;
+  }
+  const createdAt = Date.parse(grant.createdAt);
+  const nowMs = Date.parse(now);
+  if (
+    Number.isFinite(createdAt) &&
+    Number.isFinite(nowMs) &&
+    nowMs >= createdAt &&
+    nowMs - createdAt <= WEBMCP_GRANT_SECONDS * 1_000
+  ) {
+    const legacyMaterial = legacyWebMcpMaterial(grant.humanSessionHash, grant.agentId);
+    if (constantTimeStringEqual(legacyMaterial.tokenHash, grant.tokenHash)) {
+      return legacyMaterial.token;
+    }
+  }
+  return null;
 }
 
 function requireIdempotencyKey(request: IncomingMessage): string {
@@ -658,6 +744,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     "meshr-local-invitation-pepper";
   const invitationPepperPrevious = options.invitationPepperPrevious?.trim() ||
     process.env.MESHR_INVITATION_PEPPER_PREVIOUS?.trim();
+  const webMcpRecoverySecretCandidates = webMcpRecoverySecrets();
+  const webMcpCurrentRecoverySecret = webMcpRecoverySecretCandidates[0]!;
   const internalToken = options.internalToken?.trim() || process.env.MESHR_INTERNAL_TOKEN?.trim() || "";
   // Production never falls back to the general ingest token. Local fixtures
   // retain the fallback so existing emulator tests stay inexpensive.
@@ -2662,7 +2750,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
 
   // Reconcile a durable page grant into the disposable local projection. This
   // is also the recovery path for a transfer whose HTTP response/cookie was
-  // lost after Firestore committed the authority transaction: the stable
+  // lost after Firestore committed the authority transaction: the active
   // grant material can be reissued without superseding the agent a second
   // time.
   const reconcileDurableWebMcpGrant = async (
@@ -6001,23 +6089,40 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (!agent) {
         throw new ApiError(404, "agent_not_found", "Owned agent not found.");
       }
-      const pageMaterial = webMcpMaterial(human.sessionHash, agent.id);
       // The durable handoff can commit before the browser receives its
-      // response (or before the Set-Cookie reaches storage). Reissue the same
-      // deterministic grant on retry before checking native connectivity;
-      // the native session was intentionally superseded by that handoff.
-      if (repository?.findWebMcpGrant && webMcpTransfersSession) {
+      // response (or before the Set-Cookie reaches storage). Recover the
+      // currently active grant before checking native connectivity; the native
+      // session was intentionally superseded by that handoff. Each grant's
+      // transfer session id is fresh, so recovery does not make a revoked
+      // bearer valid again on a later activation.
+      if (repository?.findActiveWebMcpGrant && webMcpTransfersSession) {
         try {
-          const durableGrant = await repository.findWebMcpGrant(
-            pageMaterial.tokenHash,
+          const durableGrant = await repository.findActiveWebMcpGrant(
             human.sessionHash,
+            agent.id,
           );
           if (durableGrant) {
+            const token = webMcpTokenForActiveGrant(
+              durableGrant,
+              webMcpRecoverySecretCandidates,
+              database.now(),
+            );
+            if (!token) {
+              // A grant from an unknown material version cannot be recovered
+              // into a plaintext cookie. Its durable fence still blocks
+              // native takeover, so surface the failure rather than issuing
+              // a token that would not match the committed record.
+              throw new ApiError(
+                503,
+                "session_store_unavailable",
+                "The active page grant uses an unsupported material version.",
+              );
+            }
             const recovered = await reconcileDurableWebMcpGrant(durableGrant, human);
             if (recovered) {
               return {
                 status: 200,
-                headers: { "Set-Cookie": webMcpCookie(pageMaterial.token, secureCookies) },
+                headers: { "Set-Cookie": webMcpCookie(token, secureCookies) },
                 body: {
                   enabled: true,
                   agent: agentFromRow(recovered.agent),
@@ -6035,8 +6140,57 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           );
         }
       }
+      // SQLite is the disposable local authority. Keep the same response-loss
+      // recovery semantics for the local demo without consulting the native
+      // connectivity path that the already-transferred agent can no longer
+      // satisfy.
+      const localRecovery = !repository && webMcpTransfersSession
+        ? db
+            .prepare(
+              `SELECT wg.token_hash, wg.human_session_hash, wg.agent_id,
+                      wg.created_at, wg.expires_at, wg.last_used_at,
+                      wg.revoked_at, wg.session_id, wg.authority_epoch
+               FROM webmcp_grants wg
+               ${pageAuthorityJoin}
+               WHERE wg.human_session_hash = ? AND wg.agent_id = ?
+                 AND wg.revoked_at IS NULL AND wg.expires_at > ?
+               ORDER BY wg.created_at DESC, wg.token_hash DESC
+               LIMIT 1`,
+            )
+            .get(human.sessionHash, agent.id, database.now()) as WebMcpGrantRow | undefined
+        : undefined;
+      if (localRecovery) {
+        const token = webMcpTokenForActiveGrant(
+          {
+            tokenHash: localRecovery.token_hash,
+            humanSessionHash: localRecovery.human_session_hash,
+            agentId: localRecovery.agent_id,
+            sessionId: localRecovery.session_id,
+            createdAt: localRecovery.created_at,
+          },
+          webMcpRecoverySecretCandidates,
+          database.now(),
+        );
+        if (!token) {
+          throw new ApiError(
+            503,
+            "session_store_unavailable",
+            "The active page grant uses an unsupported material version.",
+          );
+        }
+        return {
+          status: 200,
+          headers: { "Set-Cookie": webMcpCookie(token, secureCookies) },
+          body: {
+            enabled: true,
+            agent: agentFromRow(agent),
+            createdAt: localRecovery.created_at,
+            expiresAt: localRecovery.expires_at,
+          },
+        };
+      }
       // A committed handoff may have lost its HTTP response. Reissuing that
-      // deterministic grant is recovery, not a new session start, and must
+      // active grant is recovery, not a new session start, and must
       // remain available while cost protection is active. New transfers are
       // blocked below after the recovery path has been exhausted.
       assertCostProtectionAllows("session");
@@ -6073,12 +6227,18 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           "Only a connected agent can be enabled for page WebMCP.",
         );
       }
-      const token = pageMaterial.token;
-      const tokenHash = pageMaterial.tokenHash;
       const nowDate = database.clock.now();
       const now = nowDate.toISOString();
       const expiresAt = addSeconds(nowDate, WEBMCP_GRANT_SECONDS);
-      let transferSessionId = database.id("page");
+      const transferSessionId = database.id("page");
+      const pageMaterial = webMcpMaterial(
+        human.sessionHash,
+        agent.id,
+        transferSessionId,
+        webMcpCurrentRecoverySecret,
+      );
+      const token = pageMaterial.token;
+      const tokenHash = pageMaterial.tokenHash;
       let authoritativeEpoch: number | undefined;
       const transferMeshIds = new Set<string>(
         (db
@@ -6155,7 +6315,9 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             event: transferEvent,
             audit: transferAudit,
           });
-          transferSessionId = committed.sessionId;
+          if (committed.sessionId !== transferSessionId) {
+            throw new Error("page_transfer_session_mismatch");
+          }
           authoritativeEpoch = committed.authorityEpoch;
         } catch (error) {
           if (error instanceof Error && error.message === "session_invalid") {

@@ -842,6 +842,15 @@ export interface MeshrRepository {
     tokenHash: string,
     humanSessionHash: string,
   ): Promise<RepositoryWebMcpGrant | null>;
+  /**
+   * Recover the currently active page grant after a transfer response or
+   * cookie write was interrupted. Implementations must validate the
+   * human-scoped fence before returning the grant.
+   */
+  findActiveWebMcpGrant?(
+    humanSessionHash: string,
+    agentId: string,
+  ): Promise<RepositoryWebMcpGrant | null>;
   findAccountByProvider(
     provider: SocialProvider,
     subject: string,
@@ -922,7 +931,7 @@ export interface MeshrRepository {
     grantId: string;
     humanSessionHash: string;
     expiresAt: string;
-    sessionId?: string;
+    sessionId: string;
     /** Optional immutable records committed with the authority transfer. */
     event?: RepositoryEventInput;
     audit?: RepositoryAuditInput;

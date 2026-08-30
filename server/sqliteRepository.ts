@@ -3524,6 +3524,58 @@ export class SqliteMeshrRepository implements MeshrRepository {
           expiresAt: row.expires_at,
           lastUsedAt: row.last_used_at,
           revokedAt: row.revoked_at,
+      }
+      : null;
+  }
+
+  async findActiveWebMcpGrant(
+    humanSessionHash: string,
+    agentId: string,
+  ): Promise<RepositoryWebMcpGrant | null> {
+    const row = this.db
+      .prepare(
+        `SELECT wg.token_hash, wg.human_session_hash, wg.agent_id, wg.session_id, wg.authority_epoch,
+                wg.created_at, wg.expires_at, wg.last_used_at, wg.revoked_at
+         FROM webmcp_grants wg
+         JOIN agent_authority aa
+           ON aa.agent_id = wg.agent_id
+          AND aa.authority_kind = 'page'
+          AND aa.session_id = wg.session_id
+          AND aa.epoch = wg.authority_epoch
+         JOIN webmcp_authority wa
+           ON wa.human_session_hash = wg.human_session_hash
+          AND wa.grant_id = wg.token_hash
+          AND wa.epoch = wg.authority_epoch
+          AND wa.revoked_at IS NULL
+         WHERE wg.human_session_hash = ? AND wg.agent_id = ?
+           AND wg.revoked_at IS NULL AND wg.expires_at > ?
+         ORDER BY wg.created_at DESC, wg.token_hash DESC
+         LIMIT 1`,
+      )
+      .get(humanSessionHash, agentId, this.now()) as
+      | {
+          token_hash: string;
+          human_session_hash: string;
+          agent_id: string;
+          session_id: string;
+          authority_epoch: number;
+          created_at: string;
+          expires_at: string;
+          last_used_at: string;
+          revoked_at: string | null;
+        }
+      | undefined;
+    return row
+      ? {
+          tokenHash: row.token_hash,
+          humanSessionHash: row.human_session_hash,
+          agentId: row.agent_id,
+          sessionId: row.session_id,
+          authorityEpoch: row.authority_epoch,
+          createdAt: row.created_at,
+          expiresAt: row.expires_at,
+          lastUsedAt: row.last_used_at,
+          revokedAt: row.revoked_at,
         }
       : null;
   }
@@ -3986,12 +4038,12 @@ export class SqliteMeshrRepository implements MeshrRepository {
     grantId: string;
     humanSessionHash: string;
     expiresAt: string;
-    sessionId?: string;
+    sessionId: string;
     event?: RepositoryEventInput;
     audit?: RepositoryAuditInput;
   }): Promise<{ authorityEpoch: number; sessionId: string }> {
     const now = this.now();
-    const sessionId = input.sessionId ?? this.database.id("page");
+    const sessionId = input.sessionId;
     return this.database.transaction(() => {
       const fence = this.db
         .prepare("SELECT epoch FROM webmcp_authority WHERE human_session_hash = ?")

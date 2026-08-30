@@ -223,6 +223,31 @@ test("SQLite adapter matches Firestore transaction boundaries for corrected auth
       1,
     );
 
+    // Page-grant recovery must require both authority fences. A matching
+    // grant row alone is not enough to reissue a browser bearer after a
+    // response-loss retry.
+    const pageSessionId = "sqlite-page-session";
+    const pageGrantHash = createHash("sha256")
+      .update("sqlite-page-grant")
+      .digest("hex");
+    await repository.transferPageAuthority({
+      agentId,
+      grantId: pageGrantHash,
+      humanSessionHash: ownerSessionHash,
+      expiresAt: "2026-08-28T19:10:00.000Z",
+      sessionId: pageSessionId,
+    });
+    const activePageGrant = await repository.findActiveWebMcpGrant(ownerSessionHash, agentId);
+    assert.equal(activePageGrant?.tokenHash, pageGrantHash);
+    assert.equal(activePageGrant?.sessionId, pageSessionId);
+    database.sqlite.prepare("UPDATE agent_authority SET session_id = ? WHERE agent_id = ?")
+      .run("sqlite-stale-page-session", agentId);
+    assert.equal(await repository.findActiveWebMcpGrant(ownerSessionHash, agentId), null);
+    database.sqlite.prepare("UPDATE agent_authority SET session_id = ? WHERE agent_id = ?")
+      .run(pageSessionId, agentId);
+    await repository.revokeWebMcpGrants(ownerSessionHash, "2026-08-28T18:10:01.000Z");
+    assert.equal(await repository.findActiveWebMcpGrant(ownerSessionHash, agentId), null);
+
     const postId = "sqlite-conformance-post";
     database.sqlite.prepare(
       `INSERT INTO posts(
