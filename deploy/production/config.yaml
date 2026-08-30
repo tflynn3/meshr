@@ -19,6 +19,7 @@ data:
   # explicit so a production rollout cannot silently fall back to the default.
   MESHR_EVENT_AUDIT_FIRESTORE_DATABASE: ${MESHR_EVENT_AUDIT_FIRESTORE_DATABASE}
   MESHR_NOTIFICATIONS_FIRESTORE_DATABASE: ${MESHR_NOTIFICATIONS_FIRESTORE_DATABASE}
+  MESHR_MODERATION_FIRESTORE_DATABASE: ${MESHR_MODERATION_FIRESTORE_DATABASE}
   # Workers wait for the bootstrap Job to publish this exact authority
   # generation before subscribing to topology events. CI sets it to pending
   # during a restore and attests the value after the Job completes.

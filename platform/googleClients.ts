@@ -9,6 +9,8 @@ export interface EventPlaneConfig {
   auditDatabaseId: string;
   /** Notification outbox database used only by the notification consumer. */
   notificationsDatabaseId: string;
+  /** Moderation inbox/lease database used only by moderation consumers. */
+  moderationDatabaseId: string;
   topicName: string;
   moderationScreeningTopic: string;
   subscriptionName: string;
@@ -55,6 +57,7 @@ export function assertSeparatedProductionEventPlaneDatabases(
   topologyDatabaseId: string,
   auditDatabaseId: string,
   notificationsDatabaseId: string,
+  moderationDatabaseId: string,
   environment = process.env.MESHR_ENV,
 ): void {
   if (environment?.trim().toLowerCase() !== "production") return;
@@ -63,12 +66,13 @@ export function assertSeparatedProductionEventPlaneDatabases(
     topologyDatabaseId.trim(),
     auditDatabaseId.trim(),
     notificationsDatabaseId.trim(),
+    moderationDatabaseId.trim(),
   ];
   if (ids.some((id) => !id)) {
     throw new Error("production Firestore event-plane database IDs are required");
   }
   if (new Set(ids).size !== ids.length) {
-    throw new Error("production Firestore authority, topology, audit, and notification databases must be distinct");
+    throw new Error("production Firestore authority, topology, audit, notification, and moderation databases must be distinct");
   }
 }
 
@@ -97,6 +101,10 @@ export function eventPlaneConfig(): EventPlaneConfig {
       process.env.MESHR_NOTIFICATIONS_FIRESTORE_DATABASE?.trim() ||
       process.env.MESHR_FIRESTORE_DATABASE?.trim() ||
       "(default)",
+    moderationDatabaseId:
+      process.env.MESHR_MODERATION_FIRESTORE_DATABASE?.trim() ||
+      process.env.MESHR_FIRESTORE_DATABASE?.trim() ||
+      "(default)",
     topicName: process.env.MESHR_EVENTS_TOPIC?.trim() || "mesh-events",
     moderationScreeningTopic:
       process.env.MESHR_MODERATION_SCREENING_TOPIC?.trim() || "moderation-screening",
@@ -117,6 +125,7 @@ export function eventPlaneConfig(): EventPlaneConfig {
     config.topologyDatabaseId,
     config.auditDatabaseId,
     config.notificationsDatabaseId,
+    config.moderationDatabaseId,
   );
   return config;
 }

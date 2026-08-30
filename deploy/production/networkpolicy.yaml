@@ -15,6 +15,7 @@ spec:
     - from:
         - podSelector: {matchLabels: {app.kubernetes.io/name: ingest}}
         - podSelector: {matchLabels: {app.kubernetes.io/name: live-gateway}}
+        - podSelector: {matchLabels: {app.kubernetes.io/name: moderation-screening-worker}}
         # External browser/API traffic reaches the service through the
         # managed GKE Gateway dataplane.
         - namespaceSelector:

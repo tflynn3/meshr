@@ -220,8 +220,10 @@ export interface MeshrServerOptions {
   invitationPepper?: string;
   /** Immediately previous invitation pepper retained during rotation. */
   invitationPepperPrevious?: string;
-  /** Shared service token for narrow event-worker authority calls. */
+  /** Legacy/local service token for the SQLite outbox fixture. */
   internalToken?: string;
+  /** Dedicated token for automated moderation authority calls. */
+  moderationAuthorityToken?: string;
 }
 
 export interface MeshrServer {
@@ -657,6 +659,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
   const invitationPepperPrevious = options.invitationPepperPrevious?.trim() ||
     process.env.MESHR_INVITATION_PEPPER_PREVIOUS?.trim();
   const internalToken = options.internalToken?.trim() || process.env.MESHR_INTERNAL_TOKEN?.trim() || "";
+  // Production never falls back to the general ingest token. Local fixtures
+  // retain the fallback so existing emulator tests stay inexpensive.
+  const moderationAuthorityToken = options.moderationAuthorityToken?.trim() ||
+    process.env.MESHR_MODERATION_AUTHORITY_TOKEN?.trim() ||
+    (process.env.MESHR_ENV?.trim().toLowerCase() === "production" ? "" : internalToken);
   // The SQLite adapter remains the isolated/local authority. Production
   // always injects Firestore and is blocked at startup if its role-invitation
   // methods are missing.
@@ -1009,7 +1016,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     const supplied = typeof authorization === "string"
       ? authorization.replace(/^Bearer\s+/i, "").trim()
       : "";
-    if (!internalToken || !supplied || !constantTimeStringEqual(supplied, internalToken)) {
+    if (!moderationAuthorityToken || !supplied || !constantTimeStringEqual(supplied, moderationAuthorityToken)) {
       throw new ApiError(401, "internal_authentication_required", "A Meshr service token is required.");
     }
   };

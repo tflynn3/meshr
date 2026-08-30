@@ -121,6 +121,7 @@ const app = createMeshrServer({
   invitationPepper: settings.invitationPepper,
   invitationPepperPrevious: settings.invitationPepperPrevious,
   internalToken: settings.internalToken,
+  moderationAuthorityToken: settings.moderationAuthorityToken,
   repository,
 });
 

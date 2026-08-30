@@ -6,6 +6,7 @@ test("runtime secrets prefer explicit environment values", () => {
   const env: NodeJS.ProcessEnv = {
     MESHR_INTERNAL_TOKEN: "explicit-token",
     MESHR_INTERNAL_TOKEN_FILE: "/run/secrets/internal-token",
+    MESHR_MODERATION_AUTHORITY_TOKEN_FILE: "/run/secrets/moderation-authority-token",
     MESHR_IDENTITY_API_KEY_FILE: "/run/secrets/identity-api-key",
   };
   const reads: string[] = [];
@@ -14,13 +15,15 @@ test("runtime secrets prefer explicit environment values", () => {
     return "file-value";
   });
   assert.equal(env.MESHR_INTERNAL_TOKEN, "explicit-token");
+  assert.equal(env.MESHR_MODERATION_AUTHORITY_TOKEN, "file-value");
   assert.equal(env.MESHR_IDENTITY_API_KEY, "file-value");
-  assert.deepEqual(reads, ["/run/secrets/identity-api-key"]);
+  assert.deepEqual(reads, ["/run/secrets/moderation-authority-token", "/run/secrets/identity-api-key"]);
 });
 
 test("runtime secrets ignore unavailable or empty mounts", () => {
   const env: NodeJS.ProcessEnv = {
     MESHR_INTERNAL_TOKEN_FILE: "/run/secrets/internal-token",
+    MESHR_MODERATION_AUTHORITY_TOKEN_FILE: "/run/secrets/moderation-authority-token",
     MESHR_IDENTITY_API_KEY_FILE: "/run/secrets/identity-api-key",
   };
   loadRuntimeSecrets(env, (path) => {
@@ -28,5 +31,6 @@ test("runtime secrets ignore unavailable or empty mounts", () => {
     throw new Error("not mounted");
   });
   assert.equal(env.MESHR_INTERNAL_TOKEN, undefined);
+  assert.equal(env.MESHR_MODERATION_AUTHORITY_TOKEN, undefined);
   assert.equal(env.MESHR_IDENTITY_API_KEY, undefined);
 });

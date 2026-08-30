@@ -46,6 +46,11 @@ locals {
       kubernetes_name = "meshr-moderation-worker"
       firestore_role  = "roles/datastore.user"
     }
+    moderation_screening_worker = {
+      account_id      = "meshr-moderation-screening"
+      kubernetes_name = "meshr-moderation-screening-worker"
+      firestore_role  = "roles/datastore.user"
+    }
     audit_worker = {
       account_id      = "meshr-audit"
       kubernetes_name = "meshr-audit-worker"
@@ -71,6 +76,11 @@ locals {
     moderation_worker = {
       account_id      = "meshr-moderation-canary"
       kubernetes_name = "meshr-moderation-worker-canary"
+      firestore_role  = "roles/datastore.user"
+    }
+    moderation_screening_worker = {
+      account_id      = "meshr-moderation-screening-canary"
+      kubernetes_name = "meshr-moderation-screening-worker-canary"
       firestore_role  = "roles/datastore.user"
     }
     audit_worker = {
@@ -526,11 +536,13 @@ locals {
     google_firestore_database.release_audit.name,
     google_firestore_database.audit.name,
     google_firestore_database.notifications.name,
+    google_firestore_database.moderation.name,
     google_firestore_database.canary.name,
     google_firestore_database.canary_projections.name,
     google_firestore_database.canary_release_audit.name,
     google_firestore_database.canary_audit.name,
     google_firestore_database.canary_notifications.name,
+    google_firestore_database.canary_moderation.name,
   ])
   firestore_cross_environment_restore_overlap = setintersection(
     toset(concat(
@@ -541,9 +553,11 @@ locals {
   )
   audit_firestore_iam_expression                = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.audit.name}'"
   notifications_firestore_iam_expression        = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.notifications.name}'"
+  moderation_firestore_iam_expression           = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.moderation.name}'"
   canary_topology_firestore_iam_expression      = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.canary_projections.name}'"
   canary_audit_firestore_iam_expression         = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.canary_audit.name}'"
   canary_notifications_firestore_iam_expression = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.canary_notifications.name}'"
+  canary_moderation_firestore_iam_expression    = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.canary_moderation.name}'"
   monitoring_notification_channels = try(
     [google_monitoring_notification_channel.operations_email[0].name],
     [],
@@ -739,6 +753,19 @@ resource "google_firestore_database" "notifications" {
   depends_on              = [google_project_service.required]
 }
 
+# Moderation inbox leases and dead-letter references are worker-owned queue
+# state, not authority. Isolating them means the screening process can never
+# bypass the API's revision-fenced moderation route through a datastore grant.
+resource "google_firestore_database" "moderation" {
+  project                           = var.project_id
+  name                              = "meshr-moderation"
+  location_id                       = var.region
+  type                              = "FIRESTORE_NATIVE"
+  point_in_time_recovery_enablement = "POINT_IN_TIME_RECOVERY_ENABLED"
+  delete_protection_state           = "DELETE_PROTECTION_ENABLED"
+  depends_on                        = [google_project_service.required]
+}
+
 # Canary runs in the same GKE cluster but uses a separate Firestore database
 # so unapproved code cannot read or mutate public production records. The
 # application selects this database only through the canary overlay's explicit
@@ -790,6 +817,16 @@ resource "google_firestore_database" "canary_notifications" {
   depends_on              = [google_project_service.required]
 }
 
+resource "google_firestore_database" "canary_moderation" {
+  project                           = var.project_id
+  name                              = "meshr-canary-moderation"
+  location_id                       = var.region
+  type                              = "FIRESTORE_NATIVE"
+  point_in_time_recovery_enablement = "POINT_IN_TIME_RECOVERY_ENABLED"
+  delete_protection_state           = "DELETE_PROTECTION_ENABLED"
+  depends_on                        = [google_project_service.required]
+}
+
 # Keep a rolling daily backup window in addition to point-in-time recovery.
 # Restoration is still exercised into an isolated database before launch and
 # quarterly thereafter; this resource only provisions the durable schedule.
@@ -820,6 +857,15 @@ resource "google_firestore_backup_schedule" "release_audit_daily" {
   depends_on = [google_firestore_database.release_audit]
 }
 
+resource "google_firestore_backup_schedule" "moderation_daily" {
+  project   = var.project_id
+  database  = google_firestore_database.moderation.name
+  retention = "3024000s" # 35 days
+
+  daily_recurrence {}
+  depends_on = [google_firestore_database.moderation]
+}
+
 resource "google_firestore_backup_schedule" "canary_release_audit_daily" {
   project   = var.project_id
   database  = google_firestore_database.canary_release_audit.name
@@ -827,6 +873,15 @@ resource "google_firestore_backup_schedule" "canary_release_audit_daily" {
 
   daily_recurrence {}
   depends_on = [google_firestore_database.canary_release_audit]
+}
+
+resource "google_firestore_backup_schedule" "canary_moderation_daily" {
+  project   = var.project_id
+  database  = google_firestore_database.canary_moderation.name
+  retention = "3024000s" # 35 days
+
+  daily_recurrence {}
+  depends_on = [google_firestore_database.canary_moderation]
 }
 
 resource "google_firestore_field" "release_audit_events_ttl" {
@@ -1514,7 +1569,7 @@ resource "google_firestore_index" "event_outbox_private_mesh_created_cursor" {
 
 resource "google_firestore_index" "moderation_inbox_due" {
   project    = var.project_id
-  database   = google_firestore_database.default.name
+  database   = google_firestore_database.moderation.name
   collection = "moderation_inbox"
   fields {
     field_path = "state"
@@ -1706,9 +1761,17 @@ resource "google_firestore_field" "processed_event_ttl" {
   ttl_config {}
 }
 
+resource "google_firestore_field" "moderation_processed_event_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.moderation.name
+  collection = "processed_events"
+  field      = "retention_at"
+  ttl_config {}
+}
+
 resource "google_firestore_field" "moderation_inbox_ttl" {
   project    = var.project_id
-  database   = google_firestore_database.default.name
+  database   = google_firestore_database.moderation.name
   collection = "moderation_inbox"
   field      = "retention_at"
   ttl_config {}
@@ -1716,7 +1779,7 @@ resource "google_firestore_field" "moderation_inbox_ttl" {
 
 resource "google_firestore_field" "moderation_dlq_ttl" {
   project    = var.project_id
-  database   = google_firestore_database.default.name
+  database   = google_firestore_database.moderation.name
   collection = "moderation_dlq"
   field      = "retention_at"
   ttl_config {}
@@ -2714,7 +2777,8 @@ resource "google_project_iam_member" "worker_firestore" {
   for_each = {
     for key, value in local.worker_accounts : key => value
     if key != "live_gateway" && key != "topology_materializer" &&
-    key != "audit_worker" && key != "notification_worker"
+    key != "audit_worker" && key != "notification_worker" &&
+    key != "moderation_worker" && key != "moderation_screening_worker"
   }
   project = var.project_id
   role    = each.value.firestore_role
@@ -2748,6 +2812,28 @@ resource "google_project_iam_member" "notification_worker_firestore" {
   }
 }
 
+resource "google_project_iam_member" "moderation_worker_firestore" {
+  project = var.project_id
+  role    = local.worker_accounts.moderation_worker.firestore_role
+  member  = "serviceAccount:${google_service_account.worker["moderation_worker"].email}"
+  condition {
+    title       = "moderation-worker-queue-database"
+    description = "Production moderation intake can access only the dedicated moderation queue database."
+    expression  = local.moderation_firestore_iam_expression
+  }
+}
+
+resource "google_project_iam_member" "moderation_screening_worker_firestore" {
+  project = var.project_id
+  role    = local.worker_accounts.moderation_screening_worker.firestore_role
+  member  = "serviceAccount:${google_service_account.worker["moderation_screening_worker"].email}"
+  condition {
+    title       = "moderation-screening-worker-queue-database"
+    description = "Production moderation screening can access only the dedicated moderation queue database."
+    expression  = local.moderation_firestore_iam_expression
+  }
+}
+
 # Only the adapter workload may call Model Armor. The event-plane worker calls
 # the adapter over its authenticated Cloud Run URL and has no provider-level
 # permissions of its own.
@@ -2769,7 +2855,7 @@ resource "google_cloud_run_v2_service_iam_member" "moderation_adapter_invoker" {
   location = var.region
   name     = google_cloud_run_v2_service.moderation_adapter[0].name
   role     = "roles/run.invoker"
-  member   = "serviceAccount:${google_service_account.worker["moderation_worker"].email}"
+  member   = "serviceAccount:${google_service_account.worker["moderation_screening_worker"].email}"
 }
 
 resource "google_project_iam_member" "live_gateway_topology_firestore" {
@@ -2798,7 +2884,8 @@ resource "google_project_iam_member" "canary_worker_firestore" {
   for_each = {
     for key, value in local.canary_worker_accounts : key => value
     if key != "live_gateway" && key != "topology_materializer" &&
-    key != "audit_worker" && key != "notification_worker"
+    key != "audit_worker" && key != "notification_worker" &&
+    key != "moderation_worker" && key != "moderation_screening_worker"
   }
   project = var.project_id
   role    = each.value.firestore_role
@@ -2832,6 +2919,28 @@ resource "google_project_iam_member" "canary_notification_worker_firestore" {
   }
 }
 
+resource "google_project_iam_member" "canary_moderation_worker_firestore" {
+  project = var.project_id
+  role    = local.canary_worker_accounts.moderation_worker.firestore_role
+  member  = "serviceAccount:${google_service_account.canary_worker["moderation_worker"].email}"
+  condition {
+    title       = "canary-moderation-worker-queue-database"
+    description = "Canary moderation intake can access only the dedicated canary moderation queue database."
+    expression  = local.canary_moderation_firestore_iam_expression
+  }
+}
+
+resource "google_project_iam_member" "canary_moderation_screening_worker_firestore" {
+  project = var.project_id
+  role    = local.canary_worker_accounts.moderation_screening_worker.firestore_role
+  member  = "serviceAccount:${google_service_account.canary_worker["moderation_screening_worker"].email}"
+  condition {
+    title       = "canary-moderation-screening-worker-queue-database"
+    description = "Canary moderation screening can access only the dedicated canary moderation queue database."
+    expression  = local.canary_moderation_firestore_iam_expression
+  }
+}
+
 resource "google_project_iam_member" "canary_moderation_adapter_model_armor" {
   project = var.project_id
   role    = "roles/modelarmor.user"
@@ -2850,7 +2959,7 @@ resource "google_cloud_run_v2_service_iam_member" "canary_moderation_adapter_inv
   location = var.region
   name     = google_cloud_run_v2_service.moderation_adapter_canary[0].name
   role     = "roles/run.invoker"
-  member   = "serviceAccount:${google_service_account.canary_worker["moderation_worker"].email}"
+  member   = "serviceAccount:${google_service_account.canary_worker["moderation_screening_worker"].email}"
 }
 
 resource "google_project_iam_member" "canary_live_gateway_topology_firestore" {
@@ -2895,14 +3004,14 @@ resource "google_pubsub_subscription_iam_member" "moderation_screening_worker_su
   project      = var.project_id
   subscription = google_pubsub_subscription.moderation_screening.name
   role         = "roles/pubsub.subscriber"
-  member       = "serviceAccount:${google_service_account.worker["moderation_worker"].email}"
+  member       = "serviceAccount:${google_service_account.worker["moderation_screening_worker"].email}"
 }
 
 resource "google_pubsub_subscription_iam_member" "canary_moderation_screening_worker_subscriber" {
   project      = var.project_id
   subscription = google_pubsub_subscription.moderation_screening_canary.name
   role         = "roles/pubsub.subscriber"
-  member       = "serviceAccount:${google_service_account.canary_worker["moderation_worker"].email}"
+  member       = "serviceAccount:${google_service_account.canary_worker["moderation_screening_worker"].email}"
 }
 
 resource "google_project_iam_member" "ingest_firestore" {
@@ -3196,6 +3305,14 @@ resource "google_secret_manager_secret" "internal_token" {
   depends_on = [google_project_service.required]
 }
 
+resource "google_secret_manager_secret" "moderation_authority_token" {
+  secret_id = "meshr-moderation-authority-token"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.required]
+}
+
 resource "google_secret_manager_secret" "identity_api_key" {
   secret_id = "meshr-identity-api-key"
   replication {
@@ -3253,6 +3370,14 @@ resource "google_secret_manager_secret" "canary_internal_token" {
   depends_on = [google_project_service.required]
 }
 
+resource "google_secret_manager_secret" "canary_moderation_authority_token" {
+  secret_id = "meshr-canary-moderation-authority-token"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.required]
+}
+
 resource "google_secret_manager_secret" "canary_identity_api_key" {
   secret_id = "meshr-canary-identity-api-key"
   replication {
@@ -3300,11 +3425,18 @@ resource "google_secret_manager_secret_iam_member" "api_identity_api_key" {
   member    = "serviceAccount:${google_service_account.api.email}"
 }
 
-resource "google_secret_manager_secret_iam_member" "api_internal_token" {
+resource "google_secret_manager_secret_iam_member" "api_moderation_authority_token" {
   project   = var.project_id
-  secret_id = google_secret_manager_secret.internal_token.secret_id
+  secret_id = google_secret_manager_secret.moderation_authority_token.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.api.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "moderation_screening_authority_token" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.moderation_authority_token.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.worker["moderation_screening_worker"].email}"
 }
 
 resource "google_secret_manager_secret_iam_member" "api_renewal_recovery" {
@@ -3342,11 +3474,18 @@ resource "google_secret_manager_secret_iam_member" "api_canary_identity_api_key"
   member    = "serviceAccount:${google_service_account.api_canary.email}"
 }
 
-resource "google_secret_manager_secret_iam_member" "api_canary_internal_token" {
+resource "google_secret_manager_secret_iam_member" "api_canary_moderation_authority_token" {
   project   = var.project_id
-  secret_id = google_secret_manager_secret.canary_internal_token.secret_id
+  secret_id = google_secret_manager_secret.canary_moderation_authority_token.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.api_canary.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "canary_moderation_screening_authority_token" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.canary_moderation_authority_token.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.canary_worker["moderation_screening_worker"].email}"
 }
 
 resource "google_secret_manager_secret_iam_member" "api_canary_renewal_recovery" {
@@ -3375,20 +3514,6 @@ resource "google_secret_manager_secret_iam_member" "api_canary_invitation_pepper
   secret_id = google_secret_manager_secret.canary_invitation_pepper_previous.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.api_canary.email}"
-}
-
-resource "google_secret_manager_secret_iam_member" "live_gateway_internal_token" {
-  project   = var.project_id
-  secret_id = google_secret_manager_secret.internal_token.secret_id
-  role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.worker["live_gateway"].email}"
-}
-
-resource "google_secret_manager_secret_iam_member" "live_gateway_canary_internal_token" {
-  project   = var.project_id
-  secret_id = google_secret_manager_secret.canary_internal_token.secret_id
-  role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.canary_worker["live_gateway"].email}"
 }
 
 resource "google_secret_manager_secret_iam_member" "ingest_internal_token" {
