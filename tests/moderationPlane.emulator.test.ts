@@ -239,6 +239,7 @@ test("moderation worker readiness and provider decisions are durable and replaya
       MESHR_MODERATION_TOKEN: "provider-token",
       MESHR_MODERATION_ENDPOINT: `http://127.0.0.1:${providerPort}/screen`,
       MESHR_MODERATION_HEALTHCHECK_URL: `http://127.0.0.1:${providerPort}/healthz`,
+      MESHR_MODERATION_AUTHORITY_TOKEN: `${suffix}:moderation-authority-token`,
       MESHR_MODERATION_SWEEP_FALLBACK: "0",
     });
     await waitForReady(`http://127.0.0.1:${workerPort}/readyz`, moderation, "moderation worker");

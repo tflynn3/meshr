@@ -12,6 +12,7 @@ export interface ProductionSettings {
   invitationPepperPrevious?: string;
   eventIngestUrl?: string;
   internalToken?: string;
+  moderationAuthorityToken?: string;
 }
 
 export function productionSettings(
@@ -43,6 +44,7 @@ export function productionSettings(
     invitationPepperPrevious,
     eventIngestUrl: process.env.MESHR_EVENT_INGEST_URL?.trim(),
     internalToken: process.env.MESHR_INTERNAL_TOKEN?.trim(),
+    moderationAuthorityToken: process.env.MESHR_MODERATION_AUTHORITY_TOKEN?.trim(),
   };
 }
 
@@ -69,7 +71,7 @@ export function assertProductionSettings(settings: ProductionSettings): void {
   if (!usable(settings.invitationPepper)) missing.push("MESHR_INVITATION_PEPPER");
   if (!usable(settings.invitationPepperPrevious)) missing.push("MESHR_INVITATION_PEPPER_PREVIOUS");
   if (!usable(settings.eventIngestUrl)) missing.push("MESHR_EVENT_INGEST_URL");
-  if (!usable(settings.internalToken)) missing.push("MESHR_INTERNAL_TOKEN");
+  if (!usable(settings.moderationAuthorityToken)) missing.push("MESHR_MODERATION_AUTHORITY_TOKEN");
   if (missing.length) {
     throw new Error(
       "Production Meshr startup is blocked until these settings are configured: " +

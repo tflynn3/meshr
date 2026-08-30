@@ -33,7 +33,7 @@ spec:
             - {name: MESHR_CUTOVER_VALIDATION_AGENT_ID, value: "${MESHR_CUTOVER_VALIDATION_AGENT_ID}"}
             - {name: MESHR_CUTOVER_VALIDATION_SESSION_ID, value: "${MESHR_CUTOVER_VALIDATION_SESSION_ID}"}
             - {name: MESHR_IDENTITY_API_KEY_FILE, value: /var/run/secrets/meshr/identity-api-key}
-            - {name: MESHR_INTERNAL_TOKEN_FILE, value: /var/run/secrets/meshr/internal-token}
+            - {name: MESHR_MODERATION_AUTHORITY_TOKEN_FILE, value: /var/run/secrets/meshr-moderation/moderation-authority-token}
             - {name: MESHR_RENEWAL_RECOVERY_SECRET_FILE, value: /var/run/secrets/meshr/renewal-recovery}
             - {name: MESHR_RENEWAL_RECOVERY_SECRET_PREVIOUS_FILE, value: /var/run/secrets/meshr/renewal-recovery-previous}
             - {name: MESHR_INVITATION_PEPPER_FILE, value: /var/run/secrets/meshr/invitation-pepper}
@@ -49,6 +49,7 @@ spec:
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15, periodSeconds: 20}
           volumeMounts:
             - {name: meshr-api-secrets, mountPath: /var/run/secrets/meshr, readOnly: true}
+            - {name: meshr-moderation-authority-secrets, mountPath: /var/run/secrets/meshr-moderation, readOnly: true}
           securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
           resources: {requests: {cpu: 250m, memory: 256Mi}, limits: {cpu: "1", memory: 512Mi}}
       volumes:
@@ -57,6 +58,11 @@ spec:
             driver: secrets-store-gke.csi.k8s.io
             readOnly: true
             volumeAttributes: {secretProviderClass: meshr-api-secrets-canary}
+        - name: meshr-moderation-authority-secrets
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes: {secretProviderClass: meshr-moderation-authority-secrets-canary}
 ---
 apiVersion: v1
 kind: Service
@@ -130,21 +136,12 @@ spec:
             - {name: MESHR_PORT, value: "8080"}
             - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
             - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
-            - {name: MESHR_INTERNAL_TOKEN_FILE, value: /var/run/secrets/meshr/internal-token}
             - {name: MESHR_COST_PROTECTION_MODE, value: "${MESHR_COST_PROTECTION_MODE}"}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
           securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
           resources: {requests: {cpu: 150m, memory: 192Mi}, limits: {cpu: "1", memory: 512Mi}}
-          volumeMounts:
-            - {name: meshr-event-secrets, mountPath: /var/run/secrets/meshr, readOnly: true}
-      volumes:
-        - name: meshr-event-secrets
-          csi:
-            driver: secrets-store-gke.csi.k8s.io
-            readOnly: true
-            volumeAttributes: {secretProviderClass: meshr-event-secrets-canary}
 ---
 apiVersion: v1
 kind: Service

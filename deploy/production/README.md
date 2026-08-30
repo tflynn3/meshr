@@ -16,8 +16,9 @@ fan-out.
 Before promotion:
 
 1. Apply the OpenTofu foundation and verify Firestore point-in-time recovery,
-   the isolated `meshr-canary` and aggregate-only `meshr-projections` /
-   `meshr-canary-projections` Firestore databases and Pub/Sub topics, ordered
+   the isolated `meshr-canary`, `meshr-moderation`, and aggregate-only
+   `meshr-projections` / `meshr-canary-projections` Firestore databases and
+   Pub/Sub topics, ordered
    subscriptions, service-account bindings, Certificate Manager, Cloud Armor,
    and Cloudflare Full (strict) TLS. The stack reserves separate static
    addresses for `meshr.social` and the independent `staging.meshr.social`
@@ -98,13 +99,15 @@ Before promotion:
    reserved for direct allowlisted Google APIs. The screen and health URLs
    must share one HTTPS origin, and the audience must be that origin (or its
    IAM service URL).
-   The production moderation-screening worker also requires the internal
+   The production moderation-screening worker also requires the dedicated
    authority route: set `MESHR_MODERATION_AUTHORITY_URL` to the in-cluster API
-   service and mount the shared `MESHR_INTERNAL_TOKEN` through the
-   `meshr-event-secrets` SecretProviderClass. The worker reads bounded
-   candidates and submits revision-fenced decisions over this
-   token-authenticated route; it does not receive a direct authority write
-   grant for the decision itself.
+   service and mount the dedicated `MESHR_MODERATION_AUTHORITY_TOKEN`
+   through the `meshr-moderation-authority-secrets` SecretProviderClass. The
+   screening worker reads bounded candidates and submits revision-fenced
+   decisions over this token-authenticated route; it has queue-database access
+   only and cannot bypass the API through the authority database. Intake keeps
+   its separate queue identity and never receives the moderation authority
+   token.
 
 Before public traffic, run the redacted 100-agent/500-viewer rehearsal from
 `docs/OPERATIONS.md` against the canary. The fixture contains live credentials
@@ -141,6 +144,7 @@ kubectl -n flux-system create configmap meshr-canary-runtime-values \
   --from-literal=MESHR_TOPOLOGY_FIRESTORE_DATABASE=meshr-canary-projections \
   --from-literal=MESHR_EVENT_AUDIT_FIRESTORE_DATABASE=meshr-canary-audit \
   --from-literal=MESHR_NOTIFICATIONS_FIRESTORE_DATABASE=meshr-canary-notifications \
+  --from-literal=MESHR_MODERATION_FIRESTORE_DATABASE=meshr-canary-moderation \
   --from-literal=MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID=pending \
   --from-literal=MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=1 \
   --from-literal=MESHR_MODERATION_ENDPOINT="$MESHR_MODERATION_ENDPOINT" \
@@ -191,6 +195,7 @@ kubectl -n flux-system create configmap meshr-production-runtime-values \
   --from-literal=MESHR_TOPOLOGY_FIRESTORE_DATABASE=meshr-projections \
   --from-literal=MESHR_EVENT_AUDIT_FIRESTORE_DATABASE=meshr-audit \
   --from-literal=MESHR_NOTIFICATIONS_FIRESTORE_DATABASE=meshr-notifications \
+  --from-literal=MESHR_MODERATION_FIRESTORE_DATABASE=meshr-moderation \
   --from-literal=MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID=pending \
   --from-literal=MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=1 \
   --from-literal=MESHR_MODERATION_ENDPOINT="$MESHR_MODERATION_ENDPOINT" \

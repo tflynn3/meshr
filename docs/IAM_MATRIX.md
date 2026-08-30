@@ -9,12 +9,13 @@ needed by a workload.
 
 | Workload / KSA | Google service account | Allowed data plane | Explicitly excluded |
 | --- | --- | --- | --- |
-| API (`meshr-api`) | `meshr-api` | Authority Firestore read/write; topology Firestore aggregate read; Identity Platform verification; six API-only Secret Manager values | Pub/Sub publish/subscribe, moderation provider APIs, audit-only CI paths, all topology writes |
+| API (`meshr-api`) | `meshr-api` | Authority Firestore read/write; topology Firestore aggregate read; Identity Platform verification; API-only Secret Manager values plus the dedicated moderation-authority token | Pub/Sub publish/subscribe, moderation provider APIs, audit-only CI paths, all topology writes |
 | One-shot store bootstrap (`meshr-bootstrap`) | `meshr-bootstrap` | Authority Firestore initialization and topology `projection_bootstrap/default` attestation during an explicit bootstrap Job | Runtime API traffic, Pub/Sub, moderation provider APIs, continued intended bootstrap operations after the Job completes |
-| Live gateway (`meshr-live-gateway`) | `meshr-live-gateway` | Aggregate topology Firestore read; internal API authorization call; internal token | Authority Firestore, posts, accounts, sessions, moderation, audit, Pub/Sub publish |
+| Live gateway (`meshr-live-gateway`) | `meshr-live-gateway` | Aggregate topology Firestore read; internal API authorization call | Authority Firestore, posts, accounts, sessions, moderation, audit, Pub/Sub publish, all Secret Manager values |
 | Ingest (`meshr-ingest`) | `meshr-ingest` | Authority Firestore outbox read/update; publish to the matching `mesh-events` topic; topic metadata read; internal token | Browser credentials, topology database, moderation provider |
 | Topology materializer (`meshr-topology-materializer`) | `meshr-topology` | Subscribe to the topology event subscription; aggregate topology database read/write; bounded event trace | Authority account/session data, moderation provider, Secret Manager |
-| Moderation intake/screening (`meshr-moderation-worker`) | `meshr-moderation` | Subscribe to moderation and screening subscriptions; authority moderation queue reads; publish screening jobs; invoke only the matching adapter; token-authenticated, revision-fenced decision route; ADC/ID-token adapter auth | Direct post-mutation authority from the screening process, Model Armor and DLP directly, topology projection, arbitrary Cloud Run |
+| Moderation intake (`meshr-moderation-worker`) | `meshr-moderation` | Subscribe to moderation events; write the dedicated moderation queue; publish screening jobs | Authority Firestore, post mutation, moderation authority token, provider APIs, topology projection |
+| Moderation screening (`meshr-moderation-screening-worker`) | `meshr-moderation-screening` | Read/lease the dedicated moderation queue; invoke only the matching adapter; dedicated token-authenticated, revision-fenced decision route; ADC/ID-token adapter auth | Authority Firestore and direct post mutation, Model Armor and DLP directly, topology projection, arbitrary Cloud Run |
 | Audit worker (`meshr-audit-worker`) | `meshr-audit` | Subscribe to audit subscription; dedicated `meshr-audit` Firestore `event_audit` trace and processed-event ledger | Authority accounts, sessions, posts, governance, moderation, topology projection, provider APIs |
 | Notification worker (`meshr-notification-worker`) | `meshr-notifications` | Subscribe to notification subscription; dedicated `meshr-notifications` Firestore `notification_outbox` and processed-event ledger | Agent credentials, authority accounts/sessions/posts, governance, moderation, topology projection, provider APIs |
 | Static web (`meshr-web`) | No Google service account | Static files only; Kubernetes API token disabled | All Google APIs and Secret Manager |
@@ -23,7 +24,8 @@ needed by a workload.
 
 Canary identities duplicate this matrix with separate service accounts,
 `meshr-canary` authority data, `meshr-canary-projections`, dedicated
-`meshr-canary-audit` and `meshr-canary-notifications` worker stores, a
+`meshr-canary-audit`, `meshr-canary-notifications`, and
+`meshr-canary-moderation` worker stores, a
 dedicated `meshr-canary-release-audit` database, and canary topics.
 The production and canary grants are resource-conditioned so adding a restore
 database requires an explicit OpenTofu variable and removal is a deliberate
@@ -48,46 +50,38 @@ cloud bindings.
 
 ## Residual authority-database boundary
 
-The moderation worker and ingest service still require the production authority
-database and are intentionally conditioned to that database resource.
-Firestore's predefined IAM roles cannot reliably restrict a grant to a
-collection or document path. Repository authorization and separate service
-accounts still limit normal behavior, but a compromised moderation or ingest
-worker with a database-scoped grant could read or write another collection in
-that database. Audit and notification workers no longer carry this residual
-risk: their delivery traces live in dedicated databases with separate grants.
-The release-audit identities also remain isolated because their databases
-contain only release receipts.
+The ingest service still requires the production authority database for outbox
+publication and remains database-scoped because Firestore predefined roles
+cannot express a collection/document-path IAM condition. Moderation inbox
+leases and dead letters now live in the dedicated moderation database, and the
+screening worker has no authority-database grant; all post/case decisions cross
+the API's revision-fenced route. Audit and notification workers remain isolated
+in their dedicated databases.
 
 ### Launch security acceptance
 
-The current Firestore client libraries require ingest and moderation intake to
-read and write several authority collections (`event_outbox`, `moderation_inbox`,
-and moderation state). Google predefined Firestore roles cannot express a
-collection/document-path IAM condition, so those grants remain database-scoped.
-Screening decisions themselves cross the narrow internal authority route and
-are revision-fenced in the API transaction. Audit delivery traces and
-notification fan-out state are separate databases and do not depend on this
-acceptance.
+The ingest service requires authority Firestore access for outbox publication;
+Google predefined roles cannot express a collection/document-path IAM
+condition, so that grant remains database-scoped. Moderation queue leases and
+dead letters are isolated in their own database, while screening decisions
+cross the narrow internal authority route and are revision-fenced in the API
+transaction. Audit and notification state are separate databases as well.
 
 `accept_worker_authority_database_risk` must be set explicitly for a protected
-OpenTofu launch. That acceptance records the remaining moderation/ingest
-boundary and requires the following compensating controls: distinct workload
-identities and namespaced NetworkPolicies, repository authorization tests for
-every worker operation, immutable event IDs and audit history, no user
-credentials in workers, and monitoring/alerting for unexpected collection
-access. The security owner must either sign this acceptance or move those
-authority mutations behind a narrow internal authority API before enabling
-public traffic.
+OpenTofu launch. That acceptance records the remaining ingest boundary and
+requires the following compensating controls: distinct workload identities
+and namespaced NetworkPolicies, repository authorization tests for every worker
+operation, immutable event IDs and audit history, no user credentials in
+workers, and monitoring/alerting for unexpected collection access.
 
 ## Secrets and rotation
 
-Secret Manager stores the Identity Platform browser key, internal service
-token, renewal-recovery primary/previous keys, invitation-pepper
-primary/previous keys, and separate canary values. The GKE Secret Manager CSI
-provider mounts only the paths each KSA needs; the API reads the recovery and
-invitation keyrings at startup, while the live gateway and workers receive only
-their internal token where required.
+Secret Manager stores the Identity Platform browser key, the ingest-only
+internal service token, the dedicated moderation-authority token, renewal-
+recovery primary/previous keys, invitation-pepper primary/previous keys, and
+separate canary values. The GKE Secret Manager CSI provider mounts only the
+paths each KSA needs; the API and screening worker receive the moderation token,
+while only ingest receives the general internal token.
 
 Rotate recovery and invitation keys in two complete rollouts: populate the
 `*-previous` version with the new value, roll all replicas to `{old,new}`, then
@@ -106,8 +100,9 @@ Before launch, inspect the rendered bindings and prove all of the following:
    account document read is denied by both repository authorization and its
    topology-database IAM grant. Worker database-wide authority grants and the
    residual collection-isolation decision are reviewed separately.
-3. The moderation worker can invoke only its matching adapter, while the
-   adapter alone can call Model Armor and Sensitive Data Protection.
+3. The moderation screening worker can invoke only its matching adapter and
+   call the API's moderation authority route, while the adapter alone can call
+   Model Armor and Sensitive Data Protection; intake cannot hold that token.
 4. CI can append a cost transition receipt only in its dedicated release-audit
    database but cannot mutate application data, deploy outside its environment,
    or read secret values.

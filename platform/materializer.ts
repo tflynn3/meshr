@@ -39,6 +39,15 @@ const notificationsFirestore = config.notificationsDatabaseId === config.databas
     : config.notificationsDatabaseId === config.auditDatabaseId
       ? auditFirestore
       : createFirestore(config.projectId, config.notificationsDatabaseId);
+const moderationFirestore = config.moderationDatabaseId === config.databaseId
+  ? firestore
+  : config.moderationDatabaseId === config.topologyDatabaseId
+    ? topologyFirestore
+    : config.moderationDatabaseId === config.auditDatabaseId
+      ? auditFirestore
+      : config.moderationDatabaseId === config.notificationsDatabaseId
+        ? notificationsFirestore
+        : createFirestore(config.projectId, config.moderationDatabaseId);
 const pubsub = createPubSub(config.projectId);
 const moderationScreeningTopic = pubsub.topic(config.moderationScreeningTopic, {
   messageOrdering: true,
@@ -105,10 +114,11 @@ const moderationRequired = process.env.MESHR_MODERATION_REQUIRED === "1";
 const moderationSweepFallback = process.env.MESHR_MODERATION_SWEEP_FALLBACK?.trim() !== "0";
 const moderationHealthcheckUrl = process.env.MESHR_MODERATION_HEALTHCHECK_URL?.trim();
 const moderationAuthorityUrl = process.env.MESHR_MODERATION_AUTHORITY_URL?.trim() || "";
-const moderationAuthorityToken = process.env.MESHR_INTERNAL_TOKEN?.trim() || "";
+const productionEnvironment = process.env.MESHR_ENV?.trim().toLowerCase() === "production";
+const moderationAuthorityToken = process.env.MESHR_MODERATION_AUTHORITY_TOKEN?.trim() ||
+  (!productionEnvironment ? process.env.MESHR_INTERNAL_TOKEN?.trim() || "" : "");
 const moderationAuthorityApiEnabled = Boolean(moderationAuthorityUrl && moderationAuthorityToken);
-const productionModerationScreening = requestedConsumer === "moderation-screening" &&
-  process.env.MESHR_ENV?.trim().toLowerCase() === "production";
+const productionModerationScreening = requestedConsumer === "moderation-screening" && productionEnvironment;
 if (moderationAuthorityUrl) {
   try {
     const authorityUrl = new URL(moderationAuthorityUrl);
@@ -121,7 +131,7 @@ if (moderationAuthorityUrl) {
 }
 if (productionModerationScreening && !moderationAuthorityApiEnabled) {
   throw new Error(
-    "MESHR_MODERATION_AUTHORITY_URL and MESHR_INTERNAL_TOKEN are required for the production moderation screening worker.",
+    "MESHR_MODERATION_AUTHORITY_URL and MESHR_MODERATION_AUTHORITY_TOKEN are required for the production moderation screening worker.",
   );
 }
 if (moderationAuth !== "none" && moderationAuth !== "static" && moderationAuth !== "adc") {
@@ -130,12 +140,12 @@ if (moderationAuth !== "none" && moderationAuth !== "static" && moderationAuth !
 if (moderationTokenType !== "access_token" && moderationTokenType !== "id_token") {
   throw new Error("MESHR_MODERATION_TOKEN_TYPE must be access_token or id_token.");
 }
-if ((requestedConsumer === "moderation" || requestedConsumer === "moderation-screening") && moderationRequired && !moderationEndpoint) {
+if (requestedConsumer === "moderation-screening" && moderationRequired && !moderationEndpoint) {
   throw new Error(
     "MESHR_MODERATION_ENDPOINT is required for the production moderation worker; configure the Model Armor/Sensitive Data Protection adapter.",
   );
 }
-if ((requestedConsumer === "moderation" || requestedConsumer === "moderation-screening") && moderationRequired && moderationEndpoint &&
+if (requestedConsumer === "moderation-screening" && moderationRequired && moderationEndpoint &&
     moderationAuth === "none") {
   throw new Error(
     "MESHR_MODERATION_AUTH must be adc or static when moderation is required; the worker cannot call an unauthenticated adapter.",
@@ -188,7 +198,7 @@ const moderationReadiness = createModerationReadinessProbe({
   environment: process.env.MESHR_ENV?.trim() || "local",
   authorization: moderationAuthorization,
 });
-if ((requestedConsumer === "moderation" || requestedConsumer === "moderation-screening") && moderationRequired && moderationReadiness.configError) {
+if (requestedConsumer === "moderation-screening" && moderationRequired && moderationReadiness.configError) {
   throw new Error(
     `Invalid mandatory moderation provider configuration (${moderationReadiness.configError}); configure the approved adapter and health endpoint.`,
   );
@@ -884,7 +894,7 @@ async function processMessage(
       if (!/^[A-Za-z0-9._:-]{1,256}$/.test(eventId)) {
         throw new SyntaxError("invalid moderation screening job");
       }
-      const item = await firestore.collection(authorityCollection("moderation_inbox")).doc(eventId).get();
+      const item = await moderationFirestore.collection(authorityCollection("moderation_inbox")).doc(eventId).get();
       if (!item.exists) {
         // The source event may have expired or a previous worker may already
         // have resolved it. Acking a missing item keeps the screening queue
@@ -909,7 +919,7 @@ async function processMessage(
         ? auditFirestore
         : consumer === "notifications"
           ? notificationsFirestore
-          : firestore;
+          : moderationFirestore;
     const envelope = parseEventEnvelope(JSON.parse(message.data.toString("utf8")) as unknown);
     const payload = envelope.payload ?? {};
     const postPayload = payload.post && typeof payload.post === "object" && !Array.isArray(payload.post)
@@ -993,9 +1003,6 @@ async function processMessage(
     await store.runTransaction(async (transaction) => {
       const previous = await transaction.get(processed);
       if (previous.exists) return;
-      const moderationPost = consumer === "moderation" && shouldQueueModeration && postId
-        ? await transaction.get(firestore.collection(authorityCollection("posts")).doc(postId))
-        : undefined;
       const topologies = consumer === "topology"
         ? topologyMeshIds.map((meshId) => ({
             meshId,
@@ -1144,12 +1151,20 @@ async function processMessage(
               // The provider result is a proposal against this exact post
               // revision. Human moderation updates updated_at, allowing the
               // screening transaction to reject a late provider decision.
-              expected_post_state: moderationPost?.exists
-                ? String(moderationPost.get("moderation_state") ?? "published")
-                : null,
-              expected_post_updated_at: moderationPost?.exists
-                ? String(moderationPost.get("updated_at") ?? moderationPost.get("created_at") ?? "")
-                : null,
+              // The queue is intentionally independent from authority data.
+              // Screening fetches the current candidate through the API and
+              // supplies the revision it observed to the fenced decision
+              // transaction; these hints are retained only for diagnostics.
+              expected_post_state: typeof payload.moderation_state === "string"
+                ? payload.moderation_state
+                : typeof postPayload?.moderationState === "string"
+                  ? postPayload.moderationState
+                  : null,
+              expected_post_updated_at: typeof payload.updated_at === "string"
+                ? payload.updated_at
+                : typeof postPayload?.updatedAt === "string"
+                  ? postPayload.updatedAt
+                  : null,
               attempts: 0,
               available_at: new Date().toISOString(),
               next_attempt_at: null,
@@ -1415,7 +1430,7 @@ async function claimModerationItem(itemRef: any): Promise<ModerationClaim | null
   const nowIso = now.toISOString();
   const nowMs = now.getTime();
   let deadLettered: { itemId: string; postId: string | null; caseId: string | null; attempts: number; error: string } | undefined;
-  const claim = await firestore.runTransaction(async (transaction) => {
+  const claim = await moderationFirestore.runTransaction(async (transaction) => {
     // Firestore may replay the callback on contention. Do not leak a
     // side-effect marker from an abandoned attempt into the final log.
     deadLettered = undefined;
@@ -1445,7 +1460,7 @@ async function claimModerationItem(itemRef: any): Promise<ModerationClaim | null
         dead_lettered_at: nowIso,
       }, { merge: true });
       transaction.set(
-        firestore.collection(authorityCollection("moderation_dlq")).doc(item.id),
+        moderationFirestore.collection(authorityCollection("moderation_dlq")).doc(item.id),
         moderationDlqDocument(item, attempts, error, nowIso),
         { merge: true },
       );
@@ -1496,7 +1511,7 @@ async function recordModerationFailure(claim: ModerationClaim, error: unknown): 
   const message = moderationErrorMessage(error);
   let retryScheduled = false;
   let deadLettered = false;
-  await firestore.runTransaction(async (transaction) => {
+  await moderationFirestore.runTransaction(async (transaction) => {
     // The callback can be retried; the values below must describe the
     // committed attempt rather than a transaction that was discarded.
     retryScheduled = false;
@@ -1523,7 +1538,7 @@ async function recordModerationFailure(claim: ModerationClaim, error: unknown): 
         dead_lettered_at: failedAt,
       }, { merge: true });
       transaction.set(
-        firestore.collection(authorityCollection("moderation_dlq")).doc(claim.itemId),
+        moderationFirestore.collection(authorityCollection("moderation_dlq")).doc(claim.itemId),
         moderationDlqDocument(item, attempts, message, failedAt),
         { merge: true },
       );
@@ -1594,6 +1609,37 @@ function moderationAuthorityEndpoint(pathname: string): string {
   url.search = "";
   url.hash = "";
   return url.toString();
+}
+
+/**
+ * Readiness proves the screening worker can reach the exact API authority
+ * route it will use, without mutating a post, case, or queue item. A missing
+ * candidate is an expected response for these sentinel IDs; any other
+ * non-success or malformed response keeps the worker out of service.
+ */
+async function checkModerationAuthorityReadiness(): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const eventId = "readiness";
+    const response = await fetch(moderationAuthorityEndpoint("/internal/v1/moderation/candidate"), {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        authorization: `Bearer ${moderationAuthorityToken}`,
+        "x-meshr-contract-version": "1",
+      },
+      body: JSON.stringify({ eventId, caseId: eventId, postId: eventId }),
+      signal: AbortSignal.timeout(2_000),
+    });
+    if (!response.ok) return { ok: false, error: "moderation_authority_unreachable" };
+    const body = await response.json() as Record<string, unknown>;
+    if (body.eventId !== eventId || typeof body.exists !== "boolean") {
+      return { ok: false, error: "moderation_authority_invalid_response" };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: "moderation_authority_unreachable" };
+  }
 }
 
 async function fetchModerationCandidate(claim: ModerationClaim): Promise<ModerationCandidate> {
@@ -1684,7 +1730,7 @@ async function finalizeModerationClaim(
   },
 ): Promise<void> {
   const now = new Date().toISOString();
-  await firestore.runTransaction(async (transaction) => {
+  await moderationFirestore.runTransaction(async (transaction) => {
     const current = await transaction.get(claim.itemRef);
     if (!current.exists || String(current.get("state")) !== "queued" || current.get("lease_id") !== claim.leaseId) return;
     transaction.set(claim.itemRef, {
@@ -1757,6 +1803,9 @@ async function applyModerationDecision(claim: ModerationClaim, decision: {
   reason?: string;
   severity?: string;
 }): Promise<void> {
+  if (moderationFirestore !== firestore) {
+    throw new Error("moderation authority API is required when the moderation queue is isolated");
+  }
   const now = new Date().toISOString();
   await firestore.runTransaction(async (transaction) => {
     const current = await transaction.get(claim.itemRef);
@@ -2123,7 +2172,7 @@ async function screenQueuedModeration(): Promise<void> {
   if (!moderationEndpoint || moderationSweepRunning) return;
   moderationSweepRunning = true;
   try {
-    const queued = await firestore
+    const queued = await moderationFirestore
       .collection(authorityCollection("moderation_inbox"))
       .where("state", "==", "queued")
       .where("available_at", "<=", new Date().toISOString())
@@ -2194,7 +2243,7 @@ async function startSubscriptions(): Promise<void> {
     subscription.on("error", (error) => console.error(`${consumer} subscription error`, error));
   }
 
-  if ((requestedConsumer === "moderation" || requestedConsumer === "moderation-screening") && moderationEndpoint && moderationSweepFallback) {
+  if (requestedConsumer === "moderation-screening" && moderationEndpoint && moderationSweepFallback) {
     moderationSweepTimer = setInterval(() => {
       void screenQueuedModeration().catch((error: unknown) =>
         console.error("moderation screening failed", error),
@@ -2254,7 +2303,7 @@ const server = createServer((request, response) => {
       }));
       return;
     }
-    if ((requestedConsumer === "moderation" || requestedConsumer === "moderation-screening") && moderationRequired && !moderationEndpoint) {
+    if (requestedConsumer === "moderation-screening" && moderationRequired && !moderationEndpoint) {
       response.writeHead(503, { "content-type": "application/json" });
       response.end(JSON.stringify({
         ok: false,
@@ -2278,12 +2327,12 @@ const server = createServer((request, response) => {
         ? auditFirestore
         : requestedConsumer === "notifications"
           ? notificationsFirestore
-          : firestore;
+          : moderationFirestore;
     const dependencyCheck = requestedConsumer === "topology"
       ? topologyFirestore.collection("topology_shards").limit(1).get()
       : requestedConsumer === "audit" || requestedConsumer === "notifications"
         ? dependencyStore.collection(authorityCollection("processed_events")).limit(1).get()
-        : firestore.collection("system").doc("taxonomy").get();
+        : moderationFirestore.collection(authorityCollection("processed_events")).limit(1).get();
     void Promise.all([
       dependencyCheck,
       ...activeSubscriptions.map(({ subscription }) => subscription.exists()),
@@ -2299,7 +2348,7 @@ const server = createServer((request, response) => {
           }));
           return;
         }
-        if ((requestedConsumer === "moderation" || requestedConsumer === "moderation-screening") && moderationRequired) {
+        if (requestedConsumer === "moderation-screening" && moderationRequired) {
           const provider = await moderationReadiness.check();
           if (!provider.ok) {
             response.writeHead(503, { "content-type": "application/json" });
@@ -2307,6 +2356,18 @@ const server = createServer((request, response) => {
               ok: false,
               service: "topology-materializer",
               error: provider.error ?? "moderation_provider_unreachable",
+            }));
+            return;
+          }
+        }
+        if (requestedConsumer === "moderation-screening" && moderationAuthorityApiEnabled) {
+          const authority = await checkModerationAuthorityReadiness();
+          if (!authority.ok) {
+            response.writeHead(503, { "content-type": "application/json" });
+            response.end(JSON.stringify({
+              ok: false,
+              service: "topology-materializer",
+              error: authority.error ?? "moderation_authority_unreachable",
             }));
             return;
           }
@@ -2337,7 +2398,7 @@ async function shutdown(): Promise<void> {
   await new Promise<void>((resolve, reject) =>
     server.close((error) => (error ? reject(error) : resolve())),
   );
-  const stores = [...new Set([firestore, topologyFirestore, auditFirestore, notificationsFirestore])];
+  const stores = [...new Set([firestore, topologyFirestore, auditFirestore, notificationsFirestore, moderationFirestore])];
   await Promise.all([
     pubsub.close(),
     ...stores.map((store) => store.terminate()),

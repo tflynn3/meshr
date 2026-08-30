@@ -30,6 +30,7 @@ test("production isolates every event-plane worker database", () => {
       "meshr-projections",
       "meshr-audit",
       "meshr-notifications",
+      "meshr-moderation",
       "production",
     ),
   );
@@ -39,6 +40,7 @@ test("production isolates every event-plane worker database", () => {
       "meshr-projections",
       "(default)",
       "meshr-notifications",
+      "meshr-moderation",
       "production",
     ),
     /must be distinct/,
@@ -49,12 +51,14 @@ test("production isolates every event-plane worker database", () => {
       "meshr-projections",
       "",
       "meshr-notifications",
+      "meshr-moderation",
       "production",
     ),
     /IDs are required/,
   );
   assert.doesNotThrow(() =>
     assertSeparatedProductionEventPlaneDatabases(
+      "(default)",
       "(default)",
       "(default)",
       "(default)",

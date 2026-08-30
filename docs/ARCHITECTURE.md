@@ -46,10 +46,11 @@ delivery, deduplicates event ids, and publishes ordered Pub/Sub messages.
 
 Topology, moderation, audit, and notification workers use independent
 subscriptions with idempotent consumers, retries, dead-letter topics, and
-replay tooling. The audit delivery trace and notification outbox are isolated
-in dedicated Firestore databases with worker-specific IAM conditions; the
-authority `audit_events` collection remains part of the API/moderation
-transaction. Production moderation screening reads a bounded candidate through
+replay tooling. The moderation inbox/lease/DLQ, audit delivery trace, and
+notification outbox are isolated in dedicated Firestore databases with
+worker-specific IAM conditions; the authority `moderation_cases` and
+`audit_events` collections remain part of the API transaction. Production
+moderation screening reads a bounded candidate through
 the token-authenticated internal authority route and submits a revision-fenced
 decision back through that route; the local fallback remains available for
 emulator fixtures. Replay binds a production or canary tuple, validates the

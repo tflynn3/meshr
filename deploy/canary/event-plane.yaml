@@ -105,29 +105,15 @@ spec:
           image: ${EVENT_PLANE_IMAGE}
           args: ["materializer", "moderation"]
           envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
-          # Keep endpoint rotation in the pod template so Flux rolls existing
-          # workers instead of leaving them on a retired screening adapter.
+          # Keep the queue database in the pod template. Provider calls belong
+          # exclusively to the screening deployment below.
           env:
-            - name: MESHR_MODERATION_ENDPOINT
-              value: ${MESHR_MODERATION_ENDPOINT}
             - name: MESHR_FIRESTORE_DATABASE
               value: ${MESHR_FIRESTORE_DATABASE}
             - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
               value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
-            - name: MESHR_MODERATION_HEALTHCHECK_URL
-              value: ${MESHR_MODERATION_HEALTHCHECK_URL}
-            - name: MESHR_MODERATION_AUTH
-              value: adc
-            - name: MESHR_MODERATION_TOKEN_TYPE
-              value: id_token
-            - name: MESHR_MODERATION_AUDIENCE
-              value: ${MESHR_MODERATION_AUDIENCE}
-            - {name: MESHR_MODERATION_AUTHORITY_URL, value: http://api-canary.meshr-canary.svc.cluster.local:8787}
-            - {name: MESHR_INTERNAL_TOKEN_FILE, value: /var/run/secrets/meshr/internal-token}
-            - name: MESHR_MODERATION_CONCURRENCY
-              value: "8"
-            - name: MESHR_MODERATION_SWEEP_FALLBACK
-              value: "0"
+            - name: MESHR_MODERATION_FIRESTORE_DATABASE
+              value: ${MESHR_MODERATION_FIRESTORE_DATABASE}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe:
             httpGet: {path: /readyz, port: http}
@@ -137,14 +123,6 @@ spec:
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
           securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
           resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
-          volumeMounts:
-            - {name: meshr-event-secrets, mountPath: /var/run/secrets/meshr, readOnly: true}
-      volumes:
-        - name: meshr-event-secrets
-          csi:
-            driver: secrets-store-gke.csi.k8s.io
-            readOnly: true
-            volumeAttributes: {secretProviderClass: meshr-event-secrets-canary}
 ---
 # Intake only acknowledges the source event after the durable moderation inbox
 # and screening-job publish both succeed. Provider work is handled by the
@@ -160,7 +138,7 @@ spec:
   template:
     metadata: {labels: {app.kubernetes.io/name: moderation-screening-worker-canary, app.kubernetes.io/part-of: meshr}}
     spec:
-      serviceAccountName: meshr-moderation-worker-canary
+      serviceAccountName: meshr-moderation-screening-worker-canary
       securityContext:
         runAsNonRoot: true
         seccompProfile: {type: RuntimeDefault}
@@ -176,6 +154,8 @@ spec:
               value: ${MESHR_FIRESTORE_DATABASE}
             - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
               value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
+            - name: MESHR_MODERATION_FIRESTORE_DATABASE
+              value: ${MESHR_MODERATION_FIRESTORE_DATABASE}
             - name: MESHR_MODERATION_HEALTHCHECK_URL
               value: ${MESHR_MODERATION_HEALTHCHECK_URL}
             - name: MESHR_MODERATION_AUTH
@@ -185,7 +165,7 @@ spec:
             - name: MESHR_MODERATION_AUDIENCE
               value: ${MESHR_MODERATION_AUDIENCE}
             - {name: MESHR_MODERATION_AUTHORITY_URL, value: http://api-canary.meshr-canary.svc.cluster.local:8787}
-            - {name: MESHR_INTERNAL_TOKEN_FILE, value: /var/run/secrets/meshr/internal-token}
+            - {name: MESHR_MODERATION_AUTHORITY_TOKEN_FILE, value: /var/run/secrets/meshr-moderation/moderation-authority-token}
             - name: MESHR_MODERATION_CONCURRENCY
               value: "8"
           ports: [{name: http, containerPort: 8080}]
@@ -198,13 +178,13 @@ spec:
           securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true}
           resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 256Mi}}
           volumeMounts:
-            - {name: meshr-event-secrets, mountPath: /var/run/secrets/meshr, readOnly: true}
+            - {name: meshr-moderation-authority-secrets, mountPath: /var/run/secrets/meshr-moderation, readOnly: true}
       volumes:
-        - name: meshr-event-secrets
+        - name: meshr-moderation-authority-secrets
           csi:
             driver: secrets-store-gke.csi.k8s.io
             readOnly: true
-            volumeAttributes: {secretProviderClass: meshr-event-secrets-canary}
+            volumeAttributes: {secretProviderClass: meshr-moderation-authority-secrets-canary}
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler

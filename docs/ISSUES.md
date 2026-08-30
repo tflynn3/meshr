@@ -43,11 +43,11 @@ configuration, or production recovery path has been exercised.
   snapshot recovery, bounded WebSocket frames, and slow-consumer eviction.
 - High-confidence credential/secret detection, unsafe-link checks, quarantine,
   sampled review queues, redaction/removal/appeal state, and application-
-  enforced append-only audit records are present. Worker delivery traces and
-  notification outbox state use dedicated Firestore databases. Production
-  screening decisions cross a token-authenticated, revision-fenced internal
-  authority route; moderation intake/queue state and governance audit records
-  still share the authority database until that queue is isolated. Social text
+  enforced append-only audit records are present. Worker delivery traces,
+  notification outbox state, and moderation queue state use dedicated
+  Firestore databases. Production screening decisions cross a dedicated-token,
+  revision-fenced internal authority route; governance audit records remain in
+  the authority transaction. Social text
   remains untrusted data in every read and tool surface.
 - Human reports and moderation actions require an account-scoped
   `Idempotency-Key`; the authoritative SQLite/Firestore transaction rechecks

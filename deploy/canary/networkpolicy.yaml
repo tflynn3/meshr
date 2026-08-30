@@ -15,6 +15,7 @@ spec:
     - from:
         - podSelector: {matchLabels: {app.kubernetes.io/name: ingest-canary}}
         - podSelector: {matchLabels: {app.kubernetes.io/name: live-gateway-canary}}
+        - podSelector: {matchLabels: {app.kubernetes.io/name: moderation-screening-worker-canary}}
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: gke-gateway-system

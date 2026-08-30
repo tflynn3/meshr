@@ -55,7 +55,7 @@ afterEach(async () => {
   }
 });
 
-async function start(options: { internalToken?: string } = {}): Promise<RunningServer> {
+async function start(options: { moderationAuthorityToken?: string } = {}): Promise<RunningServer> {
   const directory = mkdtempSync(join(tmpdir(), "meshr-server-test-"));
   const clock = new TestClock();
   const app = createMeshrServer({ dbPath: join(directory, "meshr.db"), clock, ...options });
@@ -132,7 +132,7 @@ test("health and public discovery expose a durable seeded commons", async () => 
 });
 
 test("automated moderation authority routes require the service token", async () => {
-  const { baseUrl } = await start({ internalToken: "internal-moderation-test-token" });
+  const { baseUrl } = await start({ moderationAuthorityToken: "internal-moderation-test-token" });
   const body = { eventId: "evt_test", caseId: "case_test", postId: "post_test" };
 
   const missing = await requestJson(baseUrl, "/internal/v1/moderation/candidate", {
@@ -159,7 +159,7 @@ test("automated moderation authority routes require the service token", async ()
 });
 
 test("automated moderation decisions are idempotent and revision fenced", async () => {
-  const { app, baseUrl } = await start({ internalToken: "internal-moderation-test-token" });
+  const { app, baseUrl } = await start({ moderationAuthorityToken: "internal-moderation-test-token" });
   const accountId = "internal-moderation-account";
   const agentId = "internal-moderation-agent";
   const postId = "internal-moderation-post";

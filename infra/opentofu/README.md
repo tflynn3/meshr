@@ -64,8 +64,10 @@ the bounded source delta was replayed, and the source and
 and `meshr-canary-release-audit` for canary. Runtime event workers use the
 separate `MESHR_EVENT_AUDIT_FIRESTORE_DATABASE` /
 `MESHR_NOTIFICATIONS_FIRESTORE_DATABASE` values (`meshr-audit` /
-`meshr-notifications`, with matching `meshr-canary-*` names) for delivery
-traces and notification outbox state. Release service accounts access only
+`meshr-notifications`, with matching `meshr-canary-*` names) and
+`MESHR_MODERATION_FIRESTORE_DATABASE` (`meshr-moderation`, with
+`meshr-canary-moderation` for canary) for worker-owned state. Release service
+accounts access only
 their dedicated release-audit databases; worker grants are similarly
 database-scoped. Firestore IAM conditions are database-scoped, so
 application-level immutability is enforced by the audit repository rather
@@ -138,18 +140,20 @@ the remote GCS state bucket restricted because the transform action contains
 the secret; never expose it to browser code, manifests, or logs.
 
 The cluster enables GKE's managed Secret Manager CSI component. Before the
-production Kustomization is reconciled, add a version to both secrets created
-by this stack (the API key can be copied from the sensitive Terraform output):
+production Kustomization is reconciled, add versions to the secrets created by
+this stack (the API key can be copied from the sensitive Terraform output):
 
 ```bash
 gcloud secrets versions add meshr-identity-api-key --data-file=identity-api-key.txt
 openssl rand -base64 32 | gcloud secrets versions add meshr-internal-token --data-file=-
+openssl rand -base64 32 | gcloud secrets versions add meshr-moderation-authority-token --data-file=-
 openssl rand -base64 32 | gcloud secrets versions add meshr-renewal-recovery --data-file=-
 openssl rand -base64 32 | gcloud secrets versions add meshr-renewal-recovery-previous --data-file=-
 openssl rand -base64 32 | gcloud secrets versions add meshr-invitation-pepper --data-file=-
 openssl rand -base64 32 | gcloud secrets versions add meshr-invitation-pepper-previous --data-file=-
 gcloud secrets versions add meshr-canary-identity-api-key --data-file=identity-api-key.txt
 openssl rand -base64 32 | gcloud secrets versions add meshr-canary-internal-token --data-file=-
+openssl rand -base64 32 | gcloud secrets versions add meshr-canary-moderation-authority-token --data-file=-
 openssl rand -base64 32 | gcloud secrets versions add meshr-canary-renewal-recovery --data-file=-
 openssl rand -base64 32 | gcloud secrets versions add meshr-canary-renewal-recovery-previous --data-file=-
 openssl rand -base64 32 | gcloud secrets versions add meshr-canary-invitation-pepper --data-file=-
@@ -162,11 +166,13 @@ repository-scoped Artifact Registry read access before the cluster is created,
 so private image pulls do not depend on a project default compute account.
 
 The Kubernetes `SecretProviderClass` resources mount these values into the API,
-ingest, and live-gateway pods. The renewal-recovery key is mounted only into
-the API; it is never available to the live gateway or event workers. A missing version intentionally leaves the pods
+ingest, and moderation screening pods. The general internal token is mounted
+only into ingest; the dedicated moderation-authority token is mounted only
+into API and screening. The renewal-recovery key is mounted only into the API;
+it is never available to the live gateway or event workers. A missing version intentionally leaves the pods
 unready and the application fails closed rather than starting with a literal
 placeholder. Canary mounts and service accounts are separate from production;
-its authoritative and aggregate topology Firestore databases and Pub/Sub
+its authoritative, moderation-queue, and aggregate topology Firestore databases and Pub/Sub
 topics are isolated, and its datastore IAM grants are conditioned on the
 matching database resources. The public live gateway has a viewer grant only
 for the aggregate topology database; it cannot read accounts, sessions, posts,

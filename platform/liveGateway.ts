@@ -3,7 +3,6 @@ import { createHash } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import { createFirestore, eventPlaneConfig } from "./googleClients.ts";
 import { liveCredentialValue, liveSourceAddress } from "./liveConnectionIdentity.ts";
-import { loadRuntimeSecrets } from "./runtimeSecrets.ts";
 import { ExpiringCache } from "./topologyCache.ts";
 
 /**
@@ -12,7 +11,6 @@ import { ExpiringCache } from "./topologyCache.ts";
  * WebSocket subscription is admitted it asks the API to authorize the
  * browser session (or agent bearer grant) for the requested mesh.
  */
-loadRuntimeSecrets();
 const config = eventPlaneConfig();
 // The gateway only needs the aggregate topology projection. In production
 // this is a separate Firestore database with a database-scoped viewer grant;
@@ -21,7 +19,6 @@ const firestore = createFirestore(config.projectId, config.topologyDatabaseId);
 const port = Number(process.env.MESHR_PORT ?? "8080");
 const host = process.env.MESHR_HOST?.trim() || "0.0.0.0";
 const apiUrl = (process.env.MESHR_API_URL?.trim() || "http://127.0.0.1:8787").replace(/\/+$/, "");
-const internalToken = process.env.MESHR_INTERNAL_TOKEN?.trim();
 const allowAnonymousLocal =
   process.env.MESHR_LOCAL_MODE === "1" && process.env.MESHR_LIVE_ALLOW_ANONYMOUS === "1";
 const maxFrameBytes = Math.max(
@@ -273,7 +270,6 @@ async function authorizeCredentials(
   const headers = new Headers({ accept: "application/json" });
   if (credentials.cookie) headers.set("cookie", credentials.cookie);
   if (credentials.authorization) headers.set("authorization", credentials.authorization);
-  if (internalToken) headers.set("x-meshr-live-internal", internalToken);
   let response: Response;
   try {
     response = await fetch(
@@ -433,7 +429,6 @@ async function readPublicActivity(
   });
   if (credentials.cookie) headers.set("cookie", credentials.cookie);
   if (credentials.authorization) headers.set("authorization", credentials.authorization);
-  if (internalToken) headers.set("x-meshr-live-internal", internalToken);
   const startedGeneration = topologyGeneration(meshId);
   const pending = fetch(
     `${apiUrl}/v1/activity/public?shared=1&meshId=${encodeURIComponent(meshId)}`,
@@ -572,7 +567,6 @@ const server = createServer(async (request, response) => {
         // dependency check without requiring access to authoritative taxonomy.
         firestore.collection("topology_shards").limit(1).get(),
         fetch(`${apiUrl}/readyz`, {
-          headers: internalToken ? { "x-meshr-live-internal": internalToken } : undefined,
           signal: AbortSignal.timeout(3_000),
         }).then((result) => result.ok).catch(() => false),
       ]);

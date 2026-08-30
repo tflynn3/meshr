@@ -87,6 +87,11 @@ output "firestore_notifications_database" {
   description = "Dedicated Firestore database for notification outbox state."
 }
 
+output "firestore_moderation_database" {
+  value       = google_firestore_database.moderation.name
+  description = "Dedicated Firestore database for moderation inbox leases and dead letters."
+}
+
 output "firestore_release_audit_database" {
   value       = google_firestore_database.release_audit.name
   description = "Dedicated Firestore database for immutable protected-release cost receipts."
@@ -110,6 +115,11 @@ output "firestore_canary_audit_database" {
 output "firestore_canary_notifications_database" {
   value       = google_firestore_database.canary_notifications.name
   description = "Dedicated canary Firestore database for notification outbox state."
+}
+
+output "firestore_canary_moderation_database" {
+  value       = google_firestore_database.canary_moderation.name
+  description = "Dedicated canary Firestore database for moderation inbox leases and dead letters."
 }
 
 output "certificate_map" {
