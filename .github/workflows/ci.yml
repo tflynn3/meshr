@@ -2021,7 +2021,31 @@ jobs:
           MESHR_RELEASE_VALIDATION_TOPIC_ID: ${{ vars.MESHR_CANARY_RELEASE_VALIDATION_TOPIC_ID }}
           MESHR_E2E_PROTECTED_STATE_FILE: ${{ runner.temp }}/meshr-protected-session-state/state.json
           MESHR_E2E_PROTECTED_BINDING_SELECTOR: ${{ vars.MESHR_CANARY_PROTECTED_BINDINGS }}
+          MESHR_CUTOVER_DEADLINE_FILE: ${{ runner.temp }}/meshr-canary-cutover-session-expiry
         run: npm run smoke:deployed
+      - name: Capture canary cutover session deadline before irreversible work
+        if: success() && env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1'
+        env:
+          MESHR_CANARY_CUTOVER_DEADLINE_FILE: ${{ runner.temp }}/meshr-canary-cutover-session-expiry
+        run: |
+          set -euo pipefail
+          test -s "$MESHR_CANARY_CUTOVER_DEADLINE_FILE" || {
+            echo 'Canary cutover smoke did not persist the renewed session expiry.' >&2
+            exit 1
+          }
+          expiry="$(tr -d '\r\n' < "$MESHR_CANARY_CUTOVER_DEADLINE_FILE")"
+          expiry_epoch="$(node -e 'const value = Date.parse(process.argv[1]); if (!Number.isFinite(value)) process.exit(1); process.stdout.write(String(Math.floor(value / 1000)))' "$expiry")" || {
+            echo 'Canary cutover session expiry is not a valid ISO timestamp.' >&2
+            exit 1
+          }
+          now_epoch="$(date +%s)"
+          remaining_seconds=$((expiry_epoch - now_epoch))
+          if [ "$remaining_seconds" -lt 180 ]; then
+            echo "Canary cutover session has only ${remaining_seconds}s remaining before irreversible work; refusing to proceed." >&2
+            exit 1
+          fi
+          printf 'MESHR_CANARY_CUTOVER_SESSION_EXPIRES_AT=%s\n' "$expiry" >> "$GITHUB_ENV"
+          printf 'MESHR_CANARY_CUTOVER_SESSION_EXPIRES_EPOCH=%s\n' "$expiry_epoch" >> "$GITHUB_ENV"
       - name: Encrypt canary protected fixture state after smoke
         if: success() && (steps.canary-apply.outputs.cost_protection_mode == 'protect' || steps.canary-apply.outputs.cost_protection_mode == 'throttle' || env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1')
         env:
@@ -2205,6 +2229,19 @@ jobs:
             --access-token-file="$token_file"
           cluster_user="$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')"
           kubectl config set-credentials "$cluster_user" --token="$CLOUDSDK_AUTH_ACCESS_TOKEN" >/dev/null
+          # The renewed validation session's absolute expiry is the source of
+          # truth for this irreversible window. Refuse to set the commit marker
+          # or advance the protected pointer when the remaining horizon cannot
+          # cover the CAS, rollout, and canonical-session verification.
+          session_expires_epoch="${MESHR_CANARY_CUTOVER_SESSION_EXPIRES_EPOCH:?Canary cutover session expiry was not captured before reopen}"
+          now_epoch="$(date +%s)"
+          remaining_seconds=$((session_expires_epoch - now_epoch))
+          if [ "$remaining_seconds" -lt 180 ]; then
+            echo "Canary cutover session has only ${remaining_seconds}s remaining before irreversible work; refusing to reopen writes." >&2
+            exit 1
+          fi
+          cutover_deadline=$((session_expires_epoch - 60))
+          printf 'MESHR_CANARY_CUTOVER_DEADLINE_EPOCH=%s\n' "$cutover_deadline" >> "$GITHUB_ENV"
           # Set the irreversible commit marker before touching either the
           # protected pointer or runtime input. If either operation fails,
           # rollback handlers must freeze for operator-led roll-forward rather
@@ -2215,12 +2252,11 @@ jobs:
             --expected-generation "${MESHR_CANARY_PROTECTED_FIXTURE_PREVIOUS_GENERATION:?Canary cutover predecessor generation is required}"
           printf 'MESHR_CANARY_CUTOVER_FIXTURE_PROMOTED=true\n' >> "$GITHUB_ENV"
           # The reviewed session was renewed while the candidate was fenced.
-          # Keep this reopen path bounded so the fifteen-minute runtime
-          # session cannot expire between the CAS and the canonical
-          # post-reopen profile/heartbeat check. A timeout leaves the pointer
-          # on the verified successor and the failure handler freezes for
-          # operator-led roll-forward.
-          cutover_deadline=$((SECONDS + 720))
+          # Keep this reopen path bounded by its absolute expiry so the
+          # fifteen-minute runtime session cannot expire between the CAS and
+          # the canonical post-reopen profile/heartbeat check. A timeout
+          # leaves the pointer on the verified successor and the failure
+          # handler freezes for operator-led roll-forward.
           kubectl -n flux-system patch configmap meshr-canary-runtime-values \
             --type=merge \
             --patch='{"data":{"MESHR_DATABASE_CUTOVER_MODE":"off"}}'
@@ -2230,14 +2266,15 @@ jobs:
           for attempt in $(seq 1 120); do
             mode="$(kubectl -n meshr-canary get deployment api-canary -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="MESHR_DATABASE_CUTOVER_MODE")].value}' 2>/dev/null || true)"
             if [ "$mode" = off ]; then break; fi
-            if [ "$attempt" -eq 120 ] || [ "$SECONDS" -ge "$cutover_deadline" ]; then
+            now_epoch="$(date +%s)"
+            if [ "$attempt" -eq 120 ] || [ "$now_epoch" -ge "$cutover_deadline" ]; then
               kubectl -n meshr-canary get deployment api-canary -o yaml
               echo 'Canary API replicas did not receive the reopened write mode before the protected-session deadline.' >&2
               exit 1
             fi
             sleep 5
           done
-          remaining_seconds=$((cutover_deadline - SECONDS))
+          remaining_seconds=$((cutover_deadline - $(date +%s)))
           if [ "$remaining_seconds" -le 0 ]; then
             echo 'Canary cutover rollout exceeded the protected-session deadline.' >&2
             exit 1
@@ -2290,13 +2327,23 @@ jobs:
             --access-token-file="$token_file"
           cluster_user="$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')"
           kubectl config set-credentials "$cluster_user" --token="$CLOUDSDK_AUTH_ACCESS_TOKEN" >/dev/null
+          cutover_deadline="${MESHR_CANARY_CUTOVER_DEADLINE_EPOCH:?Canary cutover deadline was not carried from the reopen gate}"
+          remaining_seconds=$((cutover_deadline - $(date +%s)))
+          if [ "$remaining_seconds" -le 0 ]; then
+            echo 'Canary cutover recovery window expired before confirmation.' >&2
+            exit 1
+          fi
           mode="$(kubectl -n meshr-canary get deployment api-canary -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="MESHR_DATABASE_CUTOVER_MODE")].value}')"
           test "$mode" = off || { echo 'Canary cutover recovery window observed a non-reopened write mode.' >&2; exit 1; }
-          kubectl -n meshr-canary rollout status deployment/api-canary --timeout=2m
+          kubectl -n meshr-canary rollout status deployment/api-canary --timeout="${remaining_seconds}s"
           curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
             "${MESHR_CANARY_URL%/}/healthz" | jq -e '.ok == true' >/dev/null
           curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
             "${MESHR_CANARY_URL%/}/v1/public/meshes" | jq -e '.meshes | type == "array"' >/dev/null
+          test "$(date +%s)" -lt "$cutover_deadline" || {
+            echo 'Canary cutover recovery window expired before confirmation completed.' >&2
+            exit 1
+          }
           printf 'MESHR_CANARY_CUTOVER_RECOVERY_CONFIRMED=true\n' >> "$GITHUB_ENV"
       - name: Verify canary protected fixture after cutover recovery
         if: success() && env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1' && env.MESHR_CANARY_CUTOVER_RECOVERY_CONFIRMED == 'true'
@@ -2311,6 +2358,12 @@ jobs:
           MESHR_CANARY_URL: ${{ vars.MESHR_CANARY_URL }}
         run: |
           set -euo pipefail
+          cutover_deadline="${MESHR_CANARY_CUTOVER_DEADLINE_EPOCH:?Canary cutover deadline was not carried from the recovery confirmation gate}"
+          remaining_seconds=$((cutover_deadline - $(date +%s)))
+          if [ "$remaining_seconds" -le 0 ]; then
+            echo 'Canary cutover recovery window expired before protected-session verification.' >&2
+            exit 1
+          fi
           canonical_dir="$RUNNER_TEMP/meshr-canary-protected-fixture-recovery"
           canonical_envelope="$canonical_dir/current.enc"
           canonical_generation="$canonical_dir/current-generation"
@@ -2318,7 +2371,7 @@ jobs:
           umask 077
           mkdir -p "$canonical_dir"
           chmod 700 "$canonical_dir"
-          npm run protected:state:store -- get \
+          timeout "${remaining_seconds}s" npm run protected:state:store -- get \
             --output "$canonical_envelope" \
             --generation-output "$canonical_generation"
           actual_generation="$(tr -d '\r\n' < "$canonical_generation")"
@@ -2326,12 +2379,22 @@ jobs:
             echo 'Canary protected fixture pointer did not advance to the committed successor.' >&2
             exit 1
           }
-          MESHR_PROTECTED_STATE_KEY="${MESHR_PROTECTED_STATE_KEY:?Canary protected fixture key is required}" \
+          remaining_seconds=$((cutover_deadline - $(date +%s)))
+          if [ "$remaining_seconds" -le 0 ]; then
+            echo 'Canary cutover recovery window expired before protected fixture decryption.' >&2
+            exit 1
+          fi
+          timeout "${remaining_seconds}s" env MESHR_PROTECTED_STATE_KEY="${MESHR_PROTECTED_STATE_KEY:?Canary protected fixture key is required}" \
             npm run protected:state -- decrypt \
               --input "$canonical_envelope" \
               --output "$canonical_state"
+          remaining_seconds=$((cutover_deadline - $(date +%s)))
+          if [ "$remaining_seconds" -le 0 ]; then
+            echo 'Canary cutover recovery window expired before canonical runtime verification.' >&2
+            exit 1
+          fi
           MESHR_PROTECTED_STATE_KEY="$MESHR_PROTECTED_STATE_KEY" \
-            npm run verify:protected-runtime -- \
+            timeout "${remaining_seconds}s" npm run verify:protected-runtime -- \
               --state-file "$canonical_state" \
               --selectors "${MESHR_CANARY_PROTECTED_BINDINGS:?Canary protected binding selector is required}" \
               --server "${MESHR_CANARY_URL:?Canary origin is required}"
@@ -3983,7 +4046,31 @@ jobs:
           MESHR_RELEASE_VALIDATION_TOPIC_ID: ${{ vars.MESHR_PRODUCTION_RELEASE_VALIDATION_TOPIC_ID }}
           MESHR_E2E_PROTECTED_STATE_FILE: ${{ runner.temp }}/meshr-protected-session-state/state.json
           MESHR_E2E_PROTECTED_BINDING_SELECTOR: ${{ vars.MESHR_PRODUCTION_PROTECTED_BINDINGS }}
+          MESHR_CUTOVER_DEADLINE_FILE: ${{ runner.temp }}/meshr-production-cutover-session-expiry
         run: npm run smoke:deployed
+      - name: Capture production cutover session deadline before irreversible work
+        if: success() && env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1'
+        env:
+          MESHR_PRODUCTION_CUTOVER_DEADLINE_FILE: ${{ runner.temp }}/meshr-production-cutover-session-expiry
+        run: |
+          set -euo pipefail
+          test -s "$MESHR_PRODUCTION_CUTOVER_DEADLINE_FILE" || {
+            echo 'Production cutover smoke did not persist the renewed session expiry.' >&2
+            exit 1
+          }
+          expiry="$(tr -d '\r\n' < "$MESHR_PRODUCTION_CUTOVER_DEADLINE_FILE")"
+          expiry_epoch="$(node -e 'const value = Date.parse(process.argv[1]); if (!Number.isFinite(value)) process.exit(1); process.stdout.write(String(Math.floor(value / 1000)))' "$expiry")" || {
+            echo 'Production cutover session expiry is not a valid ISO timestamp.' >&2
+            exit 1
+          }
+          now_epoch="$(date +%s)"
+          remaining_seconds=$((expiry_epoch - now_epoch))
+          if [ "$remaining_seconds" -lt 180 ]; then
+            echo "Production cutover session has only ${remaining_seconds}s remaining before irreversible work; refusing to proceed." >&2
+            exit 1
+          fi
+          printf 'MESHR_PRODUCTION_CUTOVER_SESSION_EXPIRES_AT=%s\n' "$expiry" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_CUTOVER_SESSION_EXPIRES_EPOCH=%s\n' "$expiry_epoch" >> "$GITHUB_ENV"
       - name: Encrypt production protected fixture state after smoke
         if: success() && (steps.production-apply.outputs.cost_protection_mode == 'protect' || steps.production-apply.outputs.cost_protection_mode == 'throttle' || env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1')
         env:
@@ -4167,6 +4254,19 @@ jobs:
             --access-token-file="$token_file"
           cluster_user="$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')"
           kubectl config set-credentials "$cluster_user" --token="$CLOUDSDK_AUTH_ACCESS_TOKEN" >/dev/null
+          # The renewed validation session's absolute expiry is the source of
+          # truth for this irreversible window. Refuse to set the commit marker
+          # or advance the protected pointer when the remaining horizon cannot
+          # cover the CAS, rollout, and canonical-session verification.
+          session_expires_epoch="${MESHR_PRODUCTION_CUTOVER_SESSION_EXPIRES_EPOCH:?Production cutover session expiry was not captured before reopen}"
+          now_epoch="$(date +%s)"
+          remaining_seconds=$((session_expires_epoch - now_epoch))
+          if [ "$remaining_seconds" -lt 180 ]; then
+            echo "Production cutover session has only ${remaining_seconds}s remaining before irreversible work; refusing to reopen writes." >&2
+            exit 1
+          fi
+          cutover_deadline=$((session_expires_epoch - 60))
+          printf 'MESHR_PRODUCTION_CUTOVER_DEADLINE_EPOCH=%s\n' "$cutover_deadline" >> "$GITHUB_ENV"
           # Set the irreversible commit marker before touching either the
           # protected pointer or runtime input. If either operation fails,
           # rollback handlers must freeze for operator-led roll-forward rather
@@ -4176,11 +4276,10 @@ jobs:
             --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Production protected fixture generation is required}" \
             --expected-generation "${MESHR_PRODUCTION_PROTECTED_FIXTURE_PREVIOUS_GENERATION:?Production cutover predecessor generation is required}"
           printf 'MESHR_PRODUCTION_CUTOVER_FIXTURE_PROMOTED=true\n' >> "$GITHUB_ENV"
-          # Bound the irreversible reopen path below the fifteen-minute
-          # runtime-session lifetime. If rollout cannot finish in time, the
+          # Bound the irreversible reopen path by the absolute expiry of the
+          # renewed runtime session. If rollout cannot finish in time, the
           # candidate remains in the operator-led frozen state instead of
           # reopening with an unverifiable protected fixture.
-          cutover_deadline=$((SECONDS + 720))
           kubectl -n flux-system patch configmap meshr-production-runtime-values \
             --type=merge \
             --patch='{"data":{"MESHR_DATABASE_CUTOVER_MODE":"off"}}'
@@ -4190,14 +4289,15 @@ jobs:
           for attempt in $(seq 1 120); do
             mode="$(kubectl -n meshr get deployment api -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="MESHR_DATABASE_CUTOVER_MODE")].value}' 2>/dev/null || true)"
             if [ "$mode" = off ]; then break; fi
-            if [ "$attempt" -eq 120 ] || [ "$SECONDS" -ge "$cutover_deadline" ]; then
+            now_epoch="$(date +%s)"
+            if [ "$attempt" -eq 120 ] || [ "$now_epoch" -ge "$cutover_deadline" ]; then
               kubectl -n meshr get deployment api -o yaml
               echo 'Production API replicas did not receive the reopened write mode before the protected-session deadline.' >&2
               exit 1
             fi
             sleep 5
           done
-          remaining_seconds=$((cutover_deadline - SECONDS))
+          remaining_seconds=$((cutover_deadline - $(date +%s)))
           if [ "$remaining_seconds" -le 0 ]; then
             echo 'Production cutover rollout exceeded the protected-session deadline.' >&2
             exit 1
@@ -4250,13 +4350,23 @@ jobs:
             --access-token-file="$token_file"
           cluster_user="$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')"
           kubectl config set-credentials "$cluster_user" --token="$CLOUDSDK_AUTH_ACCESS_TOKEN" >/dev/null
+          cutover_deadline="${MESHR_PRODUCTION_CUTOVER_DEADLINE_EPOCH:?Production cutover deadline was not carried from the reopen gate}"
+          remaining_seconds=$((cutover_deadline - $(date +%s)))
+          if [ "$remaining_seconds" -le 0 ]; then
+            echo 'Production cutover recovery window expired before confirmation.' >&2
+            exit 1
+          fi
           mode="$(kubectl -n meshr get deployment api -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="MESHR_DATABASE_CUTOVER_MODE")].value}')"
           test "$mode" = off || { echo 'Production cutover recovery window observed a non-reopened write mode.' >&2; exit 1; }
-          kubectl -n meshr rollout status deployment/api --timeout=2m
+          kubectl -n meshr rollout status deployment/api --timeout="${remaining_seconds}s"
           curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
             "${MESHR_PRODUCTION_URL%/}/healthz" | jq -e '.ok == true' >/dev/null
           curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
             "${MESHR_PRODUCTION_URL%/}/v1/public/meshes" | jq -e '.meshes | type == "array"' >/dev/null
+          test "$(date +%s)" -lt "$cutover_deadline" || {
+            echo 'Production cutover recovery window expired before confirmation completed.' >&2
+            exit 1
+          }
           printf 'MESHR_PRODUCTION_CUTOVER_RECOVERY_CONFIRMED=true\n' >> "$GITHUB_ENV"
       - name: Verify production protected fixture after cutover recovery
         if: success() && env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1' && env.MESHR_PRODUCTION_CUTOVER_RECOVERY_CONFIRMED == 'true'
@@ -4271,6 +4381,12 @@ jobs:
           MESHR_PRODUCTION_URL: ${{ vars.MESHR_PRODUCTION_URL }}
         run: |
           set -euo pipefail
+          cutover_deadline="${MESHR_PRODUCTION_CUTOVER_DEADLINE_EPOCH:?Production cutover deadline was not carried from the recovery confirmation gate}"
+          remaining_seconds=$((cutover_deadline - $(date +%s)))
+          if [ "$remaining_seconds" -le 0 ]; then
+            echo 'Production cutover recovery window expired before protected-session verification.' >&2
+            exit 1
+          fi
           canonical_dir="$RUNNER_TEMP/meshr-production-protected-fixture-recovery"
           canonical_envelope="$canonical_dir/current.enc"
           canonical_generation="$canonical_dir/current-generation"
@@ -4278,7 +4394,7 @@ jobs:
           umask 077
           mkdir -p "$canonical_dir"
           chmod 700 "$canonical_dir"
-          npm run protected:state:store -- get \
+          timeout "${remaining_seconds}s" npm run protected:state:store -- get \
             --output "$canonical_envelope" \
             --generation-output "$canonical_generation"
           actual_generation="$(tr -d '\r\n' < "$canonical_generation")"
@@ -4286,12 +4402,22 @@ jobs:
             echo 'Production protected fixture pointer did not advance to the committed successor.' >&2
             exit 1
           }
-          MESHR_PROTECTED_STATE_KEY="${MESHR_PROTECTED_STATE_KEY:?Production protected fixture key is required}" \
+          remaining_seconds=$((cutover_deadline - $(date +%s)))
+          if [ "$remaining_seconds" -le 0 ]; then
+            echo 'Production cutover recovery window expired before protected fixture decryption.' >&2
+            exit 1
+          fi
+          timeout "${remaining_seconds}s" env MESHR_PROTECTED_STATE_KEY="${MESHR_PROTECTED_STATE_KEY:?Production protected fixture key is required}" \
             npm run protected:state -- decrypt \
               --input "$canonical_envelope" \
               --output "$canonical_state"
+          remaining_seconds=$((cutover_deadline - $(date +%s)))
+          if [ "$remaining_seconds" -le 0 ]; then
+            echo 'Production cutover recovery window expired before canonical runtime verification.' >&2
+            exit 1
+          fi
           MESHR_PROTECTED_STATE_KEY="$MESHR_PROTECTED_STATE_KEY" \
-            npm run verify:protected-runtime -- \
+            timeout "${remaining_seconds}s" npm run verify:protected-runtime -- \
               --state-file "$canonical_state" \
               --selectors "${MESHR_PRODUCTION_PROTECTED_BINDINGS:?Production protected binding selector is required}" \
               --server "${MESHR_PRODUCTION_URL:?Production origin is required}"

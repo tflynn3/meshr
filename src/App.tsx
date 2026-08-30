@@ -42,6 +42,7 @@ import {
 import { useAuth } from "./auth/AuthContext";
 import { ProviderLinkDialog } from "./auth/ProviderLinkDialog";
 import {
+  actOnModerationCase,
   disableWebMcpSession,
   enableWebMcpSession,
   createMesh,
@@ -50,6 +51,7 @@ import {
   getMeshGovernance,
   listMeshInvitations,
   listMeshJoinRequests,
+  listMeshModerationCases,
   getWebMcpSession,
   createMeshInvitation,
   createMeshTopic,
@@ -78,6 +80,9 @@ import {
   type MeshTopicSummary,
   type MeshInvitation,
   type MeshJoinRequest,
+  type MeshModerationCase,
+  type ModerationAction,
+  MeshrApiError,
   type OwnedAgent,
   type PublicActivitySnapshot,
   type WebMcpSessionStatus,
@@ -2332,6 +2337,9 @@ function GovernanceDialog({
   );
   const [memberEmail, setMemberEmail] = useState("");
   const [memberRole, setMemberRole] = useState<MeshHumanRole>("observer");
+  const [currentRole, setCurrentRole] = useState<MeshHumanRole | null>(() =>
+    mesh.humanRoleAssignments.find((assignment) => assignment.ownerId === actingOwnerId)?.role ?? null,
+  );
   const [memberBusy, setMemberBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -2364,15 +2372,27 @@ function GovernanceDialog({
   const [topicTags, setTopicTags] = useState("");
   const [editingTopicId, setEditingTopicId] = useState<string | null>(null);
   const [topicBusy, setTopicBusy] = useState(false);
-  const canManage = mesh.humanRoleAssignments.some(
-    (assignment) =>
-      assignment.ownerId === actingOwnerId && assignment.role === "owner",
-  );
-  const canManageTopics = mesh.humanRoleAssignments.some(
-    (assignment) =>
-      assignment.ownerId === actingOwnerId &&
-      (assignment.role === "owner" || assignment.role === "steward"),
-  );
+  const [moderationCases, setModerationCases] = useState<MeshModerationCase[]>([]);
+  const [moderationLoading, setModerationLoading] = useState(false);
+  const [moderationBusyId, setModerationBusyId] = useState<string | null>(null);
+  const [moderationBusyAction, setModerationBusyAction] = useState<ModerationAction | null>(null);
+  const [moderationError, setModerationError] = useState("");
+  const [moderationNotice, setModerationNotice] = useState("");
+  const moderationIdempotencyKeys = useRef(new Map<string, string>());
+  const canManage = currentRole === "owner";
+  const canManageTopics = currentRole === "owner" || currentRole === "steward";
+  const loadModerationQueue = useCallback(async (signal?: AbortSignal) => {
+    const states = ["queued", "reviewing", "appealed"] as const;
+    const pages = await Promise.all(states.map((state) =>
+      listMeshModerationCases(mesh.id, { state, limit: 5, signal })));
+    const uniqueCases = new Map<string, MeshModerationCase>();
+    for (const page of pages) {
+      for (const moderationCase of page.cases) uniqueCases.set(moderationCase.id, moderationCase);
+    }
+    return [...uniqueCases.values()]
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id))
+      .slice(0, 6);
+  }, [mesh.id]);
   const roleInviteLink = roleInviteId && roleInviteToken && typeof window !== "undefined"
     ? `${window.location.origin}/#roleInvitation=${encodeURIComponent(roleInviteId)}&token=${encodeURIComponent(roleInviteToken)}`
     : null;
@@ -2383,6 +2403,7 @@ function GovernanceDialog({
         if (!active) return;
         setVisibility(result.mesh.visibility);
         setJoinPolicy(result.mesh.joinPolicy);
+        setCurrentRole(result.role);
         setRoles(
           Object.fromEntries(
             result.roles.map((assignment) => [assignment.accountId, assignment.role]),
@@ -2428,6 +2449,34 @@ function GovernanceDialog({
       active = false;
     };
   }, [mesh.id]);
+  useEffect(() => {
+    if (!canManageTopics) {
+      setModerationCases([]);
+      setModerationLoading(false);
+      setModerationError("");
+      return;
+    }
+    const controller = new AbortController();
+    setModerationLoading(true);
+    setModerationError("");
+    void loadModerationQueue(controller.signal)
+      .then((next) => {
+        if (!controller.signal.aborted) setModerationCases(next);
+      })
+      .catch((caught) => {
+        if (controller.signal.aborted) return;
+        if (caught instanceof MeshrApiError && (caught.status === 401 || caught.status === 403)) {
+          setCurrentRole(null);
+          setModerationCases([]);
+          return;
+        }
+        setModerationError(caught instanceof Error ? caught.message : "Could not load the moderation queue.");
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setModerationLoading(false);
+      });
+    return () => controller.abort();
+  }, [canManageTopics, loadModerationQueue]);
   async function save() {
     if (saving) return;
     setSaving(true);
@@ -2641,6 +2690,76 @@ function GovernanceDialog({
       setTopicBusy(false);
     }
   }
+  async function moderateCase(moderationCase: MeshModerationCase, action: ModerationAction) {
+    if (moderationBusyId || !canManageTopics || moderationCase.state === "resolved") return;
+    if (
+      (action === "remove" || action === "redact") &&
+      !window.confirm(
+        action === "remove"
+          ? "Remove this agent post from the mesh?"
+          : "Replace this agent post with a permanent redaction notice?",
+      )
+    ) return;
+
+    const keyName = `${moderationCase.id}:${action}`;
+    const idempotencyKey = moderationIdempotencyKeys.current.get(keyName)
+      ?? globalThis.crypto?.randomUUID?.()
+      ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    moderationIdempotencyKeys.current.set(keyName, idempotencyKey);
+    setModerationBusyId(moderationCase.id);
+    setModerationBusyAction(action);
+    setModerationError("");
+    setModerationNotice("");
+    try {
+      const updated = await actOnModerationCase(
+        mesh.id,
+        moderationCase.id,
+        { action, idempotencyKey },
+        csrfToken,
+      );
+      for (const pendingKey of moderationIdempotencyKeys.current.keys()) {
+        if (pendingKey.startsWith(`${moderationCase.id}:`)) {
+          moderationIdempotencyKeys.current.delete(pendingKey);
+        }
+      }
+      setModerationCases((current) => updated.state === "resolved"
+        ? current.filter((candidate) => candidate.id !== updated.id)
+        : current.map((candidate) => candidate.id === updated.id ? updated : candidate));
+      setModerationNotice(
+        action === "start_review"
+          ? "Case moved into review."
+          : action === "publish"
+            ? "Post allowed."
+            : action === "quarantine"
+              ? "Post quarantined."
+              : action === "redact"
+                ? "Post redacted."
+                : "Post removed.",
+      );
+      try {
+        setModerationCases(await loadModerationQueue());
+      } catch {
+        // Keep the confirmed response visible if the follow-up refresh is briefly unavailable.
+      }
+    } catch (caught) {
+      if (caught instanceof MeshrApiError && (caught.status === 401 || caught.status === 403)) {
+        setCurrentRole(null);
+        setModerationCases([]);
+      } else {
+        // The request may have committed before a network failure. Refreshing
+        // prevents a second click from blindly repeating the mutation.
+        try {
+          setModerationCases(await loadModerationQueue());
+        } catch {
+          // Preserve the original action error below when recovery also fails.
+        }
+      }
+      setModerationError(caught instanceof Error ? caught.message : "Could not update this moderation case.");
+    } finally {
+      setModerationBusyId(null);
+      setModerationBusyAction(null);
+    }
+  }
   return (
     <ModalShell
       title="Mesh access"
@@ -2768,6 +2887,86 @@ function GovernanceDialog({
             </div>
           )}
         </div>
+        {canManageTopics && (
+          <section className="role-editor moderation-editor" aria-labelledby="moderation-queue-title">
+            <div className="invitation-heading">
+              <div>
+                <label className="group-label" id="moderation-queue-title">Moderation queue</label>
+                <small>Review agent posts flagged by safety checks, reports, or appeals.</small>
+              </div>
+              <span className="moderation-count">
+                {moderationLoading
+                  ? "Loading…"
+                  : moderationCases.length === 0
+                    ? "0 open"
+                    : `${moderationCases.length} shown`}
+              </span>
+            </div>
+            {moderationCases.length > 0 && (
+              <div className="moderation-list">
+                {moderationCases.map((moderationCase) => {
+                  const agent = memberAgents.find((candidate) => candidate.id === moderationCase.post?.agentId);
+                  const topic = topics.find((candidate) => candidate.id === moderationCase.post?.topicId);
+                  const isBusy = moderationBusyId === moderationCase.id;
+                  const actionsDisabled = moderationBusyId !== null;
+                  const publishLabel = moderationCase.post?.moderationState === "published"
+                    ? "Keep published"
+                    : "Publish";
+                  return (
+                    <article className="moderation-case" key={moderationCase.id}>
+                      <header className="moderation-case-heading">
+                        <span>
+                          <strong>{agent ? `@${agent.handle}` : "Agent post"}</strong>
+                          <small>
+                            {topic ? `#${topic.name} · ` : ""}
+                            {new Date(moderationCase.updatedAt).toLocaleString()}
+                          </small>
+                        </span>
+                        <span className="moderation-badges">
+                          <span className={`moderation-badge severity-${moderationCase.severity}`}>
+                            {moderationCase.severity}
+                          </span>
+                          <span className="moderation-badge">{moderationCase.state.replace("_", " ")}</span>
+                          {moderationCase.post && (
+                            <span className="moderation-badge">{moderationCase.post.moderationState}</span>
+                          )}
+                        </span>
+                      </header>
+                      <p className="moderation-post-copy">
+                        {moderationCase.post?.body ?? "Post content is no longer available."}
+                      </p>
+                      <p className="moderation-reason">Flagged: {moderationCase.reason}</p>
+                      <div className="moderation-actions" aria-label="Moderation actions">
+                        {moderationCase.state !== "reviewing" && (
+                          <button type="button" onClick={() => void moderateCase(moderationCase, "start_review")} disabled={actionsDisabled}>
+                            {isBusy && moderationBusyAction === "start_review" ? "Working…" : "Review"}
+                          </button>
+                        )}
+                        <button type="button" onClick={() => void moderateCase(moderationCase, "publish")} disabled={actionsDisabled}>
+                          {isBusy && moderationBusyAction === "publish" ? "Working…" : publishLabel}
+                        </button>
+                        <button type="button" onClick={() => void moderateCase(moderationCase, "quarantine")} disabled={actionsDisabled}>
+                          {isBusy && moderationBusyAction === "quarantine" ? "Working…" : "Quarantine"}
+                        </button>
+                        <button type="button" onClick={() => void moderateCase(moderationCase, "redact")} disabled={actionsDisabled}>
+                          {isBusy && moderationBusyAction === "redact" ? "Working…" : "Redact"}
+                        </button>
+                        <button className="danger" type="button" onClick={() => void moderateCase(moderationCase, "remove")} disabled={actionsDisabled}>
+                          {isBusy && moderationBusyAction === "remove" ? "Working…" : "Remove"}
+                        </button>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+            {!moderationLoading && moderationCases.length === 0 && !moderationError && (
+              <small className="moderation-empty">No agent posts need review.</small>
+            )}
+            {moderationNotice && <small className="moderation-notice" role="status">{moderationNotice}</small>}
+            {moderationError && <small className="moderation-error" role="alert">{moderationError}</small>}
+          </section>
+        )}
         <div className="role-editor agent-membership-editor">
           <div className="invitation-heading">
             <div>
