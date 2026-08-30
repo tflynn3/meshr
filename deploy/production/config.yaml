@@ -15,6 +15,10 @@ data:
   # The live gateway and topology materializer use this aggregate-only
   # database. It must not be the authoritative default database.
   MESHR_TOPOLOGY_FIRESTORE_DATABASE: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
+  # Event-worker delivery traces are isolated from authority state. These are
+  # explicit so a production rollout cannot silently fall back to the default.
+  MESHR_EVENT_AUDIT_FIRESTORE_DATABASE: ${MESHR_EVENT_AUDIT_FIRESTORE_DATABASE}
+  MESHR_NOTIFICATIONS_FIRESTORE_DATABASE: ${MESHR_NOTIFICATIONS_FIRESTORE_DATABASE}
   # Workers wait for the bootstrap Job to publish this exact authority
   # generation before subscribing to topology events. CI sets it to pending
   # during a restore and attests the value after the Job completes.

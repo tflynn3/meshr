@@ -1497,6 +1497,8 @@ jobs:
             --from-literal="GCP_PROJECT_ID=$GCP_PROJECT_ID" \
             --from-literal="MESHR_FIRESTORE_DATABASE=$MESHR_FIRESTORE_DATABASE" \
             --from-literal="MESHR_TOPOLOGY_FIRESTORE_DATABASE=$MESHR_TOPOLOGY_FIRESTORE_DATABASE" \
+            --from-literal="MESHR_EVENT_AUDIT_FIRESTORE_DATABASE=meshr-canary-audit" \
+            --from-literal="MESHR_NOTIFICATIONS_FIRESTORE_DATABASE=meshr-canary-notifications" \
             --from-literal="MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID=$expected_authority_bootstrap_id" \
             --from-literal="MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=$force_projection_scan" \
             --from-literal="MESHR_DATABASE_CUTOVER_MODE=$database_cutover_mode" \
@@ -1529,6 +1531,8 @@ jobs:
               --from-literal="GCP_PROJECT_ID=$GCP_PROJECT_ID" \
               --from-literal="MESHR_FIRESTORE_DATABASE=$MESHR_FIRESTORE_DATABASE" \
               --from-literal="MESHR_TOPOLOGY_FIRESTORE_DATABASE=$MESHR_TOPOLOGY_FIRESTORE_DATABASE" \
+              --from-literal="MESHR_EVENT_AUDIT_FIRESTORE_DATABASE=meshr-canary-audit" \
+              --from-literal="MESHR_NOTIFICATIONS_FIRESTORE_DATABASE=meshr-canary-notifications" \
               --from-literal="MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID=$expected_authority_bootstrap_id" \
               --from-literal="MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=$force_projection_scan" \
               --from-literal="MESHR_DATABASE_CUTOVER_MODE=$database_cutover_mode" \
@@ -3558,6 +3562,8 @@ jobs:
             --from-literal="GCP_PROJECT_ID=$GCP_PROJECT_ID" \
             --from-literal="MESHR_FIRESTORE_DATABASE=$MESHR_FIRESTORE_DATABASE" \
             --from-literal="MESHR_TOPOLOGY_FIRESTORE_DATABASE=$MESHR_TOPOLOGY_FIRESTORE_DATABASE" \
+            --from-literal="MESHR_EVENT_AUDIT_FIRESTORE_DATABASE=meshr-audit" \
+            --from-literal="MESHR_NOTIFICATIONS_FIRESTORE_DATABASE=meshr-notifications" \
             --from-literal="MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID=$expected_authority_bootstrap_id" \
             --from-literal="MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=$force_projection_scan" \
             --from-literal="MESHR_DATABASE_CUTOVER_MODE=$database_cutover_mode" \
@@ -3591,6 +3597,8 @@ jobs:
               --from-literal="GCP_PROJECT_ID=$GCP_PROJECT_ID" \
               --from-literal="MESHR_FIRESTORE_DATABASE=$MESHR_FIRESTORE_DATABASE" \
               --from-literal="MESHR_TOPOLOGY_FIRESTORE_DATABASE=$MESHR_TOPOLOGY_FIRESTORE_DATABASE" \
+              --from-literal="MESHR_EVENT_AUDIT_FIRESTORE_DATABASE=meshr-audit" \
+              --from-literal="MESHR_NOTIFICATIONS_FIRESTORE_DATABASE=meshr-notifications" \
               --from-literal="MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID=$expected_authority_bootstrap_id" \
               --from-literal="MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=$force_projection_scan" \
               --from-literal="MESHR_DATABASE_CUTOVER_MODE=$database_cutover_mode" \

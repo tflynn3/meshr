@@ -132,6 +132,8 @@ kubectl -n flux-system create configmap meshr-canary-runtime-values \
   --from-literal=GCP_PROJECT_ID="$GCP_PROJECT_ID" \
   --from-literal=MESHR_FIRESTORE_DATABASE=meshr-canary \
   --from-literal=MESHR_TOPOLOGY_FIRESTORE_DATABASE=meshr-canary-projections \
+  --from-literal=MESHR_EVENT_AUDIT_FIRESTORE_DATABASE=meshr-canary-audit \
+  --from-literal=MESHR_NOTIFICATIONS_FIRESTORE_DATABASE=meshr-canary-notifications \
   --from-literal=MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID=pending \
   --from-literal=MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=1 \
   --from-literal=MESHR_MODERATION_ENDPOINT="$MESHR_MODERATION_ENDPOINT" \
@@ -180,6 +182,8 @@ kubectl -n flux-system create configmap meshr-production-runtime-values \
   --from-literal=GCP_PROJECT_ID="$GCP_PROJECT_ID" \
   --from-literal=MESHR_FIRESTORE_DATABASE='(default)' \
   --from-literal=MESHR_TOPOLOGY_FIRESTORE_DATABASE=meshr-projections \
+  --from-literal=MESHR_EVENT_AUDIT_FIRESTORE_DATABASE=meshr-audit \
+  --from-literal=MESHR_NOTIFICATIONS_FIRESTORE_DATABASE=meshr-notifications \
   --from-literal=MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID=pending \
   --from-literal=MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=1 \
   --from-literal=MESHR_MODERATION_ENDPOINT="$MESHR_MODERATION_ENDPOINT" \

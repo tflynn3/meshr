@@ -61,10 +61,15 @@ the bounded source delta was replayed, and the source and
   runtime values, run the generation-fenced bootstrap Job, attest the marker, and
   roll and resume the workloads. Set the protected
 `MESHR_AUDIT_FIRESTORE_DATABASE` value to `meshr-release-audit` for production
-and `meshr-canary-release-audit` for canary. Release service accounts access
-only those dedicated Firestore databases; Firestore IAM conditions are
-database-scoped, so application-level immutability is enforced by the audit
-repository rather than by a fictional collection-path IAM condition.
+and `meshr-canary-release-audit` for canary. Runtime event workers use the
+separate `MESHR_EVENT_AUDIT_FIRESTORE_DATABASE` /
+`MESHR_NOTIFICATIONS_FIRESTORE_DATABASE` values (`meshr-audit` /
+`meshr-notifications`, with matching `meshr-canary-*` names) for delivery
+traces and notification outbox state. Release service accounts access only
+their dedicated release-audit databases; worker grants are similarly
+database-scoped. Firestore IAM conditions are database-scoped, so
+application-level immutability is enforced by the audit repository rather
+than by a fictional collection-path IAM condition.
 
 The first launch is deliberately a two-phase bootstrap because the moderation
 adapter image digests are produced by the protected build job, while the

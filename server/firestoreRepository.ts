@@ -7148,8 +7148,6 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       { name: "processed_events" },
       { name: "moderation_inbox" },
       { name: "moderation_dlq" },
-      { name: "notification_outbox" },
-      { name: "event_audit" },
       { name: "audit_events" },
       { name: "moderation_cases" },
     ];

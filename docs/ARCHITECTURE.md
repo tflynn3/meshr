@@ -46,7 +46,10 @@ delivery, deduplicates event ids, and publishes ordered Pub/Sub messages.
 
 Topology, moderation, audit, and notification workers use independent
 subscriptions with idempotent consumers, retries, dead-letter topics, and
-replay tooling. Replay binds a production or canary tuple, validates the
+replay tooling. The audit delivery trace and notification outbox are isolated
+in dedicated Firestore databases with worker-specific IAM conditions; the
+authority `audit_events` collection remains part of the API/moderation
+transaction. Replay binds a production or canary tuple, validates the
 Pub/Sub dead-letter source attribute, and routes event envelopes separately
 from moderation-screening jobs. Topology is a projection of posts, replies,
 follows, joins, moderation, and session transfers; it is not a chronological

@@ -1,0 +1,45 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { test } from "node:test";
+
+const root = new URL("../", import.meta.url);
+const read = (path: string): string => readFileSync(new URL(path, root), "utf8");
+
+test("OpenTofu keeps delivery workers out of the authority Firestore grant", () => {
+  const tofu = read("infra/opentofu/main.tf");
+  const authorityGrant = tofu.match(
+    /resource "google_project_iam_member" "worker_firestore" \{([\s\S]*?)\n\}/,
+  )?.[1];
+  assert.ok(authorityGrant, "authority worker grant must remain explicit");
+  assert.match(authorityGrant, /key != "audit_worker"/);
+  assert.match(authorityGrant, /key != "notification_worker"/);
+
+  assert.match(tofu, /resource "google_project_iam_member" "audit_worker_firestore"/);
+  assert.match(tofu, /resource "google_project_iam_member" "notification_worker_firestore"/);
+  assert.match(tofu, /resource "google_project_iam_member" "canary_audit_worker_firestore"/);
+  assert.match(tofu, /resource "google_project_iam_member" "canary_notification_worker_firestore"/);
+  assert.match(tofu, /name\s+=\s+"meshr-audit"/);
+  assert.match(tofu, /name\s+=\s+"meshr-notifications"/);
+  assert.match(tofu, /name\s+=\s+"meshr-canary-audit"/);
+  assert.match(tofu, /name\s+=\s+"meshr-canary-notifications"/);
+  assert.match(tofu, /database\s+=\s+google_firestore_database\.audit\.name/);
+  assert.match(tofu, /database\s+=\s+google_firestore_database\.notifications\.name/);
+});
+
+test("production manifests make dedicated worker databases explicit", () => {
+  const production = read("deploy/production/workloads.yaml");
+  const canary = read("deploy/canary/event-plane.yaml");
+  const productionConfig = read("deploy/production/config.yaml");
+  const canaryConfig = read("deploy/canary/config.yaml");
+  const productionValues = read("deploy/production/flux/runtime-values.example.yaml");
+  const canaryValues = read("deploy/production/flux/canary-runtime-values.example.yaml");
+
+  for (const source of [production, canary, productionConfig, canaryConfig]) {
+    assert.match(source, /MESHR_EVENT_AUDIT_FIRESTORE_DATABASE/);
+    assert.match(source, /MESHR_NOTIFICATIONS_FIRESTORE_DATABASE/);
+  }
+  assert.match(productionValues, /MESHR_EVENT_AUDIT_FIRESTORE_DATABASE:\s+meshr-audit/);
+  assert.match(productionValues, /MESHR_NOTIFICATIONS_FIRESTORE_DATABASE:\s+meshr-notifications/);
+  assert.match(canaryValues, /MESHR_EVENT_AUDIT_FIRESTORE_DATABASE:\s+meshr-canary-audit/);
+  assert.match(canaryValues, /MESHR_NOTIFICATIONS_FIRESTORE_DATABASE:\s+meshr-canary-notifications/);
+});

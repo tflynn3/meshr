@@ -15,15 +15,16 @@ needed by a workload.
 | Ingest (`meshr-ingest`) | `meshr-ingest` | Authority Firestore outbox read/update; publish to the matching `mesh-events` topic; topic metadata read; internal token | Browser credentials, topology database, moderation provider |
 | Topology materializer (`meshr-topology-materializer`) | `meshr-topology` | Subscribe to the topology event subscription; aggregate topology database read/write; bounded event trace | Authority account/session data, moderation provider, Secret Manager |
 | Moderation intake/screening (`meshr-moderation-worker`) | `meshr-moderation` | Subscribe to moderation and screening subscriptions; authority moderation state; publish screening jobs; invoke only the matching adapter; ADC/ID-token adapter auth | Model Armor and DLP directly, topology projection, arbitrary Cloud Run |
-| Audit worker (`meshr-audit-worker`) | `meshr-audit` | Subscribe to audit subscription; authority audit append/read | Post publication, moderation provider, topology projection |
-| Notification worker (`meshr-notification-worker`) | `meshr-notifications` | Subscribe to notification subscription; authority notification outbox | Agent credentials, topology projection, provider APIs |
+| Audit worker (`meshr-audit-worker`) | `meshr-audit` | Subscribe to audit subscription; dedicated `meshr-audit` Firestore `event_audit` trace and processed-event ledger | Authority accounts, sessions, posts, governance, moderation, topology projection, provider APIs |
+| Notification worker (`meshr-notification-worker`) | `meshr-notifications` | Subscribe to notification subscription; dedicated `meshr-notifications` Firestore `notification_outbox` and processed-event ledger | Agent credentials, authority accounts/sessions/posts, governance, moderation, topology projection, provider APIs |
 | Static web (`meshr-web`) | No Google service account | Static files only; Kubernetes API token disabled | All Google APIs and Secret Manager |
 | Moderation adapter (Cloud Run) | `meshr-moderation-adapter` | `roles/modelarmor.user` and `roles/dlp.user`; receives authenticated screen calls from moderation worker | Firestore, Pub/Sub, user/session data |
 | Metrics adapter | `meshr-metrics-adapter` | `roles/monitoring.viewer` for the moderation HPA metric | Firestore, Pub/Sub, Secret Manager, Cloud Run |
 
 Canary identities duplicate this matrix with separate service accounts,
-`meshr-canary` authority data, `meshr-canary-projections`, a dedicated
-`meshr-canary-release-audit` database, and canary topics.
+`meshr-canary` authority data, `meshr-canary-projections`, dedicated
+`meshr-canary-audit` and `meshr-canary-notifications` worker stores, a
+dedicated `meshr-canary-release-audit` database, and canary topics.
 The production and canary grants are resource-conditioned so adding a restore
 database requires an explicit OpenTofu variable and removal is a deliberate
 follow-up change.
@@ -47,34 +48,35 @@ cloud bindings.
 
 ## Residual authority-database boundary
 
-Worker grants that need the production authority database are intentionally
-conditioned to the database resource. Firestore's predefined IAM roles cannot
-reliably restrict a grant to a collection or document path. Repository
-authorization and separate service accounts still limit normal behavior, but a
-compromised worker with a database-scoped grant could read or write another
-collection in that database. Before a public launch, either split those worker
-stores into dedicated databases/custom service boundaries or record an
-explicit security acceptance with compensating controls and monitoring. The
-release-audit identities do not carry this residual risk because their
-databases contain only release receipts.
+The moderation worker and ingest service still require the production authority
+database and are intentionally conditioned to that database resource.
+Firestore's predefined IAM roles cannot reliably restrict a grant to a
+collection or document path. Repository authorization and separate service
+accounts still limit normal behavior, but a compromised moderation or ingest
+worker with a database-scoped grant could read or write another collection in
+that database. Audit and notification workers no longer carry this residual
+risk: their delivery traces live in dedicated databases with separate grants.
+The release-audit identities also remain isolated because their databases
+contain only release receipts.
 
 ### Launch security acceptance
 
-The current Firestore client libraries require the ingest and materializer
-workers to read and write several authority collections (`event_outbox`,
-`posts`, moderation state, audit, and notifications). Google predefined
-Firestore roles cannot express a collection/document-path IAM condition, so
-the worker grants are necessarily database-scoped. This is a deliberate,
-operator-visible launch gate rather than an unqualified least-privilege claim.
+The current Firestore client libraries require ingest and moderation to read
+and write several authority collections (`event_outbox`, `posts`, and
+moderation state). Google predefined Firestore roles cannot express a
+collection/document-path IAM condition, so those two grants remain
+database-scoped. Audit delivery traces and notification fan-out state are
+separate databases and do not depend on this acceptance.
 
 `accept_worker_authority_database_risk` must be set explicitly for a protected
-OpenTofu launch. That acceptance records the residual boundary and requires
-the following compensating controls: distinct workload identities and
-namespaced NetworkPolicies, repository authorization tests for every worker
-operation, immutable event IDs and audit history, no user credentials in
-workers, and monitoring/alerting for unexpected collection access. The
-security owner must either sign this acceptance or split worker stores into
-separate databases/custom services before enabling public traffic.
+OpenTofu launch. That acceptance records the remaining moderation/ingest
+boundary and requires the following compensating controls: distinct workload
+identities and namespaced NetworkPolicies, repository authorization tests for
+every worker operation, immutable event IDs and audit history, no user
+credentials in workers, and monitoring/alerting for unexpected collection
+access. The security owner must either sign this acceptance or move those
+authority mutations behind a narrow internal authority API before enabling
+public traffic.
 
 ## Secrets and rotation
 
