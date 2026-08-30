@@ -2340,8 +2340,11 @@ jobs:
           mode="$(kubectl -n meshr-canary get deployment api-canary -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="MESHR_DATABASE_CUTOVER_MODE")].value}')"
           test "$mode" = off || { echo 'Canary cutover recovery window observed a non-reopened write mode.' >&2; exit 1; }
           kubectl -n meshr-canary rollout status deployment/api-canary --timeout="${remaining_seconds}s"
+          # The public Gateway sends /healthz to the web fallback. Keep the
+          # cutover recovery probe on the explicit web health contract so a
+          # successful recovery cannot be mistaken for an HTML shell.
           curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
-            "${MESHR_CANARY_URL%/}/healthz" | jq -e '.ok == true' >/dev/null
+            "${MESHR_CANARY_URL%/}/web-healthz" | jq -e '.ok == true and .service == "web"' >/dev/null
           curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
             "${MESHR_CANARY_URL%/}/v1/public/meshes" | jq -e '.meshes | type == "array"' >/dev/null
           test "$(date +%s)" -lt "$cutover_deadline" || {
@@ -4367,8 +4370,11 @@ jobs:
           mode="$(kubectl -n meshr get deployment api -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="MESHR_DATABASE_CUTOVER_MODE")].value}')"
           test "$mode" = off || { echo 'Production cutover recovery window observed a non-reopened write mode.' >&2; exit 1; }
           kubectl -n meshr rollout status deployment/api --timeout="${remaining_seconds}s"
+          # The public Gateway sends /healthz to the web fallback. Keep the
+          # cutover recovery probe on the explicit web health contract so a
+          # successful recovery cannot be mistaken for an HTML shell.
           curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
-            "${MESHR_PRODUCTION_URL%/}/healthz" | jq -e '.ok == true' >/dev/null
+            "${MESHR_PRODUCTION_URL%/}/web-healthz" | jq -e '.ok == true and .service == "web"' >/dev/null
           curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
             "${MESHR_PRODUCTION_URL%/}/v1/public/meshes" | jq -e '.meshes | type == "array"' >/dev/null
           test "$(date +%s)" -lt "$cutover_deadline" || {

@@ -172,6 +172,13 @@ test("real connector pairs, proves its key, calls the API, and serves the same t
     ],
     cwd: resolve("."),
     stderr: "pipe",
+    // The parent intentionally uses the documented 0600 file fallback. Keep
+    // the spawned native host on the same backend so its lifecycle patches do
+    // not attempt an interactive macOS Keychain migration during the test.
+    env: {
+      ...(process.env as Record<string, string>),
+      MESHR_CREDENTIAL_STORAGE: "file",
+    },
   });
   await client.connect(transport);
   context.after(async () => client.close());

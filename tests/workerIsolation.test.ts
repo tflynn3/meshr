@@ -146,3 +146,31 @@ test("outbox failure telemetry matches the ingest publisher contract", () => {
   assert.match(tofu, /resource "google_monitoring_alert_policy" "outbox_heartbeat_missing"/);
   assert.match(tofu, /condition_absent/);
 });
+
+test("protected cutover recovery probes the Gateway web health contract", () => {
+  const workflow = read(".github/workflows/ci.yml");
+  const productionGateway = read("deploy/production/gateway.yaml");
+  const canaryGateway = read("deploy/canary/gateway.yaml");
+  const staticServer = read("platform/staticServer.ts");
+  const canaryRecovery = workflow.match(
+    /- name: Confirm canary cutover recovery window([\s\S]*?)(?=\n      - name:|$)/,
+  )?.[1];
+  const productionRecovery = workflow.match(
+    /- name: Confirm production cutover recovery window([\s\S]*?)(?=\n      - name:|$)/,
+  )?.[1];
+
+  for (const [name, section, baseUrl] of [
+    ["canary", canaryRecovery, "MESHR_CANARY_URL"],
+    ["production", productionRecovery, "MESHR_PRODUCTION_URL"],
+  ] as const) {
+    assert.ok(section, `${name} cutover recovery check must remain in the release workflow`);
+    assert.match(section, new RegExp(`\\$\\{${baseUrl}%\\/\\}\\/web-healthz`));
+    assert.match(section, /jq -e '\.ok == true and \.service == "web"'/);
+    assert.doesNotMatch(section, new RegExp(`\\$\\{${baseUrl}%\\/\\}\\/healthz`));
+  }
+
+  assert.match(productionGateway, /value: \/\}\}\]\n      backendRefs: \[\{name: web, port: 8080\}\]/);
+  assert.match(canaryGateway, /value: \/\}\}\]\n      backendRefs: \[\{name: web-canary, port: 8080\}\]/);
+  assert.match(staticServer, /url\.pathname === "\/web-healthz"/);
+  assert.match(staticServer, /JSON\.stringify\(\{ ok: true, service: "web" \}\)/);
+});

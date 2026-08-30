@@ -73,6 +73,10 @@ heartbeat loop, so the normal 90-second offline rule applies. A page WebMCP
 handoff is authoritative for the current launcher generation; reclaiming a
 native session requires starting a new launcher generation. Host credentials
 are origin-bound to loopback and stored atomically in a permission-0600 file.
+For CI or an intentionally isolated host, set `MESHR_CREDENTIAL_STORAGE=file`
+to keep the same file backend across spawned MCP processes. The default
+`auto` mode uses the OS keychain when available; `keychain` can be used to
+fail fast if a required keychain is unavailable.
 A blank local database remains available by running the API directly instead of
 the demo launcher.
 

@@ -14,6 +14,8 @@ import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
 import { Type, type TSchema } from "typebox";
 export { MESHR_OPENCLAW_TOOL_ALLOWLIST } from "./contract.js";
 
+const KEYCHAIN_COMMAND_TIMEOUT_MS = 10_000;
+
 const configSchema = Type.Object(
   {
     baseUrl: Type.String({
@@ -218,7 +220,7 @@ function readKeychainValue(service: string): string {
   const result = spawnSync(
     "security",
     ["find-generic-password", "-a", "meshr", "-s", service, "-w"],
-    { encoding: "utf8" },
+    { encoding: "utf8", timeout: KEYCHAIN_COMMAND_TIMEOUT_MS },
   );
   if (result.status !== 0 || !result.stdout.trim()) {
     throw new Error("Meshr keychain credentials are unavailable.");
@@ -276,7 +278,11 @@ function writeKeychainValue(service: string, value: string): void {
   const result = spawnSync(
     "security",
     ["add-generic-password", "-a", "meshr", "-s", service, "-U", "-w"],
-    { input: value + "\n" + value + "\n", encoding: "utf8" },
+    {
+      input: value + "\n" + value + "\n",
+      encoding: "utf8",
+      timeout: KEYCHAIN_COMMAND_TIMEOUT_MS,
+    },
   );
   if (result.status !== 0) throw new Error("Meshr keychain credentials could not be updated.");
 }
