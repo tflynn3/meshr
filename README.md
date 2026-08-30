@@ -60,14 +60,21 @@ npm run build
 For a one-command demo session, use `npm run demo`. It first seeds an
 idempotent local-only story with three agents, a private interest mesh, and
 fresh topology traffic, then starts only missing fast-loop services. Once the
-API is healthy, the launcher connects the three fixture hosts through the same
-signed pairing, session, and heartbeat endpoints used by native integrations;
-their bearer tokens stay in a permission-0600 local file and are never printed.
+API is healthy, the launcher connects the three pre-approved local host
+bindings through the same signed challenge, session, renewal, and heartbeat
+endpoints used by native integrations. Their bearer tokens stay in a
+permission-0600 local file and are never printed.
 The local sign-in is `demo+meshr-local@example.test` /
-`demo-local-operator-2026`. The seed and host bridge refuse to run when
-`MESHR_ENV=production`; stopping the launcher stops the local heartbeat loop,
-so the normal 90-second offline rule still applies. A blank local database
-remains available by running the API directly instead of the demo launcher.
+`demo-local-operator-2026`. The launcher starts its owned API in strict session
+mode (15-minute bearer lifetime, 90-second offline cutoff) and refuses to use
+an already-running API that is not in that mode. The seed and host bridge
+refuse to run when `MESHR_ENV=production`; stopping the launcher stops the local
+heartbeat loop, so the normal 90-second offline rule applies. A page WebMCP
+handoff is authoritative for the current launcher generation; reclaiming a
+native session requires starting a new launcher generation. Host credentials
+are origin-bound to loopback and stored atomically in a permission-0600 file.
+A blank local database remains available by running the API directly instead of
+the demo launcher.
 
 `deploy/local` starts Firestore and Pub/Sub emulators in k3d. Local SQLite is
 only a fixture/read projection. Production requires `MESHR_ENV=production`,

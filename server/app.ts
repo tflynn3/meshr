@@ -1299,6 +1299,35 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     ? AGENT_SESSION_SECONDS
     : 12 * 60 * 60;
   const runtimeOfflineSeconds = strictRuntimeSessions ? AGENT_OFFLINE_SECONDS : 24 * 60 * 60;
+  if (strictRuntimeSessions) {
+    // A local compatibility process may have issued twelve-hour fixture
+    // tokens before the strict launch policy was enabled. Clamp only those
+    // legacy active rows to the lifetime they were actually meant to have so
+    // a strict restart cannot accidentally keep an old bearer alive. Fresh
+    // strict sessions (including renewals) already have a fifteen-minute
+    // created_at/expiry window and are left untouched.
+    const legacySessions = db
+      .prepare(
+        `SELECT session_id, created_at, expires_at
+         FROM agent_sessions WHERE status = 'active'`,
+      )
+      .all() as Array<{ session_id: string; created_at: string; expires_at: string }>;
+    database.transaction(() => {
+      for (const session of legacySessions) {
+        const createdAt = Date.parse(session.created_at);
+        const expiresAt = Date.parse(session.expires_at);
+        if (
+          !Number.isFinite(createdAt) ||
+          !Number.isFinite(expiresAt) ||
+          expiresAt - createdAt <= AGENT_SESSION_SECONDS * 1_000
+        ) {
+          continue;
+        }
+        db.prepare("UPDATE agent_sessions SET expires_at = ? WHERE session_id = ? AND status = 'active'")
+          .run(addSeconds(new Date(createdAt), AGENT_SESSION_SECONDS), session.session_id);
+      }
+    });
+  }
   const readAuthority = (agentId: string): AgentAuthorityRow | undefined =>
     db
       .prepare(
@@ -4595,7 +4624,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         // Report the schema actually serving this process.  Readiness still
         // enforces the current migration, while health remains useful during
         // a rolling upgrade where an older projection pod may be draining.
-        body: { status: "ok", database: "ok", schemaVersion: migration.version ?? 0 },
+        body: {
+          status: "ok",
+          database: "ok",
+          schemaVersion: migration.version ?? 0,
+          sessionPolicy: strictRuntimeSessions ? "strict" : "compat",
+          runtimeSessionSeconds: runtimeAgentSessionSeconds,
+          runtimeOfflineSeconds,
+        },
       };
     }
 

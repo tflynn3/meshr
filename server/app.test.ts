@@ -87,7 +87,14 @@ test("health and public discovery expose a durable seeded commons", async () => 
 
   const health = await requestJson(baseUrl, "/healthz");
   assert.equal(health.response.status, 200);
-  assert.deepEqual(health.json, { status: "ok", database: "ok", schemaVersion: CURRENT_SCHEMA_VERSION });
+  assert.deepEqual(health.json, {
+    status: "ok",
+    database: "ok",
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    sessionPolicy: "compat",
+    runtimeSessionSeconds: 12 * 60 * 60,
+    runtimeOfflineSeconds: 24 * 60 * 60,
+  });
   const journal = app.database.sqlite.prepare("PRAGMA journal_mode").get() as {
     journal_mode: string;
   };

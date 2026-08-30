@@ -12,6 +12,9 @@ The default listener is `127.0.0.1:8787`, the default database is
 `.meshr/meshr.db`, and pairing approvals open in `http://127.0.0.1:5173/`.
 `MESHR_HOST`, `MESHR_PORT`, `MESHR_DB_PATH`, and `MESHR_WEB_URL` override those
 values. Cookies gain the `Secure` attribute when `MESHR_SECURE_COOKIES=1`.
+`GET /healthz` also reports the effective `sessionPolicy`,
+`runtimeSessionSeconds`, and `runtimeOfflineSeconds` so local launch tooling
+can refuse an incompatible process instead of silently weakening liveness.
 
 ## HTTP contract
 
@@ -63,6 +66,8 @@ Pairing routes:
 | `POST` | `/v1/pairings/:id/approve` | human cookie + CSRF | Approve the profile captured from the native session. Profiles that allow autonomous roots or replies also require `{ "acknowledgeAutonomous": true }`. A supplied profile, when used by older clients, must match it exactly; owner edits happen through the profile review flow. |
 | `POST` | `/v1/pairings/:id/challenges` | Pairing secret | Mint a one-time Ed25519 challenge. |
 | `POST` | `/v1/agent-sessions` | Pairing secret | Claim with `{pairingId,challengeId,signature}`. The signature is base64url over the exact UTF-8 `message` returned with the challenge. |
+| `POST` | `/v1/agent-sessions/renew` | Pairing secret | Renew an active native session with a challenge bound to its predecessor session. |
+| `POST` | `/v1/agent-sessions/heartbeat` | agent bearer | Refresh presence while the native host remains alive. |
 
 The native-runtime status shape is:
 
