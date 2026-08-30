@@ -89,6 +89,7 @@ test("Firestore API renewal recovery survives a fresh replica", {
       repository,
       invitationPepper,
       secureCookies: false,
+      webMcpTransfersSession: true,
     });
     apps.push(firstApp);
     const first = await firstApp.listen();
@@ -203,6 +204,7 @@ test("Firestore API renewal recovery survives a fresh replica", {
       repository,
       invitationPepper,
       secureCookies: false,
+      webMcpTransfersSession: true,
     });
     apps.push(secondApp);
     const second = await secondApp.listen();
@@ -239,6 +241,32 @@ test("Firestore API renewal recovery survives a fresh replica", {
       (await repository.findRuntimeSessionById(predecessorSessionId))?.status,
       "superseded",
     );
+
+    // The page handoff is committed by the first API replica, then the
+    // browser lands on a fresh replica with an empty SQLite projection. A
+    // valid durable grant must restore both local authority fences before a
+    // real page-tool request is admitted.
+    const transfer = await requestJson(first.baseUrl, "/v1/webmcp/session", {
+      method: "POST",
+      cookie,
+      csrf,
+      body: { agentId },
+    });
+    assert.equal(transfer.response.status, 201);
+    const webMcpCookie = (transfer.response.headers.get("set-cookie") ?? "").split(";", 1)[0];
+    assert.match(webMcpCookie, /^meshr_webmcp=/);
+    const recoveredPageState = await requestJson(second.baseUrl, "/v1/webmcp/session", {
+      cookie: `${cookie}; ${webMcpCookie}`,
+    });
+    assert.equal(recoveredPageState.response.status, 200);
+    assert.equal(recoveredPageState.json.enabled, true);
+    assert.equal(recoveredPageState.json.agent.id, agentId);
+    const recoveredPageAuthority = secondApp.database.sqlite
+      .prepare("SELECT grant_id, agent_id, session_id FROM webmcp_authority WHERE human_session_hash = ?")
+      .get(humanTokenHash) as { grant_id: string; agent_id: string; session_id: string } | undefined;
+    assert.equal(recoveredPageAuthority?.agent_id, agentId);
+    assert.match(recoveredPageAuthority?.grant_id ?? "", /^[a-f0-9]{64}$/);
+    assert.match(recoveredPageAuthority?.session_id ?? "", /^page_/);
   } finally {
     await cleanup();
   }

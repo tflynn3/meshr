@@ -27,6 +27,19 @@ Gateway IPv4 addresses for production and staging. The Google and GitHub
 provider resources are omitted when their credentials are null only while
 `launch_mode=false`; a public launch must configure both.
 
+Set `alert_notification_email` for the operations owner on the protected
+launch apply. OpenTofu creates one Cloud Monitoring channel and routes the
+HTTP, authentication, topology, live-gateway, outbox, durable-store, and
+moderation alerts plus the billing budget notifications to it. Dry validation
+plans may leave it null. If a restore is cut over, first authorize the restored
+Firestore database with `additional_authority_database_names` and the restored
+topology database with `additional_topology_database_names`, then update the
+protected `MESHR_FIRESTORE_DATABASE` and `MESHR_TOPOLOGY_FIRESTORE_DATABASE`
+runtime values and roll the workloads.
+The release service accounts receive a database-path condition limited to
+`audit_events/*` so the CI cost-protection transition receipt can be written
+without granting them application data access.
+
 The first launch is deliberately a two-phase bootstrap because the moderation
 adapter image digests are produced by the protected build job, while the
 authenticated Cloud Run services are created by the launch apply:
@@ -140,8 +153,11 @@ environment. Set `github_actions_deploy_workload_identity_provider` and
 only this repository's matching environment, `main` ref, and exact workflow
 path, and each service account can read GKE or mutate only its own Flux input
 ConfigMaps. The build identity can write images but cannot touch the cluster.
-Also set `GCP_PROJECT_ID`, `GKE_CLUSTER`, `GKE_LOCATION`, and `MESHR_CANARY_URL`
-(for example `https://staging.meshr.social`) as protected variables. The canary
+Also set `GCP_PROJECT_ID`, `GKE_CLUSTER`, `GKE_LOCATION`, `MESHR_CANARY_URL`
+(for example `https://staging.meshr.social`),
+`MESHR_FIRESTORE_DATABASE`, `MESHR_TOPOLOGY_FIRESTORE_DATABASE`,
+`MESHR_COST_PROTECTION_OPERATOR`, and `MESHR_COST_PROTECTION_REASON` as
+protected variables. The canary
 job verifies signatures, updates `meshr-canary-*` ConfigMaps, waits for all
 canary rollouts, and probes the canary API/web health endpoints. Only after that
 protected gate does production update `meshr-production-*` ConfigMaps and the

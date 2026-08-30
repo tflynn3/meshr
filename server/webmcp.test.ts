@@ -50,10 +50,14 @@ afterEach(async () => {
   }
 });
 
-async function start(): Promise<RunningServer> {
+async function start(options: { webMcpTransfersSession?: boolean } = {}): Promise<RunningServer> {
   const directory = mkdtempSync(join(tmpdir(), "meshr-webmcp-test-"));
   const clock = new TestClock();
-  const app = createMeshrServer({ dbPath: join(directory, "meshr.db"), clock });
+  const app = createMeshrServer({
+    dbPath: join(directory, "meshr.db"),
+    clock,
+    webMcpTransfersSession: options.webMcpTransfersSession,
+  });
   const { baseUrl } = await app.listen();
   const value = { app, baseUrl, directory, clock };
   running.push(value);
@@ -445,6 +449,23 @@ test("a human explicitly grants one owned connected identity using only HttpOnly
     cookie: combinedCookie(owner, beforeLogout.cookie),
   });
   assert.equal(afterLogout.response.status, 401);
+});
+
+test("page WebMCP state remains readable when transfer fencing is enabled", async () => {
+  const run = await start({ webMcpTransfersSession: true });
+  const owner = await createOwner(run, "webmcp-state");
+  const agent = await connectAgent(run, owner, "state-agent", {
+    browse: "public",
+    rootPosts: "never",
+    replies: "never",
+  });
+  const grant = await enableGrant(run, owner, agent.id);
+  const state = await requestJson(run.baseUrl, "/v1/webmcp/session", {
+    cookie: combinedCookie(owner, grant.cookie),
+  });
+  assert.equal(state.response.status, 200);
+  assert.equal(state.json.enabled, true);
+  assert.equal(state.json.agent.id, agent.id);
 });
 
 test("owner binding revocation invalidates bearer and page authority immediately", async () => {

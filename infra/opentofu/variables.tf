@@ -134,6 +134,49 @@ variable "monthly_budget_usd" {
   default     = 250
 }
 
+variable "alert_notification_email" {
+  type        = string
+  description = "Operations email that receives Cloud Monitoring alert policies and budget notifications. Required for launch_mode=true; null keeps validation plans provider-resource free."
+  sensitive   = true
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = var.alert_notification_email == null || can(
+      regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", trimspace(var.alert_notification_email)),
+    )
+    error_message = "alert_notification_email must be a valid email address or null."
+  }
+}
+
+variable "additional_authority_database_names" {
+  type        = set(string)
+  description = "Optional Firestore database IDs temporarily authorized for a restore cutover. The managed (default) database is always included; remove a cutover ID after the restore is retired."
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for value in var.additional_authority_database_names :
+      can(regex("^[A-Za-z][A-Za-z0-9_-]{0,62}$", trimspace(value))) && trimspace(value) != "(default)"
+    ])
+    error_message = "additional_authority_database_names must contain Firestore database IDs (letters, numbers, hyphens, or underscores); (default) is implicit."
+  }
+}
+
+variable "additional_topology_database_names" {
+  type        = set(string)
+  description = "Optional Firestore topology database IDs temporarily authorized for a projection restore cutover. The managed projections database is always included; remove a cutover ID after the restore is retired."
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for value in var.additional_topology_database_names :
+      can(regex("^[A-Za-z][A-Za-z0-9_-]{0,62}$", trimspace(value))) && trimspace(value) != "(default)"
+    ])
+    error_message = "additional_topology_database_names must contain Firestore database IDs (letters, numbers, hyphens, or underscores); (default) is implicit."
+  }
+}
+
 variable "google_oauth_client_id" {
   type        = string
   description = "Google OAuth client ID registered for Identity Platform. Leave null for a dry infrastructure plan."

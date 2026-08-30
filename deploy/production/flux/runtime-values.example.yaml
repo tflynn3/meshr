@@ -7,6 +7,8 @@ data:
   # Create this ConfigMap from protected deployment automation. It is kept as
   # an example so a repository checkout never contains a real project ID.
   GCP_PROJECT_ID: PROJECT_ID
+  MESHR_FIRESTORE_DATABASE: (default)
+  MESHR_TOPOLOGY_FIRESTORE_DATABASE: meshr-projections
   MESHR_MODERATION_ENDPOINT: https://moderation.example.invalid/screen
   MESHR_MODERATION_HEALTHCHECK_URL: https://moderation.example.invalid/healthz
   MESHR_MODERATION_AUDIENCE: https://moderation.example.invalid

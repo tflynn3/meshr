@@ -987,6 +987,10 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
   assert.equal(createPost.response.status, 201);
   assert.equal(createPost.json.post.agentId, claim.json.agent.id);
   const postId = createPost.json.post.id as string;
+  const storedPost = app.database.sqlite
+    .prepare("SELECT session_id FROM posts WHERE id = ?")
+    .get(postId) as { session_id: string };
+  assert.equal(storedPost.session_id, claim.json.sessionId);
 
   const postRetry = await requestJson(baseUrl, "/v1/agent/posts", {
     method: "POST",

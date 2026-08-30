@@ -888,13 +888,15 @@ export class SqliteMeshrRepository implements MeshrRepository {
     }
     this.db.prepare(
       `UPDATE meshes SET owner_account_id = ?, name = ?, description = ?, visibility = ?,
-                         join_policy = ? WHERE id = ?`,
+                         join_policy = ?, lifecycle = ?, updated_at = ? WHERE id = ?`,
     ).run(
       input.ownerAccountId,
       input.name,
       input.description,
       input.visibility,
       input.admission,
+      input.lifecycle,
+      input.updatedAt,
       input.meshId,
     );
   }
@@ -905,7 +907,7 @@ export class SqliteMeshrRepository implements MeshrRepository {
     return this.database.transaction(() => {
       const current = this.db.prepare(
         `SELECT id, owner_account_id, name, description, visibility, join_policy,
-                created_at
+                lifecycle, created_at, updated_at
          FROM meshes WHERE id = ?`,
       ).get(input.meshId) as {
         id: string;
@@ -914,7 +916,9 @@ export class SqliteMeshrRepository implements MeshrRepository {
         description: string;
         visibility: RepositoryMeshInput["visibility"];
         join_policy: RepositoryMeshInput["admission"];
+        lifecycle: RepositoryMeshInput["lifecycle"];
         created_at: string;
+        updated_at: string;
       } | undefined;
       if (!current) throw new Error("mesh_not_found");
       this.assertHumanGovernance(
@@ -931,18 +935,19 @@ export class SqliteMeshrRepository implements MeshrRepository {
         description: input.description ?? current.description,
         visibility: input.visibility ?? current.visibility,
         admission: input.admission ?? current.join_policy,
-        lifecycle: "active",
+        lifecycle: current.lifecycle,
         createdAt: current.created_at,
         updatedAt: input.updatedAt,
       };
       this.db.prepare(
         `UPDATE meshes SET name = ?, description = ?, visibility = ?,
-                          join_policy = ? WHERE id = ?`,
+                          join_policy = ?, updated_at = ? WHERE id = ?`,
       ).run(
         next.name,
         next.description,
         next.visibility,
         next.admission,
+        next.updatedAt,
         input.meshId,
       );
       this.writeMutationArtifacts(input);
@@ -1019,8 +1024,10 @@ export class SqliteMeshrRepository implements MeshrRepository {
         throw new Error("agent_mesh_limit_reached");
       }
       this.db.prepare(
-        `INSERT INTO meshes(id, owner_account_id, name, description, visibility, join_policy, created_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO meshes(
+           id, owner_account_id, name, description, visibility, join_policy,
+           lifecycle, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         mesh.meshId,
         mesh.ownerAccountId,
@@ -1028,7 +1035,9 @@ export class SqliteMeshrRepository implements MeshrRepository {
         mesh.description,
         mesh.visibility,
         mesh.admission,
+        mesh.lifecycle,
         mesh.createdAt,
+        mesh.updatedAt,
       );
       this.db.prepare(
         `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
@@ -1049,7 +1058,22 @@ export class SqliteMeshrRepository implements MeshrRepository {
       const insertMembership = this.db.prepare(
         "INSERT INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)",
       );
-      for (const agentId of agentIds) insertMembership.run(mesh.meshId, agentId, mesh.createdAt);
+      const insertMembershipState = this.db.prepare(
+        `INSERT INTO mesh_agent_memberships(
+           mesh_id, agent_id, status, attention_policy_json,
+           admission_provenance, joined_at, updated_at
+         ) VALUES(?, ?, 'joined', ?, 'open', ?, ?)
+         ON CONFLICT(mesh_id, agent_id) DO UPDATE SET
+           status = 'joined', attention_policy_json = excluded.attention_policy_json,
+           admission_provenance = excluded.admission_provenance,
+           joined_at = COALESCE(mesh_agent_memberships.joined_at, excluded.joined_at),
+           updated_at = excluded.updated_at`,
+      );
+      for (let index = 0; index < agentIds.length; index += 1) {
+        const agentId = agentIds[index]!;
+        insertMembership.run(mesh.meshId, agentId, mesh.createdAt);
+        insertMembershipState.run(mesh.meshId, agentId, agents[index]!.attention_json, mesh.createdAt, mesh.updatedAt);
+      }
       this.writeMutationArtifacts(input);
       return { duplicate: false };
     });
@@ -1064,6 +1088,12 @@ export class SqliteMeshrRepository implements MeshrRepository {
 
   async createTopic(input: RepositoryTopicCreateInput & RepositoryMutationArtifacts): Promise<void> {
     this.database.transaction(() => {
+      const mesh = this.db.prepare(
+        "SELECT lifecycle FROM meshes WHERE id = ?",
+      ).get(input.meshId) as { lifecycle: RepositoryMeshInput["lifecycle"] } | undefined;
+      if (!mesh || mesh.lifecycle !== "active") {
+        throw new Error("mesh_not_found");
+      }
       this.assertHumanGovernance(
         input.meshId,
         input.actingAccountId,
@@ -1071,9 +1101,6 @@ export class SqliteMeshrRepository implements MeshrRepository {
         ["owner", "steward"],
         input.createdAt,
       );
-      if (!this.db.prepare("SELECT 1 FROM meshes WHERE id = ?").get(input.meshId)) {
-        throw new Error("mesh_not_found");
-      }
       if (this.db.prepare("SELECT 1 FROM topics WHERE id = ?").get(input.topicId)) {
         throw new Error("topic_already_exists");
       }
@@ -1104,6 +1131,12 @@ export class SqliteMeshrRepository implements MeshrRepository {
 
   async updateTopic(input: RepositoryTopicUpdateInput & RepositoryMutationArtifacts): Promise<void> {
     this.database.transaction(() => {
+      const mesh = this.db.prepare(
+        "SELECT lifecycle FROM meshes WHERE id = ?",
+      ).get(input.meshId) as { lifecycle: RepositoryMeshInput["lifecycle"] } | undefined;
+      if (!mesh || mesh.lifecycle !== "active") {
+        throw new Error("mesh_not_found");
+      }
       this.assertHumanGovernance(
         input.meshId,
         input.actingAccountId,
@@ -1136,6 +1169,12 @@ export class SqliteMeshrRepository implements MeshrRepository {
 
   async deleteTopic(input: RepositoryTopicDeleteInput & RepositoryMutationArtifacts): Promise<void> {
     this.database.transaction(() => {
+      const mesh = this.db.prepare(
+        "SELECT lifecycle FROM meshes WHERE id = ?",
+      ).get(input.meshId) as { lifecycle: RepositoryMeshInput["lifecycle"] } | undefined;
+      if (!mesh || mesh.lifecycle !== "active") {
+        throw new Error("mesh_not_found");
+      }
       this.assertHumanGovernance(
         input.meshId,
         input.actingAccountId,
@@ -1196,9 +1235,9 @@ export class SqliteMeshrRepository implements MeshrRepository {
 
   async listTopicsForAgent(meshId: string, agentId: string): Promise<RepositoryAgentTopic[]> {
     const mesh = this.db
-      .prepare("SELECT id, visibility FROM meshes WHERE id = ?")
-      .get(meshId) as { id: string; visibility: string } | undefined;
-    if (!mesh) throw new Error("mesh_not_found");
+      .prepare("SELECT id, visibility, lifecycle FROM meshes WHERE id = ?")
+      .get(meshId) as { id: string; visibility: string; lifecycle: string } | undefined;
+    if (!mesh || mesh.lifecycle !== "active") throw new Error("mesh_not_found");
     const membership = this.db
       .prepare("SELECT 1 AS joined FROM mesh_members WHERE mesh_id = ? AND agent_id = ?")
       .get(meshId, agentId);
@@ -1245,8 +1284,9 @@ export class SqliteMeshrRepository implements MeshrRepository {
 
   async listPublicMeshes(): Promise<RepositoryMeshInput[]> {
     return (this.db.prepare(
-      `SELECT id, owner_account_id, name, description, visibility, join_policy, created_at
-       FROM meshes WHERE visibility = 'public' ORDER BY name, id`,
+      `SELECT id, owner_account_id, name, description, visibility, join_policy,
+              lifecycle, created_at, updated_at
+       FROM meshes WHERE visibility = 'public' AND lifecycle = 'active' ORDER BY name, id`,
     ).all() as Array<Record<string, string | null>>).map((row) => ({
       meshId: String(row.id),
       ownerAccountId: row.owner_account_id == null ? null : String(row.owner_account_id),
@@ -1254,15 +1294,15 @@ export class SqliteMeshrRepository implements MeshrRepository {
       description: String(row.description),
       visibility: "public",
       admission: String(row.join_policy) as RepositoryMeshInput["admission"],
-      lifecycle: "active",
+      lifecycle: String(row.lifecycle) as RepositoryMeshInput["lifecycle"],
       createdAt: String(row.created_at),
-      updatedAt: String(row.created_at),
+      updatedAt: String(row.updated_at || row.created_at),
     }));
   }
 
   async listPublicTopics(meshId: string): Promise<RepositoryTopicInput[]> {
     const mesh = this.db
-      .prepare("SELECT 1 AS present FROM meshes WHERE id = ? AND visibility = 'public'")
+      .prepare("SELECT 1 AS present FROM meshes WHERE id = ? AND visibility = 'public' AND lifecycle = 'active'")
       .get(meshId);
     if (!mesh) throw new Error("mesh_not_found");
     return (this.db.prepare(
@@ -1418,14 +1458,64 @@ export class SqliteMeshrRepository implements MeshrRepository {
         input.updatedAt,
       );
     }
-    if (input.status === "joined") {
+    this.database.transaction(() => {
       this.db.prepare(
-        "INSERT OR IGNORE INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)",
-      ).run(input.meshId, input.agentId, input.joinedAt ?? input.updatedAt);
-    } else if (input.status === "left" || input.status === "removed") {
-      this.db.prepare("DELETE FROM mesh_members WHERE mesh_id = ? AND agent_id = ?")
-        .run(input.meshId, input.agentId);
+        `INSERT INTO mesh_agent_memberships(
+           mesh_id, agent_id, status, attention_policy_json,
+           admission_provenance, joined_at, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(mesh_id, agent_id) DO UPDATE SET
+           status = excluded.status,
+           attention_policy_json = excluded.attention_policy_json,
+           admission_provenance = excluded.admission_provenance,
+           joined_at = COALESCE(mesh_agent_memberships.joined_at, excluded.joined_at),
+           updated_at = excluded.updated_at`,
+      ).run(
+        input.meshId,
+        input.agentId,
+        input.status,
+        JSON.stringify(input.attentionPolicy),
+        input.admissionProvenance,
+        input.joinedAt,
+        input.updatedAt,
+      );
+      if (input.status === "joined") {
+        this.db.prepare(
+          `INSERT INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)
+           ON CONFLICT(mesh_id, agent_id) DO UPDATE SET joined_at = COALESCE(mesh_members.joined_at, excluded.joined_at)`,
+        ).run(input.meshId, input.agentId, input.joinedAt ?? input.updatedAt);
+      } else {
+        // mesh_members is intentionally the active-only projection used by
+        // older local read paths. The full state above remains durable for
+        // conformance and recovery checks.
+        this.db.prepare("DELETE FROM mesh_members WHERE mesh_id = ? AND agent_id = ?")
+          .run(input.meshId, input.agentId);
+      }
+      this.writeMutationArtifacts(input);
+    });
+  }
+
+  async findMeshAgentMembership(meshId: string, agentId: string): Promise<{
+    status: "joined" | "pending" | "left" | "removed";
+    attentionPolicy: Record<string, unknown>;
+  } | null> {
+    const row = this.db.prepare(
+      `SELECT status, attention_policy_json
+       FROM mesh_agent_memberships
+       WHERE mesh_id = ? AND agent_id = ?`,
+    ).get(meshId, agentId) as { status: "joined" | "pending" | "left" | "removed"; attention_policy_json: string } | undefined;
+    if (!row) return null;
+    let attentionPolicy: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(row.attention_policy_json) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        attentionPolicy = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Preserve the durable row while treating malformed local fixture data
+      // as an empty policy, matching the Firestore adapter's defensive read.
     }
+    return { status: row.status, attentionPolicy };
   }
 
   async joinMeshForAgent(input: {
@@ -1448,24 +1538,10 @@ export class SqliteMeshrRepository implements MeshrRepository {
           invitationTokenHash: input.invitationTokenHash ?? null,
         }))
         .digest("hex");
-      const existingIdempotency = this.db.prepare(
-        `SELECT request_hash, response_status, response_json
-         FROM idempotency_records
-         WHERE agent_id = ? AND operation = 'mesh.join' AND idempotency_key = ?`,
-      ).get(input.agentId, input.idempotencyKey) as {
-        request_hash: string;
-        response_status: number;
-        response_json: string;
-      } | undefined;
-      if (existingIdempotency) {
-        if (existingIdempotency.request_hash !== requestHash) throw new Error("idempotency_conflict");
-        const body = JSON.parse(existingIdempotency.response_json) as Record<string, unknown>;
-        return {
-          status: existingIdempotency.response_status === 202 ? "pending" : "joined",
-          ...(typeof body.requestId === "string" ? { requestId: body.requestId } : {}),
-          duplicate: true,
-        };
-      }
+      // A replayed idempotency key is still an authenticated mutation. Check
+      // the current native session and authority fence before returning the
+      // cached response; otherwise a superseded token could keep replaying an
+      // old successful join indefinitely.
       const active = this.db.prepare(
         `SELECT s.agent_id
          FROM agent_sessions s
@@ -1485,15 +1561,37 @@ export class SqliteMeshrRepository implements MeshrRepository {
         new Date(Date.parse(input.requestedAt) - 90_000).toISOString(),
       ) as { agent_id: string } | undefined;
       if (!active) throw new Error("session_invalid");
+      const existingIdempotency = this.db.prepare(
+        `SELECT request_hash, response_status, response_json
+         FROM idempotency_records
+         WHERE agent_id = ? AND operation = 'mesh.join' AND idempotency_key = ?`,
+      ).get(input.agentId, input.idempotencyKey) as {
+        request_hash: string;
+        response_status: number;
+        response_json: string;
+      } | undefined;
+      if (existingIdempotency) {
+        if (existingIdempotency.request_hash !== requestHash) throw new Error("idempotency_conflict");
+        const body = JSON.parse(existingIdempotency.response_json) as Record<string, unknown>;
+        return {
+          status: existingIdempotency.response_status === 202 ? "pending" : "joined",
+          ...(typeof body.requestId === "string" ? { requestId: body.requestId } : {}),
+          duplicate: true,
+        };
+      }
       const agent = this.db.prepare(
         "SELECT owner_account_id FROM agents WHERE id = ?",
       ).get(input.agentId) as { owner_account_id: string } | undefined;
       if (!agent) throw new Error("agent_not_found");
       if (agent.owner_account_id !== input.ownerAccountId) throw new Error("agent_access_denied");
       const mesh = this.db.prepare(
-        "SELECT join_policy FROM meshes WHERE id = ?",
-      ).get(input.meshId) as { join_policy: "open" | "approval" | "invite_only" } | undefined;
+        "SELECT join_policy, lifecycle FROM meshes WHERE id = ?",
+      ).get(input.meshId) as {
+        join_policy: "open" | "approval" | "invite_only";
+        lifecycle: RepositoryMeshInput["lifecycle"];
+      } | undefined;
       if (!mesh) throw new Error("mesh_not_found");
+      if (mesh.lifecycle !== "active") throw new Error("mesh_unavailable");
       const membership = this.db.prepare(
         "SELECT 1 AS joined FROM mesh_members WHERE mesh_id = ? AND agent_id = ?",
       ).get(input.meshId, input.agentId);
@@ -1554,6 +1652,15 @@ export class SqliteMeshrRepository implements MeshrRepository {
              ON CONFLICT(id) DO UPDATE SET status = 'pending', resolved_at = NULL`,
           ).run(requestId, input.meshId, input.agentId, input.ownerAccountId, input.requestedAt);
         }
+        this.db.prepare(
+          `INSERT INTO mesh_agent_memberships(
+             mesh_id, agent_id, status, attention_policy_json,
+             admission_provenance, joined_at, updated_at
+           ) VALUES(?, ?, 'pending', ?, 'approval', NULL, ?)
+           ON CONFLICT(mesh_id, agent_id) DO UPDATE SET
+             status = 'pending', attention_policy_json = excluded.attention_policy_json,
+             admission_provenance = 'approval', updated_at = excluded.updated_at`,
+        ).run(input.meshId, input.agentId, JSON.stringify(input.attentionPolicy), input.requestedAt);
         responseStatus = 202;
         body = { meshId: input.meshId, requestId, status: "pending" };
         if (!existingRequest) {
@@ -1586,8 +1693,27 @@ export class SqliteMeshrRepository implements MeshrRepository {
         ).get(input.agentId) as { count: number };
         if (Number(joinedCount.count) >= 100) throw new Error("agent_mesh_limit_reached");
         this.db.prepare(
-          "INSERT INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)",
+          `INSERT INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)
+           ON CONFLICT(mesh_id, agent_id) DO UPDATE SET joined_at = COALESCE(mesh_members.joined_at, excluded.joined_at)`,
         ).run(input.meshId, input.agentId, input.requestedAt);
+        this.db.prepare(
+          `INSERT INTO mesh_agent_memberships(
+             mesh_id, agent_id, status, attention_policy_json,
+             admission_provenance, joined_at, updated_at
+           ) VALUES(?, ?, 'joined', ?, ?, ?, ?)
+           ON CONFLICT(mesh_id, agent_id) DO UPDATE SET
+             status = 'joined', attention_policy_json = excluded.attention_policy_json,
+             admission_provenance = excluded.admission_provenance,
+             joined_at = COALESCE(mesh_agent_memberships.joined_at, excluded.joined_at),
+             updated_at = excluded.updated_at`,
+        ).run(
+          input.meshId,
+          input.agentId,
+          JSON.stringify(input.attentionPolicy),
+          invitationId ? "invite" : "open",
+          input.requestedAt,
+          input.requestedAt,
+        );
         if (invitationId) {
           const redeemed = this.db.prepare(
             `UPDATE mesh_invitations
@@ -1629,7 +1755,9 @@ export class SqliteMeshrRepository implements MeshrRepository {
       ).run(input.agentId, input.idempotencyKey, requestHash, responseStatus, JSON.stringify(body), input.requestedAt);
       return {
         status: responseStatus === 202 ? "pending" : "joined",
-        ...(responseStatus === 202 ? { requestId: input.requestId } : {}),
+        ...(responseStatus === 202 && typeof body.requestId === "string"
+          ? { requestId: body.requestId }
+          : {}),
         duplicate: false,
       };
     });
@@ -1647,6 +1775,10 @@ export class SqliteMeshrRepository implements MeshrRepository {
     humanSessionHash: string;
   } & RepositoryMutationArtifacts): Promise<RepositoryMeshInvitation> {
     return this.database.transaction(() => {
+      const mesh = this.db.prepare(
+        "SELECT lifecycle FROM meshes WHERE id = ?",
+      ).get(input.meshId) as { lifecycle: RepositoryMeshInput["lifecycle"] } | undefined;
+      if (!mesh || mesh.lifecycle !== "active") throw new Error("mesh_not_found");
       this.assertHumanGovernance(
         input.meshId,
         input.actingAccountId,
@@ -1654,8 +1786,6 @@ export class SqliteMeshrRepository implements MeshrRepository {
         ["owner", "steward"],
         input.createdAt,
       );
-      const mesh = this.db.prepare("SELECT 1 FROM meshes WHERE id = ?").get(input.meshId);
-      if (!mesh) throw new Error("mesh_not_found");
       const active = this.db.prepare(
         "SELECT COUNT(*) AS count FROM mesh_invitations WHERE mesh_id = ? AND status = 'active' AND expires_at > ?",
       ).get(input.meshId, input.createdAt) as { count: number };
@@ -1772,6 +1902,10 @@ export class SqliteMeshrRepository implements MeshrRepository {
     humanSessionHash: string;
   } & RepositoryMutationArtifacts): Promise<RepositoryMeshRoleInvitation> {
     return this.database.transaction(() => {
+      const mesh = this.db.prepare("SELECT id, lifecycle FROM meshes WHERE id = ?").get(input.meshId) as
+        | { id: string; lifecycle: RepositoryMeshInput["lifecycle"] }
+        | undefined;
+      if (!mesh || mesh.lifecycle !== "active") throw new Error("mesh_not_found");
       this.assertHumanGovernance(
         input.meshId,
         input.actingAccountId,
@@ -1779,13 +1913,6 @@ export class SqliteMeshrRepository implements MeshrRepository {
         ["owner"],
         input.createdAt,
       );
-      // The SQLite compatibility schema predates the Firestore lifecycle
-      // field; an existing local mesh is active by definition. Production
-      // Firestore performs the explicit lifecycle check above.
-      const mesh = this.db.prepare("SELECT id FROM meshes WHERE id = ?").get(input.meshId) as
-        | { id: string }
-        | undefined;
-      if (!mesh) throw new Error("mesh_not_found");
       const active = this.db.prepare(
         "SELECT COUNT(*) AS count FROM mesh_role_invitations WHERE mesh_id = ? AND status = 'active' AND expires_at > ?",
       ).get(input.meshId, input.createdAt) as { count: number };
@@ -2069,6 +2196,16 @@ export class SqliteMeshrRepository implements MeshrRepository {
          WHERE id = ? AND mesh_id = ? AND status = 'pending'`,
       ).get(input.requestId, input.meshId) as { agent_id: string } | undefined;
       if (!pending) throw new Error("join_request_not_pending");
+      // Resolve is a human governance mutation. Re-check the role and the
+      // exact session inside the same SQLite transaction as the status change
+      // so a concurrent revoke/demotion cannot approve a request.
+      this.assertHumanGovernance(
+        input.meshId,
+        input.actingAccountId,
+        input.humanSessionHash,
+        ["owner", "steward"],
+        input.resolvedAt,
+      );
       if (input.decision === "approved") {
         const existing = this.db.prepare(
           "SELECT 1 FROM mesh_members WHERE mesh_id = ? AND agent_id = ?",
@@ -2087,7 +2224,29 @@ export class SqliteMeshrRepository implements MeshrRepository {
         this.db.prepare(
           "INSERT OR IGNORE INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)",
         ).run(input.meshId, pending.agent_id, input.resolvedAt);
+        const agent = this.db.prepare(
+          "SELECT attention_json FROM agents WHERE id = ?",
+        ).get(pending.agent_id) as { attention_json: string } | undefined;
+        this.db.prepare(
+          `INSERT INTO mesh_agent_memberships(
+             mesh_id, agent_id, status, attention_policy_json,
+             admission_provenance, joined_at, updated_at
+           ) VALUES(?, ?, 'joined', ?, 'approval', ?, ?)
+           ON CONFLICT(mesh_id, agent_id) DO UPDATE SET
+             status = 'joined',
+             attention_policy_json = COALESCE(NULLIF(mesh_agent_memberships.attention_policy_json, '{}'), excluded.attention_policy_json),
+             admission_provenance = 'approval',
+             joined_at = COALESCE(mesh_agent_memberships.joined_at, excluded.joined_at),
+             updated_at = excluded.updated_at`,
+        ).run(
+          input.meshId,
+          pending.agent_id,
+          agent?.attention_json ?? "{}",
+          input.resolvedAt,
+          input.resolvedAt,
+        );
       }
+      this.writeMutationArtifacts(input);
       return { agentId: pending.agent_id, status: input.decision };
     });
   }
@@ -2850,11 +3009,13 @@ export class SqliteMeshrRepository implements MeshrRepository {
       this.db
         .prepare(
           `INSERT OR IGNORE INTO meshes(
-             id, owner_account_id, name, description, visibility, join_policy, created_at
+             id, owner_account_id, name, description, visibility, join_policy,
+             lifecycle, created_at, updated_at
            ) VALUES('mesh-public', NULL, 'Public mesh',
-                    'The open commons for agent conversation.', 'public', 'open', ?)`,
+                    'The open commons for agent conversation.', 'public', 'open',
+                    'active', ?, ?)`,
         )
-        .run(now);
+        .run(now, now);
       const topic = this.db.prepare(
         `INSERT OR IGNORE INTO topics(
            id, mesh_id, name, title, description, tags_json, created_at
@@ -3423,15 +3584,16 @@ export class SqliteMeshrRepository implements MeshrRepository {
       this.db
         .prepare(
           `INSERT INTO posts(
-             id, mesh_id, topic_id, agent_id, parent_post_id, body, created_at,
+             id, mesh_id, topic_id, agent_id, session_id, parent_post_id, body, created_at,
              moderation_state, expires_at
-           ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.postId,
           input.meshId,
           input.topicId,
           input.agentId,
+          input.sessionId,
           input.parentPostId,
           input.body,
           now,

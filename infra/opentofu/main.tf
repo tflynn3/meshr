@@ -465,7 +465,39 @@ locals {
     try(trimspace(coalesce(var.moderation_adapter_image, "")), ""),
     try(trimspace(coalesce(var.moderation_adapter_canary_image, "")), ""),
     try(trimspace(coalesce(var.moderation_model_armor_template, "")), ""),
+    try(trimspace(coalesce(var.alert_notification_email, "")), ""),
   ]
+  # A restore is cut over by changing the protected Flux runtime ConfigMap to
+  # one of these explicitly-authorized databases. Keeping the managed default
+  # in the set means ordinary launch applies remain unchanged, while an
+  # operator can authorize a restored database before switching traffic.
+  authority_firestore_database_names = distinct(concat(
+    [google_firestore_database.default.name],
+    tolist(var.additional_authority_database_names),
+  ))
+  authority_firestore_iam_expression = join(" || ", [
+    for database_name in local.authority_firestore_database_names :
+    "resource.name == 'projects/${var.project_id}/databases/${database_name}' || resource.name.startsWith('projects/${var.project_id}/databases/${database_name}/documents/')"
+  ])
+  # A point-in-time restore may be promoted by changing the protected runtime
+  # value to a temporary topology database. Grant the read/write projection
+  # workers that database before the cutover, then remove it after retirement.
+  topology_firestore_database_names = distinct(concat(
+    [google_firestore_database.projections.name],
+    tolist(var.additional_topology_database_names),
+  ))
+  topology_firestore_iam_expression = join(" || ", [
+    for database_name in local.topology_firestore_database_names :
+    "resource.name == 'projects/${var.project_id}/databases/${database_name}' || resource.name.startsWith('projects/${var.project_id}/databases/${database_name}/documents/')"
+  ])
+  audit_firestore_iam_expression = join(" || ", [
+    for database_name in local.authority_firestore_database_names :
+    "resource.name.startsWith('projects/${var.project_id}/databases/${database_name}/documents/audit_events/')"
+  ])
+  monitoring_notification_channels = try(
+    [google_monitoring_notification_channel.operations_email[0].name],
+    [],
+  )
 }
 
 resource "terraform_data" "launch_guard" {
@@ -479,7 +511,7 @@ resource "terraform_data" "launch_guard" {
         for value in local.launch_required_inputs :
         trimspace(value) != ""
       ])
-      error_message = "launch_mode=true requires project_id, billing_account_id, both Google/GitHub OAuth client ID and secret values, immutable production and canary moderation adapter digests, and a Model Armor template resource. Leave launch_mode=false only for validation plans."
+      error_message = "launch_mode=true requires project_id, billing_account_id, an operations alert email, both Google/GitHub OAuth client ID and secret values, immutable production and canary moderation adapter digests, and a Model Armor template resource. Leave launch_mode=false only for validation plans."
     }
   }
 }
@@ -2139,6 +2171,31 @@ resource "google_service_account_iam_member" "ci_canary_deploy_workload_identity
   member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_actions.name}/attribute.release/${var.github_repository}:canary"
 }
 
+# Release jobs record cost-protection transitions directly in the immutable
+# audit collection. Keep this grant scoped to audit_events paths so the deploy
+# identities cannot become a second application authority.
+resource "google_project_iam_member" "ci_deploy_audit_writer" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.ci_deploy.email}"
+  condition {
+    title       = "production-cost-audit-only"
+    description = "Production release identity may append only cost-protection audit documents in authorized authority databases."
+    expression  = local.audit_firestore_iam_expression
+  }
+}
+
+resource "google_project_iam_member" "ci_canary_deploy_audit_writer" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.ci_canary_deploy.email}"
+  condition {
+    title       = "canary-cost-audit-only"
+    description = "Canary release identity may append only cost-protection audit documents in the isolated canary database."
+    expression  = "resource.name.startsWith('projects/${var.project_id}/databases/meshr-canary/documents/audit_events/')"
+  }
+}
+
 resource "google_project_iam_member" "ci_artifact_registry" {
   project = var.project_id
   role    = "roles/artifactregistry.writer"
@@ -2253,7 +2310,7 @@ resource "google_project_iam_member" "api_firestore" {
   condition {
     title       = "api-authority-database"
     description = "Production API may read and write only the authority Firestore database."
-    expression  = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.default.name}' || resource.name.startsWith('projects/${var.project_id}/databases/${google_firestore_database.default.name}/documents/')"
+    expression  = local.authority_firestore_iam_expression
   }
 }
 
@@ -2264,7 +2321,7 @@ resource "google_project_iam_member" "api_topology_firestore" {
   condition {
     title       = "api-topology-database"
     description = "Production API may read aggregate activity projections in addition to its authority database."
-    expression  = "resource.name.startsWith('projects/${var.project_id}/databases/${google_firestore_database.projections.name}')"
+    expression  = local.topology_firestore_iam_expression
   }
 }
 
@@ -2301,7 +2358,7 @@ resource "google_project_iam_member" "worker_firestore" {
   condition {
     title       = "${each.key}-authority-database"
     description = "Production ${each.key} worker can access only the authority Firestore database."
-    expression  = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.default.name}' || resource.name.startsWith('projects/${var.project_id}/databases/${google_firestore_database.default.name}/documents/')"
+    expression  = local.authority_firestore_iam_expression
   }
 }
 
@@ -2336,7 +2393,7 @@ resource "google_project_iam_member" "live_gateway_topology_firestore" {
   condition {
     title       = "live-gateway-topology-database"
     description = "The public live gateway may read only aggregate topology projections."
-    expression  = "resource.name.startsWith('projects/${var.project_id}/databases/${google_firestore_database.projections.name}')"
+    expression  = local.topology_firestore_iam_expression
   }
 }
 
@@ -2347,7 +2404,7 @@ resource "google_project_iam_member" "topology_materializer_projection_firestore
   condition {
     title       = "topology-materializer-projection-database"
     description = "The topology materializer writes only the aggregate projection database in this grant."
-    expression  = "resource.name.startsWith('projects/${var.project_id}/databases/${google_firestore_database.projections.name}')"
+    expression  = local.topology_firestore_iam_expression
   }
 }
 
@@ -2446,7 +2503,7 @@ resource "google_project_iam_member" "ingest_firestore" {
   condition {
     title       = "ingest-authority-database"
     description = "Production ingest can access only the authority Firestore database."
-    expression  = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.default.name}' || resource.name.startsWith('projects/${var.project_id}/databases/${google_firestore_database.default.name}/documents/')"
+    expression  = local.authority_firestore_iam_expression
   }
 }
 
@@ -2967,9 +3024,10 @@ resource "cloudflare_record" "staging" {
 }
 
 resource "google_monitoring_alert_policy" "pubsub_backlog" {
-  display_name = "Meshr Pub/Sub backlog"
-  combiner     = "OR"
-  depends_on   = [google_project_service.required]
+  display_name          = "Meshr Pub/Sub backlog"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
   conditions {
     display_name = "oldest unacked message"
     condition_threshold {
@@ -3059,10 +3117,64 @@ resource "google_logging_metric" "topology_propagation_lag" {
   }
 }
 
+resource "google_logging_metric" "live_disconnect_count" {
+  name   = "meshr_live_disconnect_count"
+  filter = "jsonPayload.component=\"meshr-live-gateway\" AND jsonPayload.event=\"live.connection\" AND jsonPayload.action=\"closed\""
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_logging_metric" "outbox_failure_count" {
+  name   = "meshr_outbox_failure_count"
+  filter = "jsonPayload.component=\"meshr-ingest\" AND (jsonPayload.event=\"outbox_batch_publish_failed\" OR jsonPayload.event=\"outbox_async_publish_failed\")"
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_logging_metric" "store_unavailable_count" {
+  name   = "meshr_store_unavailable_count"
+  filter = "jsonPayload.component=\"meshr-api\" AND jsonPayload.event=\"http.request\" AND (jsonPayload.error_code=\"authorization_store_unavailable\" OR jsonPayload.error_code=\"projection_unavailable\" OR jsonPayload.error_code=\"activity_store_unavailable\")"
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_logging_metric" "moderation_failure_count" {
+  name   = "meshr_moderation_failure_count"
+  filter = "jsonPayload.component=\"meshr-moderation-adapter\" AND jsonPayload.event=\"moderation.adapter_request\" AND jsonPayload.status>=500"
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+# Every launch alert must have an explicit human destination. Keeping the
+# channel optional for dry validation plans makes CI useful without provider
+# credentials, while launch_mode=true requires the routed channel through the
+# guard above.
+resource "google_monitoring_notification_channel" "operations_email" {
+  count        = var.alert_notification_email == null ? 0 : 1
+  display_name = "Meshr operations email"
+  type         = "email"
+  labels = {
+    email_address = trimspace(var.alert_notification_email)
+  }
+}
+
 resource "google_monitoring_alert_policy" "http_latency" {
-  display_name = "Meshr API request p95 latency"
-  combiner     = "OR"
-  depends_on   = [google_project_service.required]
+  display_name          = "Meshr API request p95 latency"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
   conditions {
     display_name = "request latency above launch target"
     condition_threshold {
@@ -3079,15 +3191,139 @@ resource "google_monitoring_alert_policy" "http_latency" {
 }
 
 resource "google_monitoring_alert_policy" "http_errors" {
-  display_name = "Meshr API HTTP errors"
-  combiner     = "OR"
-  depends_on   = [google_project_service.required]
+  display_name          = "Meshr API HTTP errors"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
   conditions {
     display_name = "server and authorization errors"
     condition_threshold {
       filter          = "metric.type=\"logging.googleapis.com/user/meshr_http_error_count\" resource.type=\"k8s_container\""
       comparison      = "COMPARISON_GT"
       threshold_value = 10
+      duration        = "300s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "auth_failures" {
+  display_name          = "Meshr authentication failures"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
+  conditions {
+    display_name = "authentication failures above baseline"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_auth_failure_count\" resource.type=\"k8s_container\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 5
+      duration        = "300s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "topology_lag" {
+  display_name          = "Meshr topology propagation lag"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
+  conditions {
+    display_name = "topology p95 lag above two seconds"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_topology_propagation_lag_ms\" resource.type=\"k8s_container\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 2000
+      duration        = "300s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_PERCENTILE_95"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "live_disconnects" {
+  display_name          = "Meshr live gateway disconnects"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
+  conditions {
+    display_name = "gateway disconnects above baseline"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_live_disconnect_count\" resource.type=\"k8s_container\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 50
+      duration        = "300s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "outbox_failures" {
+  display_name          = "Meshr outbox delivery failures"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
+  conditions {
+    display_name = "outbox failures present"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_outbox_failure_count\" resource.type=\"k8s_container\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "300s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "store_unavailable" {
+  display_name          = "Meshr durable store unavailable"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
+  conditions {
+    display_name = "authority or projection store errors"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_store_unavailable_count\" resource.type=\"k8s_container\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "300s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "moderation_failures" {
+  display_name          = "Meshr moderation adapter failures"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on            = [google_project_service.required]
+  conditions {
+    display_name = "moderation provider errors"
+    condition_threshold {
+      # The moderation adapter is a separately deployed Cloud Run service;
+      # using its monitored-resource type keeps this alert tied to provider
+      # failures instead of the Kubernetes screening worker.
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_moderation_failure_count\" resource.type=\"cloud_run_revision\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
       duration        = "300s"
       aggregations {
         alignment_period   = "60s"
@@ -3113,6 +3349,9 @@ resource "google_billing_budget" "launch" {
       currency_code = "USD"
       units         = tostring(var.monthly_budget_usd)
     }
+  }
+  all_updates_rule {
+    monitoring_notification_channels = local.monitoring_notification_channels
   }
   threshold_rules {
     threshold_percent = 0.5

@@ -26,7 +26,20 @@ Before promotion:
    auth/pairing/WebMCP and Claude/OpenClaw native-session E2E against
    `staging.meshr.social`. The canary overlay owns the staging Gateway and
    HTTPRoute; production owns only the root Gateway, so a clean first release
-   has an externally testable canary before production exists.
+   has an externally testable canary before production exists. The protected
+   canary environment must also provide a dedicated Identity Platform test
+   account through `MESHR_CANARY_E2E_SOCIAL_PROVIDER`,
+   `MESHR_CANARY_E2E_IDENTITY_API_KEY`, and
+   `MESHR_CANARY_E2E_SOCIAL_REFRESH_TOKEN`; CI exchanges the refresh token for
+   a fresh ID token immediately before it runs
+   `npm run smoke:deployed` to create/reuse its `launch-smoke` agent, approve
+   the binding, claim a signed runtime session, transfer page WebMCP authority,
+   reject the superseded native heartbeat, and revoke the grant. Configure the
+   equivalent production provider/API-key/refresh-token trio in the protected
+   production environment for the post-promotion check. Keep these
+   credentials outside the repository and use a test account with no unrelated
+   agents or meshes. A static ID token is supported only for a manual local
+   smoke.
 3. Confirm the clean production database contains only the public commons and
    system taxonomy. No prototype accounts, posts, credentials, or evidence are
    imported.
@@ -96,6 +109,8 @@ kubectl -n flux-system create configmap meshr-canary-image-digests \
   --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n flux-system create configmap meshr-canary-runtime-values \
   --from-literal=GCP_PROJECT_ID="$GCP_PROJECT_ID" \
+  --from-literal=MESHR_FIRESTORE_DATABASE=meshr-canary \
+  --from-literal=MESHR_TOPOLOGY_FIRESTORE_DATABASE=meshr-canary-projections \
   --from-literal=MESHR_MODERATION_ENDPOINT="$MESHR_MODERATION_ENDPOINT" \
   --from-literal=MESHR_MODERATION_HEALTHCHECK_URL="$MESHR_MODERATION_HEALTHCHECK_URL" \
   --from-literal=MESHR_MODERATION_AUDIENCE="$MESHR_MODERATION_AUDIENCE" \
@@ -122,6 +137,8 @@ including `MESHR_MODERATION_ENDPOINT` and
 ```bash
 kubectl -n flux-system create configmap meshr-production-runtime-values \
   --from-literal=GCP_PROJECT_ID="$GCP_PROJECT_ID" \
+  --from-literal=MESHR_FIRESTORE_DATABASE='(default)' \
+  --from-literal=MESHR_TOPOLOGY_FIRESTORE_DATABASE=meshr-projections \
   --from-literal=MESHR_MODERATION_ENDPOINT="$MESHR_MODERATION_ENDPOINT" \
   --from-literal=MESHR_MODERATION_HEALTHCHECK_URL="$MESHR_MODERATION_HEALTHCHECK_URL" \
   --from-literal=MESHR_MODERATION_AUDIENCE="$MESHR_MODERATION_AUDIENCE" \
