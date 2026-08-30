@@ -441,10 +441,32 @@ locals {
     "172.64.0.0/13",
     "131.0.72.0/22",
   ]
+  # Cloudflare's published IPv6 ranges are kept beside the IPv4 ranges so
+  # dual-stack clients cannot bypass the same origin policy. Cloud Armor
+  # accepts IPv4 and IPv6 CIDRs in SRC_IPS_V1 rules; keep the lists split so
+  # each rule remains comfortably below the provider's ten-CIDR limit.
+  cloudflare_edge_ipv6_primary = [
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+  ]
+  cloudflare_edge_ipv6_secondary = [
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+  ]
   # Validation plans can omit Cloudflare entirely. Any launch or explicitly
   # managed DNS apply turns this on and is guarded below so a missing token
   # cannot produce a partial public edge.
   cloudflare_enabled = var.launch_mode || var.manage_production_dns_records || var.manage_staging_dns_records
+  # zone_name is validated as a DNS name, then normalized once for the
+  # case-insensitive Cloud Armor Host comparison. Exact equality avoids a
+  # hand-built regex whose escaping could drift when a different zone is
+  # supplied to a validation or launch plan.
+  edge_host_root     = lower(trimspace(var.zone_name))
+  edge_host_staging  = "staging.${local.edge_host_root}"
+  edge_origin_secret = try(trimspace(coalesce(var.cloudflare_origin_secret, "")), "")
 }
 
 data "google_project" "current" {
@@ -462,6 +484,7 @@ locals {
     try(trimspace(var.google_oauth_client_secret), ""),
     try(trimspace(var.github_oauth_client_id), ""),
     try(trimspace(var.github_oauth_client_secret), ""),
+    local.edge_origin_secret,
     try(trimspace(coalesce(var.moderation_adapter_image, "")), ""),
     try(trimspace(coalesce(var.moderation_adapter_canary_image, "")), ""),
     try(trimspace(coalesce(var.moderation_model_armor_template, "")), ""),
@@ -490,10 +513,7 @@ locals {
     for database_name in local.topology_firestore_database_names :
     "resource.name == 'projects/${var.project_id}/databases/${database_name}' || resource.name.startsWith('projects/${var.project_id}/databases/${database_name}/documents/')"
   ])
-  audit_firestore_iam_expression = join(" || ", [
-    for database_name in local.authority_firestore_database_names :
-    "resource.name.startsWith('projects/${var.project_id}/databases/${database_name}/documents/audit_events/')"
-  ])
+  canary_topology_firestore_iam_expression = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.canary_projections.name}' || resource.name.startsWith('projects/${var.project_id}/databases/${google_firestore_database.canary_projections.name}/documents/')"
   monitoring_notification_channels = try(
     [google_monitoring_notification_channel.operations_email[0].name],
     [],
@@ -501,17 +521,24 @@ locals {
 }
 
 resource "terraform_data" "launch_guard" {
-  count = var.launch_mode ? 1 : 0
+  # Managing the production root record is itself a public-launch operation;
+  # require the same complete credential, billing, and security preflight even
+  # when an operator has not yet flipped launch_mode.
+  count = var.launch_mode || var.manage_production_dns_records ? 1 : 0
 
   input = "public-launch"
 
   lifecycle {
     precondition {
+      condition     = !(var.launch_mode || var.manage_production_dns_records) || var.accept_worker_authority_database_risk
+      error_message = "launch_mode=true or manage_production_dns_records=true requires explicit accept_worker_authority_database_risk=true after the security owner reviews the database-scoped worker IAM boundary."
+    }
+    precondition {
       condition = alltrue([
         for value in local.launch_required_inputs :
         trimspace(value) != ""
       ])
-      error_message = "launch_mode=true requires project_id, billing_account_id, an operations alert email, both Google/GitHub OAuth client ID and secret values, immutable production and canary moderation adapter digests, and a Model Armor template resource. Leave launch_mode=false only for validation plans."
+      error_message = "launch_mode=true or manage_production_dns_records=true requires project_id, billing_account_id, an operations alert email, both Google/GitHub OAuth client ID and secret values, immutable production and canary moderation adapter digests, and a Model Armor template resource. Leave both launch_mode and production DNS management disabled for validation plans."
     }
   }
 }
@@ -524,7 +551,11 @@ resource "terraform_data" "cloudflare_guard" {
   lifecycle {
     precondition {
       condition     = try(trimspace(var.cloudflare_api_token), "") != ""
-      error_message = "launch_mode or DNS management requires cloudflare_api_token with Zone read, DNS edit, and Zone Settings edit permissions."
+      error_message = "launch_mode or DNS management requires cloudflare_api_token with Zone read, DNS edit, Zone Settings edit, Zone Transform Rules edit, and Account Rulesets read permissions."
+    }
+    precondition {
+      condition     = local.edge_origin_secret != ""
+      error_message = "launch_mode or DNS management requires cloudflare_origin_secret so Cloudflare-to-origin requests are authenticated beyond shared edge IP ranges."
     }
   }
 }
@@ -620,6 +651,19 @@ resource "google_firestore_database" "projections" {
   depends_on                        = [google_project_service.required]
 }
 
+# Protected-release receipts live in their own database so a CI identity cannot
+# read or mutate public production records. The release workflow selects this
+# database through the explicit MESHR_AUDIT_FIRESTORE_DATABASE value.
+resource "google_firestore_database" "release_audit" {
+  project                           = var.project_id
+  name                              = "meshr-release-audit"
+  location_id                       = var.region
+  type                              = "FIRESTORE_NATIVE"
+  point_in_time_recovery_enablement = "POINT_IN_TIME_RECOVERY_ENABLED"
+  delete_protection_state           = "DELETE_PROTECTION_ENABLED"
+  depends_on                        = [google_project_service.required]
+}
+
 # Canary runs in the same GKE cluster but uses a separate Firestore database
 # so unapproved code cannot read or mutate public production records. The
 # application selects this database only through the canary overlay's explicit
@@ -642,6 +686,16 @@ resource "google_firestore_database" "canary_projections" {
   depends_on              = [google_project_service.required]
 }
 
+resource "google_firestore_database" "canary_release_audit" {
+  project                           = var.project_id
+  name                              = "meshr-canary-release-audit"
+  location_id                       = var.region
+  type                              = "FIRESTORE_NATIVE"
+  point_in_time_recovery_enablement = "POINT_IN_TIME_RECOVERY_ENABLED"
+  delete_protection_state           = "DELETE_PROTECTION_ENABLED"
+  depends_on                        = [google_project_service.required]
+}
+
 # Keep a rolling daily backup window in addition to point-in-time recovery.
 # Restoration is still exercised into an isolated database before launch and
 # quarterly thereafter; this resource only provisions the durable schedule.
@@ -661,6 +715,40 @@ resource "google_firestore_backup_schedule" "projections_daily" {
 
   daily_recurrence {}
   depends_on = [google_firestore_database.projections]
+}
+
+resource "google_firestore_backup_schedule" "release_audit_daily" {
+  project   = var.project_id
+  database  = google_firestore_database.release_audit.name
+  retention = "3024000s" # 35 days
+
+  daily_recurrence {}
+  depends_on = [google_firestore_database.release_audit]
+}
+
+resource "google_firestore_backup_schedule" "canary_release_audit_daily" {
+  project   = var.project_id
+  database  = google_firestore_database.canary_release_audit.name
+  retention = "3024000s" # 35 days
+
+  daily_recurrence {}
+  depends_on = [google_firestore_database.canary_release_audit]
+}
+
+resource "google_firestore_field" "release_audit_events_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.release_audit.name
+  collection = "audit_events"
+  field      = "retention_at"
+  ttl_config {}
+}
+
+resource "google_firestore_field" "canary_release_audit_events_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.canary_release_audit.name
+  collection = "audit_events"
+  field      = "retention_at"
+  ttl_config {}
 }
 
 resource "google_pubsub_topic" "events" {
@@ -1852,20 +1940,93 @@ resource "google_compute_security_policy" "cloud_armor" {
     description = "Bound unauthenticated and abusive edge traffic per source IP (continued range set)."
   }
 
-  # Google health-checkers must still reach the backend, but arbitrary direct
-  # requests to the reserved Gateway address are rejected at the edge.
+  rule {
+    action   = "throttle"
+    priority = 1002
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = local.cloudflare_edge_ipv6_primary
+      }
+    }
+    rate_limit_options {
+      conform_action = "allow"
+      exceed_action  = "deny(429)"
+      enforce_on_key = "USER_IP"
+      rate_limit_threshold {
+        count        = 12000
+        interval_sec = 60
+      }
+    }
+    description = "Bound dual-stack edge traffic per source IPv6 range."
+  }
+
+  rule {
+    action   = "throttle"
+    priority = 1003
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = local.cloudflare_edge_ipv6_secondary
+      }
+    }
+    rate_limit_options {
+      conform_action = "allow"
+      exceed_action  = "deny(429)"
+      enforce_on_key = "USER_IP"
+      rate_limit_threshold {
+        count        = 12000
+        interval_sec = 60
+      }
+    }
+    description = "Bound dual-stack edge traffic per source IPv6 range (continued set)."
+  }
+
+  # Health checks are authorized before the hostname guard because Google's
+  # checker may use the backend address as Host. Every user-facing request
+  # still has to name one of the two Gateway listeners below.
   rule {
     action   = "allow"
-    priority = 1100
+    priority = 110
     match {
       versioned_expr = "SRC_IPS_V1"
       config {
         src_ip_ranges = ["35.191.0.0/16", "130.211.0.0/22"]
       }
     }
-    description = "Allow Google load-balancer health checks."
+    description = "Allow Google load-balancer health checks before host filtering."
   }
 
+  rule {
+    action   = "deny(403)"
+    priority = 120
+    match {
+      expr {
+        # Cloud Armor normalizes header names to lowercase. Exact equality
+        # avoids trusting a shared Cloudflare source IP as proof that the
+        # request traversed this zone; Cloudflare's transform rule below
+        # overwrites this header on both Meshr hostnames.
+        expression = local.edge_origin_secret == "" ? "false" : "!has(request.headers['x-meshr-origin-secret']) || request.headers['x-meshr-origin-secret'] != '${local.edge_origin_secret}'"
+      }
+    }
+    description = "Reject requests missing the zone-specific Cloudflare origin secret."
+  }
+
+  rule {
+    action   = "deny(403)"
+    priority = 121
+    match {
+      expr {
+        # Keep the listener comparison case-insensitive and explicit. The
+        # zone_name variable is DNS-name validated before interpolation.
+        expression = "!(request.headers['host'].lower() == '${local.edge_host_root}' || request.headers['host'].lower() == '${local.edge_host_staging}' || request.headers['host'].lower() == '${local.edge_host_root}:443' || request.headers['host'].lower() == '${local.edge_host_staging}:443')"
+      }
+    }
+    description = "Reject requests whose Host is not a Meshr Gateway listener."
+  }
+
+  # Any source that is neither a Cloudflare edge nor a Google health checker
+  # reaches this terminal deny, including direct requests to the reserved IP.
   rule {
     action   = "deny(403)"
     priority = 2147483647
@@ -2171,17 +2332,18 @@ resource "google_service_account_iam_member" "ci_canary_deploy_workload_identity
   member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_actions.name}/attribute.release/${var.github_repository}:canary"
 }
 
-# Release jobs record cost-protection transitions directly in the immutable
-# audit collection. Keep this grant scoped to audit_events paths so the deploy
-# identities cannot become a second application authority.
+# Release jobs record cost-protection transitions in a dedicated Firestore
+# database. Firestore IAM conditions are database-scoped (not collection-
+# scoped), so isolating these receipts in their own database makes the
+# database-wide datastore grant an honest least-privilege boundary.
 resource "google_project_iam_member" "ci_deploy_audit_writer" {
   project = var.project_id
   role    = "roles/datastore.user"
   member  = "serviceAccount:${google_service_account.ci_deploy.email}"
   condition {
-    title       = "production-cost-audit-only"
-    description = "Production release identity may append only cost-protection audit documents in authorized authority databases."
-    expression  = local.audit_firestore_iam_expression
+    title       = "production-cost-audit-database-only"
+    description = "Production release identity may write only the dedicated cost-protection audit database."
+    expression  = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.release_audit.name}'"
   }
 }
 
@@ -2190,9 +2352,9 @@ resource "google_project_iam_member" "ci_canary_deploy_audit_writer" {
   role    = "roles/datastore.user"
   member  = "serviceAccount:${google_service_account.ci_canary_deploy.email}"
   condition {
-    title       = "canary-cost-audit-only"
-    description = "Canary release identity may append only cost-protection audit documents in the isolated canary database."
-    expression  = "resource.name.startsWith('projects/${var.project_id}/databases/meshr-canary/documents/audit_events/')"
+    title       = "canary-cost-audit-database-only"
+    description = "Canary release identity may write only the dedicated canary cost-protection audit database."
+    expression  = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.canary_release_audit.name}'"
   }
 }
 
@@ -2343,7 +2505,7 @@ resource "google_project_iam_member" "api_canary_topology_firestore" {
   condition {
     title       = "canary-api-topology-database"
     description = "Canary API may read aggregate activity projections in the isolated canary topology database."
-    expression  = "resource.name.startsWith('projects/${var.project_id}/databases/${google_firestore_database.canary_projections.name}')"
+    expression  = local.canary_topology_firestore_iam_expression
   }
 }
 
@@ -2451,7 +2613,7 @@ resource "google_project_iam_member" "canary_live_gateway_topology_firestore" {
   condition {
     title       = "canary-live-gateway-topology-database"
     description = "The canary live gateway may read only aggregate canary topology projections."
-    expression  = "resource.name.startsWith('projects/${var.project_id}/databases/${google_firestore_database.canary_projections.name}')"
+    expression  = local.canary_topology_firestore_iam_expression
   }
 }
 
@@ -2462,7 +2624,7 @@ resource "google_project_iam_member" "canary_topology_materializer_projection_fi
   condition {
     title       = "canary-topology-materializer-projection-database"
     description = "The canary topology materializer writes only the aggregate projection database in this grant."
-    expression  = "resource.name.startsWith('projects/${var.project_id}/databases/${google_firestore_database.canary_projections.name}')"
+    expression  = local.canary_topology_firestore_iam_expression
   }
 }
 
@@ -2986,7 +3148,37 @@ resource "google_secret_manager_secret_iam_member" "ingest_canary_internal_token
 
 data "cloudflare_zone" "meshr" {
   count = local.cloudflare_enabled ? 1 : 0
-  name  = var.zone_name
+  name  = local.edge_host_root
+}
+
+# Cloudflare is the only public edge. Set a zone-specific header after the
+# client request reaches Cloudflare and overwrite any user-supplied value;
+# Cloud Armor validates it before the request reaches GKE. The value is a
+# sensitive protected input, and the remote OpenTofu state bucket must be
+# access-controlled because the Cloudflare API stores the transform action.
+resource "cloudflare_ruleset" "meshr_origin_auth" {
+  count       = local.cloudflare_enabled ? 1 : 0
+  zone_id     = data.cloudflare_zone.meshr[0].id
+  name        = "meshr-origin-auth"
+  description = "Authenticate Meshr proxied requests at the GCP origin."
+  kind        = "zone"
+  # Request-header rewrites run in Cloudflare's late-transform phase.
+  phase = "http_request_late_transform"
+
+  rules {
+    ref         = "meshr_origin_auth_header"
+    description = "Overwrite the origin-auth header for Meshr listeners."
+    expression  = "(http.host eq \"${local.edge_host_root}\" or http.host eq \"${local.edge_host_staging}\")"
+    action      = "rewrite"
+
+    action_parameters {
+      headers {
+        name      = "x-meshr-origin-secret"
+        operation = "set"
+        value     = local.edge_origin_secret
+      }
+    }
+  }
 }
 
 resource "cloudflare_zone_settings_override" "tls" {

@@ -21,6 +21,7 @@
     "replay:dlq": "tsx scripts/replay-dead-letter.ts",
     "replay:outbox": "MESHR_REPLAY_SOURCE=outbox tsx scripts/replay-dead-letter.ts",
     "audit:cost-protection": "tsx scripts/record-cost-protection.ts",
+    "cost:model": "tsx scripts/cost-model.ts",
     "smoke:deployed": "tsx scripts/smoke-deployed.ts",
     "load": "tsx scripts/run-load-rehearsal.ts",
     "load:merge": "tsx scripts/merge-load-evidence.ts",

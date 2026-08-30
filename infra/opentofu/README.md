@@ -11,7 +11,10 @@ Create a dedicated GCS state bucket before the first apply (with Object
 Versioning, uniform bucket-level access, and access limited to the launch
 operators and CI). Run `tofu init -backend-config="bucket=$STATE_BUCKET"`,
 `tofu plan`, and a protected `tofu apply` only from the launch environment; do
-not use local state for production. Validation plans intentionally leave
+not use local state for production. The Cloudflare API token must have
+Zone:Read, DNS:Edit, Zone Settings:Edit, Zone Transform Rules:Edit, and
+Account Rulesets:Read; the transform-rule permission is required for the
+zone-specific origin header. Validation plans intentionally leave
 `launch_mode=false` (the default), which keeps Cloudflare, social-provider, and
 billing credentials optional while checking syntax and dependency shape. The
 protected public launch apply must set `launch_mode=true`; OpenTofu then refuses
@@ -27,6 +30,12 @@ Gateway IPv4 addresses for production and staging. The Google and GitHub
 provider resources are omitted when their credentials are null only while
 `launch_mode=false`; a public launch must configure both.
 
+The protected launch also requires `accept_worker_authority_database_risk=true`
+after the security owner signs the residual worker Firestore boundary in
+[`docs/IAM_MATRIX.md`](../../docs/IAM_MATRIX.md). Leave it false until that
+review is complete; the guard intentionally prevents an unreviewed public
+apply.
+
 Set `alert_notification_email` for the operations owner on the protected
 launch apply. OpenTofu creates one Cloud Monitoring channel and routes the
 HTTP, authentication, topology, live-gateway, outbox, durable-store, and
@@ -35,10 +44,12 @@ plans may leave it null. If a restore is cut over, first authorize the restored
 Firestore database with `additional_authority_database_names` and the restored
 topology database with `additional_topology_database_names`, then update the
 protected `MESHR_FIRESTORE_DATABASE` and `MESHR_TOPOLOGY_FIRESTORE_DATABASE`
-runtime values and roll the workloads.
-The release service accounts receive a database-path condition limited to
-`audit_events/*` so the CI cost-protection transition receipt can be written
-without granting them application data access.
+runtime values and roll the workloads. Set the protected
+`MESHR_AUDIT_FIRESTORE_DATABASE` value to `meshr-release-audit` for production
+and `meshr-canary-release-audit` for canary. Release service accounts access
+only those dedicated Firestore databases; Firestore IAM conditions are
+database-scoped, so application-level immutability is enforced by the audit
+repository rather than by a fictional collection-path IAM condition.
 
 The first launch is deliberately a two-phase bootstrap because the moderation
 adapter image digests are produced by the protected build job, while the
@@ -89,6 +100,22 @@ approved production cutover window after the root record and production
 certificate have been imported and verified. This split prevents a staging
 validation apply from changing production traffic. Verify both hostnames before
 enabling public traffic.
+
+Before the first protected apply, inspect the Cloudflare zone for existing
+account- or zone-level rulesets. The `cloudflare_ruleset.meshr_origin_auth`
+resource assumes complete control of the zone transform phase; use
+Cloudflare's `cf-terraforming` ruleset import workflow to import and merge any
+existing ruleset, or remove the existing root/zone ruleset during an approved
+maintenance window. Do not apply this module over an unmanaged ruleset: the
+provider may replace unrelated rules. Record the imported ruleset ID and a
+plan with no unexpected deletes before enabling either DNS flag.
+
+Set `cloudflare_origin_secret` to a freshly generated 32-128 character
+URL-safe value on every launch or rotation. OpenTofu installs a Cloudflare
+zone transform that overwrites `x-meshr-origin-secret` on proxied Meshr
+requests, and Cloud Armor rejects requests without the matching value. Keep
+the remote GCS state bucket restricted because the transform action contains
+the secret; never expose it to browser code, manifests, or logs.
 
 The cluster enables GKE's managed Secret Manager CSI component. Before the
 production Kustomization is reconciled, add a version to both secrets created
@@ -155,7 +182,8 @@ path, and each service account can read GKE or mutate only its own Flux input
 ConfigMaps. The build identity can write images but cannot touch the cluster.
 Also set `GCP_PROJECT_ID`, `GKE_CLUSTER`, `GKE_LOCATION`, `MESHR_CANARY_URL`
 (for example `https://staging.meshr.social`),
-`MESHR_FIRESTORE_DATABASE`, `MESHR_TOPOLOGY_FIRESTORE_DATABASE`,
+`MESHR_FIRESTORE_DATABASE`, `MESHR_AUDIT_FIRESTORE_DATABASE`,
+`MESHR_TOPOLOGY_FIRESTORE_DATABASE`,
 `MESHR_COST_PROTECTION_OPERATOR`, and `MESHR_COST_PROTECTION_REASON` as
 protected variables. The canary
 job verifies signatures, updates `meshr-canary-*` ConfigMaps, waits for all

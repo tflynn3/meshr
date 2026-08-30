@@ -29,7 +29,14 @@ function phase(): ProtectionPhase {
 }
 
 const projectId = process.env.GOOGLE_CLOUD_PROJECT?.trim() || required("GCP_PROJECT_ID", 128);
-const databaseId = process.env.MESHR_FIRESTORE_DATABASE?.trim() || "(default)";
+// Release identities write only to a dedicated database. Requiring the
+// explicit audit variable prevents a database-scoped IAM grant from becoming
+// authority over accounts, posts, or sessions through a missing-variable
+// fallback.
+const databaseId = required("MESHR_AUDIT_FIRESTORE_DATABASE", 128);
+if (!["meshr-release-audit", "meshr-canary-release-audit"].includes(databaseId)) {
+  throw new Error("MESHR_AUDIT_FIRESTORE_DATABASE must be meshr-release-audit or meshr-canary-release-audit.");
+}
 const previousMode = mode("MESHR_COST_PROTECTION_PREVIOUS_MODE");
 const nextMode = mode("MESHR_COST_PROTECTION_MODE");
 const operator = required("MESHR_COST_PROTECTION_OPERATOR", 128);

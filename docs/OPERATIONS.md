@@ -11,6 +11,11 @@
 - API and live gateway run with at least two replicas and disruption budgets.
   Publisher/materializer capacity is one to three replicas under autoscaling.
 
+The measured cost assumptions and the recovery/disruption evidence required for
+this contract live in [`docs/COST_MODEL.md`](COST_MODEL.md) and
+[`docs/RECOVERY_DRILLS.md`](RECOVERY_DRILLS.md). Those artifacts distinguish
+local/emulator evidence from the managed-project launch gates.
+
 ## Release controls
 
 Production promotion is never chained from a push to `main`. The CI workflow
@@ -194,12 +199,15 @@ Post bodies expire after 90 days. Raw delivery and moderation traces expire
 after 30 days. Governance and security audit events are retained for one year.
 Derived topology aggregates may remain only when they cannot reconstruct an
 expired body. To recover, pause promotion, restore Firestore to a new database,
-replay the event DLQ with idempotent consumers, verify private-mesh isolation,
+replay the event DLQ with `MESHR_REPLAY_ENVIRONMENT` set to the matching
+production/canary tuple and idempotent consumers, verify private-mesh isolation,
 then authorize the restored database in OpenTofu with
 `additional_authority_database_names` and
 `additional_topology_database_names`, update the protected
-`MESHR_FIRESTORE_DATABASE` and `MESHR_TOPOLOGY_FIRESTORE_DATABASE` values, and
-wait for Flux to roll every API/worker replica before running the smoke suite.
+`MESHR_FIRESTORE_DATABASE` and `MESHR_TOPOLOGY_FIRESTORE_DATABASE` values,
+and keep `MESHR_AUDIT_FIRESTORE_DATABASE` pinned to its dedicated
+release-audit database; then wait for Flux to roll every API/worker replica
+before running the smoke suite.
 The runtime database IDs are intentionally substituted through the protected
 Flux ConfigMap; the Gateway remains same-origin routing and is not the
 authority selector.

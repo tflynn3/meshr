@@ -186,6 +186,7 @@ and receives an immutable audit receipt before its cursor advances:
 
 ```bash
 MESHR_REPLAY_SOURCE=outbox \
+MESHR_REPLAY_ENVIRONMENT=production \
 MESHR_FIRESTORE_DATABASE='(default)' \
 MESHR_REPLAY_SINCE='2026-08-28T00:00:00.000Z' \
 MESHR_REPLAY_UNTIL='2026-08-28T01:00:00.000Z' \
@@ -195,9 +196,11 @@ npm run replay:outbox
 MESHR_REPLAY_APPLY=1 \
 MESHR_REPLAY_CHECKPOINT=/secure/operator/meshr-replay.json \
 MESHR_REPLAY_SOURCE=outbox \
+MESHR_REPLAY_ENVIRONMENT=production \
 MESHR_FIRESTORE_DATABASE='(default)' \
 MESHR_REPLAY_SINCE='2026-08-28T00:00:00.000Z' \
 MESHR_REPLAY_UNTIL='2026-08-28T01:00:00.000Z' \
+MESHR_AUDIT_FIRESTORE_DATABASE='meshr-release-audit' \
 npm run replay:outbox
 ```
 

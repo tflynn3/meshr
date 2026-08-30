@@ -115,7 +115,7 @@ to host its Kubernetes nodes; it is not used to construct Meshr images.
 | Identity Platform | Development verifier and local account/session implementation | Functional local substitute; deployed token exchange uses Google Cloud Identity Platform |
 | Secret Manager | Kubernetes Secret | Local-only token; never reuse in a deployed environment |
 | Artifact Registry | Bazel OCI archives imported directly into k3d | Same image graph, but no registry push or image-signing test |
-| Cloud Storage traces | Not wired yet | Sampled trace retention remains a later slice |
+| Trace retention | Firestore `event_audit` / moderation trace collections with TTL | Raw delivery/moderation traces are bounded to 30 days; an object-storage archive is intentionally outside the launch footprint |
 | Crossplane and Flux | Not installed in the runtime path yet | Local stack proves workloads/data plane, not managed-resource reconciliation |
 
 The honest storage boundary matters: in production, Firestore is authoritative
@@ -205,6 +205,7 @@ npm test
 npm run typecheck
 npm run build
 npm run images
+npm run cost:model
 kubectl kustomize deploy/local >/tmp/meshr-local.yaml
 npm run local:up
 npm run local:smoke

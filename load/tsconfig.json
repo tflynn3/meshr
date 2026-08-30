@@ -11,5 +11,5 @@
     "strict": true,
     "types": ["node"]
   },
-  "include": ["./**/*.ts", "../scripts/run-load-rehearsal.ts", "../scripts/merge-load-evidence.ts"]
+  "include": ["./**/*.ts", "../platform/costModel.ts", "../scripts/run-load-rehearsal.ts", "../scripts/merge-load-evidence.ts", "../scripts/cost-model.ts"]
 }
