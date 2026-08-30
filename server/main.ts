@@ -74,7 +74,7 @@ if (settings.environment === "production") {
     "listTopicsForAgent", "listPublicMeshes", "listPublicTopics", "listMeshDirectoryForAccount",
     "findMeshHumanRole", "findMeshAgentMembership", "listMeshesForAgent", "listJoinedMeshIdsForAgent",
     "loadProjection", "findRuntimeSessionByTokenHash", "findRuntimeSessionById",
-    "findActiveRuntimeSessionForAgent", "purgeExpired", "findWebMcpGrant", "findAccountByProvider",
+    "findActiveRuntimeSessionForAgent", "purgeExpired", "findWebMcpGrant", "findActiveWebMcpGrant", "findAccountByProvider",
     "findAccountByEmail", "findAccountById", "createSocialAccount", "linkProvider", "listProviderIdentities",
     "createHumanSession", "findHumanSession", "touchHumanSession", "startRuntimeSession",
     "heartbeatRuntimeSession", "transferPageAuthority", "createPostWithOutbox",

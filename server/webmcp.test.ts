@@ -468,6 +468,59 @@ test("page WebMCP state remains readable when transfer fencing is enabled", asyn
   assert.equal(state.json.agent.id, agent.id);
 });
 
+test("transfer grants recover after a lost response and rotate after reactivation", async () => {
+  const run = await start({ webMcpTransfersSession: true });
+  const owner = await createOwner(run, "webmcp-rotation");
+  const agent = await connectAgent(run, owner, "rotation-agent", autonomous);
+
+  const first = await enableGrant(run, owner, agent.id);
+  assert.equal(first.response.status, 201);
+  const firstToken = decodeURIComponent(first.cookie.split("=")[1] ?? "");
+  const firstHash = sha256(firstToken);
+  const retry = await enableGrant(run, owner, agent.id);
+  assert.equal(retry.response.status, 200);
+  assert.equal(retry.cookie, first.cookie);
+  assert.equal(
+    (run.app.database.sqlite
+      .prepare("SELECT session_id FROM webmcp_grants WHERE token_hash = ?")
+      .get(firstHash) as { session_id: string }).session_id.startsWith("page_"),
+    true,
+  );
+
+  const revoked = await requestJson(run.baseUrl, "/v1/webmcp/session", {
+    method: "DELETE",
+    cookie: combinedCookie(owner, first.cookie),
+    csrf: owner.csrf,
+  });
+  assert.equal(revoked.response.status, 200);
+
+  // Re-pairing the same handle replaces the native binding for the persistent
+  // identity. The next page transfer must receive a new bearer, not revive the
+  // copied token from the earlier activation.
+  const reconnected = await connectAgent(run, owner, "rotation-agent", autonomous);
+  assert.equal(reconnected.id, agent.id);
+  const second = await enableGrant(run, owner, reconnected.id);
+  assert.equal(second.response.status, 201);
+  assert.notEqual(second.cookie, first.cookie);
+  const secondToken = decodeURIComponent(second.cookie.split("=")[1] ?? "");
+  const secondHash = sha256(secondToken);
+  const sessions = run.app.database.sqlite
+    .prepare("SELECT session_id FROM webmcp_grants WHERE token_hash IN (?, ?)")
+    .all(firstHash, secondHash) as Array<{ session_id: string }>;
+  assert.equal(sessions.length, 2);
+  assert.notEqual(sessions[0]!.session_id, sessions[1]!.session_id);
+
+  const oldBearer = await requestJson(run.baseUrl, "/v1/webmcp/profile", {
+    cookie: combinedCookie(owner, first.cookie),
+  });
+  assert.equal(oldBearer.response.status, 401);
+  const newBearer = await requestJson(run.baseUrl, "/v1/webmcp/profile", {
+    cookie: combinedCookie(owner, second.cookie),
+  });
+  assert.equal(newBearer.response.status, 200);
+  assert.equal(newBearer.json.agent.id, agent.id);
+});
+
 test("owner binding revocation invalidates bearer and page authority immediately", async () => {
   const run = await start();
   const owner = await createOwner(run, "revoker");

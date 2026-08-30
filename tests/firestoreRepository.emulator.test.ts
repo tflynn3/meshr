@@ -1156,11 +1156,18 @@ test("Firestore repository preserves the launch authority and outbox contract", 
     const pageGrant = await collection("webmcp_grants").doc(pageGrantId).get();
     assert.equal(pageGrant.exists, true);
     assert.equal(pageGrant.get("authority_epoch"), 1);
+    const activePageGrant = await repository.findActiveWebMcpGrant(accountSessionHash, agentId);
+    assert.equal(activePageGrant?.tokenHash, pageGrantId);
+    assert.equal(activePageGrant?.sessionId, `${prefix}_page_session`);
+    await collection("agent_authority").doc(agentId).update({ session_id: `${prefix}_stale_page_session` });
+    assert.equal(await repository.findActiveWebMcpGrant(accountSessionHash, agentId), null);
+    await collection("agent_authority").doc(agentId).update({ session_id: `${prefix}_page_session` });
     await assert.rejects(
       () => repository.heartbeatRuntimeSession(runtimeSessionId, now),
       /session_invalid/,
     );
     await repository.revokeWebMcpGrants(accountSessionHash, now);
+    assert.equal(await repository.findActiveWebMcpGrant(accountSessionHash, agentId), null);
     const nativeRecovery = await repository.startRuntimeSession({
       agentId,
       bindingId: pairingId,
