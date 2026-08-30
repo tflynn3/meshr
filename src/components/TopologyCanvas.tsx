@@ -87,6 +87,99 @@ const agentPositions = [
   { x: 70, y: 650 },
 ];
 
+/**
+ * React Flow expects ResizeObserver for its canvas and node lifecycle. A few
+ * embedded browser runtimes omit it, so provide the smallest compatible
+ * fallback before the first ReactFlow instance mounts. It reports an initial
+ * measurement and responds to viewport resizes; authored node geometry handles
+ * the rest of the topology layout.
+ */
+function installResizeObserverFallback() {
+  if (typeof window === "undefined" || typeof window.ResizeObserver !== "undefined") return;
+
+  class MeshrResizeObserver implements ResizeObserver {
+    private readonly callback: ResizeObserverCallback;
+    private readonly observed = new Set<Element>();
+    private frame: number | null = null;
+    private usesAnimationFrame = false;
+
+    constructor(callback: ResizeObserverCallback) {
+      this.callback = callback;
+      window.addEventListener("resize", this.schedule);
+    }
+
+    observe(target: Element) {
+      this.observed.add(target);
+      this.schedule();
+    }
+
+    unobserve(target: Element) {
+      this.observed.delete(target);
+    }
+
+    disconnect() {
+      this.observed.clear();
+      window.removeEventListener("resize", this.schedule);
+      if (this.frame !== null) {
+        if (this.usesAnimationFrame && typeof window.cancelAnimationFrame === "function") {
+          window.cancelAnimationFrame(this.frame);
+        } else {
+          window.clearTimeout(this.frame);
+        }
+      }
+      this.frame = null;
+    }
+
+    private readonly schedule = () => {
+      if (this.frame !== null || this.observed.size === 0) return;
+      const notify = () => {
+        this.frame = null;
+        const entries = [...this.observed].map((target) => ({ target }) as ResizeObserverEntry);
+        if (entries.length) this.callback(entries, this);
+      };
+      if (typeof window.requestAnimationFrame === "function") {
+        this.usesAnimationFrame = true;
+        this.frame = window.requestAnimationFrame(notify);
+      } else {
+        this.usesAnimationFrame = false;
+        this.frame = window.setTimeout(notify, 0);
+      }
+    };
+  }
+
+  window.ResizeObserver = MeshrResizeObserver;
+}
+
+installResizeObserverFallback();
+
+/**
+ * React Flow normally measures custom nodes with ResizeObserver. Supplying the
+ * authored dimensions keeps the topology visible in embedded/browser runtimes
+ * that do not provide that API, while also keeping edge anchors deterministic.
+ */
+function conversationDimensions(accent: Topic["accent"], selected: boolean) {
+  switch (accent) {
+    case "violet":
+      return { width: 252, height: 232 };
+    case "coral":
+      return { width: 264, height: 230 };
+    case "yellow":
+      return { width: 238, height: 246 };
+    case "blue":
+      return { width: 258, height: 224 };
+    default:
+      return selected ? { width: 270, height: 250 } : { width: 260, height: 240 };
+  }
+}
+
+function nodeHandles(width: number, height: number) {
+  const centerY = Math.max(0, height / 2 - 0.5);
+  return [
+    { type: "target" as const, position: Position.Left, x: 0, y: centerY, width: 1, height: 1 },
+    { type: "source" as const, position: Position.Right, x: width - 1, y: centerY, width: 1, height: 1 },
+  ];
+}
+
 function ConversationNode({ data }: NodeProps<ConversationFlowNode>) {
   const Icon = topicIcons[Math.abs(data.topic.id.length) % topicIcons.length];
   return <button className={`conversation-node ${data.topic.accent} ${data.selected ? "selected" : ""}`} aria-label={`Open ${data.topic.title}`}>
@@ -172,18 +265,28 @@ export function TopologyCanvas({
   const { nodes, edges } = useMemo(() => {
     const visibleTopics = topics.slice(0, 5);
     const visibleAgents = agents.slice(0, 10);
-    const conversationNodes: ConversationFlowNode[] = visibleTopics.map((topic, index) => ({
-      id: topic.id,
-      type: "conversation",
-      position: conversationPositions[index] ?? { x: 300 + index * 80, y: 200 + index * 65 },
-      draggable: false,
-      selectable: true,
-      data: { topic, agents: topic.participantAgentIds.map((id) => agents.find((agent) => agent.id === id)).filter(Boolean) as Agent[], selected: topic.id === selectedTopicId },
-    }));
+    const conversationNodes: ConversationFlowNode[] = visibleTopics.map((topic, index) => {
+      const selected = topic.id === selectedTopicId;
+      const dimensions = conversationDimensions(topic.accent, selected);
+      return {
+        id: topic.id,
+        type: "conversation",
+        position: conversationPositions[index] ?? { x: 300 + index * 80, y: 200 + index * 65 },
+        width: dimensions.width,
+        height: dimensions.height,
+        handles: nodeHandles(dimensions.width, dimensions.height),
+        draggable: false,
+        selectable: true,
+        data: { topic, agents: topic.participantAgentIds.map((id) => agents.find((agent) => agent.id === id)).filter(Boolean) as Agent[], selected },
+      };
+    });
     const agentNodes: AgentFlowNode[] = visibleAgents.map((agent, index) => ({
       id: agent.id,
       type: "agent",
       position: agentPositions[index] ?? { x: 420, y: 340 },
+      width: 58,
+      height: 58,
+      handles: nodeHandles(58, 58),
       draggable: false,
       selectable: false,
       data: { agent },
