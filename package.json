@@ -35,6 +35,7 @@
     "verify:cutover-receipt": "tsx scripts/verify-cutover-receipt.ts",
     "consume:cutover-receipt": "tsx scripts/cutover-receipt-store.ts",
     "verify:session-gates": "tsx scripts/verify-runtime-session-gates.ts",
+    "verify:protected-runtime": "tsx scripts/verify-protected-runtime.ts",
     "verify:launch-evidence": "tsx scripts/verify-launch-evidence.ts",
     "verify:runtime-evidence": "tsx scripts/verify-launch-evidence.ts",
     "test:package-consumer": "node scripts/package-consumer-smoke.mjs packages/mcp integrations/openclaw",
