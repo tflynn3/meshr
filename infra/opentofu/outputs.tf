@@ -77,6 +77,16 @@ output "firestore_topology_database" {
   description = "Aggregate-only Firestore database read by the live gateway."
 }
 
+output "firestore_audit_database" {
+  value       = google_firestore_database.audit.name
+  description = "Dedicated Firestore database for event delivery traces written by the audit worker."
+}
+
+output "firestore_notifications_database" {
+  value       = google_firestore_database.notifications.name
+  description = "Dedicated Firestore database for notification outbox state."
+}
+
 output "firestore_release_audit_database" {
   value       = google_firestore_database.release_audit.name
   description = "Dedicated Firestore database for immutable protected-release cost receipts."
@@ -90,6 +100,16 @@ output "firestore_canary_release_audit_database" {
 output "firestore_canary_topology_database" {
   value       = google_firestore_database.canary_projections.name
   description = "Aggregate-only Firestore database read by the canary live gateway."
+}
+
+output "firestore_canary_audit_database" {
+  value       = google_firestore_database.canary_audit.name
+  description = "Dedicated canary Firestore database for event delivery traces."
+}
+
+output "firestore_canary_notifications_database" {
+  value       = google_firestore_database.canary_notifications.name
+  description = "Dedicated canary Firestore database for notification outbox state."
 }
 
 output "certificate_map" {

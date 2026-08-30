@@ -9,18 +9,34 @@ import {
   TOPOLOGY_ACTIVITY_WINDOW_MINUTES,
 } from "./activityWindow.ts";
 import { readProjectionBootstrap } from "../server/projectionBootstrap.ts";
-import { type AuthorityCollection } from "../server/authorityCollections.ts";
+import {
+  type AuthorityCollection,
+  type WorkerCollection,
+} from "../server/authorityCollections.ts";
 
-// Keep worker-owned durable state tied to the same authority inventory used by
-// cutover receipts and first-launch emptiness checks. A renamed or newly added
-// collection must update that inventory before this file can compile.
+// Authority collections are included in cutover receipts and first-launch
+// emptiness checks. Worker delivery traces have a separate inventory because
+// production routes them to dedicated Firestore databases.
 const authorityCollection = <T extends AuthorityCollection>(name: T): T => name;
+const workerCollection = <T extends WorkerCollection>(name: T): T => name;
 
 const config = eventPlaneConfig();
 const firestore = createFirestore(config.projectId, config.databaseId);
 const topologyFirestore = config.topologyDatabaseId === config.databaseId
   ? firestore
   : createFirestore(config.projectId, config.topologyDatabaseId);
+const auditFirestore = config.auditDatabaseId === config.databaseId
+  ? firestore
+  : config.auditDatabaseId === config.topologyDatabaseId
+    ? topologyFirestore
+    : createFirestore(config.projectId, config.auditDatabaseId);
+const notificationsFirestore = config.notificationsDatabaseId === config.databaseId
+  ? firestore
+  : config.notificationsDatabaseId === config.topologyDatabaseId
+    ? topologyFirestore
+    : config.notificationsDatabaseId === config.auditDatabaseId
+      ? auditFirestore
+      : createFirestore(config.projectId, config.notificationsDatabaseId);
 const pubsub = createPubSub(config.projectId);
 const moderationScreeningTopic = pubsub.topic(config.moderationScreeningTopic, {
   messageOrdering: true,
@@ -865,7 +881,13 @@ async function processMessage(
       message.ack();
       return true;
     }
-    const store = consumer === "topology" ? topologyFirestore : firestore;
+    const store = consumer === "topology"
+      ? topologyFirestore
+      : consumer === "audit"
+        ? auditFirestore
+        : consumer === "notifications"
+          ? notificationsFirestore
+          : firestore;
     const envelope = parseEventEnvelope(JSON.parse(message.data.toString("utf8")) as unknown);
     const payload = envelope.payload ?? {};
     const postPayload = payload.post && typeof payload.post === "object" && !Array.isArray(payload.post)
@@ -1124,7 +1146,7 @@ async function processMessage(
         }
       } else if (consumer === "audit") {
         transaction.set(
-          store.collection(authorityCollection("event_audit")).doc(envelope.event_id),
+          store.collection(workerCollection("event_audit")).doc(envelope.event_id),
           {
             ...envelope,
             consumer,
@@ -1137,7 +1159,7 @@ async function processMessage(
         );
       } else {
         transaction.set(
-          store.collection(authorityCollection("notification_outbox")).doc(envelope.event_id),
+          store.collection(workerCollection("notification_outbox")).doc(envelope.event_id),
           {
             contract_version: 1,
             event_id: envelope.event_id,
@@ -1961,9 +1983,18 @@ const server = createServer((request, response) => {
       }));
       return;
     }
+    const dependencyStore = requestedConsumer === "topology"
+      ? topologyFirestore
+      : requestedConsumer === "audit"
+        ? auditFirestore
+        : requestedConsumer === "notifications"
+          ? notificationsFirestore
+          : firestore;
     const dependencyCheck = requestedConsumer === "topology"
       ? topologyFirestore.collection("topology_shards").limit(1).get()
-      : firestore.collection("system").doc("taxonomy").get();
+      : requestedConsumer === "audit" || requestedConsumer === "notifications"
+        ? dependencyStore.collection(authorityCollection("processed_events")).limit(1).get()
+        : firestore.collection("system").doc("taxonomy").get();
     void Promise.all([
       dependencyCheck,
       ...activeSubscriptions.map(({ subscription }) => subscription.exists()),
@@ -2017,10 +2048,10 @@ async function shutdown(): Promise<void> {
   await new Promise<void>((resolve, reject) =>
     server.close((error) => (error ? reject(error) : resolve())),
   );
+  const stores = [...new Set([firestore, topologyFirestore, auditFirestore, notificationsFirestore])];
   await Promise.all([
     pubsub.close(),
-    firestore.terminate(),
-    topologyFirestore === firestore ? Promise.resolve() : topologyFirestore.terminate(),
+    ...stores.map((store) => store.terminate()),
   ]);
 }
 

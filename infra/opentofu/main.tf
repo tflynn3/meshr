@@ -388,8 +388,6 @@ locals {
     processed_events         = { collection = "processed_events", field = "retention_at" }
     moderation_inbox         = { collection = "moderation_inbox", field = "retention_at" }
     moderation_dlq           = { collection = "moderation_dlq", field = "retention_at" }
-    notification_outbox      = { collection = "notification_outbox", field = "retention_at" }
-    event_audit              = { collection = "event_audit", field = "retention_at" }
     audit_events             = { collection = "audit_events", field = "retention_at" }
     moderation_cases         = { collection = "moderation_cases", field = "retention_at" }
     quota_counter            = { collection = "quota_counters", field = "expires_at_ttl" }
@@ -526,9 +524,13 @@ locals {
   # side of the authority/topology pair.
   firestore_cross_environment_database_names = toset([
     google_firestore_database.release_audit.name,
+    google_firestore_database.audit.name,
+    google_firestore_database.notifications.name,
     google_firestore_database.canary.name,
     google_firestore_database.canary_projections.name,
     google_firestore_database.canary_release_audit.name,
+    google_firestore_database.canary_audit.name,
+    google_firestore_database.canary_notifications.name,
   ])
   firestore_cross_environment_restore_overlap = setintersection(
     toset(concat(
@@ -537,7 +539,11 @@ locals {
     )),
     local.firestore_cross_environment_database_names,
   )
-  canary_topology_firestore_iam_expression = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.canary_projections.name}'"
+  audit_firestore_iam_expression                = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.audit.name}'"
+  notifications_firestore_iam_expression        = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.notifications.name}'"
+  canary_topology_firestore_iam_expression      = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.canary_projections.name}'"
+  canary_audit_firestore_iam_expression         = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.canary_audit.name}'"
+  canary_notifications_firestore_iam_expression = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.canary_notifications.name}'"
   monitoring_notification_channels = try(
     [google_monitoring_notification_channel.operations_email[0].name],
     [],
@@ -707,6 +713,32 @@ resource "google_firestore_database" "release_audit" {
   depends_on                        = [google_project_service.required]
 }
 
+# Event-worker delivery traces are intentionally separate from the authority
+# database. The audit worker only needs the bounded `event_audit` trace and its
+# processed-event ledger; keeping that state here makes its database-scoped IAM
+# grant useful even if the worker process is compromised.
+resource "google_firestore_database" "audit" {
+  project                           = var.project_id
+  name                              = "meshr-audit"
+  location_id                       = var.region
+  type                              = "FIRESTORE_NATIVE"
+  point_in_time_recovery_enablement = "POINT_IN_TIME_RECOVERY_ENABLED"
+  delete_protection_state           = "DELETE_PROTECTION_ENABLED"
+  depends_on                        = [google_project_service.required]
+}
+
+# Notifications are operational fan-out state, not authority. Keep it in a
+# separate database so the notification worker cannot read accounts, posts,
+# sessions, or governance records through its Firestore role.
+resource "google_firestore_database" "notifications" {
+  project                 = var.project_id
+  name                    = "meshr-notifications"
+  location_id             = var.region
+  type                    = "FIRESTORE_NATIVE"
+  delete_protection_state = "DELETE_PROTECTION_ENABLED"
+  depends_on              = [google_project_service.required]
+}
+
 # Canary runs in the same GKE cluster but uses a separate Firestore database
 # so unapproved code cannot read or mutate public production records. The
 # application selects this database only through the canary overlay's explicit
@@ -737,6 +769,25 @@ resource "google_firestore_database" "canary_release_audit" {
   point_in_time_recovery_enablement = "POINT_IN_TIME_RECOVERY_ENABLED"
   delete_protection_state           = "DELETE_PROTECTION_ENABLED"
   depends_on                        = [google_project_service.required]
+}
+
+resource "google_firestore_database" "canary_audit" {
+  project                           = var.project_id
+  name                              = "meshr-canary-audit"
+  location_id                       = var.region
+  type                              = "FIRESTORE_NATIVE"
+  point_in_time_recovery_enablement = "POINT_IN_TIME_RECOVERY_ENABLED"
+  delete_protection_state           = "DELETE_PROTECTION_ENABLED"
+  depends_on                        = [google_project_service.required]
+}
+
+resource "google_firestore_database" "canary_notifications" {
+  project                 = var.project_id
+  name                    = "meshr-canary-notifications"
+  location_id             = var.region
+  type                    = "FIRESTORE_NATIVE"
+  delete_protection_state = "DELETE_PROTECTION_ENABLED"
+  depends_on              = [google_project_service.required]
 }
 
 # Keep a rolling daily backup window in addition to point-in-time recovery.
@@ -1671,26 +1722,42 @@ resource "google_firestore_field" "moderation_dlq_ttl" {
   ttl_config {}
 }
 
-resource "google_firestore_field" "notification_outbox_ttl" {
+resource "google_firestore_field" "audit_events_ttl" {
   project    = var.project_id
   database   = google_firestore_database.default.name
-  collection = "notification_outbox"
+  collection = "audit_events"
   field      = "retention_at"
   ttl_config {}
 }
 
-resource "google_firestore_field" "event_audit_ttl" {
+resource "google_firestore_field" "audit_event_trace_ttl" {
   project    = var.project_id
-  database   = google_firestore_database.default.name
+  database   = google_firestore_database.audit.name
   collection = "event_audit"
   field      = "retention_at"
   ttl_config {}
 }
 
-resource "google_firestore_field" "audit_events_ttl" {
+resource "google_firestore_field" "audit_processed_event_ttl" {
   project    = var.project_id
-  database   = google_firestore_database.default.name
-  collection = "audit_events"
+  database   = google_firestore_database.audit.name
+  collection = "processed_events"
+  field      = "retention_at"
+  ttl_config {}
+}
+
+resource "google_firestore_field" "notification_outbox_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.notifications.name
+  collection = "notification_outbox"
+  field      = "retention_at"
+  ttl_config {}
+}
+
+resource "google_firestore_field" "notification_processed_event_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.notifications.name
+  collection = "processed_events"
   field      = "retention_at"
   ttl_config {}
 }
@@ -1829,6 +1896,38 @@ resource "google_firestore_field" "canary_ttl" {
   database   = google_firestore_database.canary.name
   collection = each.value.collection
   field      = each.value.field
+  ttl_config {}
+}
+
+resource "google_firestore_field" "canary_audit_event_trace_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.canary_audit.name
+  collection = "event_audit"
+  field      = "retention_at"
+  ttl_config {}
+}
+
+resource "google_firestore_field" "canary_audit_processed_event_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.canary_audit.name
+  collection = "processed_events"
+  field      = "retention_at"
+  ttl_config {}
+}
+
+resource "google_firestore_field" "canary_notification_outbox_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.canary_notifications.name
+  collection = "notification_outbox"
+  field      = "retention_at"
+  ttl_config {}
+}
+
+resource "google_firestore_field" "canary_notification_processed_event_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.canary_notifications.name
+  collection = "processed_events"
+  field      = "retention_at"
   ttl_config {}
 }
 
@@ -2614,7 +2713,8 @@ resource "google_project_iam_member" "bootstrap_canary_topology_firestore" {
 resource "google_project_iam_member" "worker_firestore" {
   for_each = {
     for key, value in local.worker_accounts : key => value
-    if key != "live_gateway" && key != "topology_materializer"
+    if key != "live_gateway" && key != "topology_materializer" &&
+    key != "audit_worker" && key != "notification_worker"
   }
   project = var.project_id
   role    = each.value.firestore_role
@@ -2623,6 +2723,28 @@ resource "google_project_iam_member" "worker_firestore" {
     title       = "${each.key}-authority-database"
     description = "Production ${each.key} worker can access only the authority Firestore database."
     expression  = local.authority_firestore_iam_expression
+  }
+}
+
+resource "google_project_iam_member" "audit_worker_firestore" {
+  project = var.project_id
+  role    = local.worker_accounts.audit_worker.firestore_role
+  member  = "serviceAccount:${google_service_account.worker["audit_worker"].email}"
+  condition {
+    title       = "audit-worker-database"
+    description = "Production audit worker can access only delivery traces in the dedicated audit Firestore database."
+    expression  = local.audit_firestore_iam_expression
+  }
+}
+
+resource "google_project_iam_member" "notification_worker_firestore" {
+  project = var.project_id
+  role    = local.worker_accounts.notification_worker.firestore_role
+  member  = "serviceAccount:${google_service_account.worker["notification_worker"].email}"
+  condition {
+    title       = "notification-worker-database"
+    description = "Production notification worker can access only the dedicated notification Firestore database."
+    expression  = local.notifications_firestore_iam_expression
   }
 }
 
@@ -2675,7 +2797,8 @@ resource "google_project_iam_member" "topology_materializer_projection_firestore
 resource "google_project_iam_member" "canary_worker_firestore" {
   for_each = {
     for key, value in local.canary_worker_accounts : key => value
-    if key != "live_gateway" && key != "topology_materializer"
+    if key != "live_gateway" && key != "topology_materializer" &&
+    key != "audit_worker" && key != "notification_worker"
   }
   project = var.project_id
   role    = each.value.firestore_role
@@ -2684,6 +2807,28 @@ resource "google_project_iam_member" "canary_worker_firestore" {
     title       = "canary-firestore-database-${each.key}"
     description = "Canary event worker can access only the isolated canary Firestore database."
     expression  = "resource.name == 'projects/${var.project_id}/databases/meshr-canary'"
+  }
+}
+
+resource "google_project_iam_member" "canary_audit_worker_firestore" {
+  project = var.project_id
+  role    = local.canary_worker_accounts.audit_worker.firestore_role
+  member  = "serviceAccount:${google_service_account.canary_worker["audit_worker"].email}"
+  condition {
+    title       = "canary-audit-worker-database"
+    description = "Canary audit worker can access only delivery traces in the dedicated canary audit Firestore database."
+    expression  = local.canary_audit_firestore_iam_expression
+  }
+}
+
+resource "google_project_iam_member" "canary_notification_worker_firestore" {
+  project = var.project_id
+  role    = local.canary_worker_accounts.notification_worker.firestore_role
+  member  = "serviceAccount:${google_service_account.canary_worker["notification_worker"].email}"
+  condition {
+    title       = "canary-notification-worker-database"
+    description = "Canary notification worker can access only the dedicated canary notification Firestore database."
+    expression  = local.canary_notifications_firestore_iam_expression
   }
 }
 

@@ -137,12 +137,14 @@ to host its Kubernetes nodes; it is not used to construct Meshr images.
 | Identity Platform | Development verifier and local account/session implementation | Functional local substitute; deployed token exchange uses Google Cloud Identity Platform |
 | Secret Manager | Kubernetes Secret | Local-only token; never reuse in a deployed environment |
 | Artifact Registry | Bazel OCI archives imported directly into k3d | Same image graph, but no registry push or image-signing test |
-| Trace retention | Firestore `event_audit` / moderation trace collections with TTL | Raw delivery/moderation traces are bounded to 30 days; an object-storage archive is intentionally outside the launch footprint |
+| Trace retention | Firestore `event_audit` / moderation trace collections with TTL | Production keeps `event_audit` and notification outbox state in dedicated worker databases; raw delivery/moderation traces are bounded to 30 days and an object-storage archive is intentionally outside the launch footprint |
 | Crossplane and Flux | Not installed in the runtime path yet | Local stack proves workloads/data plane, not managed-resource reconciliation |
 
 The honest storage boundary matters: in production, Firestore is authoritative
 for identities, sessions, bindings, meshes, memberships, posts, idempotency,
-moderation, audit, and outbox state. The API keeps a disposable in-memory SQLite
+moderation, governance audit, and authoritative outbox state. Production worker
+delivery traces and notification outbox state live in dedicated Firestore
+databases. The API keeps a disposable in-memory SQLite
 projection for cursors and low-latency aggregate reads; it is populated from
 Firestore on demand and lost on every process restart. The local stack itself
 uses the SQLite adapter for fast fixtures and the Firestore/Pub/Sub emulators

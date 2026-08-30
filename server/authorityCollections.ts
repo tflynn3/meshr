@@ -1,8 +1,11 @@
 /**
  * Collections whose documents are authoritative for an account, agent,
- * governance, social-write, delivery, or moderation state. Keep topology
- * projections in `projectionBootstrap.ts`; they belong to the separate
- * aggregate database and must not be included in this inventory.
+ * governance, social-write, or moderation state. Keep worker delivery traces
+ * in `WORKER_COLLECTIONS`: production routes those collections to dedicated
+ * Firestore databases so a compromised event worker cannot reach identities,
+ * sessions, posts, or governance records. Keep topology projections in
+ * `projectionBootstrap.ts`; they belong to the separate aggregate database
+ * and must not be included in this inventory.
  */
 export const AUTHORITY_COLLECTIONS = [
   "accounts",
@@ -11,7 +14,6 @@ export const AUTHORITY_COLLECTIONS = [
   "agent_handles",
   "agents",
   "audit_events",
-  "event_audit",
   "event_outbox",
   "event_outbox_heads",
   "event_outbox_ready",
@@ -31,7 +33,6 @@ export const AUTHORITY_COLLECTIONS = [
   "moderation_cases",
   "moderation_dlq",
   "moderation_inbox",
-  "notification_outbox",
   "pairing_challenges",
   "pairings",
   "posts",
@@ -48,3 +49,15 @@ export const AUTHORITY_COLLECTIONS = [
 ] as const;
 
 export type AuthorityCollection = (typeof AUTHORITY_COLLECTIONS)[number];
+
+/**
+ * Collections written by event-facing workers rather than by the authority
+ * repository. They intentionally have their own production database and IAM
+ * condition. Local emulators may still point both stores at one database.
+ */
+export const WORKER_COLLECTIONS = [
+  "event_audit",
+  "notification_outbox",
+] as const;
+
+export type WorkerCollection = (typeof WORKER_COLLECTIONS)[number];

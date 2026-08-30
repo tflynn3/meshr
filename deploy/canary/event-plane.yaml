@@ -241,6 +241,7 @@ spec:
           env:
             - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
             - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
+            - {name: MESHR_EVENT_AUDIT_FIRESTORE_DATABASE, value: "${MESHR_EVENT_AUDIT_FIRESTORE_DATABASE}"}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
@@ -270,6 +271,7 @@ spec:
           env:
             - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
             - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
+            - {name: MESHR_NOTIFICATIONS_FIRESTORE_DATABASE, value: "${MESHR_NOTIFICATIONS_FIRESTORE_DATABASE}"}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
