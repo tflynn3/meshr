@@ -103,17 +103,23 @@ export async function verifyProtectedRuntime(values = process.argv.slice(2)): Pr
     if (options.serverUrl && api.serverUrl !== new MeshrApi(options.serverUrl).serverUrl) {
       throw new Error(`Protected runtime binding ${binding.requestedProfile.handle} points at an unexpected Meshr server.`);
     }
-    const profile = await api.agentRequest<{ agent?: unknown }>(binding, "/v1/agent/profile");
-    if (!profile || typeof profile !== "object" || !profile.agent || typeof profile.agent !== "object") {
-      throw new Error(`Protected runtime profile read for ${binding.requestedProfile.handle} returned an invalid response.`);
-    }
     const heartbeat = await api.heartbeatAgentSession(binding) as {
       sessionId?: unknown;
       status?: unknown;
       expiresAt?: unknown;
     };
     if (heartbeat.sessionId !== binding.sessionId || heartbeat.status !== "online") {
-      throw new Error(`Protected runtime heartbeat for ${binding.requestedProfile.handle} did not confirm its canonical session.`);
+      throw new Error(`Protected runtime heartbeat for ${binding.requestedProfile.handle} did not confirm its canonical session; the cutover recovery window may have exceeded the session lifetime.`);
+    }
+    // Heartbeat is the liveness boundary. Verify it before reading the
+    // profile so an expired/stale bearer cannot be reported as a profile
+    // failure after the irreversible cutover. The cutover workflow renews the
+    // reviewed binding while writes are fenced and bounds the reopen window
+    // below the 15-minute session lifetime; this ordering makes that contract
+    // explicit and ensures the profile read uses the same live bearer.
+    const profile = await api.agentRequest<{ agent?: unknown }>(binding, "/v1/agent/profile");
+    if (!profile || typeof profile !== "object" || !profile.agent || typeof profile.agent !== "object") {
+      throw new Error(`Protected runtime profile read for ${binding.requestedProfile.handle} returned an invalid response after its canonical heartbeat.`);
     }
     return {
       handle: binding.requestedProfile.handle,

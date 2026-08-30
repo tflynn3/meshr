@@ -372,6 +372,56 @@ test("expired native renewal recovers deterministically and fences stale retries
   assert.equal(claim.response.status, 201);
   const agentId = claim.json.agent.id as string;
   const predecessorSessionId = claim.json.sessionId as string;
+
+  // A cutover candidate must be able to rotate the reviewed predecessor
+  // while writes are still fenced, even when the normal two-minute renewal
+  // window has not started. The exception is scoped to the configured
+  // binding/agent/session and its joined private validation mesh.
+  const validationMesh = await requestJson(baseUrl, "/v1/meshes", {
+    method: "POST",
+    cookie,
+    csrf,
+    idempotencyKey: "renewal-validation-mesh",
+    body: {
+      name: "Renewal validation",
+      description: "Private cutover validation mesh",
+      visibility: "private",
+      joinPolicy: "open",
+      agentIds: [agentId],
+    },
+  });
+  assert.equal(validationMesh.response.status, 201);
+  const previousCutoverEnvironment = {
+    mode: process.env.MESHR_DATABASE_CUTOVER_MODE,
+    meshId: process.env.MESHR_CUTOVER_VALIDATION_MESH_ID,
+    bindingId: process.env.MESHR_CUTOVER_VALIDATION_BINDING_ID,
+    agentId: process.env.MESHR_CUTOVER_VALIDATION_AGENT_ID,
+    sessionId: process.env.MESHR_CUTOVER_VALIDATION_SESSION_ID,
+  };
+  process.env.MESHR_DATABASE_CUTOVER_MODE = "validation";
+  process.env.MESHR_CUTOVER_VALIDATION_MESH_ID = validationMesh.json.mesh.id as string;
+  process.env.MESHR_CUTOVER_VALIDATION_BINDING_ID = pairingId;
+  process.env.MESHR_CUTOVER_VALIDATION_AGENT_ID = agentId;
+  process.env.MESHR_CUTOVER_VALIDATION_SESSION_ID = predecessorSessionId;
+  try {
+    const earlyValidationChallenge = await requestJson(baseUrl, `/v1/pairings/${pairingId}/challenges`, {
+      method: "POST",
+      authorization: pairingAuth,
+      body: { sessionId: predecessorSessionId },
+    });
+    assert.equal(earlyValidationChallenge.response.status, 201);
+    assert.match(earlyValidationChallenge.json.message as string, /:renew:/);
+  } finally {
+    const restoreEnvironment = (name: string, value: string | undefined) => {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    };
+    restoreEnvironment("MESHR_DATABASE_CUTOVER_MODE", previousCutoverEnvironment.mode);
+    restoreEnvironment("MESHR_CUTOVER_VALIDATION_MESH_ID", previousCutoverEnvironment.meshId);
+    restoreEnvironment("MESHR_CUTOVER_VALIDATION_BINDING_ID", previousCutoverEnvironment.bindingId);
+    restoreEnvironment("MESHR_CUTOVER_VALIDATION_AGENT_ID", previousCutoverEnvironment.agentId);
+    restoreEnvironment("MESHR_CUTOVER_VALIDATION_SESSION_ID", previousCutoverEnvironment.sessionId);
+  }
   app.database.sqlite
     .prepare("UPDATE agent_sessions SET expires_at = ? WHERE session_id = ? AND agent_id = ?")
     .run("2026-08-27T17:59:00.000Z", predecessorSessionId, agentId);
