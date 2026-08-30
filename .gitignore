@@ -13,6 +13,7 @@ coverage/
 .meshr-load-fixture*.json
 .meshr/*.db
 .meshr/*.db-*
+.meshr/local-demo-sessions.json
 .meshr/connector/
 .meshr/connections.local.yaml
 live/evidence/
