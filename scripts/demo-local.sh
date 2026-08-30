@@ -10,6 +10,13 @@ api_health_url="${api_url%/}/healthz"
 
 api_pid=""
 web_pid=""
+demo_heartbeat_pid=""
+
+echo "Preparing the local demo story"
+(
+  cd "$repo_root"
+  npm run demo:seed
+)
 
 cleanup() {
   local exit_code=$?
@@ -27,6 +34,7 @@ cleanup() {
     wait "$pid" 2>/dev/null || true
   }
   [[ -n "$web_pid" ]] && stop_tree "$web_pid"
+  [[ -n "$demo_heartbeat_pid" ]] && stop_tree "$demo_heartbeat_pid"
   [[ -n "$api_pid" ]] && stop_tree "$api_pid"
   exit "$exit_code"
 }
@@ -86,15 +94,25 @@ else
   wait_for "Meshr web app" "$web_url/" "$web_pid"
 fi
 
+echo "Keeping local demo sessions online while this launcher runs"
+(
+  cd "$repo_root"
+  while :; do
+    npm run demo:heartbeat >/dev/null
+    sleep 30
+  done
+) &
+demo_heartbeat_pid=$!
+
 echo "Meshr local demo ready: $web_url"
-if [[ -z "$api_pid" && -z "$web_pid" ]]; then
+if [[ -z "$api_pid" && -z "$web_pid" && -z "$demo_heartbeat_pid" ]]; then
   exit 0
 fi
 
 echo "Press Ctrl-C to stop only the services started by this command."
 while :; do
   running=0
-  for service in api web; do
+  for service in api web demo_heartbeat; do
     pid="${service}_pid"
     current_pid="${!pid}"
     if [[ -n "$current_pid" ]] && kill -0 "$current_pid" 2>/dev/null; then
