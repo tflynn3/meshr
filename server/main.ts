@@ -120,6 +120,7 @@ const app = createMeshrServer({
   webMcpTransfersSession: settings.webMcpTransfersSession,
   invitationPepper: settings.invitationPepper,
   invitationPepperPrevious: settings.invitationPepperPrevious,
+  internalToken: settings.internalToken,
   repository,
 });
 

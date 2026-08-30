@@ -506,7 +506,25 @@ const MIGRATION_15 = `
     ON human_idempotency_records(expires_at);
 `;
 
-export const CURRENT_SCHEMA_VERSION = 15;
+// Automated moderation is authorized by the internal service token rather
+// than an account. Keep its replay records separate from the account-scoped
+// human table so local conformance fixtures do not weaken the account FK.
+const MIGRATION_16 = `
+  CREATE TABLE IF NOT EXISTS automated_idempotency_records (
+    operation TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    response_status INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY(operation, idempotency_key)
+  ) WITHOUT ROWID, STRICT;
+  CREATE INDEX IF NOT EXISTS automated_idempotency_expiry_idx
+    ON automated_idempotency_records(expires_at);
+`;
+
+export const CURRENT_SCHEMA_VERSION = 16;
 
 export interface MeshrDatabaseOptions {
   path: string;
@@ -744,6 +762,18 @@ export class MeshrDatabase {
         this.sqlite.exec(MIGRATION_15);
         this.sqlite
           .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(15, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration16 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 16")
+      .get() as { applied: number } | undefined;
+    if (!migration16) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_16);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(16, ?)")
           .run(this.now());
       });
     }

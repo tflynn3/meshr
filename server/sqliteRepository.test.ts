@@ -281,6 +281,92 @@ test("SQLite adapter matches Firestore transaction boundaries for corrected auth
       1,
     );
 
+    // Automated decisions must carry the worker marker and the exact post
+    // revision observed by the provider. A stale provider result is rejected
+    // even when the caller supplies a valid idempotency key.
+    const automatedPostId = "sqlite-automated-moderation-post";
+    const automatedCreatedAt = "2026-08-28T18:20:00.000Z";
+    database.sqlite.prepare(
+      `INSERT INTO posts(
+         id, mesh_id, topic_id, agent_id, session_id, parent_post_id, body,
+         created_at, moderation_state, moderation_reason, expires_at
+       ) VALUES(?, ?, ?, ?, ?, NULL, ?, ?, 'quarantined', ?, ?)`,
+    ).run(
+      automatedPostId,
+      meshId,
+      topicId,
+      agentId,
+      "sqlite-automated-session",
+      "automated body",
+      automatedCreatedAt,
+      "policy review",
+      "2026-11-26T18:20:00.000Z",
+    );
+    const automatedCaseId = "sqlite-automated-moderation-case";
+    await repository.upsertModerationCase({
+      caseId: automatedCaseId,
+      postId: automatedPostId,
+      meshId,
+      reason: "policy review",
+      state: "queued",
+      severity: "high",
+      resolution: null,
+      createdAt: automatedCreatedAt,
+      updatedAt: automatedCreatedAt,
+      resolvedAt: null,
+    });
+    await assert.rejects(
+      repository.updatePostModeration({
+        caseId: automatedCaseId,
+        postId: automatedPostId,
+        state: "published",
+        reason: "automated allow",
+        caseState: "resolved",
+        resolution: "allow",
+        updatedAt: "2026-08-28T18:21:00.000Z",
+        actingAccountId: owner.accountId,
+        humanSessionHash: ownerSessionHash,
+        idempotencyKey: "sqlite-automated-invalid-marker",
+        requestHash: "sqlite-automated-invalid-marker-hash",
+        automated: { expectedPostState: "quarantined", expectedPostUpdatedAt: automatedCreatedAt },
+      }),
+      /moderation_authorization_denied/,
+    );
+    const automated = await repository.updatePostModeration({
+      caseId: automatedCaseId,
+      postId: automatedPostId,
+      state: "published",
+      reason: "automated allow",
+      caseState: "resolved",
+      resolution: "allow",
+      updatedAt: "2026-08-28T18:21:00.000Z",
+      actingAccountId: "moderation-worker",
+      humanSessionHash: "internal",
+      idempotencyKey: "sqlite-automated-allow",
+      requestHash: "sqlite-automated-allow-hash",
+      automated: { expectedPostState: "quarantined", expectedPostUpdatedAt: automatedCreatedAt },
+      ...artifact("moderation-automated", meshId, "internal", "2026-08-28T18:21:00.000Z"),
+    });
+    assert.equal(automated.duplicate, false);
+    assert.equal(automated.post?.moderationState, "published");
+    await assert.rejects(
+      repository.updatePostModeration({
+        caseId: automatedCaseId,
+        postId: automatedPostId,
+        state: "removed",
+        reason: "stale provider result",
+        caseState: "resolved",
+        resolution: "remove",
+        updatedAt: "2026-08-28T18:22:00.000Z",
+        actingAccountId: "moderation-worker",
+        humanSessionHash: "internal",
+        idempotencyKey: "sqlite-automated-stale",
+        requestHash: "sqlite-automated-stale-hash",
+        automated: { expectedPostState: "quarantined", expectedPostUpdatedAt: automatedCreatedAt },
+      }),
+      /moderation_transition_conflict/,
+    );
+
     // Two operators racing to start the same queued case must not both win.
     // SQLite's transaction boundary is the local conformance stand-in for the
     // Firestore transaction: one request records its idempotency result and

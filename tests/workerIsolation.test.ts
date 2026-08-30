@@ -43,3 +43,23 @@ test("production manifests make dedicated worker databases explicit", () => {
   assert.match(canaryValues, /MESHR_EVENT_AUDIT_FIRESTORE_DATABASE:\s+meshr-canary-audit/);
   assert.match(canaryValues, /MESHR_NOTIFICATIONS_FIRESTORE_DATABASE:\s+meshr-canary-notifications/);
 });
+
+test("screening workers use the token-authenticated moderation authority route", () => {
+  const materializer = read("platform/materializer.ts");
+  const production = read("deploy/production/workloads.yaml");
+  const canary = read("deploy/canary/event-plane.yaml");
+  const productionConfig = read("deploy/production/config.yaml");
+  const canaryConfig = read("deploy/canary/config.yaml");
+
+  assert.match(materializer, /MESHR_MODERATION_AUTHORITY_URL/);
+  assert.match(materializer, /internal\/v1\/moderation\/candidate/);
+  assert.match(materializer, /internal\/v1\/moderation\/decision/);
+  assert.match(materializer, /moderationAuthorityApiEnabled/);
+  for (const source of [production, canary]) {
+    assert.match(source, /MESHR_MODERATION_AUTHORITY_URL/);
+    assert.match(source, /MESHR_INTERNAL_TOKEN_FILE/);
+    assert.match(source, /secretProviderClass: meshr-event-secrets/);
+  }
+  assert.match(productionConfig, /MESHR_MODERATION_AUTHORITY_URL: http:\/\/api\.meshr\.svc\.cluster\.local:8787/);
+  assert.match(canaryConfig, /MESHR_MODERATION_AUTHORITY_URL: http:\/\/api-canary\.meshr-canary\.svc\.cluster\.local:8787/);
+});

@@ -14,7 +14,7 @@ needed by a workload.
 | Live gateway (`meshr-live-gateway`) | `meshr-live-gateway` | Aggregate topology Firestore read; internal API authorization call; internal token | Authority Firestore, posts, accounts, sessions, moderation, audit, Pub/Sub publish |
 | Ingest (`meshr-ingest`) | `meshr-ingest` | Authority Firestore outbox read/update; publish to the matching `mesh-events` topic; topic metadata read; internal token | Browser credentials, topology database, moderation provider |
 | Topology materializer (`meshr-topology-materializer`) | `meshr-topology` | Subscribe to the topology event subscription; aggregate topology database read/write; bounded event trace | Authority account/session data, moderation provider, Secret Manager |
-| Moderation intake/screening (`meshr-moderation-worker`) | `meshr-moderation` | Subscribe to moderation and screening subscriptions; authority moderation state; publish screening jobs; invoke only the matching adapter; ADC/ID-token adapter auth | Model Armor and DLP directly, topology projection, arbitrary Cloud Run |
+| Moderation intake/screening (`meshr-moderation-worker`) | `meshr-moderation` | Subscribe to moderation and screening subscriptions; authority moderation queue reads; publish screening jobs; invoke only the matching adapter; token-authenticated, revision-fenced decision route; ADC/ID-token adapter auth | Direct post-mutation authority from the screening process, Model Armor and DLP directly, topology projection, arbitrary Cloud Run |
 | Audit worker (`meshr-audit-worker`) | `meshr-audit` | Subscribe to audit subscription; dedicated `meshr-audit` Firestore `event_audit` trace and processed-event ledger | Authority accounts, sessions, posts, governance, moderation, topology projection, provider APIs |
 | Notification worker (`meshr-notification-worker`) | `meshr-notifications` | Subscribe to notification subscription; dedicated `meshr-notifications` Firestore `notification_outbox` and processed-event ledger | Agent credentials, authority accounts/sessions/posts, governance, moderation, topology projection, provider APIs |
 | Static web (`meshr-web`) | No Google service account | Static files only; Kubernetes API token disabled | All Google APIs and Secret Manager |
@@ -61,12 +61,14 @@ contain only release receipts.
 
 ### Launch security acceptance
 
-The current Firestore client libraries require ingest and moderation to read
-and write several authority collections (`event_outbox`, `posts`, and
-moderation state). Google predefined Firestore roles cannot express a
-collection/document-path IAM condition, so those two grants remain
-database-scoped. Audit delivery traces and notification fan-out state are
-separate databases and do not depend on this acceptance.
+The current Firestore client libraries require ingest and moderation intake to
+read and write several authority collections (`event_outbox`, `moderation_inbox`,
+and moderation state). Google predefined Firestore roles cannot express a
+collection/document-path IAM condition, so those grants remain database-scoped.
+Screening decisions themselves cross the narrow internal authority route and
+are revision-fenced in the API transaction. Audit delivery traces and
+notification fan-out state are separate databases and do not depend on this
+acceptance.
 
 `accept_worker_authority_database_risk` must be set explicitly for a protected
 OpenTofu launch. That acceptance records the remaining moderation/ingest

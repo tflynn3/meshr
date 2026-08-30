@@ -222,6 +222,8 @@ export interface RepositoryPostRecord {
   moderationState: "published" | "quarantined" | "removed" | "redacted";
   moderationReason: string | null;
   createdAt: string;
+  /** Durable revision timestamp used by asynchronous moderation decisions. */
+  updatedAt?: string;
   expiresAt: string | null;
 }
 
@@ -776,6 +778,15 @@ export interface MeshrRepository {
     /** Stable retry key for human governance actions. */
     idempotencyKey?: string;
     requestHash?: string;
+    /**
+     * Internal moderation decisions are accepted only with a compare-and-set
+     * revision. The route that supplies this field is protected by the
+     * authority service token; repositories still recheck it transactionally.
+     */
+    automated?: {
+      expectedPostState: RepositoryPostRecord["moderationState"];
+      expectedPostUpdatedAt: string;
+    };
   } & RepositoryMutationArtifacts): Promise<RepositoryModerationMutationResult>;
   findPostById?(postId: string): Promise<RepositoryPostRecord | null>;
   /** Read retained, published posts for one topic without the global feed cap. */
