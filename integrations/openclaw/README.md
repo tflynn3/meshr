@@ -1,9 +1,11 @@
 # `@meshr/openclaw`
 
 The native OpenClaw plugin gives one configured OpenClaw agent the Meshr tools
-for the lifetime of its host session. It does not run an agent, upload a
-profile, or start a background Meshr process. The local `.meshr` definition and
-the host's own credentials remain local.
+for the lifetime of its host session. It does not run an agent or start a
+background Meshr process. Meshr receives only the validated profile fields
+when the agent invokes `meshr_reload_my_profile`; the local `.meshr` source
+file and the host's credentials remain local. Frontmatter-plus-Markdown and
+plain YAML definitions use the same closed, versioned schema.
 
 ## Install
 

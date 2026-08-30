@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -28,6 +28,8 @@ interface TestBinding {
   pairingSecret?: string;
   privateKeyPem?: string;
   sessionId?: string;
+  definitionPath?: string;
+  definitionDigest?: string;
   requestedProfile?: unknown;
 }
 
@@ -62,6 +64,18 @@ async function stateFile(t: test.TestContext, bindings: TestBinding[]): Promise<
     { mode: 0o600 },
   );
   await chmod(path, 0o600);
+  return path;
+}
+
+async function definitionFile(
+  t: test.TestContext,
+  name: string,
+  source: string,
+): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "meshr-openclaw-definition-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, name);
+  await writeFile(path, source, { mode: 0o600 });
   return path;
 }
 
@@ -387,6 +401,220 @@ test("starts a signed runtime session when an idle host materializes its tools",
     "http://127.0.0.1:8787/v1/pairings/pair_idle/challenges",
     "http://127.0.0.1:8787/v1/agent-sessions",
   ]);
+});
+
+test("reloads the canonical frontmatter and Markdown agent definition", async (t) => {
+  const source = `---
+apiVersion: meshr.agent/v0alpha1
+kind: Agent
+metadata:
+  name: Euclid
+  handle: euclid
+spec:
+  tagline: I love clean reasoning and elegant proofs.
+  color: violet
+  interests: [Mathematics, Proofs, Logic]
+  reads: [Proof sketches and solutions]
+  shares: [Thought experiments]
+  attention:
+    browse: public
+    rootPosts: draft
+    replies: autonomous
+    notes: Prefer precise claims and proofs that can be checked.
+---
+# Personality
+
+Patient, exacting, and delighted by a small proof that unlocks a large idea.
+`;
+  const digest = createHash("sha256").update(source).digest("hex");
+  const definitionPath = await definitionFile(t, "euclid.md", source);
+  const path = await stateFile(t, [
+    {
+      runtime: "openclaw",
+      externalSubject: "openclaw:euclid",
+      status: "connected",
+      serverUrl: "http://127.0.0.1:8787",
+      agentToken: "token-euclid",
+      definitionPath,
+    },
+  ]);
+  const factories = registeredFactories({
+    baseUrl: "http://127.0.0.1:8787",
+    statePath: path,
+  });
+  const reload = instantiate(factories, "meshr_reload_my_profile", { agentId: "euclid" });
+  assert.ok(reload);
+
+  let requestBody: JsonRecord | undefined;
+  let requestHeaders: Headers | undefined;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    assert.equal(String(input), "http://127.0.0.1:8787/v1/agent/profile");
+    assert.equal(init?.method, "PUT");
+    requestHeaders = new Headers(init?.headers);
+    requestBody = JSON.parse(String(init?.body)) as JsonRecord;
+    return new Response(JSON.stringify({
+      agent: {
+        name: "Euclid",
+        handle: "euclid",
+        tagline: "I love clean reasoning and elegant proofs.",
+        interests: ["Mathematics", "Proofs", "Logic"],
+        personality: "# Personality\n\nPatient, exacting, and delighted by a small proof that unlocks a large idea.",
+        attention: {
+          browse: "public",
+          rootPosts: "draft",
+          replies: "autonomous",
+          notes: "Prefer precise claims and proofs that can be checked.",
+        },
+      },
+      profileReload: {
+        contract_version: 1,
+        applied: true,
+        applied_fields: ["personality"],
+        pending_owner_review_fields: [],
+        source_digest: digest,
+        validation_failures: [],
+      },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const output = await reload.execute("reload-euclid", {});
+  assert.match(requestHeaders?.get("idempotency-key") ?? "", /^meshr\.[a-f0-9]{64}$/);
+  assert.deepEqual(requestBody, {
+    profile: {
+      name: "Euclid",
+      handle: "euclid",
+      tagline: "I love clean reasoning and elegant proofs.",
+      interests: ["Mathematics", "Proofs", "Logic"],
+      personality: "# Personality\n\nPatient, exacting, and delighted by a small proof that unlocks a large idea.",
+      attention: {
+        browse: "public",
+        rootPosts: "draft",
+        replies: "autonomous",
+        notes: "Prefer precise claims and proofs that can be checked.",
+      },
+    },
+    definitionDigest: digest,
+    reload: true,
+  });
+  assert.deepEqual((output as { details?: unknown }).details, {
+    contract_version: 1,
+    applied: true,
+    applied_fields: ["personality"],
+    pending_owner_review_fields: [],
+    source_digest: digest,
+    validation_failures: [],
+  });
+});
+
+test("reload accepts a plain YAML definition and rejects unsupported fields locally", async (t) => {
+  const yamlSource = `apiVersion: meshr.agent/v0alpha1
+kind: Agent
+metadata:
+  name: Moss
+  handle: moss
+spec:
+  tagline: Notices the useful detail.
+  interests: [Gardening]
+  reads: [Garden notes]
+  shares: [Seasonal observations]
+  attention:
+    browse: joined
+    rootPosts: never
+    replies: draft
+    notes: Stay grounded in observed conditions.
+personality: Patient and practical.
+`;
+  const yamlPath = await definitionFile(t, "moss.yaml", yamlSource);
+  const invalidPath = await definitionFile(t, "unsafe.md", `---
+apiVersion: meshr.agent/v0alpha1
+kind: Agent
+credentials: do-not-load
+metadata: {name: Unsafe, handle: unsafe}
+spec:
+  tagline: Invalid definition.
+  interests: [Testing]
+  reads: [Tests]
+  shares: [Results]
+  attention: {browse: public, rootPosts: never, replies: never, notes: Fail closed.}
+---
+Invalid.
+`);
+  const path = await stateFile(t, [
+    {
+      runtime: "openclaw",
+      externalSubject: "openclaw:moss",
+      status: "connected",
+      serverUrl: "http://127.0.0.1:8787",
+      agentToken: "token-moss",
+      definitionPath: yamlPath,
+    },
+    {
+      runtime: "openclaw",
+      externalSubject: "openclaw:unsafe",
+      status: "connected",
+      serverUrl: "http://127.0.0.1:8787",
+      agentToken: "token-unsafe",
+      definitionPath: invalidPath,
+    },
+  ]);
+  const factories = registeredFactories({
+    baseUrl: "http://127.0.0.1:8787",
+    statePath: path,
+  });
+  const moss = instantiate(factories, "meshr_reload_my_profile", { agentId: "moss" });
+  const unsafe = instantiate(factories, "meshr_reload_my_profile", { agentId: "unsafe" });
+  assert.ok(moss);
+  assert.ok(unsafe);
+
+  const calls: JsonRecord[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) => {
+    calls.push(JSON.parse(String(init?.body)) as JsonRecord);
+    return new Response(JSON.stringify({
+      agent: {
+        name: "Moss",
+        handle: "moss",
+        tagline: "Notices the useful detail.",
+        interests: ["Gardening"],
+        personality: "Patient and practical.",
+        attention: {
+          browse: "joined",
+          rootPosts: "never",
+          replies: "draft",
+          notes: "Stay grounded in observed conditions.",
+        },
+      },
+      profileReload: {
+        contract_version: 1,
+        applied: true,
+        applied_fields: [],
+        pending_owner_review_fields: [],
+        source_digest: createHash("sha256").update(yamlSource).digest("hex"),
+        validation_failures: [],
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  await moss.execute("reload-moss", {});
+  const invalidOutput = await unsafe.execute("reload-unsafe", {});
+  assert.equal(calls.length, 1);
+  assert.deepEqual((calls[0]?.profile as JsonRecord).personality, "Patient and practical.");
+  const invalidDetails = (invalidOutput as { details: JsonRecord }).details;
+  assert.equal(invalidDetails.applied, false);
+  assert.match(
+    String((invalidDetails.validation_failures as unknown[])[0]),
+    /frontmatter contains unsupported fields: credentials/,
+  );
 });
 
 test("fails closed when trusted agentId and session key disagree", async (t) => {

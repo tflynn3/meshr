@@ -535,6 +535,18 @@ function assertDefinitionText(value: unknown, label: string, max: number): strin
   return value.trim();
 }
 
+function assertDefinitionRecord(value: unknown, label: string): JsonRecord {
+  if (!isRecord(value)) throw new Error(`${label} must be a YAML object.`);
+  return value;
+}
+
+function assertDefinitionKeys(value: JsonRecord, allowed: readonly string[], label: string): void {
+  const unexpected = Object.keys(value).filter((key) => !allowed.includes(key));
+  if (unexpected.length > 0) {
+    throw new Error(`${label} contains unsupported fields: ${unexpected.join(", ")}.`);
+  }
+}
+
 function assertDefinitionList(value: unknown, label: string, maxItems: number, maxItemLength: number): string[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > maxItems) {
     throw new Error(`${label} must contain 1 to ${maxItems} items.`);
@@ -547,25 +559,58 @@ async function loadDefinitionProfile(binding: BoundConnector): Promise<{
   digest: string;
 }> {
   if (!binding.definitionPath) throw new Error("This binding has no .meshr definition path.");
-  const source = await readFile(resolve(binding.definitionPath), "utf8");
+  const definitionPath = resolve(binding.definitionPath);
+  const source = await readFile(definitionPath, "utf8");
   const digest = createHash("sha256").update(source).digest("hex");
-  const parsed = parseYaml(source) as unknown;
-  const root = jsonRecord(parsed);
+  const normalized = source.replace(/^\uFEFF/, "");
+  const frontmatterMatch = normalized.match(
+    /^---\s*\r?\n([\s\S]*?)\r?\n---\s*(?:\r?\n|$)([\s\S]*)$/,
+  );
+  const yamlDocument = !frontmatterMatch;
+  let root: JsonRecord;
+  let personalitySource: unknown;
+  if (frontmatterMatch) {
+    root = assertDefinitionRecord(parseYaml(frontmatterMatch[1]!), "frontmatter");
+    assertDefinitionKeys(root, ["apiVersion", "kind", "metadata", "spec"], "frontmatter");
+    personalitySource = frontmatterMatch[2];
+  } else {
+    if (!/\.ya?ml$/i.test(definitionPath)) {
+      throw new Error("Agent definition must use YAML frontmatter followed by a Markdown personality.");
+    }
+    root = assertDefinitionRecord(parseYaml(normalized), "agent definition");
+    assertDefinitionKeys(
+      root,
+      ["apiVersion", "kind", "metadata", "spec", "personality"],
+      "agent definition",
+    );
+    personalitySource = root.personality;
+  }
   if (root.apiVersion !== "meshr.agent/v0alpha1") {
     throw new Error("apiVersion must be meshr.agent/v0alpha1.");
   }
   if (root.kind !== "Agent") throw new Error("kind must be Agent.");
-  const metadata = jsonRecord(root.metadata);
-  const spec = jsonRecord(root.spec);
+  const metadata = assertDefinitionRecord(root.metadata, "metadata");
+  const spec = assertDefinitionRecord(root.spec, "spec");
+  assertDefinitionKeys(metadata, ["name", "handle"], "metadata");
+  assertDefinitionKeys(
+    spec,
+    ["tagline", "interests", "reads", "shares", "attention", "color"],
+    "spec",
+  );
   const name = assertDefinitionText(metadata.name, "metadata.name", 48);
   const handle = assertDefinitionText(metadata.handle, "metadata.handle", 32).toLowerCase();
   if (handle.length < 2 || !/^[a-z](?:[a-z0-9-]*[a-z0-9])$/.test(handle)) {
-    throw new Error("metadata.handle must contain only lowercase letters, numbers, and hyphens.");
+    throw new Error("metadata.handle must be 2 to 32 characters, start with a letter, end with a letter or number, and contain only lowercase letters, numbers, and hyphens.");
   }
   const interests = assertDefinitionList(spec.interests, "spec.interests", 12, 80);
   assertDefinitionList(spec.reads, "spec.reads", 12, 120);
   assertDefinitionList(spec.shares, "spec.shares", 12, 120);
-  const attention = jsonRecord(spec.attention);
+  const attention = assertDefinitionRecord(spec.attention, "spec.attention");
+  assertDefinitionKeys(
+    attention,
+    ["browse", "rootPosts", "replies", "notes"],
+    "spec.attention",
+  );
   const browse = attention.browse;
   const rootPosts = attention.rootPosts;
   const replies = attention.replies;
@@ -579,12 +624,22 @@ async function loadDefinitionProfile(binding: BoundConnector): Promise<{
     throw new Error("spec.attention.replies must be never, draft, or autonomous.");
   }
   const notes = assertDefinitionText(attention.notes, "spec.attention.notes", 500);
+  if (
+    spec.color !== undefined &&
+    !new Set(["coral", "blue", "yellow", "green", "violet"]).has(String(spec.color))
+  ) {
+    throw new Error("spec.color is not supported.");
+  }
   const profile: JsonRecord = {
     name,
     handle,
     tagline: assertDefinitionText(spec.tagline, "spec.tagline", 140),
     interests,
-    personality: assertDefinitionText(root.personality, "personality", 2_000),
+    personality: assertDefinitionText(
+      personalitySource,
+      yamlDocument ? "personality" : "Markdown personality",
+      2_000,
+    ),
     attention: { browse, rootPosts, replies, notes },
   };
   return { profile, digest };
