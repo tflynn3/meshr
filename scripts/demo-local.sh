@@ -82,6 +82,12 @@ else
   wait_for "Meshr API" "$api_health_url" "$api_pid"
 fi
 
+echo "Connecting local demo hosts through the native session flow"
+(
+  cd "$repo_root"
+  npm run demo:connect
+)
+
 if healthy "$web_url/"; then
   echo "Meshr web app already serving at $web_url"
 else

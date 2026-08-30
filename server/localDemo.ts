@@ -1,4 +1,4 @@
-import { generateKeyPairSync } from "node:crypto";
+import { createPrivateKey, createPublicKey, sign, type KeyObject } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { hashPassword, sha256 } from "./security.ts";
 
@@ -14,7 +14,12 @@ export const LOCAL_DEMO_ACCOUNT = {
   password: "demo-local-operator-2026",
 } as const;
 
-const DEMO_AGENT_SPECS = [
+// These deterministic keys exist only so the local host bridge can complete a
+// real signed challenge after a fresh checkout. This module is never imported
+// by the production bootstrap and the keys have no value outside the fixture.
+const ED25519_PKCS8_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
+
+export const LOCAL_DEMO_AGENT_SPECS = [
   {
     id: "agt_demo_euclid",
     name: "Euclid",
@@ -70,16 +75,40 @@ const DEMO_AGENT_SPECS = [
 
 const DEMO_MESH_ID = "mesh-demo-garden";
 const DEMO_TOPIC_IDS = {
-  connections: "topic-demo-connections",
+  connections: "topic-cross-pollination",
   garden: "topic-demo-garden",
   home: "topic-demo-home",
 } as const;
 
-function publicKeyPem(): string {
-  return generateKeyPairSync("ed25519").publicKey.export({
+function localDemoPrivateKey(handle: string): KeyObject {
+  const seed = Buffer.from(sha256(`meshr-local-demo-key:${handle}`), "hex");
+  return createPrivateKey({
+    key: Buffer.concat([ED25519_PKCS8_PREFIX, seed]),
+    format: "der",
+    type: "pkcs8",
+  });
+}
+
+function publicKeyPem(handle: string): string {
+  return createPublicKey(localDemoPrivateKey(handle)).export({
     type: "spki",
     format: "pem",
   }).toString();
+}
+
+/** Sign a local-only demo challenge using the same key advertised at pairing. */
+export function signLocalDemoChallenge(handle: string, message: string): string {
+  return sign(null, Buffer.from(message, "utf8"), localDemoPrivateKey(handle)).toString("base64url");
+}
+
+export function localDemoPairingSecret(handle: string): string {
+  return `meshr-demo-pairing:${handle}`;
+}
+
+export function localDemoSessionId(handle: string, authorityEpoch = 0): string {
+  return authorityEpoch === 0
+    ? `sess_demo_${handle}`
+    : `sess_demo_${handle}_e${authorityEpoch}`;
 }
 
 function isoAt(nowMs: number, minutesAgo: number): string {
@@ -118,9 +147,9 @@ export async function seedLocalDemoData(
   const demoPasswordHash = existing?.password_hash
     ? undefined
     : await hashPassword(LOCAL_DEMO_ACCOUNT.password);
-  const agentRows = DEMO_AGENT_SPECS.map((spec) => ({
+  const agentRows = LOCAL_DEMO_AGENT_SPECS.map((spec) => ({
     ...spec,
-    publicKeyPem: publicKeyPem(),
+    publicKeyPem: publicKeyPem(spec.handle),
   }));
 
   runTransaction(db, () => {
@@ -162,6 +191,7 @@ export async function seedLocalDemoData(
          runtime = excluded.runtime,
          runtime_label = excluded.runtime_label,
          runtime_subject = excluded.runtime_subject,
+         public_key_pem = excluded.public_key_pem,
          updated_at = excluded.updated_at`,
     );
     for (const spec of agentRows) {
@@ -195,6 +225,7 @@ export async function seedLocalDemoData(
          runtime = excluded.runtime,
          runtime_label = excluded.runtime_label,
          external_subject = excluded.external_subject,
+         public_key_pem = excluded.public_key_pem,
          requested_profile_json = excluded.requested_profile_json,
          definition_digest = excluded.definition_digest,
          status = 'claimed',
@@ -204,34 +235,8 @@ export async function seedLocalDemoData(
          approved_at = excluded.approved_at,
          claimed_at = excluded.claimed_at`,
     );
-    const sessionInsert = db.prepare(
-      `INSERT INTO agent_sessions(
-         token_hash, agent_id, pairing_id, created_at, expires_at, last_seen_at,
-         session_id, runtime_kind, status, superseded_by, authority_epoch
-       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, 0)
-       ON CONFLICT(token_hash) DO UPDATE SET
-         agent_id = excluded.agent_id,
-         pairing_id = excluded.pairing_id,
-         expires_at = excluded.expires_at,
-         last_seen_at = excluded.last_seen_at,
-         session_id = excluded.session_id,
-         runtime_kind = excluded.runtime_kind,
-         status = 'active',
-         superseded_by = NULL,
-         authority_epoch = 0`,
-    );
-    const authorityInsert = db.prepare(
-      `INSERT INTO agent_authority(agent_id, epoch, authority_kind, session_id, updated_at)
-       VALUES(?, 0, 'native', ?, ?)
-       ON CONFLICT(agent_id) DO UPDATE SET
-         epoch = 0,
-         authority_kind = 'native',
-         session_id = excluded.session_id,
-         updated_at = excluded.updated_at`,
-    );
     for (const spec of agentRows) {
       const pairingId = `pair_demo_${spec.handle}`;
-      const sessionId = `sess_demo_${spec.handle}`;
       const createdAt = isoAt(nowMs, 90);
       const expiresAt = new Date(nowMs + 7 * 24 * 60 * 60_000).toISOString();
       const profile = {
@@ -259,17 +264,6 @@ export async function seedLocalDemoData(
         createdAt,
         createdAt,
       );
-      sessionInsert.run(
-        sha256(`meshr-demo-session:${spec.handle}`),
-        spec.id,
-        pairingId,
-        createdAt,
-        expiresAt,
-        now.toISOString(),
-        sessionId,
-        spec.runtime,
-      );
-      authorityInsert.run(spec.id, sessionId, now.toISOString());
     }
 
     db.prepare(
@@ -308,15 +302,6 @@ export async function seedLocalDemoData(
          title = excluded.title,
          description = excluded.description,
          tags_json = excluded.tags_json`,
-    );
-    topicInsert.run(
-      DEMO_TOPIC_IDS.connections,
-      "mesh-public",
-      "cross-interest-signals",
-      "Unexpected connections",
-      "Ideas crossing between different interests.",
-      JSON.stringify(["connections", "ideas"]),
-      isoAt(nowMs, 90),
     );
     topicInsert.run(
       DEMO_TOPIC_IDS.garden,
@@ -462,10 +447,32 @@ export async function seedLocalDemoData(
          expires_at = excluded.expires_at,
          session_id = excluded.session_id`,
     );
+    // `events` is an append-only projection with an autoincrement sequence,
+    // not a keyed table. Use the stable post id carried in each event payload
+    // as the fixture's idempotency key so rerunning the demo seed does not
+    // grow a second copy of the same story.
+    const eventExists = db.prepare(
+      `SELECT 1
+       FROM events
+       WHERE type = ?
+         AND mesh_id = ?
+         AND topic_id = ?
+         AND agent_id = ?
+         AND json_extract(data_json, '$.postId') = ?
+       LIMIT 1`,
+    );
     const eventInsert = db.prepare(
-      `INSERT OR IGNORE INTO events(type, mesh_id, topic_id, agent_id, data_json, created_at)
+      `INSERT INTO events(type, mesh_id, topic_id, agent_id, data_json, created_at)
        VALUES(?, ?, ?, ?, ?, ?)`,
     );
+    // Refresh the reserved fixture events before enforcing the stable post-id
+    // check below. Older versions used a different topic id, so retaining one
+    // copy would leave stale topology edges; unrelated local event history is
+    // untouched.
+    db.prepare(
+      `DELETE FROM events
+       WHERE json_extract(data_json, '$.postId') LIKE 'post_demo_%'`,
+    ).run();
     const outboxInsert = db.prepare(
       `INSERT INTO outbox_events(
          event_id, schema_version, type, mesh_id, topic_id, agent_id, session_id,
@@ -480,6 +487,9 @@ export async function seedLocalDemoData(
          next_attempt_at = NULL`,
     );
     const expiresAt = new Date(nowMs + 90 * 24 * 60 * 60_000).toISOString();
+    // Seeded posts retain a stable fixture attribution for topology replay;
+    // runtime write authority is established separately by the signed host
+    // bridge after the API is ready.
     for (const post of posts) {
       const spec = agentRows.find((candidate) => candidate.id === post.agentId)!;
       const createdAt = isoAt(nowMs, post.minutesAgo);
@@ -498,23 +508,20 @@ export async function seedLocalDemoData(
         post.body,
         createdAt,
         expiresAt,
-        `sess_demo_${spec.handle}`,
+        localDemoSessionId(spec.handle),
       );
-      eventInsert.run(
-        eventType,
-        post.topicId === DEMO_TOPIC_IDS.garden ? DEMO_MESH_ID : "mesh-public",
-        post.topicId,
-        post.agentId,
-        JSON.stringify(payload),
-        createdAt,
-      );
+      const meshId = post.topicId === DEMO_TOPIC_IDS.garden ? DEMO_MESH_ID : "mesh-public";
+      const payloadJson = JSON.stringify(payload);
+      if (!eventExists.get(eventType, meshId, post.topicId, post.agentId, post.id)) {
+        eventInsert.run(eventType, meshId, post.topicId, post.agentId, payloadJson, createdAt);
+      }
       outboxInsert.run(
         `evt_demo_${post.id}`,
         eventType,
         post.topicId === DEMO_TOPIC_IDS.garden ? DEMO_MESH_ID : "mesh-public",
         post.topicId,
         post.agentId,
-        `sess_demo_${spec.handle}`,
+        localDemoSessionId(spec.handle),
         spec.runtime,
         JSON.stringify(payload),
         createdAt,
@@ -530,24 +537,4 @@ export async function seedLocalDemoData(
     meshId: DEMO_MESH_ID,
     postCount: 8,
   };
-}
-
-/** Keep the explicitly local demo host sessions online while the launcher runs. */
-export function touchLocalDemoSessions(
-  db: DatabaseSync,
-  now = new Date(),
-): number {
-  const nowMs = now.getTime();
-  if (!Number.isFinite(nowMs)) throw new Error("Demo heartbeat time must be a valid date.");
-  return runTransaction(db, () => {
-    const result = db.prepare(
-      `UPDATE agent_sessions
-       SET last_seen_at = ?
-       WHERE agent_id LIKE 'agt_demo_%'
-         AND session_id LIKE 'sess_demo_%'
-         AND status = 'active'
-         AND expires_at > ?`,
-    ).run(now.toISOString(), now.toISOString());
-    return Number(result.changes);
-  });
 }

@@ -15,22 +15,25 @@ npm run dev
 ```
 
 For a local demo session, the launcher seeds an additive, repeatable story for
-the demo account (three connected-looking agents, one private interest mesh,
-and recent topology traffic), then starts whichever fast-loop process is
-missing, waits for API health and UI readiness, and leaves any service it did
-not start untouched:
+the demo account (three agents, one private interest mesh, and recent topology
+traffic), then starts whichever fast-loop process is missing. After the API is
+healthy it connects the fixture hosts through the normal signed pairing,
+session, and heartbeat endpoints, waits for UI readiness, and leaves any
+service it did not start untouched:
 
 ```bash
 npm run demo
 ```
 
 The demo account is `demo+meshr-local@example.test` with password
-`demo-local-operator-2026`. The fixture is local-only and the seed refuses to
-run with `MESHR_ENV=production`; production bootstrap still starts empty. To
-refresh the story without restarting the services, run `npm run demo:seed` and
-reload the page. While `npm run demo` is running, a local-only heartbeat keeps
-the three fixture sessions connected; stopping the launcher lets them expire by
-the normal 90-second runtime rule.
+`demo-local-operator-2026`. The fixture is local-only and the seed/host bridge
+refuses to run with `MESHR_ENV=production`; production bootstrap still starts
+empty. To refresh the story without restarting the services, run
+`npm run demo:seed` and reload the page, then run `npm run demo:connect` if the
+hosts are not already connected. The launcher stores its local bearer tokens in
+`.meshr/local-demo-sessions.json` with mode 0600 and keeps them alive through
+the API heartbeat endpoint; stopping the launcher lets them expire by the
+normal 90-second runtime rule.
 
 Open <http://127.0.0.1:5173/>. Press Ctrl-C to stop only the processes started
 by that command. The isolated k3d loop remains available separately at
