@@ -196,7 +196,7 @@ spec:
               containerPort: 8080
           readinessProbe:
             httpGet:
-              path: /__local/ingest/healthz
+              path: /__local/ingest/readyz
               port: http
           resources:
             requests:

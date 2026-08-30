@@ -13,6 +13,37 @@ async function json(response: Response): Promise<Record<string, unknown>> {
   return payload;
 }
 
+async function postEventWithRetry(
+  url: string,
+  headers: Record<string, string>,
+  envelope: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  let lastResponse: Response | undefined;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(envelope),
+      });
+      if (response.ok) return (await response.json()) as Record<string, unknown>;
+      lastResponse = response;
+      // A restarted ingress or event-plane client can briefly return a 5xx
+      // after Kubernetes reports the pod ready. Reusing the same event ID is
+      // safe because the ingest transaction is idempotent.
+      if (![502, 503, 504].includes(response.status)) {
+        return await json(response);
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  if (lastResponse) return await json(lastResponse);
+  throw new Error(`event ingest did not recover after restart: ${String(lastError)}`);
+}
+
 const health = await json(await fetch(`${baseUrl}/healthz`));
 assert.equal(health.status, "ok");
 assert.equal(health.database, "ok");
@@ -119,9 +150,7 @@ if (replayFile) {
     Number(initialSnapshot?.event_count ?? 0) >= replayEventCount,
     "restart lost materialized event count",
   );
-  const replayResponse = await json(
-    await fetch(eventUrl, { method: "POST", headers, body: JSON.stringify(replayEvent) }),
-  );
+  const replayResponse = await postEventWithRetry(eventUrl, headers, replayEvent);
   assert.equal(replayResponse.duplicate, true, "restart lost event deduplication state");
   const replaySnapshotResponse = await json(await fetch(`${baseUrl}/v1/live/snapshots/${meshId}`));
   const replaySnapshot = replaySnapshotResponse.snapshot as Record<string, unknown> | null;
@@ -144,9 +173,7 @@ const envelope = {
   received_at: now,
   payload: { source: "scripts/smoke-local-stack.ts" },
 };
-const accepted = await json(
-  await fetch(eventUrl, { method: "POST", headers, body: JSON.stringify(envelope) }),
-);
+const accepted = await postEventWithRetry(eventUrl, headers, envelope);
 assert.equal(accepted.accepted, true);
 assert.equal(accepted.duplicate, false);
 
@@ -164,9 +191,7 @@ const projected = await new Promise<Record<string, unknown>>((resolve, reject) =
 });
 assert.equal(projected.event_count, beforeCount + 1);
 
-const duplicate = await json(
-  await fetch(eventUrl, { method: "POST", headers, body: JSON.stringify(envelope) }),
-);
+const duplicate = await postEventWithRetry(eventUrl, headers, envelope);
 assert.equal(duplicate.duplicate, true);
 
 const snapshotResponse = await json(await fetch(`${baseUrl}/v1/live/snapshots/${meshId}`));
