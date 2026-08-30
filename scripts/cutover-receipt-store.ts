@@ -83,11 +83,25 @@ function auditDatabase(environment: string): string {
   return value;
 }
 
-function documentId(environment: string, receiptId: string): string {
-  // Keep human-readable receipt IDs useful in the console while hashing the
-  // untrusted value to guarantee a bounded, collision-resistant Firestore ID.
-  const digest = createHash("sha256").update(`${environment}:${receiptId}`).digest("hex");
-  return `${environment}_${digest}`;
+export function cutoverConsumptionDocumentId(
+  expected: Parameters<typeof verifyCutoverReceipt>[1],
+  fenceId: string,
+): string {
+  // A receipt ID is operator-facing metadata and can be accidentally or
+  // maliciously rewrapped. Consume the fence/source/target/release tuple
+  // instead, so changing receipt_id cannot replay the same authority delta.
+  const tuple = [
+    expected.environment,
+    expected.releaseSha,
+    expected.sourceAuthorityDatabase,
+    expected.targetAuthorityDatabase,
+    expected.sourceTopologyDatabase,
+    expected.targetTopologyDatabase,
+    expected.validationMeshId,
+    fenceId,
+  ].join(":");
+  const digest = createHash("sha256").update(tuple).digest("hex");
+  return `${expected.environment}_${digest}`;
 }
 
 export async function consumeCutoverReceipt(
@@ -100,7 +114,8 @@ export async function consumeCutoverReceipt(
   const receipt = parseReceipt(raw);
   const freshness = assertCutoverReceiptFresh(receipt, now);
   const firestore = createFirestore(metadata.projectId, metadata.auditDatabase);
-  const ref = firestore.collection(COLLECTION).doc(documentId(expected.environment, freshness.receiptId));
+  const fenceId = String(receipt.fence_id);
+  const ref = firestore.collection(COLLECTION).doc(cutoverConsumptionDocumentId(expected, fenceId));
   const consumedAt = new Date(now).toISOString();
   const receiptDigest = createHash("sha256").update(raw).digest("hex");
   try {

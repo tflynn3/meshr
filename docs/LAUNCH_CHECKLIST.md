@@ -67,7 +67,8 @@ Those files are not substitutes for the managed-project readbacks listed below.
       pass.
 - [ ] Any authority-database cutover has a protected, redacted schema-2 receipt
       proving quiesced writer fencing before restore, complete fence-bound
-      authority-delta copy with matching collection digests/counts, bounded
+      authority-delta copy with an exact per-collection SHA-256 manifest
+      (sorted names, counts, and digests), bounded
       replay ordering, and equal source/target outbox high-watermarks. The
       receipt has a unique `receipt_id` and recent `issued_at`; the workflow
       passes `npm run verify:cutover-receipt` and atomically consumes it in the

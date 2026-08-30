@@ -667,7 +667,7 @@ jobs:
             # of its pods to terminate; Flux is already paused above.
             kubectl -n meshr-canary patch job "$bootstrap_job" --type=merge --patch='{"spec":{"suspend":true}}'
             for attempt in $(seq 1 60); do
-              pod_lines="$(kubectl -n meshr-canary get pods -l "job-name=$bootstrap_job" --no-headers 2>/dev/null || true)"
+              pod_lines="$(kubectl -n meshr-canary get pods -l "job-name=$bootstrap_job" --field-selector='status.phase!=Succeeded,status.phase!=Failed' --no-headers 2>/dev/null || true)"
               remaining="$(printf '%s\n' "$pod_lines" | awk 'NF {count++} END {print count+0}')"
               if [ "$remaining" = 0 ]; then break; fi
               if [ "$attempt" -eq 60 ]; then
@@ -1003,8 +1003,8 @@ jobs:
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
           token_format: access_token
           access_token_lifetime: 3600s
-      - name: Apply the protected Flux promotion inputs
-        id: canary-apply
+      - name: Prepare the protected canary Flux promotion inputs
+        id: canary-apply-prep
         env:
           CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.canary-apply-auth.outputs.access_token }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
@@ -1173,6 +1173,62 @@ jobs:
           stored_transition_phase="$(kubectl -n flux-system get configmap meshr-canary-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_TRANSITION_PHASE}' 2>/dev/null || true)"
           stored_transition_previous_mode="$(kubectl -n flux-system get configmap meshr-canary-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_TRANSITION_PREVIOUS_MODE}' 2>/dev/null || true)"
           stored_transition_mode="$(kubectl -n flux-system get configmap meshr-canary-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_TRANSITION_MODE}' 2>/dev/null || true)"
+          # Persist the bounded decision state for the second half of this
+          # promotion. GitHub Actions starts each step in a fresh shell; the
+          # values are non-secret identifiers and are needed to keep the
+          # apply step below under the Actions expression-size limit.
+          printf 'MESHR_CANARY_PREVIOUS_AUTHORITY_DATABASE=%s\n' "$previous_authority_database" >> "$GITHUB_ENV"
+          printf 'MESHR_CANARY_PREVIOUS_TOPOLOGY_DATABASE=%s\n' "$previous_topology_database" >> "$GITHUB_ENV"
+          printf 'MESHR_CANARY_RUNTIME_VALUES_WAS_PRESENT=%s\n' "$runtime_values_was_present" >> "$GITHUB_ENV"
+          printf 'MESHR_CANARY_FORCE_PROJECTION_SCAN=%s\n' "$force_projection_scan" >> "$GITHUB_ENV"
+          printf 'MESHR_CANARY_EXPECTED_AUTHORITY_BOOTSTRAP_ID=%s\n' "$expected_authority_bootstrap_id" >> "$GITHUB_ENV"
+          printf 'MESHR_CANARY_PREVIOUS_MODE=%s\n' "$previous_mode" >> "$GITHUB_ENV"
+          printf 'MESHR_CANARY_STORED_TRANSITION_ID=%s\n' "$stored_transition_id" >> "$GITHUB_ENV"
+          printf 'MESHR_CANARY_STORED_TRANSITION_PHASE=%s\n' "$stored_transition_phase" >> "$GITHUB_ENV"
+          printf 'MESHR_CANARY_STORED_TRANSITION_PREVIOUS_MODE=%s\n' "$stored_transition_previous_mode" >> "$GITHUB_ENV"
+          printf 'MESHR_CANARY_STORED_TRANSITION_MODE=%s\n' "$stored_transition_mode" >> "$GITHUB_ENV"
+      - name: Apply the protected canary Flux promotion inputs
+        id: canary-apply
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.canary-apply-auth.outputs.access_token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          MESHR_MODERATION_ENDPOINT: ${{ vars.MESHR_MODERATION_ENDPOINT }}
+          MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
+          MESHR_MODERATION_AUDIENCE: ${{ vars.MESHR_MODERATION_AUDIENCE }}
+          MESHR_COST_PROTECTION_MODE: ${{ vars.MESHR_COST_PROTECTION_MODE }}
+          MESHR_COST_PROTECTION_OPERATOR: ${{ vars.MESHR_COST_PROTECTION_OPERATOR }}
+          MESHR_COST_PROTECTION_REASON: ${{ vars.MESHR_COST_PROTECTION_REASON }}
+          MESHR_CANARY_URL: ${{ vars.MESHR_CANARY_URL }}
+          MESHR_FIRESTORE_DATABASE: ${{ vars.MESHR_FIRESTORE_DATABASE }}
+          MESHR_AUDIT_FIRESTORE_DATABASE: ${{ vars.MESHR_AUDIT_FIRESTORE_DATABASE }}
+          MESHR_TOPOLOGY_FIRESTORE_DATABASE: ${{ vars.MESHR_TOPOLOGY_FIRESTORE_DATABASE }}
+          MESHR_CANARY_RELEASE_VALIDATION_MESH_ID: ${{ vars.MESHR_CANARY_RELEASE_VALIDATION_MESH_ID }}
+          MESHR_CANARY_DATABASE_CUTOVER_RECEIPT: ${{ secrets.MESHR_CANARY_DATABASE_CUTOVER_RECEIPT }}
+          MESHR_CANARY_PROTECTED_STATE_JSON: ${{ secrets.MESHR_CANARY_PROTECTED_STATE_JSON }}
+          MESHR_CANARY_PROTECTED_STATE_KEY: ${{ secrets.MESHR_CANARY_PROTECTED_STATE_KEY }}
+          MESHR_CANARY_PROTECTED_BINDINGS: ${{ vars.MESHR_CANARY_PROTECTED_BINDINGS }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ steps.resolve.outputs.api }}
+          EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ steps.resolve.outputs.event_plane }}
+          MODERATION_ADAPTER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/moderation-adapter@${{ steps.resolve.outputs.moderation_adapter }}
+          WEB_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/web@${{ steps.resolve.outputs.web }}
+        run: |
+          set -euo pipefail
+          previous_authority_database="${MESHR_CANARY_PREVIOUS_AUTHORITY_DATABASE:?Canary previous authority database was not carried from preparation}"
+          previous_topology_database="${MESHR_CANARY_PREVIOUS_TOPOLOGY_DATABASE:?Canary previous topology database was not carried from preparation}"
+          runtime_values_was_present="${MESHR_CANARY_RUNTIME_VALUES_WAS_PRESENT:?Canary runtime ConfigMap state was not carried from preparation}"
+          force_projection_scan="${MESHR_CANARY_FORCE_PROJECTION_SCAN:?Canary projection-scan decision was not carried from preparation}"
+          expected_authority_bootstrap_id="${MESHR_CANARY_EXPECTED_AUTHORITY_BOOTSTRAP_ID:?Canary bootstrap generation was not carried from preparation}"
+          database_cutover_required="${MESHR_CANARY_DATABASE_CUTOVER_REQUIRED:?Canary cutover decision was not carried from preparation}"
+          database_cutover_mode="${MESHR_CANARY_DATABASE_CUTOVER_MODE:?Canary cutover mode was not carried from preparation}"
+          previous_mode="${MESHR_CANARY_PREVIOUS_MODE:?Canary cost-protection mode was not carried from preparation}"
+          stored_transition_id="${MESHR_CANARY_STORED_TRANSITION_ID:-}"
+          stored_transition_phase="${MESHR_CANARY_STORED_TRANSITION_PHASE:-}"
+          stored_transition_previous_mode="${MESHR_CANARY_STORED_TRANSITION_PREVIOUS_MODE:-}"
+          stored_transition_mode="${MESHR_CANARY_STORED_TRANSITION_MODE:-}"
           if [ -z "$MESHR_COST_PROTECTION_MODE" ]; then
             MESHR_COST_PROTECTION_MODE="$(kubectl -n flux-system get configmap meshr-canary-runtime-values -o jsonpath='{.data.MESHR_COST_PROTECTION_MODE}' 2>/dev/null || true)"
           fi
@@ -1324,6 +1380,29 @@ jobs:
               exit 1
             }
           fi
+          cutover_binding_id=""
+          cutover_agent_id=""
+          cutover_session_id=""
+          if [ "$database_cutover_required" = 1 ]; then
+            : "${MESHR_CANARY_PROTECTED_BINDINGS:?Canary cutover binding selector is required}"
+            selector_count="$(printf '%s' "$MESHR_CANARY_PROTECTED_BINDINGS" | awk -F',' '{count=0; for (i=1; i<=NF; i++) if ($i != "") count++} END {print count+0}')"
+            test "$selector_count" = 1 || {
+              echo 'Canary database cutover requires exactly one protected binding selector.' >&2
+              exit 1
+            }
+            cutover_selector="${MESHR_CANARY_PROTECTED_BINDINGS%%,*}"
+            cutover_binding_record="$(jq -c --arg selector "$cutover_selector" '[.bindings[]? | select((.pairingId // "") == $selector or (.bindingId // "") == $selector or (.requestedProfile.handle // "") == $selector)] | if length == 1 then .[0] else empty end' "$protected_state_dir/state.json")"
+            test -n "$cutover_binding_record" || {
+              echo 'Canary cutover binding selector did not resolve to exactly one protected state binding.' >&2
+              exit 1
+            }
+            cutover_binding_id="$(jq -r '.bindingId // .pairingId // empty' <<<"$cutover_binding_record")"
+            cutover_agent_id="$(jq -r '.agentId // empty' <<<"$cutover_binding_record")"
+            cutover_session_id="$(jq -r '.sessionId // empty' <<<"$cutover_binding_record")"
+            : "${cutover_binding_id:?Canary cutover binding ID is missing from protected state}"
+            : "${cutover_agent_id:?Canary cutover agent ID is missing from protected state}"
+            : "${cutover_session_id:?Canary cutover predecessor session ID is missing from protected state}"
+          fi
           if [ "$transition_required" = true ] && [ "$MESHR_COST_PROTECTION_MODE" != normal ] && \
              [ "$previous_mode" = normal ]; then
             npm run refresh:sessions -- \
@@ -1387,6 +1466,9 @@ jobs:
             --from-literal="MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=$force_projection_scan" \
             --from-literal="MESHR_DATABASE_CUTOVER_MODE=$database_cutover_mode" \
             --from-literal="MESHR_CUTOVER_VALIDATION_MESH_ID=$MESHR_CANARY_RELEASE_VALIDATION_MESH_ID" \
+            --from-literal="MESHR_CUTOVER_VALIDATION_BINDING_ID=$cutover_binding_id" \
+            --from-literal="MESHR_CUTOVER_VALIDATION_AGENT_ID=$cutover_agent_id" \
+            --from-literal="MESHR_CUTOVER_VALIDATION_SESSION_ID=$cutover_session_id" \
             --from-literal="MESHR_MODERATION_ENDPOINT=$MESHR_MODERATION_ENDPOINT" \
             --from-literal="MESHR_MODERATION_HEALTHCHECK_URL=$MESHR_MODERATION_HEALTHCHECK_URL" \
             --from-literal="MESHR_MODERATION_AUDIENCE=$MESHR_MODERATION_AUDIENCE" \
@@ -1416,6 +1498,9 @@ jobs:
               --from-literal="MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=$force_projection_scan" \
               --from-literal="MESHR_DATABASE_CUTOVER_MODE=$database_cutover_mode" \
               --from-literal="MESHR_CUTOVER_VALIDATION_MESH_ID=$MESHR_CANARY_RELEASE_VALIDATION_MESH_ID" \
+              --from-literal="MESHR_CUTOVER_VALIDATION_BINDING_ID=$cutover_binding_id" \
+              --from-literal="MESHR_CUTOVER_VALIDATION_AGENT_ID=$cutover_agent_id" \
+              --from-literal="MESHR_CUTOVER_VALIDATION_SESSION_ID=$cutover_session_id" \
               --from-literal="MESHR_MODERATION_ENDPOINT=$MESHR_MODERATION_ENDPOINT" \
               --from-literal="MESHR_MODERATION_HEALTHCHECK_URL=$MESHR_MODERATION_HEALTHCHECK_URL" \
               --from-literal="MESHR_MODERATION_AUDIENCE=$MESHR_MODERATION_AUDIENCE" \
@@ -1524,7 +1609,7 @@ jobs:
             printf '%s\t%s\n' "$bootstrap_job" "$job_suspend" >> "$job_state"
             kubectl -n meshr-canary patch job "$bootstrap_job" --type=merge --patch='{"spec":{"suspend":true}}'
             for attempt in $(seq 1 60); do
-              pod_lines="$(kubectl -n meshr-canary get pods -l "job-name=$bootstrap_job" --no-headers 2>/dev/null || true)"
+              pod_lines="$(kubectl -n meshr-canary get pods -l "job-name=$bootstrap_job" --field-selector='status.phase!=Succeeded,status.phase!=Failed' --no-headers 2>/dev/null || true)"
               remaining="$(printf '%s\n' "$pod_lines" | awk 'NF {count++} END {print count+0}')"
               if [ "$remaining" = 0 ]; then break; fi
               if [ "$attempt" -eq 60 ]; then
@@ -1933,11 +2018,8 @@ jobs:
           npm run protected:state:store -- put \
             --input "$MESHR_PROTECTED_STATE_ENCRYPTED" \
             --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Canary protected fixture generation is required}"
-      - name: Mark canary cutover fixture handoff durable
-        if: success() && env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1'
-        run: echo 'MESHR_CANARY_PROTECTED_FIXTURE_DURABLE=true' >> "$GITHUB_ENV"
       - name: Promote canary protected fixture state after smoke
-        if: success() && (steps.canary-apply.outputs.cost_protection_mode == 'protect' || steps.canary-apply.outputs.cost_protection_mode == 'throttle')
+        if: success() && (steps.canary-apply.outputs.cost_protection_mode == 'protect' || steps.canary-apply.outputs.cost_protection_mode == 'throttle' || env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1')
         env:
           GOOGLE_CLOUD_PROJECT: ${{ vars.GCP_PROJECT_ID }}
           MESHR_AUDIT_FIRESTORE_DATABASE: ${{ vars.MESHR_AUDIT_FIRESTORE_DATABASE }}
@@ -1955,6 +2037,20 @@ jobs:
           npm run protected:state:store -- promote \
             --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Canary protected fixture generation is required}" \
             --expected-generation "$expected_generation"
+      - name: Mark canary protected fixture handoff durable
+        if: success() && (steps.canary-apply.outputs.cost_protection_mode == 'protect' || steps.canary-apply.outputs.cost_protection_mode == 'throttle' || env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1')
+        run: echo 'MESHR_CANARY_PROTECTED_FIXTURE_DURABLE=true' >> "$GITHUB_ENV"
+      - name: Prune superseded canary protected fixture generation
+        if: success() && (steps.canary-apply.outputs.cost_protection_mode == 'protect' || steps.canary-apply.outputs.cost_protection_mode == 'throttle' || env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1') && env.MESHR_CANARY_PROTECTED_FIXTURE_PREVIOUS_GENERATION != ''
+        env:
+          GOOGLE_CLOUD_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          MESHR_AUDIT_FIRESTORE_DATABASE: ${{ vars.MESHR_AUDIT_FIRESTORE_DATABASE }}
+          MESHR_PROTECTED_FIXTURE_ENVIRONMENT: canary
+          MESHR_PROTECTED_FIXTURE_GENERATION: ${{ env.MESHR_CANARY_PROTECTED_FIXTURE_PREVIOUS_GENERATION }}
+        run: |
+          set -euo pipefail
+          npm run protected:state:store -- prune \
+            --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Canary superseded fixture generation is required}"
       - name: Upload canary protected fixture state after smoke
         if: success() && (steps.canary-apply.outputs.cost_protection_mode == 'protect' || steps.canary-apply.outputs.cost_protection_mode == 'throttle' || env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1')
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
@@ -2130,28 +2226,6 @@ jobs:
           kubectl config set-credentials "$cluster_user" --token="$CLOUDSDK_AUTH_ACCESS_TOKEN" >/dev/null
           kubectl -n flux-system patch kustomization meshr-canary \
             --type=merge --patch='{"spec":{"suspend":true}}'
-      - name: Refresh GCP credentials before promoting canary cutover fixture
-        if: success() && env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1'
-        id: canary-cutover-fixture-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
-          token_format: access_token
-          access_token_lifetime: 3600s
-      - name: Promote canary cutover fixture after writes reopen
-        if: success() && env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1'
-        env:
-          GOOGLE_CLOUD_PROJECT: ${{ vars.GCP_PROJECT_ID }}
-          MESHR_AUDIT_FIRESTORE_DATABASE: ${{ vars.MESHR_AUDIT_FIRESTORE_DATABASE }}
-          MESHR_PROTECTED_FIXTURE_ENVIRONMENT: canary
-          MESHR_PROTECTED_FIXTURE_GENERATION: ${{ steps.canary-apply.outputs.protected_fixture_post_generation }}
-          MESHR_CANARY_PROTECTED_FIXTURE_PREVIOUS_GENERATION: ${{ env.MESHR_CANARY_PROTECTED_FIXTURE_PREVIOUS_GENERATION }}
-        run: |
-          set -euo pipefail
-          npm run protected:state:store -- promote \
-            --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Canary cutover fixture generation is required}" \
-            --expected-generation "${MESHR_CANARY_PROTECTED_FIXTURE_PREVIOUS_GENERATION:?Canary cutover predecessor generation is required}"
       - name: Refresh GCP credentials before freezing canary
         if: failure()
         id: canary-freeze-auth
@@ -2696,7 +2770,7 @@ jobs:
             # must be fenced alongside Deployments before receipt consumption.
             kubectl -n meshr patch job "$bootstrap_job" --type=merge --patch='{"spec":{"suspend":true}}'
             for attempt in $(seq 1 60); do
-              pod_lines="$(kubectl -n meshr get pods -l "job-name=$bootstrap_job" --no-headers 2>/dev/null || true)"
+              pod_lines="$(kubectl -n meshr get pods -l "job-name=$bootstrap_job" --field-selector='status.phase!=Succeeded,status.phase!=Failed' --no-headers 2>/dev/null || true)"
               remaining="$(printf '%s\n' "$pod_lines" | awk 'NF {count++} END {print count+0}')"
               if [ "$remaining" = 0 ]; then break; fi
               if [ "$attempt" -eq 60 ]; then
@@ -2801,7 +2875,7 @@ jobs:
           token_format: access_token
           access_token_lifetime: 3600s
       - name: Apply the protected Flux promotion inputs
-        id: production-apply
+        id: production-apply-prep
         env:
           CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.production-apply-auth.outputs.access_token }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
@@ -2988,6 +3062,67 @@ jobs:
             MESHR_AUDIT_FIRESTORE_DATABASE="$MESHR_AUDIT_FIRESTORE_DATABASE" \
             npm run consume:cutover-receipt
           fi
+          # Persist the bounded decision state for the second half of this
+          # promotion. GitHub Actions starts each step in a fresh shell; the
+          # values are non-secret identifiers and are needed to keep the
+          # apply step below under the Actions expression-size limit.
+          printf 'MESHR_PRODUCTION_PREVIOUS_AUTHORITY_DATABASE=%s\n' "$previous_authority_database" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_PREVIOUS_TOPOLOGY_DATABASE=%s\n' "$previous_topology_database" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_RUNTIME_VALUES_WAS_PRESENT=%s\n' "$runtime_values_was_present" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_FORCE_PROJECTION_SCAN=%s\n' "$force_projection_scan" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_EXPECTED_AUTHORITY_BOOTSTRAP_ID=%s\n' "$expected_authority_bootstrap_id" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED=%s\n' "$database_cutover_required" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_DATABASE_CUTOVER_MODE=%s\n' "$database_cutover_mode" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_PREVIOUS_MODE=%s\n' "$previous_mode" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_CURRENT_MODE=%s\n' "$current_mode" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_STORED_TRANSITION_ID=%s\n' "$stored_transition_id" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_STORED_TRANSITION_PHASE=%s\n' "$stored_transition_phase" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_STORED_TRANSITION_PREVIOUS_MODE=%s\n' "$stored_transition_previous_mode" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_STORED_TRANSITION_MODE=%s\n' "$stored_transition_mode" >> "$GITHUB_ENV"
+      - name: Apply the protected production Flux promotion inputs
+        id: production-apply
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.production-apply-auth.outputs.access_token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          MESHR_MODERATION_ENDPOINT: ${{ vars.MESHR_MODERATION_ENDPOINT }}
+          MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
+          MESHR_MODERATION_AUDIENCE: ${{ vars.MESHR_MODERATION_AUDIENCE }}
+          MESHR_RELEASE_SHA: ${{ steps.release.outputs.release_sha }}
+          MESHR_COST_PROTECTION_MODE: ${{ vars.MESHR_COST_PROTECTION_MODE }}
+          MESHR_COST_PROTECTION_OPERATOR: ${{ vars.MESHR_COST_PROTECTION_OPERATOR }}
+          MESHR_COST_PROTECTION_REASON: ${{ vars.MESHR_COST_PROTECTION_REASON }}
+          MESHR_PRODUCTION_URL: ${{ vars.MESHR_PRODUCTION_URL }}
+          MESHR_FIRESTORE_DATABASE: ${{ vars.MESHR_FIRESTORE_DATABASE }}
+          MESHR_AUDIT_FIRESTORE_DATABASE: ${{ vars.MESHR_AUDIT_FIRESTORE_DATABASE }}
+          MESHR_TOPOLOGY_FIRESTORE_DATABASE: ${{ vars.MESHR_TOPOLOGY_FIRESTORE_DATABASE }}
+          MESHR_PRODUCTION_RELEASE_VALIDATION_MESH_ID: ${{ vars.MESHR_PRODUCTION_RELEASE_VALIDATION_MESH_ID }}
+          MESHR_PRODUCTION_DATABASE_CUTOVER_RECEIPT: ${{ secrets.MESHR_PRODUCTION_DATABASE_CUTOVER_RECEIPT }}
+          MESHR_PRODUCTION_PROTECTED_STATE_JSON: ${{ secrets.MESHR_PRODUCTION_PROTECTED_STATE_JSON }}
+          MESHR_PRODUCTION_PROTECTED_STATE_KEY: ${{ secrets.MESHR_PRODUCTION_PROTECTED_STATE_KEY }}
+          MESHR_PRODUCTION_PROTECTED_BINDINGS: ${{ vars.MESHR_PRODUCTION_PROTECTED_BINDINGS }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ needs.canary.outputs.api_digest }}
+          EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ needs.canary.outputs.event_plane_digest }}
+          MODERATION_ADAPTER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/moderation-adapter@${{ needs.canary.outputs.moderation_adapter_digest }}
+          WEB_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/web@${{ needs.canary.outputs.web_digest }}
+        run: |
+          set -euo pipefail
+          previous_authority_database="${MESHR_PRODUCTION_PREVIOUS_AUTHORITY_DATABASE:?Production previous authority database was not carried from preparation}"
+          previous_topology_database="${MESHR_PRODUCTION_PREVIOUS_TOPOLOGY_DATABASE:?Production previous topology database was not carried from preparation}"
+          runtime_values_was_present="${MESHR_PRODUCTION_RUNTIME_VALUES_WAS_PRESENT:?Production runtime ConfigMap state was not carried from preparation}"
+          force_projection_scan="${MESHR_PRODUCTION_FORCE_PROJECTION_SCAN:?Production projection-scan decision was not carried from preparation}"
+          expected_authority_bootstrap_id="${MESHR_PRODUCTION_EXPECTED_AUTHORITY_BOOTSTRAP_ID:?Production bootstrap generation was not carried from preparation}"
+          database_cutover_required="${MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED:?Production cutover decision was not carried from preparation}"
+          database_cutover_mode="${MESHR_PRODUCTION_DATABASE_CUTOVER_MODE:?Production cutover mode was not carried from preparation}"
+          previous_mode="${MESHR_PRODUCTION_PREVIOUS_MODE:?Production cost-protection mode was not carried from preparation}"
+          current_mode="${MESHR_PRODUCTION_CURRENT_MODE:?Production resolved mode was not carried from preparation}"
+          stored_transition_id="${MESHR_PRODUCTION_STORED_TRANSITION_ID:-}"
+          stored_transition_phase="${MESHR_PRODUCTION_STORED_TRANSITION_PHASE:-}"
+          stored_transition_previous_mode="${MESHR_PRODUCTION_STORED_TRANSITION_PREVIOUS_MODE:-}"
+          stored_transition_mode="${MESHR_PRODUCTION_STORED_TRANSITION_MODE:-}"
           # Carry the mode actually resolved from the protected runtime
           # ConfigMap into the authenticated smoke step below. This keeps a
           # blank repository variable from making protected production smoke
@@ -3125,6 +3260,29 @@ jobs:
               exit 1
             }
           fi
+          cutover_binding_id=""
+          cutover_agent_id=""
+          cutover_session_id=""
+          if [ "$database_cutover_required" = 1 ]; then
+            : "${MESHR_PRODUCTION_PROTECTED_BINDINGS:?Production cutover binding selector is required}"
+            selector_count="$(printf '%s' "$MESHR_PRODUCTION_PROTECTED_BINDINGS" | awk -F',' '{count=0; for (i=1; i<=NF; i++) if ($i != "") count++} END {print count+0}')"
+            test "$selector_count" = 1 || {
+              echo 'Production database cutover requires exactly one protected binding selector.' >&2
+              exit 1
+            }
+            cutover_selector="${MESHR_PRODUCTION_PROTECTED_BINDINGS%%,*}"
+            cutover_binding_record="$(jq -c --arg selector "$cutover_selector" '[.bindings[]? | select((.pairingId // "") == $selector or (.bindingId // "") == $selector or (.requestedProfile.handle // "") == $selector)] | if length == 1 then .[0] else empty end' "$protected_state_dir/state.json")"
+            test -n "$cutover_binding_record" || {
+              echo 'Production cutover binding selector did not resolve to exactly one protected state binding.' >&2
+              exit 1
+            }
+            cutover_binding_id="$(jq -r '.bindingId // .pairingId // empty' <<<"$cutover_binding_record")"
+            cutover_agent_id="$(jq -r '.agentId // empty' <<<"$cutover_binding_record")"
+            cutover_session_id="$(jq -r '.sessionId // empty' <<<"$cutover_binding_record")"
+            : "${cutover_binding_id:?Production cutover binding ID is missing from protected state}"
+            : "${cutover_agent_id:?Production cutover agent ID is missing from protected state}"
+            : "${cutover_session_id:?Production cutover predecessor session ID is missing from protected state}"
+          fi
           if [ "$transition_required" = true ] && [ "$current_mode" != normal ] && \
              [ "$previous_mode" = normal ]; then
             npm run refresh:sessions -- \
@@ -3188,6 +3346,9 @@ jobs:
             --from-literal="MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=$force_projection_scan" \
             --from-literal="MESHR_DATABASE_CUTOVER_MODE=$database_cutover_mode" \
             --from-literal="MESHR_CUTOVER_VALIDATION_MESH_ID=$MESHR_PRODUCTION_RELEASE_VALIDATION_MESH_ID" \
+            --from-literal="MESHR_CUTOVER_VALIDATION_BINDING_ID=$cutover_binding_id" \
+            --from-literal="MESHR_CUTOVER_VALIDATION_AGENT_ID=$cutover_agent_id" \
+            --from-literal="MESHR_CUTOVER_VALIDATION_SESSION_ID=$cutover_session_id" \
             --from-literal="MESHR_MODERATION_ENDPOINT=$MESHR_MODERATION_ENDPOINT" \
             --from-literal="MESHR_MODERATION_HEALTHCHECK_URL=$MESHR_MODERATION_HEALTHCHECK_URL" \
             --from-literal="MESHR_MODERATION_AUDIENCE=$MESHR_MODERATION_AUDIENCE" \
@@ -3218,6 +3379,9 @@ jobs:
               --from-literal="MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=$force_projection_scan" \
               --from-literal="MESHR_DATABASE_CUTOVER_MODE=$database_cutover_mode" \
               --from-literal="MESHR_CUTOVER_VALIDATION_MESH_ID=$MESHR_PRODUCTION_RELEASE_VALIDATION_MESH_ID" \
+              --from-literal="MESHR_CUTOVER_VALIDATION_BINDING_ID=$cutover_binding_id" \
+              --from-literal="MESHR_CUTOVER_VALIDATION_AGENT_ID=$cutover_agent_id" \
+              --from-literal="MESHR_CUTOVER_VALIDATION_SESSION_ID=$cutover_session_id" \
               --from-literal="MESHR_MODERATION_ENDPOINT=$MESHR_MODERATION_ENDPOINT" \
               --from-literal="MESHR_MODERATION_HEALTHCHECK_URL=$MESHR_MODERATION_HEALTHCHECK_URL" \
               --from-literal="MESHR_MODERATION_AUDIENCE=$MESHR_MODERATION_AUDIENCE" \
@@ -3326,7 +3490,7 @@ jobs:
             printf '%s\t%s\n' "$bootstrap_job" "$job_suspend" >> "$job_state"
             kubectl -n meshr patch job "$bootstrap_job" --type=merge --patch='{"spec":{"suspend":true}}'
             for attempt in $(seq 1 60); do
-              pod_lines="$(kubectl -n meshr get pods -l "job-name=$bootstrap_job" --no-headers 2>/dev/null || true)"
+              pod_lines="$(kubectl -n meshr get pods -l "job-name=$bootstrap_job" --field-selector='status.phase!=Succeeded,status.phase!=Failed' --no-headers 2>/dev/null || true)"
               remaining="$(printf '%s\n' "$pod_lines" | awk 'NF {count++} END {print count+0}')"
               if [ "$remaining" = 0 ]; then break; fi
               if [ "$attempt" -eq 60 ]; then
@@ -3698,11 +3862,8 @@ jobs:
           npm run protected:state:store -- put \
             --input "$MESHR_PROTECTED_STATE_ENCRYPTED" \
             --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Production protected fixture generation is required}"
-      - name: Mark production cutover fixture handoff durable
-        if: success() && env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1'
-        run: echo 'MESHR_PRODUCTION_PROTECTED_FIXTURE_DURABLE=true' >> "$GITHUB_ENV"
       - name: Promote production protected fixture state after smoke
-        if: success() && (steps.production-apply.outputs.cost_protection_mode == 'protect' || steps.production-apply.outputs.cost_protection_mode == 'throttle')
+        if: success() && (steps.production-apply.outputs.cost_protection_mode == 'protect' || steps.production-apply.outputs.cost_protection_mode == 'throttle' || env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1')
         env:
           GOOGLE_CLOUD_PROJECT: ${{ vars.GCP_PROJECT_ID }}
           MESHR_AUDIT_FIRESTORE_DATABASE: ${{ vars.MESHR_AUDIT_FIRESTORE_DATABASE }}
@@ -3720,6 +3881,20 @@ jobs:
           npm run protected:state:store -- promote \
             --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Production protected fixture generation is required}" \
             --expected-generation "$expected_generation"
+      - name: Mark production protected fixture handoff durable
+        if: success() && (steps.production-apply.outputs.cost_protection_mode == 'protect' || steps.production-apply.outputs.cost_protection_mode == 'throttle' || env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1')
+        run: echo 'MESHR_PRODUCTION_PROTECTED_FIXTURE_DURABLE=true' >> "$GITHUB_ENV"
+      - name: Prune superseded production protected fixture generation
+        if: success() && (steps.production-apply.outputs.cost_protection_mode == 'protect' || steps.production-apply.outputs.cost_protection_mode == 'throttle' || env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1') && env.MESHR_PRODUCTION_PROTECTED_FIXTURE_PREVIOUS_GENERATION != ''
+        env:
+          GOOGLE_CLOUD_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          MESHR_AUDIT_FIRESTORE_DATABASE: ${{ vars.MESHR_AUDIT_FIRESTORE_DATABASE }}
+          MESHR_PROTECTED_FIXTURE_ENVIRONMENT: production
+          MESHR_PROTECTED_FIXTURE_GENERATION: ${{ env.MESHR_PRODUCTION_PROTECTED_FIXTURE_PREVIOUS_GENERATION }}
+        run: |
+          set -euo pipefail
+          npm run protected:state:store -- prune \
+            --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Production superseded fixture generation is required}"
       - name: Upload production protected fixture state after smoke
         if: success() && (steps.production-apply.outputs.cost_protection_mode == 'protect' || steps.production-apply.outputs.cost_protection_mode == 'throttle' || env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1')
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
@@ -3895,28 +4070,6 @@ jobs:
           kubectl config set-credentials "$cluster_user" --token="$CLOUDSDK_AUTH_ACCESS_TOKEN" >/dev/null
           kubectl -n flux-system patch kustomization meshr-production \
             --type=merge --patch='{"spec":{"suspend":true}}'
-      - name: Refresh GCP credentials before promoting production cutover fixture
-        if: success() && env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1'
-        id: production-cutover-fixture-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
-          token_format: access_token
-          access_token_lifetime: 3600s
-      - name: Promote production cutover fixture after writes reopen
-        if: success() && env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1'
-        env:
-          GOOGLE_CLOUD_PROJECT: ${{ vars.GCP_PROJECT_ID }}
-          MESHR_AUDIT_FIRESTORE_DATABASE: ${{ vars.MESHR_AUDIT_FIRESTORE_DATABASE }}
-          MESHR_PROTECTED_FIXTURE_ENVIRONMENT: production
-          MESHR_PROTECTED_FIXTURE_GENERATION: ${{ steps.production-apply.outputs.protected_fixture_post_generation }}
-          MESHR_PRODUCTION_PROTECTED_FIXTURE_PREVIOUS_GENERATION: ${{ env.MESHR_PRODUCTION_PROTECTED_FIXTURE_PREVIOUS_GENERATION }}
-        run: |
-          set -euo pipefail
-          npm run protected:state:store -- promote \
-            --generation "${MESHR_PROTECTED_FIXTURE_GENERATION:?Production cutover fixture generation is required}" \
-            --expected-generation "${MESHR_PRODUCTION_PROTECTED_FIXTURE_PREVIOUS_GENERATION:?Production cutover predecessor generation is required}"
       - name: Refresh GCP credentials before freezing production
         if: failure()
         id: production-freeze-auth

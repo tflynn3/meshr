@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 
 type CutoverReceipt = {
@@ -23,12 +24,72 @@ type CutoverReceipt = {
   authority_delta_source_digest?: unknown;
   authority_delta_target_digest?: unknown;
   authority_delta_collections_match?: unknown;
+  authority_delta_source_manifest?: unknown;
+  authority_delta_target_manifest?: unknown;
   authority_delta_replayed_at?: unknown;
   source_outbox_high_watermark?: unknown;
   target_outbox_high_watermark?: unknown;
   validation_mesh_id?: unknown;
   receipt_id?: unknown;
   issued_at?: unknown;
+};
+
+const AUTHORITY_MANIFEST_ALGORITHM = "sha256-canonical-json-v1";
+const AUTHORITY_MANIFEST_PRODUCER = "meshr-authority-delta/v1";
+const MAX_MANIFEST_COLLECTIONS = 128;
+const MAX_MANIFEST_COLLECTION_NAME = 128;
+// This is the authority database boundary. Topology shards/events and worker
+// inboxes live in the separate aggregate database and must never be silently
+// included in (or omitted from) a restore attestation.
+export const AUTHORITY_COLLECTIONS = [
+  "accounts",
+  "agent_authority",
+  "agent_bindings",
+  "agent_handles",
+  "agents",
+  "audit_events",
+  "event_audit",
+  "event_outbox",
+  "event_outbox_heads",
+  "event_outbox_ready",
+  "follows",
+  "governance_events",
+  "human_activity_preferences",
+  "human_sessions",
+  "idempotency",
+  "live_access_epochs",
+  "mesh_access_epochs",
+  "mesh_agent_memberships",
+  "mesh_human_roles",
+  "mesh_invitations",
+  "mesh_join_requests",
+  "mesh_role_invitations",
+  "meshes",
+  "moderation_cases",
+  "pairing_challenges",
+  "pairings",
+  "posts",
+  "profile_review_proposals",
+  "provider_identities",
+  "quota_counters",
+  "retention_leases",
+  "runtime_sessions",
+  "system",
+  "topics",
+  "webmcp_authority",
+  "webmcp_grants",
+] as const;
+
+type AuthorityManifestEntry = {
+  name: string;
+  count: number;
+  digest: string;
+};
+
+type AuthorityManifest = {
+  algorithm: string;
+  producer: string;
+  collections: AuthorityManifestEntry[];
 };
 
 function requiredString(value: unknown, field: string): string {
@@ -40,6 +101,60 @@ function timestamp(value: unknown, field: string): number {
   const parsed = Date.parse(requiredString(value, field));
   if (!Number.isFinite(parsed)) throw new Error(`Cutover receipt field ${field} must be an ISO timestamp.`);
   return parsed;
+}
+
+function authorityManifest(value: unknown, field: string): AuthorityManifest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Cutover receipt field ${field} must be an authority collection manifest.`);
+  }
+  const manifest = value as Record<string, unknown>;
+  if (manifest.algorithm !== AUTHORITY_MANIFEST_ALGORITHM) {
+    throw new Error(`Cutover receipt field ${field}.algorithm must be ${AUTHORITY_MANIFEST_ALGORITHM}.`);
+  }
+  if (manifest.producer !== AUTHORITY_MANIFEST_PRODUCER) {
+    throw new Error(`Cutover receipt field ${field}.producer must be ${AUTHORITY_MANIFEST_PRODUCER}.`);
+  }
+  if (!Array.isArray(manifest.collections) || manifest.collections.length === 0 || manifest.collections.length > MAX_MANIFEST_COLLECTIONS) {
+    throw new Error(`Cutover receipt field ${field}.collections must contain 1-${MAX_MANIFEST_COLLECTIONS} entries.`);
+  }
+  const entries: AuthorityManifestEntry[] = [];
+  let previousName = "";
+  for (const [index, rawEntry] of manifest.collections.entries()) {
+    if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
+      throw new Error(`Cutover receipt field ${field}.collections[${index}] must be an object.`);
+    }
+    const entry = rawEntry as Record<string, unknown>;
+    const name = requiredString(entry.name, `${field}.collections[${index}].name`);
+    if (name.length > MAX_MANIFEST_COLLECTION_NAME || !/^[A-Za-z][A-Za-z0-9_.-]*$/.test(name)) {
+      throw new Error(`Cutover receipt field ${field}.collections[${index}].name is invalid.`);
+    }
+    if (name <= previousName) {
+      throw new Error(`Cutover receipt field ${field}.collections must be sorted and unique by name.`);
+    }
+    previousName = name;
+    if (!Number.isSafeInteger(entry.count) || (entry.count as number) < 0) {
+      throw new Error(`Cutover receipt field ${field}.collections[${index}].count must be a non-negative safe integer.`);
+    }
+    const digest = requiredString(entry.digest, `${field}.collections[${index}].digest`);
+    if (!/^[a-f0-9]{64}$/.test(digest)) {
+      throw new Error(`Cutover receipt field ${field}.collections[${index}].digest must be a lowercase SHA-256 hex digest.`);
+    }
+    entries.push({ name, count: entry.count as number, digest });
+  }
+  const actualNames = entries.map((entry) => entry.name);
+  const expectedNames = [...AUTHORITY_COLLECTIONS];
+  if (actualNames.length !== expectedNames.length || actualNames.some((name, index) => name !== expectedNames[index])) {
+    throw new Error(`Cutover receipt field ${field}.collections must exactly enumerate the authority collection allowlist.`);
+  }
+  return {
+    algorithm: manifest.algorithm as string,
+    producer: manifest.producer as string,
+    collections: entries,
+  };
+}
+
+function canonicalManifest(value: AuthorityManifest): string {
+  return JSON.stringify(value);
 }
 
 function environment(name: string): string {
@@ -96,13 +211,16 @@ export function verifyCutoverReceipt(
     throw new Error("Cutover receipt validation mesh does not match the protected release mesh.");
   }
   requiredString(receipt.receipt_id, "receipt_id");
-  timestamp(receipt.issued_at, "issued_at");
+  const issuedAt = timestamp(receipt.issued_at, "issued_at");
   requiredString(receipt.fence_id, "fence_id");
   const fencedAt = timestamp(receipt.fenced_at, "fenced_at");
   const restoredAt = timestamp(receipt.restored_at, "restored_at");
   const replayedAt = timestamp(receipt.authority_delta_replayed_at, "authority_delta_replayed_at");
   const drainedAt = timestamp(receipt.outbox_drained_at, "outbox_drained_at");
   const verifiedAt = timestamp(receipt.verified_at, "verified_at");
+  if (issuedAt < verifiedAt) {
+    throw new Error("Cutover receipt issued_at must be at or after verified_at; obtain a newly attested receipt after the cutover evidence is complete.");
+  }
   if (restoredAt < fencedAt || replayedAt < restoredAt || drainedAt < replayedAt || verifiedAt < drainedAt) {
     throw new Error("Cutover receipt ordering is invalid; fence writers, restore, replay the authority delta, drain the outbox, then verify.");
   }
@@ -122,6 +240,18 @@ export function verifyCutoverReceipt(
   const targetAuthorityDigest = requiredString(receipt.authority_delta_target_digest, "authority_delta_target_digest");
   if (sourceAuthorityDigest !== targetAuthorityDigest) {
     throw new Error("Cutover receipt source and target authority digests differ; refusing to switch authorities.");
+  }
+  const sourceManifest = authorityManifest(receipt.authority_delta_source_manifest, "authority_delta_source_manifest");
+  const targetManifest = authorityManifest(receipt.authority_delta_target_manifest, "authority_delta_target_manifest");
+  if (canonicalManifest(sourceManifest) !== canonicalManifest(targetManifest)) {
+    throw new Error("Cutover receipt source and target authority collection manifests differ; refusing to switch authorities.");
+  }
+  const manifestDigest = createHash("sha256").update(canonicalManifest(sourceManifest)).digest("hex");
+  if (
+    sourceAuthorityDigest !== `sha256:${manifestDigest}` ||
+    targetAuthorityDigest !== `sha256:${manifestDigest}`
+  ) {
+    throw new Error("Cutover receipt authority digests do not match the canonical per-collection manifest.");
   }
   const sourceWatermark = requiredString(receipt.source_outbox_high_watermark, "source_outbox_high_watermark");
   const targetWatermark = requiredString(receipt.target_outbox_high_watermark, "target_outbox_high_watermark");
