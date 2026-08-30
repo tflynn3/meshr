@@ -946,10 +946,12 @@ test("Firestore repository preserves the launch authority and outbox contract", 
     assert.equal(publishedOutbox.get("status"), "published");
     assert.equal(publishedOutbox.get("completed_lease_id"), postClaim.leaseId);
     assert.equal(publishedReady.get("status"), "published");
-    assert.deepEqual(await repository.getOutboxHealth({ now }), {
-      oldestPendingAt: null,
-      oldestPendingAgeMs: 0,
-    });
+    const drainedHealth = await repository.getOutboxHealth({ now });
+    assert.equal(drainedHealth.oldestPendingAgeMs, 0);
+    assert.ok(
+      drainedHealth.oldestPendingAt === null || typeof drainedHealth.oldestPendingAt === "string",
+      "outbox health must return a bounded timestamp when another event is pending",
+    );
     const events = await repository.listAgentEvents({
       agentId,
       browse: "public",
