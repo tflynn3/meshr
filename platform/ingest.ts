@@ -184,12 +184,21 @@ async function sweep(): Promise<void> {
   }
 }
 
-const retryTimer = setInterval(() => {
-  void sweep().catch((error) => console.error(JSON.stringify({
+function reportSweepFailure(error: unknown, requestId?: string): void {
+  console.error(JSON.stringify({
     component: "meshr-ingest",
     event: "outbox_sweep_failed",
+    ...(requestId ? { request_id: requestId } : {}),
     error: error instanceof Error ? error.message : String(error),
-  })));
+  }));
+}
+
+function startSweep(requestId?: string): void {
+  void sweep().catch((error) => reportSweepFailure(error, requestId));
+}
+
+const retryTimer = setInterval(() => {
+  startSweep();
 }, 1_000);
 retryTimer.unref();
 
@@ -241,7 +250,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && path === "/v1/events") {
       const envelope = parseEventEnvelope(await readBody(request));
       const result = await apiRequest(eventUrl, envelope);
-      void sweep().catch(() => undefined);
+      startSweep(requestId);
       json(response, result.duplicate === true ? 200 : 202, result);
       return;
     }
@@ -268,7 +277,7 @@ const server = createServer(async (request, response) => {
 
 server.listen(port, host, () => {
   console.log(`ingest listening on ${host}:${port}`);
-  void sweep().catch(() => undefined);
+  startSweep();
 });
 
 async function shutdown(): Promise<void> {

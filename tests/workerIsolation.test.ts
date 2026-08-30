@@ -118,3 +118,22 @@ test("screening workers use the token-authenticated moderation authority route",
   assert.doesNotMatch(productionLive, /meshr-event-secrets/);
   assert.doesNotMatch(canaryLive, /meshr-event-secrets-canary/);
 });
+
+test("outbox failure telemetry matches the ingest publisher contract", () => {
+  const ingest = read("platform/ingest.ts");
+  const tofu = read("infra/opentofu/main.tf");
+  const metric = tofu.match(
+    /resource "google_logging_metric" "outbox_failure_count" \{([\s\S]*?)\n\}/,
+  )?.[1];
+
+  assert.ok(metric, "the outbox failure metric must remain explicit");
+  assert.match(ingest, /event: "outbox_batch_completed"/);
+  assert.match(ingest, /event: "outbox_sweep_failed"/);
+  assert.match(ingest, /function reportSweepFailure\(/);
+  assert.match(ingest, /function startSweep\(/);
+  assert.doesNotMatch(ingest, /sweep\(\)\.catch\(\(\) => undefined\)/);
+  assert.match(metric, /jsonPayload\.event=\\"outbox_batch_completed\\"/);
+  assert.match(metric, /jsonPayload\.failed>0/);
+  assert.match(metric, /jsonPayload\.event=\\"outbox_sweep_failed\\"/);
+  assert.doesNotMatch(metric, /outbox_batch_publish_failed|outbox_async_publish_failed/);
+});
