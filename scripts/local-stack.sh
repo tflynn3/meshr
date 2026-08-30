@@ -143,10 +143,25 @@ smoke() {
     local url="$1"
     local attempts=0
     local response
-    until response="$(curl --fail --silent --show-error "$url" 2>/dev/null)" && [[ "$response" == \{* ]]; do
+    until response="$(curl --fail --silent --show-error "$url" 2>/dev/null)" \
+      && jq -e 'type == "object"' >/dev/null 2>&1 <<<"$response"; do
       attempts=$((attempts + 1))
       if (( attempts >= 60 )); then
         echo "timed out waiting for JSON response from $url after rollout" >&2
+        return 1
+      fi
+      sleep 1
+    done
+  }
+  wait_health() {
+    local url="$1"
+    local attempts=0
+    local response
+    until response="$(curl --fail --silent --show-error "$url" 2>/dev/null)" \
+      && jq -e 'type == "object" and .status == "ok" and .database == "ok"' >/dev/null 2>&1 <<<"$response"; do
+      attempts=$((attempts + 1))
+      if (( attempts >= 60 )); then
+        echo "timed out waiting for healthy JSON response from $url after rollout" >&2
         return 1
       fi
       sleep 1
@@ -168,11 +183,19 @@ smoke() {
   # Traefik can briefly retain the old endpoint set after the deployment
   # rollout reports complete. Warm the same-origin ingress before replaying so
   # a transient 504 is not mistaken for event-plane loss.
-  wait_http http://localhost:8080/healthz
+  wait_health http://localhost:8080/healthz
   wait_http http://localhost:8080/
   # The ingest process has a dependency-aware readiness endpoint. Waiting on
   # it through the same ingress closes the gap between a ready HTTP listener
   # and a Firestore/Pub/Sub client that can actually accept an event.
+  wait_json "${MESHR_LOCAL_URL:-http://localhost:8080}/__local/ingest/readyz"
+  wait_json "${MESHR_LOCAL_URL:-http://localhost:8080}/v1/live/snapshots/mesh-public"
+  # Require the complete endpoint set to remain healthy across one additional
+  # ingress refresh. This avoids starting the replay while Traefik is still
+  # replacing a terminating endpoint and briefly serves the web shell for an
+  # API path.
+  sleep 1
+  wait_health "${MESHR_LOCAL_URL:-http://localhost:8080}/healthz"
   wait_json "${MESHR_LOCAL_URL:-http://localhost:8080}/__local/ingest/readyz"
   wait_json "${MESHR_LOCAL_URL:-http://localhost:8080}/v1/live/snapshots/mesh-public"
   (
