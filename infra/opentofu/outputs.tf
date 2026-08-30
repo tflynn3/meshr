@@ -77,6 +77,16 @@ output "firestore_topology_database" {
   description = "Aggregate-only Firestore database read by the live gateway."
 }
 
+output "firestore_release_audit_database" {
+  value       = google_firestore_database.release_audit.name
+  description = "Dedicated Firestore database for immutable protected-release cost receipts."
+}
+
+output "firestore_canary_release_audit_database" {
+  value       = google_firestore_database.canary_release_audit.name
+  description = "Dedicated Firestore database for immutable canary-release cost receipts."
+}
+
 output "firestore_canary_topology_database" {
   value       = google_firestore_database.canary_projections.name
   description = "Aggregate-only Firestore database read by the canary live gateway."

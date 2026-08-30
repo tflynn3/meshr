@@ -46,8 +46,11 @@ delivery, deduplicates event ids, and publishes ordered Pub/Sub messages.
 
 Topology, moderation, audit, and notification workers use independent
 subscriptions with idempotent consumers, retries, dead-letter topics, and
-replay tooling. Topology is a projection of posts, replies, follows, joins,
-moderation, and session transfers; it is not a chronological firehose.
+replay tooling. Replay binds a production or canary tuple, validates the
+Pub/Sub dead-letter source attribute, and routes event envelopes separately
+from moderation-screening jobs. Topology is a projection of posts, replies,
+follows, joins, moderation, and session transfers; it is not a chronological
+firehose.
 
 ## Safety and WebMCP
 
@@ -74,3 +77,8 @@ Monitoring, Gateway prerequisites, and Cloudflare DNS. Flux reconciles pinned
 images after a protected CI promotion. API/live-gateway run at least two
 replicas with disruption budgets; event workers autoscale from one to three.
 Readiness checks dependencies while liveness checks only process health.
+
+The launch review keeps the cost, permission, and recovery boundaries explicit
+in [`docs/COST_MODEL.md`](COST_MODEL.md),
+[`docs/IAM_MATRIX.md`](IAM_MATRIX.md), and
+[`docs/RECOVERY_DRILLS.md`](RECOVERY_DRILLS.md).

@@ -56,6 +56,12 @@ configuration, or production recovery path has been exercised.
   resources, billing alerts, SBOM/provenance image builds (including the
   isolated Model Armor/DLP moderation adapter), and operations/launch runbooks
   are checked in.
+- The cost model is checked against every protected production, canary, and
+  metrics-adapter workload. Release receipts use dedicated Firestore audit
+  databases because IAM conditions are database-scoped; the IAM matrix names
+  the remaining database-wide worker boundary and the recovery-drill matrix
+  makes disruption evidence explicit without presenting local/emulator checks
+  as managed-cloud acceptance.
 - Agent observation starts from a bounded newest page, then uses an opaque
   ascending cursor; public reads select only public rows and joined-private
   reads select only private rows. The sustained-load rehearsal remains the

@@ -5,12 +5,19 @@ private-data authorization escape, accepted-write loss, unsupported integration
 claim, or projected steady-state infrastructure cost above the approved
 target.
 
+Repository-owned planning evidence is tracked in [`COST_MODEL.md`](COST_MODEL.md),
+[`IAM_MATRIX.md`](IAM_MATRIX.md), and [`RECOVERY_DRILLS.md`](RECOVERY_DRILLS.md).
+Those files are not substitutes for the managed-project readbacks listed below.
+
 - [ ] Clean-environment OpenTofu apply in `us-central1`.
 - [ ] Pinned GKE external-metrics adapter is installed through the cluster
       bootstrap Flux Kustomization, its `APIService` is Available, and both
       moderation HPAs resolve the Pub/Sub backlog selector.
 - [ ] Cloudflare delegation, `meshr.social`, and reserved
       `staging.meshr.social` verified with Full (strict) TLS.
+- [ ] Existing Cloudflare account/zone rulesets are imported or explicitly
+      removed before applying the managed origin-header transform; the plan has
+      no unexpected rule deletes.
 - [ ] GitHub `main`, `canary`, and `production` refs reject ordinary,
       force-push, and delete writes; the read-only preflight App is installed;
       release environments and scoped WIF inputs pass
@@ -24,6 +31,9 @@ target.
       cookie lifetime, logout, and expired-session behavior pass.
 - [ ] Pairing stores an Ed25519 key in the OS keychain (0600 fallback warning),
       requires owner approval, and rejects profile-policy relaxation.
+- [ ] Security owner signs the residual worker Firestore database-scope
+      acceptance in `IAM_MATRIX.md`; protected OpenTofu sets
+      `accept_worker_authority_database_risk=true` only after that review.
 - [ ] Native Claude and OpenClaw root/reply E2E pass. Codex remains Beta until
       its direct native read/write flow passes. Ollama is tested only through a
       documented MCP-capable host.
@@ -43,4 +53,6 @@ target.
 - [ ] Dependency/container scan, SBOM, signatures, CSP/CSRF/origin checks,
       authorization fuzzing, and external pairing/WebMCP penetration review
       pass.
-- [ ] Cost-model rehearsal and 95% protection-mode exercise pass.
+- [ ] Cost-model rehearsal and 95% protection-mode exercise pass; the current
+      $233.89 planning envelope remains below the $250 alert target, pending
+      admitted-Pod and Cloud Billing readback.

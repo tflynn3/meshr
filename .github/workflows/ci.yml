@@ -99,6 +99,8 @@ jobs:
           skip-dirs: deploy/local
           exit-code: '1'
       - run: npm run typecheck
+      - name: Verify the production cost model matches the HPA envelope
+        run: npm run cost:model -- --json
       # The root OpenClaw live-contract tests load the packaged plugin entry.
       # Build it before the root test glob so a clean checkout does not depend
       # on an ignored developer artifact left in integrations/openclaw/dist.
@@ -421,6 +423,7 @@ jobs:
           GKE_LOCATION: ${{ vars.GKE_LOCATION }}
           MESHR_CANARY_URL: ${{ vars.MESHR_CANARY_URL }}
           MESHR_FIRESTORE_DATABASE: ${{ vars.MESHR_FIRESTORE_DATABASE }}
+          MESHR_AUDIT_FIRESTORE_DATABASE: ${{ vars.MESHR_AUDIT_FIRESTORE_DATABASE }}
           MESHR_TOPOLOGY_FIRESTORE_DATABASE: ${{ vars.MESHR_TOPOLOGY_FIRESTORE_DATABASE }}
           MESHR_MODERATION_ENDPOINT: ${{ vars.MESHR_MODERATION_ENDPOINT }}
           MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
@@ -443,6 +446,7 @@ jobs:
           : "${GKE_LOCATION:?Set the protected GKE_LOCATION repository variable before canary promotion}"
           : "${MESHR_CANARY_URL:?Set the protected MESHR_CANARY_URL repository variable before canary promotion}"
           : "${MESHR_FIRESTORE_DATABASE:?Set the protected MESHR_FIRESTORE_DATABASE canary variable before canary promotion}"
+          : "${MESHR_AUDIT_FIRESTORE_DATABASE:?Set the protected MESHR_AUDIT_FIRESTORE_DATABASE canary variable before canary promotion}"
           : "${MESHR_TOPOLOGY_FIRESTORE_DATABASE:?Set the protected MESHR_TOPOLOGY_FIRESTORE_DATABASE canary variable before canary promotion}"
           test "$MESHR_FIRESTORE_DATABASE" = "meshr-canary" || {
             echo "MESHR_FIRESTORE_DATABASE must be exactly meshr-canary for the isolated canary IAM boundary." >&2
@@ -450,6 +454,10 @@ jobs:
           }
           test "$MESHR_TOPOLOGY_FIRESTORE_DATABASE" = "meshr-canary-projections" || {
             echo "MESHR_TOPOLOGY_FIRESTORE_DATABASE must be exactly meshr-canary-projections for the isolated canary IAM boundary." >&2
+            exit 1
+          }
+          test "$MESHR_AUDIT_FIRESTORE_DATABASE" = "meshr-canary-release-audit" || {
+            echo "MESHR_AUDIT_FIRESTORE_DATABASE must be exactly meshr-canary-release-audit for the isolated canary release-audit IAM boundary." >&2
             exit 1
           }
           : "${MESHR_MODERATION_ENDPOINT:?Set the protected MESHR_MODERATION_ENDPOINT canary variable before canary promotion}"
@@ -809,6 +817,7 @@ jobs:
           MESHR_COST_PROTECTION_REASON: ${{ vars.MESHR_COST_PROTECTION_REASON }}
           MESHR_CANARY_URL: ${{ vars.MESHR_CANARY_URL }}
           MESHR_FIRESTORE_DATABASE: ${{ vars.MESHR_FIRESTORE_DATABASE }}
+          MESHR_AUDIT_FIRESTORE_DATABASE: ${{ vars.MESHR_AUDIT_FIRESTORE_DATABASE }}
           MESHR_TOPOLOGY_FIRESTORE_DATABASE: ${{ vars.MESHR_TOPOLOGY_FIRESTORE_DATABASE }}
           API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ steps.resolve.outputs.api }}
           EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ steps.resolve.outputs.event_plane }}
@@ -820,7 +829,13 @@ jobs:
           : "${GKE_CLUSTER:?Set the protected GKE_CLUSTER repository variable}"
           : "${GKE_LOCATION:?Set the protected GKE_LOCATION repository variable}"
           : "${MESHR_FIRESTORE_DATABASE:?Set the protected MESHR_FIRESTORE_DATABASE canary variable}"
+          : "${MESHR_AUDIT_FIRESTORE_DATABASE:?Set the protected MESHR_AUDIT_FIRESTORE_DATABASE canary variable}"
           : "${MESHR_TOPOLOGY_FIRESTORE_DATABASE:?Set the protected MESHR_TOPOLOGY_FIRESTORE_DATABASE canary variable}"
+          test "$MESHR_AUDIT_FIRESTORE_DATABASE" = "meshr-canary-release-audit" || {
+            echo "MESHR_AUDIT_FIRESTORE_DATABASE must be exactly meshr-canary-release-audit for the isolated canary release-audit IAM boundary." >&2
+            exit 1
+          }
+          export MESHR_AUDIT_FIRESTORE_DATABASE
           : "${MESHR_MODERATION_ENDPOINT:?Set the protected MESHR_MODERATION_ENDPOINT repository variable to the approved Model Armor/Sensitive Data Protection adapter}"
           : "${MESHR_MODERATION_HEALTHCHECK_URL:?Set the protected MESHR_MODERATION_HEALTHCHECK_URL canary variable to the provider health endpoint}"
           : "${MESHR_MODERATION_AUDIENCE:?Set the protected MESHR_MODERATION_AUDIENCE canary variable for the IAM-protected adapter}"
@@ -1316,6 +1331,7 @@ jobs:
           GKE_LOCATION: ${{ vars.GKE_LOCATION }}
           MESHR_PRODUCTION_URL: ${{ vars.MESHR_PRODUCTION_URL }}
           MESHR_FIRESTORE_DATABASE: ${{ vars.MESHR_FIRESTORE_DATABASE }}
+          MESHR_AUDIT_FIRESTORE_DATABASE: ${{ vars.MESHR_AUDIT_FIRESTORE_DATABASE }}
           MESHR_TOPOLOGY_FIRESTORE_DATABASE: ${{ vars.MESHR_TOPOLOGY_FIRESTORE_DATABASE }}
           MESHR_MODERATION_ENDPOINT: ${{ vars.MESHR_MODERATION_ENDPOINT }}
           MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
@@ -1338,7 +1354,12 @@ jobs:
           : "${GKE_LOCATION:?Set the protected GKE_LOCATION repository variable before production promotion}"
           : "${MESHR_PRODUCTION_URL:?Set the protected MESHR_PRODUCTION_URL production variable before production promotion}"
           : "${MESHR_FIRESTORE_DATABASE:?Set the protected MESHR_FIRESTORE_DATABASE production variable before production promotion}"
+          : "${MESHR_AUDIT_FIRESTORE_DATABASE:?Set the protected MESHR_AUDIT_FIRESTORE_DATABASE production variable before production promotion}"
           : "${MESHR_TOPOLOGY_FIRESTORE_DATABASE:?Set the protected MESHR_TOPOLOGY_FIRESTORE_DATABASE production variable before production promotion}"
+          test "$MESHR_AUDIT_FIRESTORE_DATABASE" = "meshr-release-audit" || {
+            echo "MESHR_AUDIT_FIRESTORE_DATABASE must be exactly meshr-release-audit for the isolated production release-audit IAM boundary." >&2
+            exit 1
+          }
           : "${MESHR_MODERATION_ENDPOINT:?Set the protected MESHR_MODERATION_ENDPOINT production variable before production promotion}"
           : "${MESHR_MODERATION_HEALTHCHECK_URL:?Set the protected MESHR_MODERATION_HEALTHCHECK_URL production variable before production promotion}"
           : "${MESHR_MODERATION_AUDIENCE:?Set the protected MESHR_MODERATION_AUDIENCE production variable before production promotion}"
@@ -1644,6 +1665,7 @@ jobs:
           MESHR_COST_PROTECTION_REASON: ${{ vars.MESHR_COST_PROTECTION_REASON }}
           MESHR_PRODUCTION_URL: ${{ vars.MESHR_PRODUCTION_URL }}
           MESHR_FIRESTORE_DATABASE: ${{ vars.MESHR_FIRESTORE_DATABASE }}
+          MESHR_AUDIT_FIRESTORE_DATABASE: ${{ vars.MESHR_AUDIT_FIRESTORE_DATABASE }}
           MESHR_TOPOLOGY_FIRESTORE_DATABASE: ${{ vars.MESHR_TOPOLOGY_FIRESTORE_DATABASE }}
           API_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/api@${{ needs.canary.outputs.api_digest }}
           EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/event-plane@${{ needs.canary.outputs.event_plane_digest }}
@@ -1655,7 +1677,13 @@ jobs:
           : "${GKE_CLUSTER:?Set the protected GKE_CLUSTER repository variable}"
           : "${GKE_LOCATION:?Set the protected GKE_LOCATION repository variable}"
           : "${MESHR_FIRESTORE_DATABASE:?Set the protected MESHR_FIRESTORE_DATABASE production variable}"
+          : "${MESHR_AUDIT_FIRESTORE_DATABASE:?Set the protected MESHR_AUDIT_FIRESTORE_DATABASE production variable}"
           : "${MESHR_TOPOLOGY_FIRESTORE_DATABASE:?Set the protected MESHR_TOPOLOGY_FIRESTORE_DATABASE production variable}"
+          test "$MESHR_AUDIT_FIRESTORE_DATABASE" = "meshr-release-audit" || {
+            echo "MESHR_AUDIT_FIRESTORE_DATABASE must be exactly meshr-release-audit for the isolated production release-audit IAM boundary." >&2
+            exit 1
+          }
+          export MESHR_AUDIT_FIRESTORE_DATABASE
           : "${MESHR_MODERATION_ENDPOINT:?Set the protected MESHR_MODERATION_ENDPOINT repository variable to the approved Model Armor/Sensitive Data Protection adapter}"
           : "${MESHR_MODERATION_HEALTHCHECK_URL:?Set the protected MESHR_MODERATION_HEALTHCHECK_URL production variable to the provider health endpoint}"
           : "${MESHR_MODERATION_AUDIENCE:?Set the protected MESHR_MODERATION_AUDIENCE production variable for the IAM-protected adapter}"

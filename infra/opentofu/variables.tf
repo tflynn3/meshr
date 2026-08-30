@@ -9,6 +9,12 @@ variable "launch_mode" {
   default     = false
 }
 
+variable "accept_worker_authority_database_risk" {
+  type        = bool
+  description = "Explicit security-owner acceptance that current workers receive database-scoped Firestore access because predefined IAM roles cannot isolate collections. Required for launch_mode=true or production DNS management; set false while the boundary is unreviewed."
+  default     = false
+}
+
 variable "region" {
   type        = string
   description = "Single regional launch location."
@@ -19,14 +25,36 @@ variable "zone_name" {
   type        = string
   description = "Cloudflare DNS zone name, without a trailing dot."
   default     = "meshr.social"
+
+  validation {
+    condition     = var.zone_name == trimspace(var.zone_name) && can(regex("^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$", var.zone_name))
+    error_message = "zone_name must be a DNS name with at least two labels and no trailing dot."
+  }
 }
 
 variable "cloudflare_api_token" {
   type        = string
-  description = "Token with Zone:Read, DNS:Edit, and Zone Settings:Edit permission for the zone."
+  description = "Token with Zone:Read, DNS:Edit, Zone Settings:Edit, Zone Transform Rules:Edit, and Account Rulesets:Read permission for the zone."
   sensitive   = true
   default     = null
   nullable    = true
+}
+
+variable "cloudflare_origin_secret" {
+  type        = string
+  description = "High-entropy secret that Cloudflare's zone transform rule adds to proxied requests and Cloud Armor requires at the GCP origin. Keep it in the protected OpenTofu variable/state; never put it in browser or workload configuration."
+  sensitive   = true
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = var.cloudflare_origin_secret == null || (
+      var.cloudflare_origin_secret == trimspace(var.cloudflare_origin_secret) && can(
+        regex("^[A-Za-z0-9_-]{32,128}$", var.cloudflare_origin_secret),
+      )
+    )
+    error_message = "cloudflare_origin_secret must be null or a 32-128 character URL-safe high-entropy value."
+  }
 }
 
 variable "manage_production_dns_records" {
