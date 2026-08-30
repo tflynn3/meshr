@@ -10,6 +10,7 @@
     "index.ts",
     "cli.ts",
     "../../connector/**/*.ts",
+    "../../integrations/openclaw/src/contract.ts",
     "../../src/domain/agentDefinition.ts",
     "../../src/domain/types.ts"
   ]
