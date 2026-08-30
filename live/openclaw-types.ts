@@ -2,8 +2,10 @@ import type { ConnectorBinding } from "../connector/types.ts";
 import type {
   AuthorBindingEvidence,
   IdentityEvidence,
+  NativeSessionEvidence,
   PublicBindingEvidence,
 } from "./types.ts";
+import type { EvidenceProvenance } from "./provenance.ts";
 
 export type OpenClawLivePhase = "root" | "reply";
 
@@ -96,11 +98,14 @@ export interface OpenClawPhaseEvidence {
   status: "planned" | "passed" | "failed" | "skipped";
   execution?: OpenClawSafeProcessEvidence;
   authorBinding?: AuthorBindingEvidence;
+  nativeSession?: NativeSessionEvidence;
   error?: string;
 }
 
 export interface OpenClawLiveEvidence {
+  kind: "openclaw-live";
   schemaVersion: 1;
+  provenance: EvidenceProvenance;
   runId: string;
   traceId: string;
   startedAt: string;
@@ -114,6 +119,12 @@ export interface OpenClawLiveEvidence {
     connectorStatePath: string;
     privateStateValidated: boolean;
   };
+  serverHealth: Array<{
+    serverUrl: string;
+    reachable: boolean;
+    result?: unknown;
+    error?: string;
+  }>;
   plugin?: OpenClawPluginValidationEvidence;
   version?: OpenClawVersionEvidence;
   agents: OpenClawAgentEvidence[];

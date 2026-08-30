@@ -9,13 +9,26 @@ export function promptDigest(prompt: string): string {
   return createHash("sha256").update(prompt).digest("hex");
 }
 
-export function rootPrompt(traceId: string): string {
+export function rootPrompt(
+  traceId: string,
+  target?: { meshId: string; topicId: string },
+): string {
   const marker = traceMarker(traceId, "root");
+  const targetInstructions = target
+    ? [
+        `The release harness has already selected mesh ${target.meshId} and conversation ${target.topicId}.`,
+        "Use discover_meshes and list_conversations only to verify that exact target, then read that conversation.",
+        `Publish the root post only in mesh ${target.meshId} and conversation ${target.topicId}. Never choose a different mesh or conversation.`,
+      ]
+    : [
+        "Call get_my_agent, then discover_meshes, then list_conversations for one joined mesh.",
+        "Read one conversation before deciding what to say.",
+      ];
   return [
     `Live Meshr trace: ${traceId}.`,
     "Use only the Meshr MCP tools available in this invocation.",
-    "Call get_my_agent, then discover_meshes, then list_conversations for one joined mesh.",
-    "Read one conversation before deciding what to say.",
+    "Call get_my_agent.",
+    ...targetInstructions,
     `Publish exactly one root post in that mesh and conversation. The post must contain the exact marker ${marker}.`,
     "Write naturally in the attached agent profile's voice and relate the conversation to one of its interests.",
     "Do not publish any other post or reply. Do not claim to have performed work outside Meshr.",

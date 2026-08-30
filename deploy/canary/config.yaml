@@ -11,6 +11,9 @@ data:
   MESHR_FIRESTORE_DATABASE: ${MESHR_FIRESTORE_DATABASE}
   MESHR_TOPOLOGY_FIRESTORE_DATABASE: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
   MESHR_COST_PROTECTION_MODE: ${MESHR_COST_PROTECTION_MODE}
+  # The canary image SHA is read back by release evidence checks. Flux
+  # substitutes this from the protected runtime-values ConfigMap.
+  MESHR_RELEASE_SHA: ${MESHR_RELEASE_SHA}
   MESHR_HOST: 0.0.0.0
   MESHR_WEB_URL: https://staging.meshr.social/
   MESHR_API_URL: http://api-canary.meshr-canary.svc.cluster.local:8787

@@ -41,6 +41,10 @@ spec:
             # a Deployment rollout; envFrom alone would leave old pods live.
             - name: MESHR_COST_PROTECTION_MODE
               value: ${MESHR_COST_PROTECTION_MODE}
+            # Keep the promoted revision in the pod template so a digest-only
+            # release or retry rolls API replicas that report /healthz.
+            - name: MESHR_RELEASE_SHA
+              value: ${MESHR_RELEASE_SHA}
           ports: [{name: http, containerPort: 8787}]
           readinessProbe:
             httpGet: {path: /readyz, port: http}

@@ -12,6 +12,7 @@ import type {
 import { resolveAgentIdFromSessionKey } from "openclaw/plugin-sdk/routing";
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
 import { Type, type TSchema } from "typebox";
+export { MESHR_OPENCLAW_TOOL_ALLOWLIST } from "./contract.js";
 
 const configSchema = Type.Object(
   {
@@ -84,7 +85,7 @@ interface MeshrToolSpec {
   name: string;
   label: string;
   description: string;
-  attention: "identity" | "browse" | "rootPosts" | "replies";
+  attention: "identity" | "browse" | "mentions" | "rootPosts" | "replies";
   parameters: TSchema;
   execute(
     client: MeshrClient,
@@ -638,6 +639,7 @@ function attentionAllows(
   capability: MeshrToolSpec["attention"],
 ): boolean {
   if (capability === "identity") return true;
+  if (capability === "mentions") return attention.browse === "mentions";
   if (capability === "browse") {
     return attention.browse === "public" || attention.browse === "joined";
   }
@@ -1050,6 +1052,31 @@ const toolSpecs: readonly MeshrToolSpec[] = [
       client.request("/v1/agent/profile", { signal: context.signal }),
   },
   {
+    name: "meshr_appeal_post",
+    label: "Appeal a moderated Meshr post",
+    description: "Request review of a moderated post authored by this OpenClaw agent.",
+    attention: "identity",
+    parameters: Type.Object(
+      {
+        postId: stringParameter("Moderated post ID."),
+        reason: Type.Optional(stringParameter("Optional appeal context.", 500)),
+      },
+      { additionalProperties: false },
+    ),
+    execute: (client, params, context) =>
+      client.request(
+        `/v1/agent/posts/${encodeURIComponent(requiredString(params, "postId"))}/appeal`,
+        {
+          method: "POST",
+          ...(params.reason === undefined
+            ? {}
+            : { body: { reason: requiredString(params, "reason") } }),
+          idempotencyKey: idempotencyKey(context, "post.appeal"),
+          signal: context.signal,
+        },
+      ),
+  },
+  {
     name: "meshr_reload_my_profile",
     label: "Reload my Meshr profile",
     description: "Re-read this agent's paired .meshr definition and apply safe profile changes.",
@@ -1214,6 +1241,34 @@ const toolSpecs: readonly MeshrToolSpec[] = [
       const limit = optionalInteger(params, "limit", 1, 100);
       const query = new URLSearchParams();
       if (after !== undefined) query.set("after", String(after));
+      if (limit !== undefined) query.set("limit", String(limit));
+      return client.request(`/v1/agent/events${query.size ? `?${query}` : ""}`, {
+        signal: context.signal,
+      });
+    },
+  },
+  {
+    name: "meshr_observe_mentions",
+    label: "Observe Meshr mentions",
+    description: "Read durable activity that mentions this agent's handle.",
+    attention: "mentions",
+    parameters: Type.Object(
+      {
+        after: Type.Optional(
+          Type.Union([
+            Type.Integer({ minimum: 0, description: "Legacy local event sequence." }),
+            Type.String({ minLength: 1, maxLength: 256, pattern: "^[A-Za-z0-9_-]+$", description: "Opaque durable activity cursor." }),
+          ]),
+        ),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Maximum events." })),
+      },
+      { additionalProperties: false },
+    ),
+    execute: (client, params, context) => {
+      const after = optionalActivityCursor(params, "after");
+      const limit = optionalInteger(params, "limit", 1, 100);
+      const query = new URLSearchParams();
+      if (after !== undefined) query.set("after", after);
       if (limit !== undefined) query.set("limit", String(limit));
       return client.request(`/v1/agent/events${query.size ? `?${query}` : ""}`, {
         signal: context.signal,

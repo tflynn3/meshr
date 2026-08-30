@@ -99,6 +99,7 @@ jobs:
           skip-dirs: deploy/local
           exit-code: '1'
       - run: npm run typecheck
+      - run: npm run typecheck:live
       - name: Verify the production cost model matches the HPA envelope
         run: npm run cost:model -- --json
       # The root OpenClaw live-contract tests load the packaged plugin entry.
@@ -166,6 +167,7 @@ jobs:
       - run: npm run test:openclaw-live
       - run: cd packages/mcp && npm ci && npm run typecheck && npm run build
       - run: cd integrations/openclaw && npm test
+      - run: npm run test:package-consumer
       # Keep the checked-in OpenClaw manifest generated from the native entry
       # point. The package test exercises runtime factories but does not catch
       # stale manifest metadata or an invalid plugin bundle.
@@ -216,8 +218,58 @@ jobs:
         if: always()
         run: npm run local:down
 
+  # Validate the published package engine contracts on every supported Node
+  # line. The root application intentionally targets Node 24, while the
+  # standalone MCP package supports the tested Node 20-25 range and the OpenClaw plugin follows
+  # OpenClaw's supported 22/24/25 lines.
+  package-engines:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - node: "20.x"
+            package: packages/mcp
+          - node: "21.x"
+            package: packages/mcp
+          - node: "22.x"
+            package: packages/mcp
+          - node: "23.x"
+            package: packages/mcp
+          - node: "24.x"
+            package: packages/mcp
+          - node: "25.x"
+            package: packages/mcp
+          - node: "22.x"
+            package: integrations/openclaw
+          - node: "24.x"
+            package: integrations/openclaw
+          - node: "25.x"
+            package: integrations/openclaw
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: ${{ matrix.package }}/package-lock.json
+      - name: Install the package source
+        run: npm ci --prefix "${{ matrix.package }}" --ignore-scripts --no-audit --no-fund
+      - name: Build the package source
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.package }}" = "packages/mcp" ]; then
+            npm run typecheck --prefix "${{ matrix.package }}"
+          fi
+          npm run build --prefix "${{ matrix.package }}"
+      - name: Install and import the packed package as a consumer
+        env:
+          npm_config_engine_strict: "true"
+        run: node scripts/package-consumer-smoke.mjs "${{ matrix.package }}"
+
   build:
-    needs: [verify, local-stack, release-preflight]
+    needs: [verify, local-stack, package-engines, release-preflight]
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -434,6 +486,14 @@ jobs:
           MESHR_CANARY_E2E_SOCIAL_PROVIDER: ${{ vars.MESHR_CANARY_E2E_SOCIAL_PROVIDER }}
           MESHR_CANARY_E2E_IDENTITY_API_KEY: ${{ vars.MESHR_CANARY_E2E_IDENTITY_API_KEY }}
           MESHR_CANARY_E2E_SOCIAL_REFRESH_TOKEN: ${{ secrets.MESHR_CANARY_E2E_SOCIAL_REFRESH_TOKEN }}
+          MESHR_CANARY_CLAUDE_STATE_JSON: ${{ secrets.MESHR_CANARY_CLAUDE_STATE_JSON }}
+          MESHR_CANARY_OPENCLAW_STATE_JSON: ${{ secrets.MESHR_CANARY_OPENCLAW_STATE_JSON }}
+          MESHR_CANARY_OPENCLAW_CONFIG_JSON: ${{ secrets.MESHR_CANARY_OPENCLAW_CONFIG_JSON }}
+          MESHR_CANARY_CLAUDE_BINDINGS: ${{ vars.MESHR_CANARY_CLAUDE_BINDINGS }}
+          MESHR_CANARY_OPENCLAW_AGENTS: ${{ vars.MESHR_CANARY_OPENCLAW_AGENTS }}
+          MESHR_CANARY_OPENCLAW_BINDINGS: ${{ vars.MESHR_CANARY_OPENCLAW_BINDINGS }}
+          MESHR_CANARY_RELEASE_VALIDATION_MESH_ID: ${{ vars.MESHR_CANARY_RELEASE_VALIDATION_MESH_ID }}
+          MESHR_CANARY_RELEASE_VALIDATION_TOPIC_ID: ${{ vars.MESHR_CANARY_RELEASE_VALIDATION_TOPIC_ID }}
           MESHR_CANARY_RELEASE_APP_ID: ${{ vars.MESHR_CANARY_RELEASE_APP_ID }}
           MESHR_CANARY_RELEASE_APP_SLUG: ${{ vars.MESHR_CANARY_RELEASE_APP_SLUG }}
           MESHR_CANARY_RELEASE_APP_PRIVATE_KEY: ${{ secrets.MESHR_CANARY_RELEASE_APP_PRIVATE_KEY }}
@@ -469,6 +529,18 @@ jobs:
           : "${MESHR_CANARY_E2E_SOCIAL_PROVIDER:?Set the protected MESHR_CANARY_E2E_SOCIAL_PROVIDER canary variable before canary promotion}"
           : "${MESHR_CANARY_E2E_IDENTITY_API_KEY:?Set the protected MESHR_CANARY_E2E_IDENTITY_API_KEY canary variable before canary promotion}"
           : "${MESHR_CANARY_E2E_SOCIAL_REFRESH_TOKEN:?Set the protected MESHR_CANARY_E2E_SOCIAL_REFRESH_TOKEN canary secret before canary promotion}"
+          : "${MESHR_CANARY_CLAUDE_STATE_JSON:?Set the protected MESHR_CANARY_CLAUDE_STATE_JSON canary secret before canary promotion}"
+          : "${MESHR_CANARY_OPENCLAW_STATE_JSON:?Set the protected MESHR_CANARY_OPENCLAW_STATE_JSON canary secret before canary promotion}"
+          : "${MESHR_CANARY_OPENCLAW_CONFIG_JSON:?Set the protected MESHR_CANARY_OPENCLAW_CONFIG_JSON canary secret before canary promotion}"
+          : "${MESHR_CANARY_CLAUDE_BINDINGS:?Set the protected MESHR_CANARY_CLAUDE_BINDINGS canary variable before canary promotion}"
+          : "${MESHR_CANARY_OPENCLAW_AGENTS:?Set the protected MESHR_CANARY_OPENCLAW_AGENTS canary variable before canary promotion}"
+          : "${MESHR_CANARY_OPENCLAW_BINDINGS:?Set the protected MESHR_CANARY_OPENCLAW_BINDINGS canary variable before canary promotion}"
+          : "${MESHR_CANARY_RELEASE_VALIDATION_MESH_ID:?Set the protected MESHR_CANARY_RELEASE_VALIDATION_MESH_ID canary variable before canary promotion}"
+          : "${MESHR_CANARY_RELEASE_VALIDATION_TOPIC_ID:?Set the protected MESHR_CANARY_RELEASE_VALIDATION_TOPIC_ID canary variable before canary promotion}"
+          test "$MESHR_CANARY_RELEASE_VALIDATION_MESH_ID" != "mesh-public" || {
+            echo "MESHR_CANARY_RELEASE_VALIDATION_MESH_ID must identify the private validation mesh, not mesh-public" >&2
+            exit 1
+          }
           : "${MESHR_CANARY_RELEASE_APP_ID:?Set the protected MESHR_CANARY_RELEASE_APP_ID canary variable before canary promotion}"
           : "${MESHR_CANARY_RELEASE_APP_SLUG:?Set the protected MESHR_CANARY_RELEASE_APP_SLUG canary variable before canary promotion}"
           : "${MESHR_CANARY_RELEASE_APP_PRIVATE_KEY:?Set the protected MESHR_CANARY_RELEASE_APP_PRIVATE_KEY canary secret before canary promotion}"
@@ -939,6 +1011,7 @@ jobs:
             --from-literal="MESHR_MODERATION_ENDPOINT=$MESHR_MODERATION_ENDPOINT" \
             --from-literal="MESHR_MODERATION_HEALTHCHECK_URL=$MESHR_MODERATION_HEALTHCHECK_URL" \
             --from-literal="MESHR_MODERATION_AUDIENCE=$MESHR_MODERATION_AUDIENCE" \
+            --from-literal="MESHR_RELEASE_SHA=$GITHUB_SHA" \
             --from-literal="MESHR_COST_PROTECTION_MODE=$MESHR_COST_PROTECTION_MODE" \
             --from-literal="MESHR_COST_PROTECTION_TRANSITION_ID=$transition_id_to_store" \
             --from-literal="MESHR_COST_PROTECTION_TRANSITION_PHASE=$transition_phase_to_store" \
@@ -962,6 +1035,7 @@ jobs:
               --from-literal="MESHR_MODERATION_ENDPOINT=$MESHR_MODERATION_ENDPOINT" \
               --from-literal="MESHR_MODERATION_HEALTHCHECK_URL=$MESHR_MODERATION_HEALTHCHECK_URL" \
               --from-literal="MESHR_MODERATION_AUDIENCE=$MESHR_MODERATION_AUDIENCE" \
+              --from-literal="MESHR_RELEASE_SHA=$GITHUB_SHA" \
               --from-literal="MESHR_COST_PROTECTION_MODE=$MESHR_COST_PROTECTION_MODE" \
               --from-literal="MESHR_COST_PROTECTION_TRANSITION_ID=$transition_id_to_store" \
               --from-literal="MESHR_COST_PROTECTION_TRANSITION_PHASE=$transition_phase_to_store" \
@@ -1205,6 +1279,19 @@ jobs:
               sleep 2
             done
           done
+      - name: Prepare protected canary session smoke binding
+        if: success() && steps.canary-apply.outputs.cost_protection_mode != 'normal'
+        env:
+          BINDING_STATE_JSON: ${{ secrets.MESHR_CANARY_CLAUDE_STATE_JSON }}
+        run: |
+          set -euo pipefail
+          : "${BINDING_STATE_JSON:?Set MESHR_CANARY_CLAUDE_STATE_JSON for protected-mode session smoke}"
+          umask 077
+          state_dir="$RUNNER_TEMP/meshr-protected-session-state"
+          mkdir -p "$state_dir"
+          chmod 700 "$state_dir"
+          printf '%s\n' "$BINDING_STATE_JSON" > "$state_dir/state.json"
+          chmod 600 "$state_dir/state.json"
       - name: Run authenticated canary pairing and WebMCP smoke
         if: success()
         env:
@@ -1214,7 +1301,48 @@ jobs:
           MESHR_E2E_SOCIAL_PROVIDER: ${{ vars.MESHR_CANARY_E2E_SOCIAL_PROVIDER }}
           MESHR_E2E_IDENTITY_API_KEY: ${{ vars.MESHR_CANARY_E2E_IDENTITY_API_KEY }}
           MESHR_E2E_SOCIAL_REFRESH_TOKEN: ${{ secrets.MESHR_CANARY_E2E_SOCIAL_REFRESH_TOKEN }}
+          MESHR_RELEASE_VALIDATION_MESH_ID: ${{ vars.MESHR_CANARY_RELEASE_VALIDATION_MESH_ID }}
+          MESHR_RELEASE_VALIDATION_TOPIC_ID: ${{ vars.MESHR_CANARY_RELEASE_VALIDATION_TOPIC_ID }}
+          MESHR_E2E_PROTECTED_STATE_FILE: ${{ runner.temp }}/meshr-protected-session-state/state.json
+          MESHR_E2E_PROTECTED_BINDING_SELECTOR: ${{ vars.MESHR_CANARY_CLAUDE_BINDINGS }}
         run: npm run smoke:deployed
+      - name: Build the native OpenClaw plugin for acceptance
+        if: success()
+        run: cd integrations/openclaw && npm ci --ignore-scripts --no-audit --no-fund && npm run build
+      - name: Run native Claude and OpenClaw acceptance
+        if: success() && steps.canary-apply.outputs.cost_protection_mode == 'normal'
+        env:
+          MESHR_RELEASE_ENVIRONMENT: canary
+          MESHR_RELEASE_ORIGIN: ${{ vars.MESHR_CANARY_URL }}
+          MESHR_RELEASE_SHA: ${{ github.sha }}
+          MESHR_RELEASE_CLAUDE_STATE_JSON: ${{ secrets.MESHR_CANARY_CLAUDE_STATE_JSON }}
+          MESHR_RELEASE_OPENCLAW_STATE_JSON: ${{ secrets.MESHR_CANARY_OPENCLAW_STATE_JSON }}
+          MESHR_RELEASE_OPENCLAW_CONFIG_JSON: ${{ secrets.MESHR_CANARY_OPENCLAW_CONFIG_JSON }}
+          MESHR_RELEASE_CLAUDE_BINDINGS: ${{ vars.MESHR_CANARY_CLAUDE_BINDINGS }}
+          MESHR_RELEASE_OPENCLAW_AGENTS: ${{ vars.MESHR_CANARY_OPENCLAW_AGENTS }}
+          MESHR_RELEASE_OPENCLAW_BINDINGS: ${{ vars.MESHR_CANARY_OPENCLAW_BINDINGS }}
+          MESHR_RELEASE_VALIDATION_MESH_ID: ${{ vars.MESHR_CANARY_RELEASE_VALIDATION_MESH_ID }}
+          MESHR_RELEASE_VALIDATION_TOPIC_ID: ${{ vars.MESHR_CANARY_RELEASE_VALIDATION_TOPIC_ID }}
+          MESHR_RELEASE_CLAUDE_COMMAND: ${{ vars.MESHR_CANARY_CLAUDE_COMMAND }}
+          MESHR_RELEASE_CLAUDE_MODEL: ${{ vars.MESHR_CANARY_CLAUDE_MODEL }}
+          MESHR_RELEASE_OPENCLAW_COMMAND: ${{ vars.MESHR_CANARY_OPENCLAW_COMMAND }}
+          MESHR_RELEASE_OPENCLAW_MODEL: ${{ vars.MESHR_CANARY_OPENCLAW_MODEL }}
+          MESHR_RELEASE_RECEIPT_OUTPUT: ${{ runner.temp }}/meshr-runtime-receipt.json
+        run: bash scripts/run-native-release-acceptance.sh
+      - name: Upload redacted canary runtime receipt
+        if: success() && steps.canary-apply.outputs.cost_protection_mode == 'normal'
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: meshr-canary-runtime-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/meshr-runtime-receipt.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Record canary protected-mode acceptance
+        if: success() && steps.canary-apply.outputs.cost_protection_mode != 'normal'
+        env:
+          MESHR_COST_PROTECTION_MODE: ${{ steps.canary-apply.outputs.cost_protection_mode }}
+        run: >-
+          echo "Protected-mode acceptance recorded for $MESHR_COST_PROTECTION_MODE: authenticated reads plus pairing, session-start, and mesh-creation blocks passed; native writes and WebMCP transfer are intentionally deferred while cost protection is active."
       - name: Refresh GCP credentials before restoring canary
         if: success()
         id: canary-restore-auth
@@ -1342,6 +1470,14 @@ jobs:
           MESHR_PRODUCTION_E2E_SOCIAL_PROVIDER: ${{ vars.MESHR_PRODUCTION_E2E_SOCIAL_PROVIDER }}
           MESHR_PRODUCTION_E2E_IDENTITY_API_KEY: ${{ vars.MESHR_PRODUCTION_E2E_IDENTITY_API_KEY }}
           MESHR_PRODUCTION_E2E_SOCIAL_REFRESH_TOKEN: ${{ secrets.MESHR_PRODUCTION_E2E_SOCIAL_REFRESH_TOKEN }}
+          MESHR_PRODUCTION_CLAUDE_STATE_JSON: ${{ secrets.MESHR_PRODUCTION_CLAUDE_STATE_JSON }}
+          MESHR_PRODUCTION_OPENCLAW_STATE_JSON: ${{ secrets.MESHR_PRODUCTION_OPENCLAW_STATE_JSON }}
+          MESHR_PRODUCTION_OPENCLAW_CONFIG_JSON: ${{ secrets.MESHR_PRODUCTION_OPENCLAW_CONFIG_JSON }}
+          MESHR_PRODUCTION_CLAUDE_BINDINGS: ${{ vars.MESHR_PRODUCTION_CLAUDE_BINDINGS }}
+          MESHR_PRODUCTION_OPENCLAW_AGENTS: ${{ vars.MESHR_PRODUCTION_OPENCLAW_AGENTS }}
+          MESHR_PRODUCTION_OPENCLAW_BINDINGS: ${{ vars.MESHR_PRODUCTION_OPENCLAW_BINDINGS }}
+          MESHR_PRODUCTION_RELEASE_VALIDATION_MESH_ID: ${{ vars.MESHR_PRODUCTION_RELEASE_VALIDATION_MESH_ID }}
+          MESHR_PRODUCTION_RELEASE_VALIDATION_TOPIC_ID: ${{ vars.MESHR_PRODUCTION_RELEASE_VALIDATION_TOPIC_ID }}
           MESHR_PRODUCTION_RELEASE_APP_ID: ${{ vars.MESHR_PRODUCTION_RELEASE_APP_ID }}
           MESHR_PRODUCTION_RELEASE_APP_SLUG: ${{ vars.MESHR_PRODUCTION_RELEASE_APP_SLUG }}
           MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY: ${{ secrets.MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY }}
@@ -1369,6 +1505,18 @@ jobs:
           : "${MESHR_PRODUCTION_E2E_SOCIAL_PROVIDER:?Set the protected MESHR_PRODUCTION_E2E_SOCIAL_PROVIDER production variable before production promotion}"
           : "${MESHR_PRODUCTION_E2E_IDENTITY_API_KEY:?Set the protected MESHR_PRODUCTION_E2E_IDENTITY_API_KEY production variable before production promotion}"
           : "${MESHR_PRODUCTION_E2E_SOCIAL_REFRESH_TOKEN:?Set the protected MESHR_PRODUCTION_E2E_SOCIAL_REFRESH_TOKEN production secret before production promotion}"
+          : "${MESHR_PRODUCTION_CLAUDE_STATE_JSON:?Set the protected MESHR_PRODUCTION_CLAUDE_STATE_JSON production secret before production promotion}"
+          : "${MESHR_PRODUCTION_OPENCLAW_STATE_JSON:?Set the protected MESHR_PRODUCTION_OPENCLAW_STATE_JSON production secret before production promotion}"
+          : "${MESHR_PRODUCTION_OPENCLAW_CONFIG_JSON:?Set the protected MESHR_PRODUCTION_OPENCLAW_CONFIG_JSON production secret before production promotion}"
+          : "${MESHR_PRODUCTION_CLAUDE_BINDINGS:?Set the protected MESHR_PRODUCTION_CLAUDE_BINDINGS production variable before production promotion}"
+          : "${MESHR_PRODUCTION_OPENCLAW_AGENTS:?Set the protected MESHR_PRODUCTION_OPENCLAW_AGENTS production variable before production promotion}"
+          : "${MESHR_PRODUCTION_OPENCLAW_BINDINGS:?Set the protected MESHR_PRODUCTION_OPENCLAW_BINDINGS production variable before production promotion}"
+          : "${MESHR_PRODUCTION_RELEASE_VALIDATION_MESH_ID:?Set the protected MESHR_PRODUCTION_RELEASE_VALIDATION_MESH_ID production variable before production promotion}"
+          : "${MESHR_PRODUCTION_RELEASE_VALIDATION_TOPIC_ID:?Set the protected MESHR_PRODUCTION_RELEASE_VALIDATION_TOPIC_ID production variable before production promotion}"
+          test "$MESHR_PRODUCTION_RELEASE_VALIDATION_MESH_ID" != "mesh-public" || {
+            echo "MESHR_PRODUCTION_RELEASE_VALIDATION_MESH_ID must identify the private validation mesh, not mesh-public" >&2
+            exit 1
+          }
           : "${MESHR_PRODUCTION_RELEASE_APP_ID:?Set the protected MESHR_PRODUCTION_RELEASE_APP_ID production variable before production promotion}"
           : "${MESHR_PRODUCTION_RELEASE_APP_SLUG:?Set the protected MESHR_PRODUCTION_RELEASE_APP_SLUG production variable before production promotion}"
           : "${MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY:?Set the protected MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY production secret before production promotion}"
@@ -1601,6 +1749,13 @@ jobs:
           test "$(kubectl auth can-i patch kustomizations.kustomize.toolkit.fluxcd.io/meshr-production -n flux-system)" = yes
           was_suspended="$(kubectl -n flux-system get kustomization meshr-production -o jsonpath='{.spec.suspend}' 2>/dev/null || true)"
           printf 'MESHR_PRODUCTION_SUSPEND_WAS=%s\n' "${was_suspended:-false}" >> "$GITHUB_ENV"
+          image_backup="$RUNNER_TEMP/meshr-production-image-digests-before.json"
+          runtime_backup="$RUNNER_TEMP/meshr-production-runtime-values-before.json"
+          kubectl -n flux-system get configmap meshr-production-image-digests -o json > "$image_backup"
+          kubectl -n flux-system get configmap meshr-production-runtime-values -o json > "$runtime_backup"
+          chmod 600 "$image_backup" "$runtime_backup"
+          printf 'MESHR_PRODUCTION_IMAGE_BACKUP=%s\n' "$image_backup" >> "$GITHUB_ENV"
+          printf 'MESHR_PRODUCTION_RUNTIME_BACKUP=%s\n' "$runtime_backup" >> "$GITHUB_ENV"
           kubectl -n flux-system patch kustomization meshr-production \
             --type=merge --patch='{"spec":{"suspend":true}}'
       - name: Commit verified Flux pins
@@ -1621,6 +1776,7 @@ jobs:
           # branch instead of failing after the first digest-only commit.
           if git ls-remote --exit-code --heads origin production >/dev/null 2>&1; then
             git fetch --no-tags origin refs/heads/production:refs/remotes/origin/production
+            previous_release_sha="$(git rev-parse refs/remotes/origin/production)"
             git checkout -B release-promotion HEAD
             # Production contains only previously verified release metadata.
             # Use the `ours` merge strategy (not the recursive `-X ours`
@@ -1628,8 +1784,10 @@ jobs:
             # enter the promoted tree.
             git merge --no-ff -s ours --no-edit origin/production
           else
-            git checkout -B release-promotion HEAD
+            echo 'The protected production ref must exist before a candidate can be promoted; create its first verified baseline explicitly.' >&2
+            exit 1
           fi
+          printf 'MESHR_PRODUCTION_PREVIOUS_RELEASE_SHA=%s\n' "$previous_release_sha" >> "$GITHUB_ENV"
           echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           helper="$RUNNER_TEMP/meshr-git-credential-helper"
           cat >"$helper" <<'EOF'
@@ -1660,6 +1818,7 @@ jobs:
           MESHR_MODERATION_ENDPOINT: ${{ vars.MESHR_MODERATION_ENDPOINT }}
           MESHR_MODERATION_HEALTHCHECK_URL: ${{ vars.MESHR_MODERATION_HEALTHCHECK_URL }}
           MESHR_MODERATION_AUDIENCE: ${{ vars.MESHR_MODERATION_AUDIENCE }}
+          MESHR_RELEASE_SHA: ${{ steps.release.outputs.release_sha }}
           MESHR_COST_PROTECTION_MODE: ${{ vars.MESHR_COST_PROTECTION_MODE }}
           MESHR_COST_PROTECTION_OPERATOR: ${{ vars.MESHR_COST_PROTECTION_OPERATOR }}
           MESHR_COST_PROTECTION_REASON: ${{ vars.MESHR_COST_PROTECTION_REASON }}
@@ -1789,6 +1948,7 @@ jobs:
             --from-literal="MESHR_MODERATION_ENDPOINT=$MESHR_MODERATION_ENDPOINT" \
             --from-literal="MESHR_MODERATION_HEALTHCHECK_URL=$MESHR_MODERATION_HEALTHCHECK_URL" \
             --from-literal="MESHR_MODERATION_AUDIENCE=$MESHR_MODERATION_AUDIENCE" \
+            --from-literal="MESHR_RELEASE_SHA=$MESHR_RELEASE_SHA" \
             --from-literal="MESHR_COST_PROTECTION_MODE=$current_mode" \
             --from-literal="MESHR_COST_PROTECTION_TRANSITION_ID=$transition_id_to_store" \
             --from-literal="MESHR_COST_PROTECTION_TRANSITION_PHASE=$transition_phase_to_store" \
@@ -1813,6 +1973,7 @@ jobs:
               --from-literal="MESHR_MODERATION_ENDPOINT=$MESHR_MODERATION_ENDPOINT" \
               --from-literal="MESHR_MODERATION_HEALTHCHECK_URL=$MESHR_MODERATION_HEALTHCHECK_URL" \
               --from-literal="MESHR_MODERATION_AUDIENCE=$MESHR_MODERATION_AUDIENCE" \
+              --from-literal="MESHR_RELEASE_SHA=$MESHR_RELEASE_SHA" \
               --from-literal="MESHR_COST_PROTECTION_MODE=$current_mode" \
               --from-literal="MESHR_COST_PROTECTION_TRANSITION_ID=$transition_id_to_store" \
               --from-literal="MESHR_COST_PROTECTION_TRANSITION_PHASE=$transition_phase_to_store" \
@@ -2021,6 +2182,19 @@ jobs:
             echo "Production live edge did not reach the live gateway contract guard."
             exit 1
           }
+      - name: Prepare protected production session smoke binding
+        if: success() && steps.production-apply.outputs.cost_protection_mode != 'normal'
+        env:
+          BINDING_STATE_JSON: ${{ secrets.MESHR_PRODUCTION_CLAUDE_STATE_JSON }}
+        run: |
+          set -euo pipefail
+          : "${BINDING_STATE_JSON:?Set MESHR_PRODUCTION_CLAUDE_STATE_JSON for protected-mode session smoke}"
+          umask 077
+          state_dir="$RUNNER_TEMP/meshr-protected-session-state"
+          mkdir -p "$state_dir"
+          chmod 700 "$state_dir"
+          printf '%s\n' "$BINDING_STATE_JSON" > "$state_dir/state.json"
+          chmod 600 "$state_dir/state.json"
       - name: Run authenticated production pairing and WebMCP smoke
         if: success()
         env:
@@ -2030,7 +2204,48 @@ jobs:
           MESHR_E2E_SOCIAL_PROVIDER: ${{ vars.MESHR_PRODUCTION_E2E_SOCIAL_PROVIDER }}
           MESHR_E2E_IDENTITY_API_KEY: ${{ vars.MESHR_PRODUCTION_E2E_IDENTITY_API_KEY }}
           MESHR_E2E_SOCIAL_REFRESH_TOKEN: ${{ secrets.MESHR_PRODUCTION_E2E_SOCIAL_REFRESH_TOKEN }}
+          MESHR_RELEASE_VALIDATION_MESH_ID: ${{ vars.MESHR_PRODUCTION_RELEASE_VALIDATION_MESH_ID }}
+          MESHR_RELEASE_VALIDATION_TOPIC_ID: ${{ vars.MESHR_PRODUCTION_RELEASE_VALIDATION_TOPIC_ID }}
+          MESHR_E2E_PROTECTED_STATE_FILE: ${{ runner.temp }}/meshr-protected-session-state/state.json
+          MESHR_E2E_PROTECTED_BINDING_SELECTOR: ${{ vars.MESHR_PRODUCTION_CLAUDE_BINDINGS }}
         run: npm run smoke:deployed
+      - name: Build the native OpenClaw plugin for production acceptance
+        if: success()
+        run: cd integrations/openclaw && npm ci --ignore-scripts --no-audit --no-fund && npm run build
+      - name: Run native Claude and OpenClaw production acceptance
+        if: success() && steps.production-apply.outputs.cost_protection_mode == 'normal'
+        env:
+          MESHR_RELEASE_ENVIRONMENT: production
+          MESHR_RELEASE_ORIGIN: ${{ vars.MESHR_PRODUCTION_URL }}
+          MESHR_RELEASE_SHA: ${{ steps.release.outputs.release_sha }}
+          MESHR_RELEASE_CLAUDE_STATE_JSON: ${{ secrets.MESHR_PRODUCTION_CLAUDE_STATE_JSON }}
+          MESHR_RELEASE_OPENCLAW_STATE_JSON: ${{ secrets.MESHR_PRODUCTION_OPENCLAW_STATE_JSON }}
+          MESHR_RELEASE_OPENCLAW_CONFIG_JSON: ${{ secrets.MESHR_PRODUCTION_OPENCLAW_CONFIG_JSON }}
+          MESHR_RELEASE_CLAUDE_BINDINGS: ${{ vars.MESHR_PRODUCTION_CLAUDE_BINDINGS }}
+          MESHR_RELEASE_OPENCLAW_AGENTS: ${{ vars.MESHR_PRODUCTION_OPENCLAW_AGENTS }}
+          MESHR_RELEASE_OPENCLAW_BINDINGS: ${{ vars.MESHR_PRODUCTION_OPENCLAW_BINDINGS }}
+          MESHR_RELEASE_VALIDATION_MESH_ID: ${{ vars.MESHR_PRODUCTION_RELEASE_VALIDATION_MESH_ID }}
+          MESHR_RELEASE_VALIDATION_TOPIC_ID: ${{ vars.MESHR_PRODUCTION_RELEASE_VALIDATION_TOPIC_ID }}
+          MESHR_RELEASE_CLAUDE_COMMAND: ${{ vars.MESHR_PRODUCTION_CLAUDE_COMMAND }}
+          MESHR_RELEASE_CLAUDE_MODEL: ${{ vars.MESHR_PRODUCTION_CLAUDE_MODEL }}
+          MESHR_RELEASE_OPENCLAW_COMMAND: ${{ vars.MESHR_PRODUCTION_OPENCLAW_COMMAND }}
+          MESHR_RELEASE_OPENCLAW_MODEL: ${{ vars.MESHR_PRODUCTION_OPENCLAW_MODEL }}
+          MESHR_RELEASE_RECEIPT_OUTPUT: ${{ runner.temp }}/meshr-runtime-receipt.json
+        run: bash scripts/run-native-release-acceptance.sh
+      - name: Upload redacted production runtime receipt
+        if: success() && steps.production-apply.outputs.cost_protection_mode == 'normal'
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: meshr-production-runtime-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/meshr-runtime-receipt.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Record production protected-mode acceptance
+        if: success() && steps.production-apply.outputs.cost_protection_mode != 'normal'
+        env:
+          MESHR_COST_PROTECTION_MODE: ${{ steps.production-apply.outputs.cost_protection_mode }}
+        run: >-
+          echo "Protected-mode acceptance recorded for $MESHR_COST_PROTECTION_MODE: authenticated reads plus pairing, session-start, and mesh-creation blocks passed; native writes and WebMCP transfer are intentionally deferred while cost protection is active."
       - name: Refresh GCP credentials before restoring production
         if: success()
         id: production-restore-auth
@@ -2114,3 +2329,127 @@ jobs:
           kubectl -n flux-system patch kustomization meshr-production \
             --type=merge --patch='{"spec":{"suspend":true}}'
           echo 'Production promotion failed; Flux remains suspended. Inspect the candidate and perform an explicit rollback/recovery before resuming.' >&2
+      - name: Mint fresh production rollback token
+        if: failure() && env.MESHR_PRODUCTION_PREVIOUS_RELEASE_SHA != '' && steps.release.outputs.release_sha != ''
+        id: production-rollback-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ vars.MESHR_PRODUCTION_RELEASE_APP_ID }}
+          private-key: ${{ secrets.MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+      - name: Mint fresh GCP rollback credentials
+        if: failure() && env.MESHR_PRODUCTION_PREVIOUS_RELEASE_SHA != '' && steps.release.outputs.release_sha != ''
+        id: production-rollback-auth
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+      - name: Roll back the failed production application and release ref
+        if: failure() && env.MESHR_PRODUCTION_PREVIOUS_RELEASE_SHA != '' && steps.release.outputs.release_sha != ''
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.production-rollback-auth.outputs.access_token }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          MESHR_RELEASE_TOKEN: ${{ steps.production-rollback-token.outputs.token }}
+          PREVIOUS_RELEASE_SHA: ${{ env.MESHR_PRODUCTION_PREVIOUS_RELEASE_SHA }}
+          CANDIDATE_RELEASE_SHA: ${{ steps.release.outputs.release_sha }}
+          IMAGE_BACKUP: ${{ env.MESHR_PRODUCTION_IMAGE_BACKUP }}
+          RUNTIME_BACKUP: ${{ env.MESHR_PRODUCTION_RUNTIME_BACKUP }}
+        run: |
+          set -euo pipefail
+          : "${MESHR_RELEASE_TOKEN:?The production release token was not minted}"
+          : "${PREVIOUS_RELEASE_SHA:?The previous protected production release was not captured}"
+          : "${CANDIDATE_RELEASE_SHA:?The failed production release was not captured}"
+          : "${IMAGE_BACKUP:?The pre-promotion image ConfigMap backup was not captured}"
+          : "${RUNTIME_BACKUP:?The pre-promotion runtime ConfigMap backup was not captured}"
+          test -s "$IMAGE_BACKUP"
+          test -s "$RUNTIME_BACKUP"
+
+          # The promotion ref is a merge commit whose first parent is the
+          # candidate main commit and whose second parent is the previous
+          # release. A normal fast-forward rollback cannot point at that old
+          # commit, so create a new protected commit with the exact previous
+          # release tree and the candidate as its parent. No force push is
+          # needed, and a concurrent promotion is detected by the lease check.
+          git config user.name 'meshr-release[bot]'
+          git config user.email 'meshr-release[bot]@users.noreply.github.com'
+          git fetch --no-tags origin refs/heads/production:refs/remotes/origin/production
+          current_release_sha="$(git rev-parse refs/remotes/origin/production)"
+          test "$current_release_sha" = "$CANDIDATE_RELEASE_SHA" || {
+            echo "Production ref moved from failed candidate $CANDIDATE_RELEASE_SHA to $current_release_sha; refusing an unsafe rollback." >&2
+            exit 1
+          }
+          test "$(git cat-file -t "$PREVIOUS_RELEASE_SHA")" = commit
+          test "$(git cat-file -t "$CANDIDATE_RELEASE_SHA")" = commit
+          previous_tree_sha="$(git rev-parse "$PREVIOUS_RELEASE_SHA^{tree}")"
+          rollback_sha="$(printf 'chore(release): rollback failed production candidate %s [skip ci]\n\nRestore the exact previously verified production tree after a failed launch gate.\n' "${CANDIDATE_RELEASE_SHA:0:12}" | GIT_AUTHOR_NAME='meshr-release[bot]' GIT_AUTHOR_EMAIL='meshr-release[bot]@users.noreply.github.com' GIT_COMMITTER_NAME='meshr-release[bot]' GIT_COMMITTER_EMAIL='meshr-release[bot]@users.noreply.github.com' git commit-tree "$previous_tree_sha" -p "$CANDIDATE_RELEASE_SHA")"
+          test "$(git rev-parse "$rollback_sha^{tree}")" = "$previous_tree_sha"
+          helper="$RUNNER_TEMP/meshr-git-credential-helper-rollback"
+          cat >"$helper" <<'EOF'
+          #!/bin/sh
+          if [ "${1:-}" = get ]; then
+            printf 'protocol=https\nhost=github.com\nusername=x-access-token\npassword=%s\n' "$MESHR_RELEASE_TOKEN"
+          fi
+          EOF
+          chmod 700 "$helper"
+          trap 'rm -f "$helper"' EXIT
+          MESHR_RELEASE_TOKEN="$MESHR_RELEASE_TOKEN" git -c credential.helper="$helper" \
+            push "https://github.com/${GITHUB_REPOSITORY}.git" "$rollback_sha:refs/heads/production"
+
+          token_file="$RUNNER_TEMP/meshr-gcp-access-token-rollback"
+          umask 077
+          printf '%s' "$CLOUDSDK_AUTH_ACCESS_TOKEN" > "$token_file"
+          gcloud container clusters get-credentials "$GKE_CLUSTER" \
+            --region "$GKE_LOCATION" --project "$GCP_PROJECT_ID" \
+            --access-token-file="$token_file"
+          cluster_user="$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')"
+          kubectl config set-credentials "$cluster_user" --token="$CLOUDSDK_AUTH_ACCESS_TOKEN" >/dev/null
+          rollback_resuspend() {
+            kubectl -n flux-system patch kustomization meshr-production \
+              --type=merge --patch='{"spec":{"suspend":true}}' >/dev/null 2>&1 || \
+              echo 'Rollback cleanup could not re-suspend Flux; operator action required.' >&2
+          }
+          rollback_cleanup() {
+            rollback_resuspend
+            rm -f "$helper"
+          }
+          trap rollback_cleanup EXIT
+          kubectl apply --server-side --force-conflicts -f "$IMAGE_BACKUP"
+          kubectl apply --server-side --force-conflicts -f "$RUNTIME_BACKUP"
+
+          # Reconcile the exact previous tree even when promotion started with
+          # Flux already suspended. Temporarily resuming is required for the
+          # GitRepository/Kustomization to observe the rollback commit; the
+          # failure path always freezes again for operator review.
+          kubectl -n flux-system patch kustomization meshr-production \
+            --type=merge --patch='{"spec":{"suspend":false}}'
+          for attempt in $(seq 1 120); do
+            revision="$(kubectl -n flux-system get gitrepository meshr -o jsonpath='{.status.artifact.revision}' 2>/dev/null || true)"
+            if [ "$revision" = "production@sha1:${rollback_sha}" ]; then break; fi
+            if [ "$attempt" -eq 120 ]; then
+              kubectl -n flux-system get gitrepository meshr -o yaml
+              exit 1
+            fi
+            sleep 5
+          done
+          for attempt in $(seq 1 120); do
+            applied_revision="$(kubectl -n flux-system get kustomization meshr-production -o jsonpath='{.status.lastAppliedRevision}' 2>/dev/null || true)"
+            ready="$(kubectl -n flux-system get kustomization meshr-production -o jsonpath='{range .status.conditions[?(@.type==\"Ready\")]}{.status}{end}' 2>/dev/null || true)"
+            if [ "$applied_revision" = "production@sha1:${rollback_sha}" ] && [ "$ready" = "True" ]; then break; fi
+            if [ "$attempt" -eq 120 ]; then
+              kubectl -n flux-system get kustomization meshr-production -o yaml
+              exit 1
+            fi
+            sleep 5
+          done
+          for deployment in api live-gateway web ingest topology-materializer moderation-worker moderation-screening-worker audit-worker notification-worker; do
+            kubectl -n meshr rollout status "deployment/$deployment" --timeout=5m
+          done
+          kubectl -n flux-system patch kustomization meshr-production \
+            --type=merge --patch='{"spec":{"suspend":true}}'
+          echo "Production rollback applied at $rollback_sha and Flux is frozen for operator review."

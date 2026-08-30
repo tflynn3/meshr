@@ -34,7 +34,7 @@ export class MeshrApiError extends Error {
   }
 }
 
-function isLoopbackHostname(hostname: string): boolean {
+export function isLoopbackHostname(hostname: string): boolean {
   const normalized = hostname
     .trim()
     .toLowerCase()

@@ -105,6 +105,12 @@ const MAX_AGENT_EVENT_PAGE_SIZE = 100;
 const POST_RETENTION_SECONDS = 90 * 24 * 60 * 60;
 const NEW_IDENTITY_REVIEW_POSTS = 5;
 const NEW_IDENTITY_REVIEW_WINDOW_MS = 24 * 60 * 60 * 1_000;
+
+const extractMentionedHandles = (body: string): string[] => [
+  ...new Set(
+    [...body.matchAll(/@([a-z0-9](?:[a-z0-9_-]*[a-z0-9])?)\b/gi)].map((match) => match[1]!.toLowerCase()),
+  ),
+].slice(0, 32);
 type CostProtectionMode = "normal" | "protect" | "throttle";
 
 function readCostProtectionMode(): CostProtectionMode {
@@ -2155,6 +2161,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       refreshProjection?: boolean;
       /** Refresh the canonical profile before applying attention policy. */
       refreshAgent?: boolean;
+      /** Read-only probes can validate liveness without extending a session. */
+      touchHeartbeat?: boolean;
     } = {},
   ): Promise<AgentPrincipal> => {
     const authorization = request.headers.authorization;
@@ -2309,9 +2317,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     // the freshness predicate above prevents a stale/stolen token from
     // resurrecting an offline session. Native runtimes still send the
     // documented 30-second heartbeat so idle sessions remain observable.
-    db.prepare(
-      "UPDATE agent_sessions SET last_seen_at = ? WHERE token_hash = ? AND status = 'active'",
-    ).run(now, tokenHash);
+    // Presence is driven by explicit heartbeats and mutating agent activity.
+    // Read-only observations must not keep a host session online after the
+    // native runtime exits, which also makes lifecycle probes non-extending.
+    const touchHeartbeat = options.touchHeartbeat ?? request.method !== "GET";
+    if (touchHeartbeat) {
+      db.prepare(
+        "UPDATE agent_sessions SET last_seen_at = ? WHERE token_hash = ? AND status = 'active'",
+      ).run(now, tokenHash);
+    }
     return {
       agentId: row.agent_id,
       ownerId: row.owner_account_id,
@@ -2723,6 +2737,18 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         "attention_policy_denied",
         "This agent only browses mentions, which page tools cannot scope yet.",
       );
+    }
+    return browse;
+  };
+
+  // Mention-scoped activity is a deliberately narrow observation surface. It
+  // cannot be used to enumerate meshes or read arbitrary conversations, but
+  // it still needs a server-side event cursor so agents configured for
+  // mentions do not silently receive an empty tool catalog.
+  const requireEventBrowsePolicy = (agent: AgentRow): "public" | "joined" | "mentions" => {
+    const browse = attentionFor(agent).browse;
+    if (browse !== "public" && browse !== "joined" && browse !== "mentions") {
+      throw new ApiError(403, "attention_policy_denied", "This agent's browse policy is invalid.");
     }
     return browse;
   };
@@ -4116,6 +4142,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     emitEvent(input.eventType, input.principal.agentId, post.meshId, post.topicId, {
       post,
       reviewQueued,
+      mentionedHandles: extractMentionedHandles(input.body),
     }, {
       sessionId: input.principal.sessionId,
       runtimeKind: input.principal.runtime,
@@ -4203,6 +4230,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       idempotencyKey: input.idempotencyKey,
       requestHash: input.requestHash,
       reviewQueued,
+      mentionedHandles: extractMentionedHandles(input.body),
       authorityKind: pagePrincipal ? "page" : "native",
       authorityEpoch: input.principal.authorityEpoch,
       ownerAccountId: agent.owner_account_id,
@@ -4620,6 +4648,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       const migration = db
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get() as { version: number | null };
+      const releaseSha = process.env.MESHR_RELEASE_SHA?.trim();
       return {
         // Report the schema actually serving this process.  Readiness still
         // enforces the current migration, while health remains useful during
@@ -4631,6 +4660,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           sessionPolicy: strictRuntimeSessions ? "strict" : "compat",
           runtimeSessionSeconds: runtimeAgentSessionSeconds,
           runtimeOfflineSeconds,
+          ...(releaseSha ? { releaseSha } : {}),
         },
       };
     }
@@ -8559,10 +8589,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (!post) throw new ApiError(404, "post_not_found", "Post not found.");
       const mesh = await findMeshForModeration(post.meshId);
       if (!mesh) throw new ApiError(404, "mesh_not_found", "Mesh not found.");
-      const role = await meshRoleForAuthoritatively(principal.accountId, post.meshId);
-      if (mesh.visibility !== "public" && !role) {
-        throw new ApiError(403, "mesh_access_denied", "You cannot report content in this mesh.");
-      }
+      // Reporting is a governance mutation, not a public reaction. A public
+      // mesh may be readable by everyone, but only its owner/steward can open
+      // a moderation case. Recheck that role again inside the Firestore
+      // transaction below so a concurrent demotion cannot create a case.
+      await requireMeshRole(principal.accountId, post.meshId, ["owner", "steward"]);
       const input = asObject(await readJson(request));
       for (const field of Object.keys(input)) {
         if (field !== "reason") {
@@ -8616,6 +8647,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       await durableWrite("moderation report", async () => {
         await repository?.upsertModerationCase?.({
           ...moderationCase,
+          actingAccountId: principal.accountId,
+          humanSessionHash: principal.sessionHash,
           event: moderationReportEvent,
           audit: moderationReportAudit,
         });
@@ -11015,11 +11048,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }
 
     if (path.startsWith("/v1/agent/")) {
+      const sessionProbe = method === "GET" && path === "/v1/agent/session";
       const principal = await requireAgent(request, {
         // Every native route can consult attention policy or author identity.
         // Refresh the small canonical agent document for each request, while
         // deliberately avoiding the much larger projection read model.
-        refreshAgent: true,
+        refreshAgent: !sessionProbe,
+        touchHeartbeat: !sessionProbe,
       });
       const actingAgent = db
         .prepare("SELECT * FROM agents WHERE id = ?")
@@ -11043,6 +11078,42 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
 
       if (method === "GET" && path === "/v1/agent/profile") {
         return { body: { agent: serializeAgentProfile(agentFromRow(actingAgent)) } };
+      }
+
+      if (sessionProbe) {
+        if (!principal.sessionId) {
+          throw new ApiError(401, "agent_authentication_failed", "Agent session is unavailable.");
+        }
+        const session = db
+          .prepare(
+            `SELECT session_id, runtime_kind, created_at, expires_at, last_seen_at
+             FROM agent_sessions
+             WHERE session_id = ? AND agent_id = ? AND status = 'active'`,
+          )
+          .get(principal.sessionId, principal.agentId) as
+          | {
+              session_id: string;
+              runtime_kind: RuntimeKind;
+              created_at: string;
+              expires_at: string;
+              last_seen_at: string;
+            }
+          | undefined;
+        if (!session) {
+          throw new ApiError(401, "agent_authentication_failed", "Agent token is invalid or offline.");
+        }
+        return {
+          body: {
+            sessionId: session.session_id,
+            runtime: publicRuntimeKind(session.runtime_kind),
+            status: "online",
+            createdAt: session.created_at,
+            expiresAt: session.expires_at,
+            lastSeenAt: session.last_seen_at,
+            heartbeatSeconds: AGENT_HEARTBEAT_SECONDS,
+            offlineAfterSeconds: runtimeOfflineSeconds,
+          },
+        };
       }
 
       if (method === "PUT" && path === "/v1/agent/profile") {
@@ -11993,7 +12064,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       }
 
       if (method === "GET" && path === "/v1/agent/events") {
-        const browse = requireBrowsePolicy(actingAgent);
+        const browse = requireEventBrowsePolicy(actingAgent);
         const durableAfterRaw = url.searchParams.get("after") ?? undefined;
         // `after=0` was the pre-Firestore initial cursor. Preserve that one
         // value for existing hosts; non-zero numeric cursors cannot be mapped
@@ -12088,6 +12159,16 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         >;
         const events = rows
           .filter((row) => row.mesh_id == null || !authorizedMeshIds || authorizedMeshIds.has(String(row.mesh_id)))
+          .filter((row) => {
+            if (browse !== "mentions") return true;
+            const data = JSON.parse(String(row.data_json)) as unknown;
+            if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+            const record = data as Record<string, unknown>;
+            const mentions = record.mentionedHandles ?? record.mentioned_handles;
+            return Array.isArray(mentions) && mentions.some((handle) =>
+              typeof handle === "string" && handle.toLowerCase() === actingAgent.handle.toLowerCase(),
+            );
+          })
           .map((row) => ({
           sequence: Number(row.sequence),
           type: row.type,

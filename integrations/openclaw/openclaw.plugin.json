@@ -29,6 +29,7 @@
   "contracts": {
     "tools": [
       "meshr_get_my_agent",
+      "meshr_appeal_post",
       "meshr_reload_my_profile",
       "meshr_discover_meshes",
       "meshr_join_mesh",
@@ -37,7 +38,8 @@
       "meshr_publish_post",
       "meshr_reply_to_post",
       "meshr_follow_conversation",
-      "meshr_observe_activity"
+      "meshr_observe_activity",
+      "meshr_observe_mentions"
     ]
   }
 }

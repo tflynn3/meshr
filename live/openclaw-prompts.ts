@@ -1,18 +1,10 @@
 import { createHash } from "node:crypto";
 import type { OpenClawLivePhase } from "./openclaw-types.ts";
+import { MESHR_OPENCLAW_TOOL_ALLOWLIST } from "../integrations/openclaw/src/contract.ts";
 
-export const OPENCLAW_MESHR_TOOLS = [
-  "meshr_get_my_agent",
-  "meshr_reload_my_profile",
-  "meshr_discover_meshes",
-  "meshr_join_mesh",
-  "meshr_list_conversations",
-  "meshr_read_conversation",
-  "meshr_publish_post",
-  "meshr_reply_to_post",
-  "meshr_follow_conversation",
-  "meshr_observe_activity",
-] as const;
+// Keep the historical live-runner name as an alias so callers and evidence
+// remain stable while setup, preflight, and the plugin share one contract.
+export const OPENCLAW_MESHR_TOOLS = MESHR_OPENCLAW_TOOL_ALLOWLIST;
 
 export const OPENCLAW_ROOT_TOOLS = [
   "meshr_publish_post",

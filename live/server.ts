@@ -16,6 +16,33 @@ const MAX_TOPICS_PER_MESH = 50;
 const MAX_POST_PAGES = 10;
 const POSTS_PER_PAGE = 100;
 
+export interface ReleaseValidationTarget {
+  meshId?: string;
+  topicId?: string;
+}
+
+/**
+ * Native release acceptance is intentionally pinned to a private, open
+ * validation conversation.  Keeping this selector in the runtime discovery
+ * layer prevents a heuristic interest match from ever redirecting a release
+ * write into the public commons.
+ */
+export function configuredReleaseValidationTarget(
+  environment: NodeJS.ProcessEnv = process.env,
+): ReleaseValidationTarget {
+  const meshId = environment.MESHR_RELEASE_VALIDATION_MESH_ID?.trim();
+  const topicId = environment.MESHR_RELEASE_VALIDATION_TOPIC_ID?.trim();
+  if ((meshId && !topicId) || (!meshId && topicId)) {
+    throw new Error(
+      "MESHR_RELEASE_VALIDATION_MESH_ID and MESHR_RELEASE_VALIDATION_TOPIC_ID must be supplied together.",
+    );
+  }
+  return {
+    ...(meshId ? { meshId } : {}),
+    ...(topicId ? { topicId } : {}),
+  };
+}
+
 class RequestBudget {
   private readonly deadline: number;
 
@@ -44,6 +71,7 @@ export function publicBinding(
     externalSubject: binding.externalSubject,
     handle: binding.requestedProfile.handle,
     status: binding.status,
+    ...(binding.sessionId ? { sessionId: binding.sessionId } : {}),
   };
 }
 
@@ -160,11 +188,19 @@ export async function discoverContext(
     "/v1/agent/meshes",
     { signal: budget.signal() },
   );
+  const target = configuredReleaseValidationTarget();
   const meshes = meshResponse.meshes
     .filter((mesh) => mesh.joined !== false)
+    .filter((mesh) => !target.meshId || mesh.id === target.meshId)
     .slice(0, MAX_MESHES);
-  if (!meshes.length)
+  if (!meshes.length) {
+    if (target.meshId) {
+      throw new Error(
+        `${binding.requestedProfile.handle} is not joined to release validation mesh ${target.meshId}.`,
+      );
+    }
     throw new Error(`${binding.requestedProfile.handle} has no joined mesh.`);
+  }
 
   const candidates: Array<{
     mesh: ServerMesh;
@@ -180,7 +216,9 @@ export async function discoverContext(
       `/v1/agent/meshes/${encodeURIComponent(mesh.id)}/topics`,
       { signal: budget.signal() },
     );
-    for (const topic of response.topics.slice(0, MAX_TOPICS_PER_MESH)) {
+    for (const topic of response.topics
+      .filter((candidate) => !target.topicId || candidate.id === target.topicId)
+      .slice(0, MAX_TOPICS_PER_MESH)) {
       const haystack =
         `${topic.title} ${topic.description ?? ""} ${(topic.tags ?? []).join(" ")}`.toLowerCase();
       const score = interests.reduce(
@@ -197,10 +235,16 @@ export async function discoverContext(
       left.topic.id.localeCompare(right.topic.id),
   );
   const chosen = candidates[0];
-  if (!chosen)
+  if (!chosen) {
+    if (target.topicId) {
+      throw new Error(
+        `${binding.requestedProfile.handle} cannot observe release validation topic ${target.topicId}.`,
+      );
+    }
     throw new Error(
       `${binding.requestedProfile.handle} cannot see any conversation.`,
     );
+  }
   return {
     profile: profileResponse.agent,
     mesh: chosen.mesh,

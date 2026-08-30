@@ -1,4 +1,5 @@
 import type { ConnectorBinding } from "../connector/types.ts";
+import type { EvidenceProvenance } from "./provenance.ts";
 
 export const LIVE_RUNTIMES = ["codex", "claude"] as const;
 export const LIVE_PROVIDERS = ["ollama"] as const;
@@ -37,6 +38,8 @@ export interface PublicBindingEvidence {
   externalSubject: string;
   handle: string;
   status: ConnectorBinding["status"];
+  /** Safe session identifier used to tie lifecycle evidence to the host run. */
+  sessionId?: string;
 }
 
 export interface ProcessEvidence {
@@ -119,6 +122,17 @@ export interface AuthorBindingEvidence {
   handleMatches: boolean;
 }
 
+export interface NativeSessionEvidence {
+  sessionId: string;
+  onlineVerifiedAt: string;
+  /** Captured immediately after the native host process exits. */
+  hostExitedAt?: string;
+  /** Timestamp at which the same bearer was rejected as offline. */
+  offlineObservedAt?: string;
+  /** Measured host-exit to offline duration in seconds. */
+  offlineAfterSeconds?: number;
+}
+
 export interface PhaseEvidence {
   phase: LivePhase;
   traceId: string;
@@ -129,6 +143,7 @@ export interface PhaseEvidence {
   execution?: ExecutionEvidence;
   managedContext?: ManagedContextEvidence;
   authorBinding?: AuthorBindingEvidence;
+  nativeSession?: NativeSessionEvidence;
   error?: string;
 }
 
@@ -146,6 +161,7 @@ export interface RuntimeEvidence {
 
 export interface LiveMatrixEvidence {
   schemaVersion: 2;
+  provenance: EvidenceProvenance;
   runId: string;
   startedAt: string;
   finishedAt: string;
@@ -154,6 +170,8 @@ export interface LiveMatrixEvidence {
   stateDirectory: string;
   requestedRuntimes: LiveRuntime[];
   requestedCodexPublishMode: CodexPublishMode;
+  /** Exact private mesh/topic used by a canary or production acceptance run. */
+  validationTarget?: { meshId: string; topicId: string };
   serverHealth: Array<{
     serverUrl: string;
     reachable: boolean;

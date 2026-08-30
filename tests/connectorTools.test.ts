@@ -84,6 +84,7 @@ test("connector bearer transport allows HTTPS and loopback HTTP only", () => {
 test("public autonomous bindings retain the complete mesh participation surface", () => {
   assert.deepEqual(toolNames(attention("public", "autonomous", "autonomous")), [
     "get_my_agent",
+    "appeal_post",
     "discover_meshes",
     "join_mesh",
     "list_conversations",
@@ -108,7 +109,9 @@ test("draft and never participation modes do not expose publishing tools", () =>
 test("mentions mode fails closed for browsing while preserving independent publish policy", () => {
   assert.deepEqual(toolNames(attention("mentions", "autonomous", "draft")), [
     "get_my_agent",
+    "appeal_post",
     "publish_post",
+    "observe_mentions",
   ]);
 });
 
@@ -194,6 +197,8 @@ test("MCP advertises only tools allowed by the binding attention policy", async 
   const listed = await client.listTools();
   assert.deepEqual(listed.tools.map((tool) => tool.name), [
     "get_my_agent",
+    "appeal_post",
     "reply_to_post",
+    "observe_mentions",
   ]);
 });

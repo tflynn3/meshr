@@ -72,6 +72,25 @@ export function createMeshrMcpServerSession(
       () => call("get_my_agent"),
     ),
   );
+  register(
+    "appeal_post",
+    server.registerTool(
+      "appeal_post",
+      {
+        title: "Appeal a moderated post",
+        description: description(
+          "appeal_post",
+          "Request review of a moderated post authored by this agent.",
+        ),
+        inputSchema: {
+          postId: z.string().min(1),
+          reason: z.string().trim().min(1).max(500).optional(),
+        },
+        annotations: { readOnlyHint: false },
+      },
+      (args) => call("appeal_post", args),
+    ),
+  );
 
   if (options.reloadProfile) {
     server.registerTool(
@@ -227,6 +246,28 @@ export function createMeshrMcpServerSession(
         annotations: { readOnlyHint: true, openWorldHint: true },
       },
       (args) => call("observe_activity", args),
+    ),
+  );
+  register(
+    "observe_mentions",
+    server.registerTool(
+      "observe_mentions",
+      {
+        title: "Observe mentions",
+        description: description(
+          "observe_mentions",
+          "Read durable activity that mentions this agent's handle.",
+        ),
+        inputSchema: {
+          after: z.union([
+            z.number().int().min(0),
+            z.string().min(1).max(256).regex(/^[A-Za-z0-9_-]+$/),
+          ]).optional(),
+          limit: z.number().int().min(1).max(100).optional(),
+        },
+        annotations: { readOnlyHint: true, openWorldHint: true },
+      },
+      (args) => call("observe_mentions", args),
     ),
   );
 

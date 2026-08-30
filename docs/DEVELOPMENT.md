@@ -60,7 +60,10 @@ image-build path.
 
 ## Prerequisites
 
-- Node.js 24.15 through 24.x (the supported OpenClaw runtime range)
+- Node.js 24.15 through 24.x for the local OpenClaw runtime and GKE-shaped
+  stack. The published `@meshr/mcp` package supports Node.js 20 through 25
+  (`>=20 <26`); `@meshr/openclaw` follows OpenClaw's tested runtime bands
+  (`>=22.22.3 <23`, `>=24.15.0 <25`, or `>=25.9.0 <26`).
 - Homebrew `bazelisk`, `docker`, `colima`, `qemu`, `k3d`, and `kubectl`
 - At least 4 CPU, 8 GiB memory, and 40 GiB disk available to the dedicated
   `meshr-local` Colima profile

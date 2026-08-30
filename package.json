@@ -28,6 +28,12 @@
     "smoke:deployed": "tsx scripts/smoke-deployed.ts",
     "load": "tsx scripts/run-load-rehearsal.ts",
     "load:merge": "tsx scripts/merge-load-evidence.ts",
+    "evidence:receipt": "tsx scripts/write-launch-receipt.ts",
+    "refresh:sessions": "tsx scripts/refresh-runtime-sessions.ts",
+    "verify:session-gates": "tsx scripts/verify-runtime-session-gates.ts",
+    "verify:launch-evidence": "tsx scripts/verify-launch-evidence.ts",
+    "verify:runtime-evidence": "tsx scripts/verify-launch-evidence.ts",
+    "test:package-consumer": "node scripts/package-consumer-smoke.mjs packages/mcp integrations/openclaw",
     "check:github-protections": "node scripts/check-github-protections.mjs",
     "build": "bazelisk build //:api //:bootstrap //:ingest //:materializer //:live_gateway //:static_server //:moderation_adapter //:web_dist",
     "build:npm": "tsc -b && vite build",
@@ -41,7 +47,8 @@
     "test:moderation-plane": "tsx --test tests/moderationPlane.emulator.test.ts",
     "test:load": "tsx --test tests/loadRehearsal.test.ts",
     "test:server": "tsx --test server/*.test.ts",
-    "typecheck": "tsc -b --pretty false"
+    "typecheck": "tsc -b --pretty false",
+    "typecheck:live": "tsc -p live/tsconfig.json --pretty false --noEmit"
   },
   "dependencies": {
     "@google-cloud/firestore": "^9.0.0",

@@ -13,6 +13,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { MeshrApi } from "../connector/api.ts";
 import { ConnectorStateStore } from "../connector/state.ts";
 import type { ConnectorBinding } from "../connector/types.ts";
+import { captureEvidenceProvenance } from "./provenance.ts";
 import {
   buildClaudeInvocation,
   buildCodexInvocation,
@@ -29,6 +30,7 @@ import {
 } from "./managed.ts";
 import { invokeOllama } from "./ollama.ts";
 import { readVersion, runProcess } from "./process.ts";
+import { observeNativeSessionOffline } from "./session-lifecycle.ts";
 import {
   ollamaReplyPrompt,
   ollamaRootPrompt,
@@ -39,6 +41,7 @@ import {
 } from "./prompts.ts";
 import {
   authorBindingEvidence,
+  configuredReleaseValidationTarget,
   discoverContext,
   locateMarkedPost,
   publicBinding,
@@ -216,6 +219,21 @@ function emptyPhase(input: {
     status: input.status,
     ...(input.error ? { error: input.error } : {}),
   };
+}
+
+async function reloadActiveBinding(
+  stateDirectory: string,
+  binding: ConnectorBinding,
+): Promise<ConnectorBinding> {
+  const current = await new ConnectorStateStore(stateDirectory).require(
+    binding.pairingId,
+  );
+  if (current.status !== "connected" || !current.agentToken || !current.sessionId) {
+    throw new Error(
+      `Native host did not leave an active session for binding ${binding.pairingId}.`,
+    );
+  }
+  return current;
 }
 
 async function plannedPhases(input: {
@@ -589,9 +607,40 @@ async function runCliRuntime(input: {
   options: LiveMatrixOptions;
   stateDirectory: string;
   temporaryDirectory: string;
+  observeNativeSessions: boolean;
 }): Promise<PhaseEvidence[]> {
   const phases: PhaseEvidence[] = [];
-  const rootText = rootPrompt(input.traceId);
+  // A release acceptance run supplies an exact private validation target. Do
+  // the discovery while the harness still owns the preflight session, then
+  // pin both the native prompt and the post locator to those IDs. The native
+  // host receives no MESHR_* environment variables, so it cannot silently
+  // fall back to the public commons if its model follows a heuristic.
+  let rootTarget: { meshId: string; topicId: string } | undefined;
+  const configuredTarget = configuredReleaseValidationTarget();
+  if (configuredTarget.meshId && configuredTarget.topicId) {
+    const context = await discoverContext(
+      input.bindings[0],
+      input.options.timeoutMs,
+    );
+    rootTarget = { meshId: context.mesh.id, topicId: context.topic.id };
+    if (
+      rootTarget.meshId !== configuredTarget.meshId ||
+      rootTarget.topicId !== configuredTarget.topicId
+    ) {
+      throw new Error(
+        "Release validation discovery did not resolve the configured private mesh and topic.",
+      );
+    }
+    // Fail before starting the first native host if the reply identity cannot
+    // read the same private conversation.
+    await readTargetContext({
+      binding: input.bindings[1],
+      meshId: rootTarget.meshId,
+      topicId: rootTarget.topicId,
+      timeoutMs: input.options.timeoutMs,
+    });
+  }
+  const rootText = rootPrompt(input.traceId, rootTarget);
   const preparedRoot = await prepareProcessInvocation({
     runtime: input.runtime,
     binding: input.bindings[0],
@@ -613,6 +662,7 @@ async function runCliRuntime(input: {
     cwd: input.options.projectRoot,
     timeoutMs: input.options.timeoutMs,
   });
+  const rootHostExitedAt = new Date().toISOString();
   if (
     rootPhase.execution.exitCode !== 0 ||
     rootPhase.execution.timedOut ||
@@ -632,14 +682,42 @@ async function runCliRuntime(input: {
   }
   let located: Awaited<ReturnType<typeof locateMarkedPost>>;
   try {
-    located = await locateMarkedPost({
-      binding: input.bindings[0],
-      marker: rootPhase.marker,
-      timeoutMs: input.options.timeoutMs,
-      parentPostId: null,
-    });
-    rootPhase.authorBinding = authorBindingEvidence(
+    // The native MCP server deliberately starts a fresh signed session and
+    // atomically supersedes the preflight token. Re-read the private state
+    // written by that host before using the harness for readback; otherwise a
+    // successful post would be invisible behind the old session fence.
+    const activeRootBinding = await reloadActiveBinding(
+      input.stateDirectory,
       input.bindings[0],
+    );
+    rootPhase.binding = publicBinding(activeRootBinding);
+    const rootReadback = input.observeNativeSessions
+      ? await observeNativeSessionOffline(
+          activeRootBinding,
+          () =>
+            locateMarkedPost({
+              binding: activeRootBinding,
+              marker: rootPhase.marker,
+              timeoutMs: input.options.timeoutMs,
+              parentPostId: null,
+              targetMeshId: rootTarget?.meshId,
+              targetTopicId: rootTarget?.topicId,
+            }),
+          { hostExitedAt: rootHostExitedAt },
+        )
+      : undefined;
+    located =
+      rootReadback?.value ??
+      (await locateMarkedPost({
+        binding: activeRootBinding,
+        marker: rootPhase.marker,
+        timeoutMs: input.options.timeoutMs,
+        parentPostId: null,
+        targetMeshId: rootTarget?.meshId,
+        targetTopicId: rootTarget?.topicId,
+      }));
+    rootPhase.authorBinding = authorBindingEvidence(
+      activeRootBinding,
       rootPhase.marker,
       located,
     );
@@ -651,6 +729,11 @@ async function runCliRuntime(input: {
         "Root post author does not match the first connector binding.",
       );
     }
+    rootPhase.nativeSession = {
+      sessionId: activeRootBinding.sessionId!,
+      onlineVerifiedAt: new Date().toISOString(),
+      ...(rootReadback?.observation ?? {}),
+    };
     rootPhase.status = "passed";
   } catch (error) {
     rootPhase.error = errorText(error);
@@ -691,6 +774,7 @@ async function runCliRuntime(input: {
     cwd: input.options.projectRoot,
     timeoutMs: input.options.timeoutMs,
   });
+  const replyHostExitedAt = new Date().toISOString();
   if (
     replyPhase.execution.exitCode !== 0 ||
     replyPhase.execution.timedOut ||
@@ -703,16 +787,38 @@ async function runCliRuntime(input: {
     return phases;
   }
   try {
-    const replyLocated = await locateMarkedPost({
-      binding: input.bindings[1],
-      marker: replyPhase.marker,
-      timeoutMs: input.options.timeoutMs,
-      parentPostId: located.post.id,
-      targetMeshId: located.post.meshId,
-      targetTopicId: located.post.topicId,
-    });
-    replyPhase.authorBinding = authorBindingEvidence(
+    const activeReplyBinding = await reloadActiveBinding(
+      input.stateDirectory,
       input.bindings[1],
+    );
+    replyPhase.binding = publicBinding(activeReplyBinding);
+    const replyReadback = input.observeNativeSessions
+      ? await observeNativeSessionOffline(
+          activeReplyBinding,
+          () =>
+            locateMarkedPost({
+              binding: activeReplyBinding,
+              marker: replyPhase.marker,
+              timeoutMs: input.options.timeoutMs,
+              parentPostId: located.post.id,
+              targetMeshId: located.post.meshId,
+              targetTopicId: located.post.topicId,
+            }),
+          { hostExitedAt: replyHostExitedAt },
+        )
+      : undefined;
+    const replyLocated =
+      replyReadback?.value ??
+      (await locateMarkedPost({
+        binding: activeReplyBinding,
+        marker: replyPhase.marker,
+        timeoutMs: input.options.timeoutMs,
+        parentPostId: located.post.id,
+        targetMeshId: located.post.meshId,
+        targetTopicId: located.post.topicId,
+      }));
+    replyPhase.authorBinding = authorBindingEvidence(
+      activeReplyBinding,
       replyPhase.marker,
       replyLocated,
     );
@@ -724,6 +830,11 @@ async function runCliRuntime(input: {
         "Reply author does not match the second connector binding.",
       );
     }
+    replyPhase.nativeSession = {
+      sessionId: activeReplyBinding.sessionId!,
+      onlineVerifiedAt: new Date().toISOString(),
+      ...(replyReadback?.observation ?? {}),
+    };
     replyPhase.status = "passed";
   } catch (error) {
     replyPhase.error = errorText(error);
@@ -926,6 +1037,7 @@ async function runRuntime(input: {
   options: LiveMatrixOptions;
   stateDirectory: string;
   temporaryDirectory: string;
+  observeNativeSessions: boolean;
 }): Promise<RuntimeEvidence> {
   const traceId = `${input.runtime}-${randomUUID()}`;
   const codexPublishMode =
@@ -1024,6 +1136,7 @@ async function runRuntime(input: {
             options: input.options,
             stateDirectory: input.stateDirectory,
             temporaryDirectory: input.temporaryDirectory,
+            observeNativeSessions: input.observeNativeSessions,
           });
   const passed =
     phases.length === 2 && phases.every((phase) => phase.status === "passed");
@@ -1064,6 +1177,11 @@ export async function runLiveMatrix(
 ): Promise<LiveMatrixEvidence> {
   const runId = randomUUID();
   const startedAt = new Date().toISOString();
+  const provenance = await captureEvidenceProvenance(options.projectRoot);
+  const configuredTarget = configuredReleaseValidationTarget();
+  const validationTarget = configuredTarget.meshId && configuredTarget.topicId
+    ? { meshId: configuredTarget.meshId, topicId: configuredTarget.topicId }
+    : undefined;
   const store = new ConnectorStateStore(options.stateDirectory);
   const temporaryDirectory = await mkdtemp(
     join(tmpdir(), "meshr-live-matrix-"),
@@ -1112,6 +1230,7 @@ export async function runLiveMatrix(
           options,
           stateDirectory: store.directory,
           temporaryDirectory,
+          observeNativeSessions: provenance.environment !== "local",
         }),
       );
     }
@@ -1120,6 +1239,7 @@ export async function runLiveMatrix(
       runtimes.some((runtime) => runtime.outcome === "failed");
     return {
       schemaVersion: 2,
+      provenance,
       runId,
       startedAt,
       finishedAt: new Date().toISOString(),
@@ -1128,6 +1248,7 @@ export async function runLiveMatrix(
       stateDirectory: store.directory,
       requestedRuntimes: options.runtimes,
       requestedCodexPublishMode: options.codexPublishMode,
+      ...(validationTarget ? { validationTarget } : {}),
       serverHealth,
       runtimes,
       outcome: anyFailure ? "failed" : options.dryRun ? "planned" : "passed",
@@ -1135,6 +1256,7 @@ export async function runLiveMatrix(
   } catch (error) {
     return {
       schemaVersion: 2,
+      provenance,
       runId,
       startedAt,
       finishedAt: new Date().toISOString(),
@@ -1143,6 +1265,7 @@ export async function runLiveMatrix(
       stateDirectory: store.directory,
       requestedRuntimes: options.runtimes,
       requestedCodexPublishMode: options.codexPublishMode,
+      ...(validationTarget ? { validationTarget } : {}),
       serverHealth: [],
       runtimes: [],
       outcome: "failed",

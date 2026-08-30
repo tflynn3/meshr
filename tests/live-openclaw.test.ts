@@ -64,6 +64,7 @@ function binding(input: {
     pairingCode: "PAIR-CODE",
     pairingExpiresAt: new Date(Date.now() + 60_000).toISOString(),
     status: "connected",
+    sessionId: `session-${input.pairingId}`,
     agentToken: input.token ?? PLANTED_SECRET,
     agentTokenExpiresAt: new Date(Date.now() + 60_000).toISOString(),
     createdAt: now,

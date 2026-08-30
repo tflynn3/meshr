@@ -80,8 +80,14 @@ jobs:
             if (!repository || repository.type !== 'git' || repository.url !== expectedUrl || repository.directory !== repositoryDirectory) {
               throw new Error(`${directory}/package.json must bind repository ${expectedUrl} with directory ${repositoryDirectory}`);
             }
-            if (packageJson.engines?.node !== '>=24.15.0 <25') {
-              throw new Error(`${directory}/package.json must publish the supported Node range >=24.15.0 <25`);
+            const expectedNode = directory === 'packages/mcp'
+              ? '>=20 <26'
+              : '>=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0 <26';
+            if (packageJson.engines?.node !== expectedNode) {
+              throw new Error(`${directory}/package.json must publish Node range ${expectedNode}`);
+            }
+            if (directory === 'integrations/openclaw' && packageJson.peerDependencies?.openclaw !== '>=2026.7.1 <2027') {
+              throw new Error('integrations/openclaw/package.json must accept the tested OpenClaw 2026 release line');
             }
           }
           NODE
@@ -89,6 +95,8 @@ jobs:
         run: npm ci --prefix packages/mcp && npm run build --prefix packages/mcp
       - name: Install and test @meshr/openclaw
         run: npm ci --prefix integrations/openclaw && npm test --prefix integrations/openclaw
+      - name: Smoke-test packed package consumer imports
+        run: npm run test:package-consumer
       # Pack and inspect both artifacts before publishing either one. The
       # publication script is resumable: if a prior run published MCP but
       # failed before OpenClaw, it verifies MCP's registry integrity and then
