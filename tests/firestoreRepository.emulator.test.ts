@@ -628,6 +628,178 @@ test("Firestore repository preserves the launch authority and outbox contract", 
     assert.deepEqual(joinedPrivateRetry, { status: "joined", duplicate: true });
     assert.equal((await repository.listMeshInvitations(privateMeshId))[0]?.status, "redeemed");
 
+    // Keyed moderation writes exercise the same replay and race semantics as
+    // the HTTP governance path. Two reports for one post are retained for
+    // auditability; finalizing one atomically supersedes the other so a stale
+    // review retry cannot overwrite the post.
+    const moderationPostId = `${prefix}_moderation_post`;
+    await repository.createPostWithOutbox({
+      postId: moderationPostId,
+      meshId: privateMeshId,
+      topicId: privateTopicId,
+      agentId,
+      sessionId: runtimeSessionId,
+      parentPostId: null,
+      body: "A moderation race fixture.",
+      moderationState: "published",
+      moderationReason: null,
+      expiresAt: postExpiresAt,
+      eventType: "post.created",
+      idempotencyKey: `${prefix}:moderation-post-key`,
+      requestHash: createHash("sha256").update(`${prefix}:moderation-post-request`).digest("hex"),
+    });
+    const moderationArtifacts = (
+      caseId: string,
+      accountId: string,
+      sessionHash: string,
+      suffix: string,
+      type: string,
+      data: Record<string, unknown>,
+    ) => ({
+      event: {
+        eventId: `${prefix}_${suffix}_event`,
+        type,
+        meshId: privateMeshId,
+        topicId: privateTopicId,
+        agentId,
+        sessionId: sessionHash,
+        runtimeKind: null,
+        payload: { caseId, postId: moderationPostId, ...data },
+        occurredAt: now,
+      },
+      audit: {
+        auditId: `${prefix}_${suffix}_audit`,
+        actorType: "human" as const,
+        actorId: accountId,
+        sessionId: sessionHash,
+        action: type,
+        resourceType: "moderation_case",
+        resourceId: caseId,
+        data: { caseId, postId: moderationPostId, ...data },
+        createdAt: now,
+      },
+    });
+    const moderationCaseA = `${prefix}_moderation_case_a`;
+    const moderationCaseB = `${prefix}_moderation_case_b`;
+    const reportAHash = createHash("sha256").update(`${prefix}:report-a`).digest("hex");
+    const reportBHash = createHash("sha256").update(`${prefix}:report-b`).digest("hex");
+    const reportA = await repository.upsertModerationCase({
+      caseId: moderationCaseA,
+      postId: moderationPostId,
+      meshId: privateMeshId,
+      reason: "Owner review",
+      state: "queued",
+      severity: "medium",
+      resolution: null,
+      createdAt: now,
+      updatedAt: now,
+      resolvedAt: null,
+      actingAccountId: account.accountId,
+      humanSessionHash: accountSessionHash,
+      idempotencyKey: `${prefix}:report-a-key`,
+      requestHash: reportAHash,
+      idempotencyOperation: "moderation.report",
+      ...moderationArtifacts(moderationCaseA, account.accountId, accountSessionHash, "report-a", "moderation.reported", { reason: "Owner review" }),
+    });
+    assert.equal(reportA.duplicate, false);
+    const reportARetry = await repository.upsertModerationCase({
+      caseId: moderationCaseA,
+      postId: moderationPostId,
+      meshId: privateMeshId,
+      reason: "Owner review",
+      state: "queued",
+      severity: "medium",
+      resolution: null,
+      createdAt: now,
+      updatedAt: now,
+      resolvedAt: null,
+      actingAccountId: account.accountId,
+      humanSessionHash: accountSessionHash,
+      idempotencyKey: `${prefix}:report-a-key`,
+      requestHash: reportAHash,
+      idempotencyOperation: "moderation.report",
+      ...moderationArtifacts(moderationCaseA, account.accountId, accountSessionHash, "report-a-retry", "moderation.reported", { reason: "Owner review" }),
+    });
+    assert.equal(reportARetry.duplicate, true);
+    assert.equal(reportARetry.moderationCase?.state, "queued");
+    const reportB = await repository.upsertModerationCase({
+      caseId: moderationCaseB,
+      postId: moderationPostId,
+      meshId: privateMeshId,
+      reason: "Steward review",
+      state: "queued",
+      severity: "medium",
+      resolution: null,
+      createdAt: now,
+      updatedAt: now,
+      resolvedAt: null,
+      actingAccountId: transferTarget.account.accountId,
+      humanSessionHash: transferTarget.sessionHash,
+      idempotencyKey: `${prefix}:report-b-key`,
+      requestHash: reportBHash,
+      idempotencyOperation: "moderation.report",
+      ...moderationArtifacts(moderationCaseB, transferTarget.account.accountId, transferTarget.sessionHash, "report-b", "moderation.reported", { reason: "Steward review" }),
+    });
+    assert.equal(reportB.duplicate, false);
+    const reviewBHash = createHash("sha256").update(`${prefix}:review-b`).digest("hex");
+    const reviewB = await repository.upsertModerationCase({
+      caseId: moderationCaseB,
+      postId: moderationPostId,
+      meshId: privateMeshId,
+      reason: "Steward review",
+      state: "reviewing",
+      severity: "medium",
+      resolution: null,
+      createdAt: now,
+      updatedAt: "2026-08-28T18:06:00.000Z",
+      resolvedAt: null,
+      actingAccountId: transferTarget.account.accountId,
+      humanSessionHash: transferTarget.sessionHash,
+      idempotencyKey: `${prefix}:review-b-key`,
+      requestHash: reviewBHash,
+      idempotencyOperation: "moderation.action",
+      ...moderationArtifacts(moderationCaseB, transferTarget.account.accountId, transferTarget.sessionHash, "review-b", "moderation.start_review", { action: "start_review" }),
+    });
+    assert.equal(reviewB.moderationCase?.state, "reviewing");
+    const resolveA = await repository.updatePostModeration({
+      caseId: moderationCaseA,
+      postId: moderationPostId,
+      state: "quarantined",
+      reason: "Owner decision",
+      caseState: "resolved",
+      resolution: "quarantine",
+      updatedAt: "2026-08-28T18:07:00.000Z",
+      actingAccountId: account.accountId,
+      humanSessionHash: accountSessionHash,
+      idempotencyKey: `${prefix}:resolve-a-key`,
+      requestHash: createHash("sha256").update(`${prefix}:resolve-a`).digest("hex"),
+      ...moderationArtifacts(moderationCaseA, account.accountId, accountSessionHash, "resolve-a", "moderation.quarantine", { action: "quarantine" }),
+    });
+    assert.equal(resolveA.moderationCase?.state, "resolved");
+    assert.equal(resolveA.post?.moderationState, "quarantined");
+    assert.equal((await repository.findModerationCase(moderationCaseB))?.resolution, "superseded");
+    await assert.rejects(
+      repository.upsertModerationCase({
+        caseId: moderationCaseB,
+        postId: moderationPostId,
+        meshId: privateMeshId,
+        reason: "Steward review",
+        state: "reviewing",
+        severity: "medium",
+        resolution: null,
+        createdAt: now,
+        updatedAt: "2026-08-28T18:06:00.000Z",
+        resolvedAt: null,
+        actingAccountId: transferTarget.account.accountId,
+        humanSessionHash: transferTarget.sessionHash,
+        idempotencyKey: `${prefix}:review-b-key`,
+        requestHash: reviewBHash,
+        idempotencyOperation: "moderation.action",
+        ...moderationArtifacts(moderationCaseB, transferTarget.account.accountId, transferTarget.sessionHash, "review-b-retry", "moderation.start_review", { action: "start_review" }),
+      }),
+      /idempotency_replay_superseded/,
+    );
+
     const write = await repository.createPostWithOutbox({
       postId,
       meshId: "mesh-public",
@@ -722,7 +894,7 @@ test("Firestore repository preserves the launch authority and outbox contract", 
     const events = await repository.listAgentEvents({
       agentId,
       browse: "public",
-      limit: 10,
+      limit: 50,
     });
     assert.equal(events.events.some((event) => event.type === "post.created" && event.topicId === "topic-small-discoveries"), true);
 
@@ -744,7 +916,7 @@ test("Firestore repository preserves the launch authority and outbox contract", 
     const followEvents = await repository.listAgentEvents({
       agentId,
       browse: "public",
-      limit: 10,
+      limit: 50,
     });
     assert.equal(followEvents.events.some((event) => event.eventId === followEventId), true);
 

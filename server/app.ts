@@ -52,6 +52,7 @@ import type {
   RepositoryTopicDeleteInput,
   RepositoryModerationCase,
   RepositoryModerationCasesPage,
+  RepositoryModerationMutationResult,
   RepositoryPostRecord,
   RepositoryJoinRequest,
   RepositoryMeshInvitation,
@@ -793,13 +794,14 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       throw new ApiError(503, "database_cutover_active", "Meshr is completing a database cutover; only the reviewed validation session may write.", 30);
     }
   };
-  const durableWrite = async (
+  const durableWrite = async <T>(
     label: string,
-    operation: () => Promise<void>,
-  ): Promise<void> => {
-    if (!repository) return;
+    operation: () => Promise<T>,
+    options: { allowLocal?: boolean } = {},
+  ): Promise<T | undefined> => {
+    if (!repository && !options.allowLocal) return undefined;
     try {
-      await operation();
+      return await operation();
     } catch (error) {
       if (error instanceof ApiError) throw error;
       if (error instanceof Error && error.message === "handle_unavailable") {
@@ -908,6 +910,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       }
       if (error instanceof Error && error.message === "idempotency_expired") {
         throw new ApiError(409, "idempotency_expired", "The idempotency record has expired; retry with a new key.");
+      }
+      if (error instanceof Error && error.message === "moderation_transition_conflict") {
+        throw new ApiError(409, "moderation_transition_conflict", "That moderation case is no longer eligible for this action; refresh the queue and choose another action.");
+      }
+      if (error instanceof Error && error.message === "idempotency_replay_superseded") {
+        throw new ApiError(409, "idempotency_replay_superseded", "The original moderation result has since changed; use a new idempotency key after refreshing the queue.");
+      }
+      if (error instanceof Error && error.message === "idempotency_required") {
+        throw new ApiError(400, "idempotency_key_required", "A stable Idempotency-Key is required for moderation mutations.");
       }
       if (error instanceof Error && error.message === "join_request_not_pending") {
         throw new ApiError(404, "join_request_not_found", "Join request is not pending.");
@@ -8758,16 +8769,19 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       // a moderation case. Recheck that role again inside the Firestore
       // transaction below so a concurrent demotion cannot create a case.
       await requireMeshRole(principal.accountId, post.meshId, ["owner", "steward"]);
+      const idempotencyKey = requireIdempotencyKey(request);
       const input = asObject(await readJson(request));
       for (const field of Object.keys(input)) {
         if (field !== "reason") {
           throw new ApiError(400, "invalid_request", `${field} is not allowed.`);
         }
       }
-      const reason = optionalString(input, "reason", 500) ?? "reported_by_user";
+      const reason = optionalString(input, "reason", 200) ?? "reported_by_user";
       const now = database.now();
+      const requestHash = sha256(JSON.stringify({ postId, meshId: post.meshId, reason }));
+      const reportDigest = sha256(`moderation-report:${principal.accountId}:${postId}:${idempotencyKey}`);
       const moderationCase: RepositoryModerationCase = {
-        caseId: database.id("case"),
+        caseId: `case_moderation_${reportDigest.slice(0, 40)}`,
         postId,
         meshId: post.meshId,
         reason,
@@ -8778,8 +8792,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         updatedAt: now,
         resolvedAt: null,
       };
-      const moderationReportEventId = database.id("evt");
-      const moderationReportAuditId = database.id("audit");
+      const moderationReportEventId = `evt_moderation_report_${reportDigest.slice(0, 40)}`;
+      const moderationReportAuditId = `audit_moderation_report_${reportDigest.slice(0, 40)}`;
       const moderationReportPayload = {
         caseId: moderationCase.caseId,
         postId,
@@ -8808,54 +8822,56 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         data: { caseId: moderationCase.caseId, meshId: post.meshId, reason },
         createdAt: now,
       };
-      await durableWrite("moderation report", async () => {
-        await repository?.upsertModerationCase?.({
+      const mutation = await durableWrite<RepositoryModerationMutationResult>("moderation report", async () => {
+        return await roleInvitationStore.upsertModerationCase!({
           ...moderationCase,
           actingAccountId: principal.accountId,
           humanSessionHash: principal.sessionHash,
+          idempotencyKey,
+          requestHash,
+          idempotencyOperation: "moderation.report",
           event: moderationReportEvent,
           audit: moderationReportAudit,
         });
-      });
-      if (localPostRecord(postId)) {
-        database.transaction(() => {
-          db.prepare(
-            `INSERT INTO moderation_cases(
-               id, post_id, mesh_id, reason, state, severity, created_at, updated_at
-             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-          ).run(
-            moderationCase.caseId,
-            moderationCase.postId,
-            moderationCase.meshId,
-            moderationCase.reason,
-            moderationCase.state,
-            moderationCase.severity,
-            moderationCase.createdAt,
-            moderationCase.updatedAt,
-          );
-          emitAudit({
-            auditId: moderationReportAuditId,
-            createdAt: now,
-            actorType: "human",
-            actorId: principal.accountId,
-            sessionId: principal.sessionHash,
-            action: "moderation.reported",
-            resourceType: "post",
-            resourceId: postId,
-            data: { caseId: moderationCase.caseId, meshId: post.meshId, reason },
-            durable: Boolean(repository?.upsertModerationCase),
+      }, { allowLocal: true });
+      if (!mutation?.moderationCase || !mutation.post) {
+        throw new ApiError(503, "moderation_store_unavailable", "The moderation store did not return the committed case.");
+      }
+      if (repository) {
+        const committedCase = mutation.moderationCase;
+        // Firestore is authoritative in production. A request can land on a
+        // replica whose local read projection has not caught up with the
+        // committed post yet; never turn that normal lag into a 500 after the
+        // durable write has succeeded.
+        if (localPostRecord(committedCase.postId)) {
+          database.transaction(() => {
+            db.prepare(
+              `INSERT INTO moderation_cases(
+                 id, post_id, mesh_id, reason, state, severity, created_at, updated_at,
+                 resolved_at, resolution
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET reason = excluded.reason,
+                 state = excluded.state, severity = excluded.severity,
+                 updated_at = excluded.updated_at, resolved_at = excluded.resolved_at,
+                 resolution = excluded.resolution`,
+            ).run(
+              committedCase.caseId,
+              committedCase.postId,
+              committedCase.meshId,
+              committedCase.reason,
+              committedCase.state,
+              committedCase.severity,
+              committedCase.createdAt,
+              committedCase.updatedAt,
+              committedCase.resolvedAt,
+              committedCase.resolution,
+            );
           });
-          emitEvent("moderation.reported", post.agentId, post.meshId, post.topicId, moderationReportPayload, {
-            eventId: moderationReportEventId,
-            occurredAt: now,
-            sessionId: principal.sessionHash,
-            durable: Boolean(repository?.upsertModerationCase),
-          });
-        });
+        }
       }
       return {
         status: 202,
-        body: moderationCaseRepresentation(moderationCase, post, false),
+        body: moderationCaseRepresentation(mutation.moderationCase, mutation.post, false),
       };
     }
 
@@ -8905,6 +8921,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     if (method === "POST" && moderationActionMatch) {
       const principal = await requireHuman(request, true);
       requireCsrf(request, principal);
+      const idempotencyKey = requireIdempotencyKey(request);
       const meshId = decodeURIComponent(moderationActionMatch[1]);
       const caseId = decodeURIComponent(moderationActionMatch[2]);
       const mesh = await findMeshForModeration(meshId);
@@ -8928,13 +8945,31 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (action !== "start_review" && action !== "publish" && action !== "quarantine" && action !== "remove" && action !== "redact") {
         throw new ApiError(400, "invalid_moderation_action", "action must be start_review, publish, quarantine, remove, or redact.");
       }
-      const reason = input.reason === undefined
-        ? moderationCase.reason
-        : (optionalString(input, "reason", 500) ?? moderationCase.reason);
+      // Hash the caller's intent, not a mutable value read from the case. An
+      // omitted reason is a distinct, stable request shape even if another
+      // reviewer edits the case between retries.
+      const reasonProvided = Object.prototype.hasOwnProperty.call(input, "reason");
+      const reasonOverride = reasonProvided ? optionalString(input, "reason", 200) : undefined;
+      const reason = reasonOverride ?? moderationCase.reason;
       const now = database.now();
+      const requestHash = sha256(JSON.stringify({
+        meshId,
+        caseId,
+        action,
+        reasonOverride: reasonProvided ? reasonOverride ?? null : { absent: true },
+      }));
+      // Stable artifact IDs are derived from the account, case, and retry key.
+      // The authoritative repository still checks the idempotency record first,
+      // while deterministic IDs make an uncertain response safe even if the
+      // client retries after a retention boundary.
+      const actionDigest = sha256(`moderation:${principal.accountId}:${meshId}:${caseId}:${idempotencyKey}`);
+      const moderationActionEventId = `evt_moderation_${actionDigest.slice(0, 40)}`;
+      const moderationActionAuditId = `audit_moderation_${actionDigest.slice(0, 40)}`;
       // Publication activity is materialized from bounded transition metadata,
-      // never from a moderation envelope containing the post body. Resolve the
-      // parent once so reply edges remain attributable after quarantine.
+      // never from a moderation envelope containing the post body. The
+      // repository replaces the state fields below with the post read inside
+      // its transaction, so a concurrent moderation decision cannot publish a
+      // stale previous state.
       const parentPost = post.parentPostId
         ? await findPostForModeration(post.parentPostId)
         : null;
@@ -8949,8 +8984,6 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
               ? "redacted"
               : post.moderationState;
       const redactedBody = action === "redact" ? "[Content redacted by mesh moderation]" : undefined;
-      const moderationActionEventId = database.id("evt");
-      const moderationActionAuditId = database.id("audit");
       const moderationActionPayload = {
         caseId,
         postId: post.postId,
@@ -8987,102 +9020,85 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         data: { meshId, postId: post.postId, role, reason },
         createdAt: now,
       };
-      if (action === "start_review") {
-        await durableWrite("moderation review", async () => {
-          await repository?.upsertModerationCase?.({
-            ...moderationCase,
-            state: "reviewing",
-            reason,
-            updatedAt: now,
-            actingAccountId: principal.accountId,
-            humanSessionHash: principal.sessionHash,
-            event: moderationActionEvent,
-            audit: moderationActionAudit,
-          });
-        });
-      } else {
-        await durableWrite("moderation resolution", async () => {
-          await repository?.updatePostModeration?.({
-            caseId,
-            postId: post.postId,
-            state: nextPostState as "published" | "quarantined" | "removed" | "redacted",
-            reason,
-            body: redactedBody,
-            caseState: nextCaseState,
-            resolution: action,
-            updatedAt: now,
-            actingAccountId: principal.accountId,
-            humanSessionHash: principal.sessionHash,
-            event: moderationActionEvent,
-            audit: moderationActionAudit,
-          });
-        });
+      const mutation = await durableWrite<RepositoryModerationMutationResult>(
+        "moderation action",
+        async () => action === "start_review"
+          ? await roleInvitationStore.upsertModerationCase!({
+              ...moderationCase,
+              state: "reviewing",
+              reason,
+              updatedAt: now,
+              actingAccountId: principal.accountId,
+              humanSessionHash: principal.sessionHash,
+              idempotencyKey,
+              requestHash,
+              event: moderationActionEvent,
+              audit: moderationActionAudit,
+            })
+          : await roleInvitationStore.updatePostModeration!({
+              caseId,
+              postId: post.postId,
+              state: nextPostState as "published" | "quarantined" | "removed" | "redacted",
+              reason,
+              body: redactedBody,
+              caseState: nextCaseState,
+              resolution: action,
+              updatedAt: now,
+              actingAccountId: principal.accountId,
+              humanSessionHash: principal.sessionHash,
+              idempotencyKey,
+              requestHash,
+              event: moderationActionEvent,
+              audit: moderationActionAudit,
+            }),
+        { allowLocal: true },
+      );
+      if (!mutation?.moderationCase || !mutation.post) {
+        throw new ApiError(503, "moderation_store_unavailable", "The moderation store did not return the committed case.");
       }
-      if (localPostRecord(post.postId)) {
-        database.transaction(() => {
-          if (action !== "start_review") {
-            if (redactedBody === undefined) {
-              db.prepare(
-                "UPDATE posts SET moderation_state = ?, moderation_reason = ? WHERE id = ?",
-              ).run(nextPostState, reason, post.postId);
-            } else {
-              db.prepare(
-                "UPDATE posts SET moderation_state = ?, moderation_reason = ?, body = ? WHERE id = ?",
-              ).run(nextPostState, reason, redactedBody, post.postId);
-            }
-          }
-          db.prepare(
-            `INSERT INTO moderation_cases(
-               id, post_id, mesh_id, reason, state, severity, created_at, updated_at,
-               resolved_at, resolution
-             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET reason = excluded.reason,
-               state = excluded.state, updated_at = excluded.updated_at,
-               resolved_at = excluded.resolved_at, resolution = excluded.resolution`,
-          ).run(
-            caseId,
-            post.postId,
-            meshId,
-            reason,
-            nextCaseState,
-            moderationCase.severity,
-            moderationCase.createdAt,
-            now,
-            nextCaseState === "resolved" ? now : null,
-            action === "start_review" ? null : action,
-          );
-          emitAudit({
-            auditId: moderationActionAuditId,
-            createdAt: now,
-            actorType: "human",
-            actorId: principal.accountId,
-            sessionId: principal.sessionHash,
-            action: `moderation.${action}`,
-            resourceType: "moderation_case",
-            resourceId: caseId,
-            data: { meshId, postId: post.postId, role, reason },
-            durable: Boolean(action === "start_review" ? repository?.upsertModerationCase : repository?.updatePostModeration),
+      // Firestore is authoritative in production; keep the local database as a
+      // read projection only and never emit a second event/audit pair here.
+      if (repository) {
+        const committedCase = mutation.moderationCase;
+        const committedPost = mutation.post;
+        if (localPostRecord(committedPost.postId)) {
+          database.transaction(() => {
+            db.prepare(
+              `UPDATE posts SET moderation_state = ?, moderation_reason = ?, body = ? WHERE id = ?`,
+            ).run(
+              committedPost.moderationState,
+              committedPost.moderationReason,
+              committedPost.body,
+              committedPost.postId,
+            );
+            db.prepare(
+              `INSERT INTO moderation_cases(
+                 id, post_id, mesh_id, reason, state, severity, created_at, updated_at,
+                 resolved_at, resolution
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET reason = excluded.reason,
+                 state = excluded.state, severity = excluded.severity,
+                 updated_at = excluded.updated_at, resolved_at = excluded.resolved_at,
+                 resolution = excluded.resolution`,
+            ).run(
+              committedCase.caseId,
+              committedCase.postId,
+              committedCase.meshId,
+              committedCase.reason,
+              committedCase.state,
+              committedCase.severity,
+              committedCase.createdAt,
+              committedCase.updatedAt,
+              committedCase.resolvedAt,
+              committedCase.resolution,
+            );
           });
-          emitEvent(`moderation.${action}`, post.agentId, meshId, post.topicId, moderationActionPayload, {
-            eventId: moderationActionEventId,
-            occurredAt: now,
-            sessionId: principal.sessionHash,
-            durable: Boolean(action === "start_review" ? repository?.upsertModerationCase : repository?.updatePostModeration),
-          });
-        });
+        }
       }
-      const nextCase: RepositoryModerationCase = {
-        ...moderationCase,
-        reason,
-        state: nextCaseState,
-        resolution: action === "start_review" ? null : action,
-        updatedAt: now,
-        resolvedAt: nextCaseState === "resolved" ? now : null,
-      };
       return {
         body: moderationCaseRepresentation(
-          nextCase,
-          { ...post, body: redactedBody ?? post.body, moderationState: nextPostState as RepositoryPostRecord["moderationState"], moderationReason: reason },
+          mutation.moderationCase,
+          mutation.post,
           true,
         ),
       };

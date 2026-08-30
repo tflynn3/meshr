@@ -280,6 +280,99 @@ test("SQLite adapter matches Firestore transaction boundaries for corrected auth
         .get("moderation-resolve-event")?.count,
       1,
     );
+
+    // Two operators racing to start the same queued case must not both win.
+    // SQLite's transaction boundary is the local conformance stand-in for the
+    // Firestore transaction: one request records its idempotency result and
+    // the other observes the reviewing state and gets a deterministic
+    // transition conflict.
+    const racePostId = "sqlite-moderation-race-post";
+    database.sqlite.prepare(
+      `INSERT INTO posts(
+         id, mesh_id, topic_id, agent_id, session_id, parent_post_id, body,
+         created_at, moderation_state, moderation_reason, expires_at
+       ) VALUES(?, ?, ?, ?, ?, NULL, ?, ?, 'quarantined', ?, ?)`,
+    ).run(
+      racePostId,
+      meshId,
+      topicId,
+      agentId,
+      "sqlite-race-session",
+      "race body",
+      "2026-08-28T18:11:00.000Z",
+      "needs review",
+      "2026-11-26T18:11:00.000Z",
+    );
+    const raceCaseId = "sqlite-moderation-race-case";
+    await repository.upsertModerationCase({
+      caseId: raceCaseId,
+      postId: racePostId,
+      meshId,
+      reason: "needs review",
+      state: "queued",
+      severity: "medium",
+      resolution: null,
+      createdAt: "2026-08-28T18:11:00.000Z",
+      updatedAt: "2026-08-28T18:11:00.000Z",
+      resolvedAt: null,
+    });
+    const raceRequest = (suffix: string) => repository.upsertModerationCase({
+      caseId: raceCaseId,
+      postId: racePostId,
+      meshId,
+      reason: "needs review",
+      state: "reviewing",
+      severity: "medium",
+      resolution: null,
+      createdAt: "2026-08-28T18:11:00.000Z",
+      updatedAt: "2026-08-28T18:12:00.000Z",
+      resolvedAt: null,
+      actingAccountId: owner.accountId,
+      humanSessionHash: ownerSessionHash,
+      idempotencyKey: `sqlite-race-${suffix}`,
+      requestHash: `sqlite-race-hash-${suffix}`,
+      ...artifact(`moderation-race-${suffix}`, meshId, ownerSessionHash, "2026-08-28T18:12:00.000Z"),
+    });
+    const raceResults = await Promise.allSettled([
+      raceRequest("a"),
+      raceRequest("b"),
+    ]);
+    assert.equal(raceResults.filter((result) => result.status === "fulfilled").length, 1);
+    assert.equal(raceResults.filter((result) => result.status === "rejected").length, 1);
+    const rejectedRace = raceResults.find((result) => result.status === "rejected");
+    assert.ok(rejectedRace && rejectedRace.reason instanceof Error);
+    assert.equal(rejectedRace.reason.message, "moderation_transition_conflict");
+    const winningRace = raceResults.find((result) => result.status === "fulfilled");
+    assert.ok(winningRace && winningRace.value.moderationCase?.state === "reviewing");
+    const winningSuffix = raceResults[0]?.status === "fulfilled" ? "a" : "b";
+    const raceRetry = await raceRequest(winningSuffix);
+    assert.equal(raceRetry.duplicate, true);
+    assert.equal(raceRetry.moderationCase?.state, "reviewing");
+    await assert.rejects(
+      repository.upsertModerationCase({
+        caseId: raceCaseId,
+        postId: racePostId,
+        meshId,
+        reason: "needs review",
+        state: "reviewing",
+        severity: "medium",
+        resolution: null,
+        createdAt: "2026-08-28T18:11:00.000Z",
+        updatedAt: "2026-08-28T18:12:00.000Z",
+        resolvedAt: null,
+        actingAccountId: owner.accountId,
+        humanSessionHash: ownerSessionHash,
+        idempotencyKey: `sqlite-race-${winningSuffix}`,
+        requestHash: "different-request",
+        ...artifact("moderation-race-conflict", meshId, ownerSessionHash, "2026-08-28T18:12:00.000Z"),
+      }),
+      /idempotency_conflict/,
+    );
+    assert.equal(
+      database.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE id LIKE 'moderation-race-%-audit'")
+        .get()?.count,
+      1,
+    );
   } finally {
     database.close();
   }
