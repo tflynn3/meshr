@@ -1299,6 +1299,15 @@ function createBoundTool(
   if (!binding) return null;
   if (binding.sessionSuperseded) return null;
   if (!attentionAllows(binding.attention, spec.attention)) return null;
+  // OpenClaw may load a plugin and sit idle before the first model tool call.
+  // Start the signed runtime session as soon as the trusted tool factory is
+  // materialized so the presence shown in Meshr reflects the host lifecycle,
+  // not merely the last request. The per-binding start/heartbeat maps make
+  // this safe when OpenClaw materializes several tools at once; execution
+  // still calls ensureRuntimeSession and retries a transient startup failure.
+  void ensureRuntimeSession(binding, agentId).catch((error: unknown) => {
+    if (isSessionSupersededError(error)) stopRuntimeSession(binding, agentId);
+  });
   const client = new MeshrClient(binding, agentId);
 
   return {

@@ -125,9 +125,22 @@ export async function registerMeshrTools({
     signal,
   });
 
-  await Promise.all(
-    createAgentToolCatalog(resolvedClient, attention).map((tool) =>
-      modelContext.registerTool(
+  // Registration is a batch from the page's point of view. A host can reject
+  // one tool after accepting others, so give every registration a shared
+  // child signal and abort the whole batch on the first failure. WebMCP hosts
+  // use that signal as the cleanup fence for tools that were registered before
+  // the rejection; without it the UI could revoke the grant while a partial
+  // tool surface remained exposed in the browser.
+  const registrationController = new AbortController();
+  const abortFromCaller = () => registrationController.abort(signal.reason);
+  if (signal.aborted) abortFromCaller();
+  else signal.addEventListener("abort", abortFromCaller, { once: true });
+  const registrations: Array<Promise<void>> = [];
+  try {
+    // Keep the calls inside the guarded section as well: a host is allowed to
+    // throw synchronously before returning its registration promise.
+    for (const tool of createAgentToolCatalog(resolvedClient, attention)) {
+      registrations.push(modelContext.registerTool(
         {
           name: tool.name,
           title: tool.title,
@@ -136,10 +149,19 @@ export async function registerMeshrTools({
           annotations: tool.annotations,
           execute: async (toolInput) => result(await tool.execute(toolInput)),
         },
-        { signal },
-      ),
-    ),
-  );
-
-  return "ready";
+        { signal: registrationController.signal },
+      ));
+    }
+    await Promise.all(registrations);
+    return "ready";
+  } catch (error) {
+    registrationController.abort(error);
+    // Let hosts finish their abort cleanup before the caller revokes the
+    // server-side grant. This also keeps an already-resolved rejection from
+    // racing the revoke request in the React effect.
+    await Promise.allSettled(registrations);
+    throw error;
+  } finally {
+    signal.removeEventListener("abort", abortFromCaller);
+  }
 }

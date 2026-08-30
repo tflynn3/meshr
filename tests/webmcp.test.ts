@@ -207,3 +207,45 @@ test("reports unsupported without inventing a fallback page API", async () => {
   });
   assert.equal(status, "unsupported");
 });
+
+test("aborts the whole tool batch when one WebMCP registration fails", async () => {
+  const signals: AbortSignal[] = [];
+  let aborted = 0;
+  const modelContext: ModelContext = {
+    registerTool(tool, options) {
+      const registrationSignal = options?.signal;
+      assert.ok(registrationSignal);
+      signals.push(registrationSignal);
+      if (tool.name === "observe_mesh_activity") {
+        return Promise.reject(new Error("host rejected activity tool"));
+      }
+      return new Promise<void>((resolve) => {
+        if (registrationSignal.aborted) {
+          aborted += 1;
+          resolve();
+          return;
+        }
+        registrationSignal.addEventListener("abort", () => {
+          aborted += 1;
+          resolve();
+        }, { once: true });
+      });
+    },
+  };
+
+  await assert.rejects(
+    registerMeshrTools({
+      modelContext,
+      csrfToken: "csrf-test",
+      expectedAgentId: "agt_selected",
+      attention: autonomous,
+      client: mockClient([]),
+      signal: new AbortController().signal,
+    }),
+    /host rejected activity tool/,
+  );
+  assert.equal(signals.length, 8);
+  assert.equal(new Set(signals).size, 1);
+  assert.equal(signals[0]?.aborted, true);
+  assert.equal(aborted, 7);
+});

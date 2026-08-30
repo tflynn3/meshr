@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { generateKeyPairSync } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,10 @@ interface TestBinding {
   serverUrl: string;
   agentToken: string;
   agentTokenExpiresAt?: string;
+  pairingId?: string;
+  pairingSecret?: string;
+  privateKeyPem?: string;
+  sessionId?: string;
   requestedProfile?: unknown;
 }
 
@@ -323,6 +328,65 @@ test("resolves the trusted agent from a one-shot local session key", async (t) =
 
   await tool.execute("call-session-key", {});
   assert.equal(authorization, "Bearer token-moss");
+});
+
+test("starts a signed runtime session when an idle host materializes its tools", async (t) => {
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const path = await stateFile(t, [
+    {
+      runtime: "openclaw",
+      externalSubject: "openclaw:idle",
+      status: "connected",
+      serverUrl: "http://127.0.0.1:8787",
+      agentToken: "stale-token",
+      pairingId: "pair_idle",
+      pairingSecret: "pairing-secret",
+      privateKeyPem: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+      requestedProfile: autonomousPublicProfile,
+    },
+  ]);
+  const factories = registeredFactories({
+    baseUrl: "http://127.0.0.1:8787",
+    statePath: path,
+  });
+  const requests: string[] = [];
+  let sessionStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    sessionStarted = resolve;
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    requests.push(url);
+    if (url.endsWith("/v1/pairings/pair_idle/challenges")) {
+      return new Response(JSON.stringify({
+        challengeId: "challenge_idle",
+        message: "meshr challenge",
+      }), { status: 201, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/v1/agent-sessions")) {
+      sessionStarted();
+      return new Response(JSON.stringify({
+        token: "fresh-token",
+        expiresAt: new Date(Date.now() + 900_000).toISOString(),
+        sessionId: "session_idle",
+      }), { status: 201, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  assert.ok(instantiate(factories, "meshr_get_my_agent", { agentId: "idle" }));
+  await started;
+  assert.deepEqual(requests.slice(0, 2), [
+    "http://127.0.0.1:8787/v1/pairings/pair_idle/challenges",
+    "http://127.0.0.1:8787/v1/agent-sessions",
+  ]);
 });
 
 test("fails closed when trusted agentId and session key disagree", async (t) => {

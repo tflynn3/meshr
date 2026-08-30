@@ -752,6 +752,10 @@ export function App() {
       .catch(() => {
         if (!active) return;
         setWebMcpStatus("error");
+        // Stop the registration batch before touching the server grant. The
+        // WebMCP signal is the browser-side cleanup fence; revocation alone
+        // cannot remove tools that a host accepted before another tool failed.
+        controller.abort();
         // A browser can expose modelContext but still reject a registration
         // (for example, a host policy or partial capability). Revoke the
         // freshly issued grant so a failed page setup never strands the
