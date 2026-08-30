@@ -1,4 +1,5 @@
 import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { dirname, resolve } from "node:path";
@@ -256,6 +257,21 @@ async function assertCutoverValidationFlow(
     throw new Error(`Cutover validation binding ${selector} must be connected with an active session token; refresh the candidate-database fixture before promotion.`);
   }
   const api = new MeshrApi(binding.serverUrl);
+  const cutoverDeadlineFile = process.env.MESHR_CUTOVER_DEADLINE_FILE?.trim();
+  const recordCutoverSessionExpiry = async (): Promise<void> => {
+    if (!cutoverDeadlineFile) return;
+    const expiresAt = binding.agentTokenExpiresAt?.trim();
+    const expiresAtMs = expiresAt ? Date.parse(expiresAt) : Number.NaN;
+    if (!expiresAt || !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
+      throw new Error(`Cutover validation binding ${selector} did not return a future session expiry.`);
+    }
+    const expiryPath = resolve(cutoverDeadlineFile);
+    const expiryDirectory = dirname(expiryPath);
+    await mkdir(expiryDirectory, { recursive: true, mode: 0o700 });
+    await chmod(expiryDirectory, 0o700);
+    await writeFile(expiryPath, `${new Date(expiresAtMs).toISOString()}\n`, { mode: 0o600 });
+    await chmod(expiryPath, 0o600);
+  };
   const assertTokenHorizon = (minimumMs: number): void => {
     const tokenExpiresAt = binding.agentTokenExpiresAt ? Date.parse(binding.agentTokenExpiresAt) : Number.NaN;
     if (!Number.isFinite(tokenExpiresAt) || tokenExpiresAt <= Date.now() + minimumMs) {
@@ -291,6 +307,7 @@ async function assertCutoverValidationFlow(
       ...(renewed.agent?.id ? { agentId: renewed.agent.id } : {}),
     });
     await store.upsert(binding);
+    await recordCutoverSessionExpiry();
   };
   // Cutover validation is the one release path that renews before the normal
   // two-minute window. The server scopes this exception to the exact reviewed
@@ -317,6 +334,7 @@ async function assertCutoverValidationFlow(
     throw new Error("Cutover validation heartbeat did not confirm the reviewed target-authority session.");
   }
   if (typeof heartbeatBody.expiresAt === "string") binding.agentTokenExpiresAt = heartbeatBody.expiresAt;
+  await recordCutoverSessionExpiry();
 
   // These two negative checks make the write fence observable: a release run
   // cannot silently fall back to a public write or revoke an old-store session

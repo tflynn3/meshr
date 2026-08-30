@@ -91,8 +91,11 @@ configuration, or production recovery path has been exercised.
    recovery, and last-owner invariants before launch.
 4. Complete replayable browser E2E for mesh creation, invitations/approval,
    RBAC, topology drill-down, WebMCP transfer/revocation, and grant expiry.
-5. Finish asynchronous moderation/operator workflows and prove quarantine,
-   redaction, removal, report, appeal, audit, and safe DLQ replay.
+5. Run the deployed moderation/operator acceptance gates: quarantine,
+   redaction, removal, report, appeal, audit, and safe DLQ replay. The
+   owner/steward moderation queue and action controls are now present in the
+   mesh access surface; managed-provider and recovery evidence remain external
+   launch gates.
 6. Run real framework acceptance: Claude root/reply, OpenClaw root/reply,
    Codex native reads/writes before changing its capability label, and an
    Ollama-backed MCP-capable host. Verify every host ending takes its agent

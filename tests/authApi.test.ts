@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  actOnModerationCase,
   createSocialSession,
   getCurrentSession,
+  listMeshModerationCases,
   MeshrApiError,
 } from "../src/auth/api.ts";
 
@@ -45,5 +47,62 @@ test("only an expired human session dispatches the browser session-expired event
     } else {
       (globalThis as { window?: unknown }).window = originalWindow;
     }
+  }
+});
+
+test("moderation clients scope reads and protect actions with CSRF and idempotency", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ path: string; init?: RequestInit }> = [];
+  try {
+    globalThis.fetch = async (input, init) => {
+      requests.push({ path: String(input), init });
+      if (requests.length === 1) {
+        return new Response(JSON.stringify({ cases: [], nextCursor: null }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({
+        id: "case/1",
+        postId: "post-1",
+        meshId: "mesh/private",
+        reason: "credential-like text",
+        state: "resolved",
+        severity: "high",
+        resolution: "quarantine",
+        createdAt: "2026-08-30T00:00:00.000Z",
+        updatedAt: "2026-08-30T00:01:00.000Z",
+        resolvedAt: "2026-08-30T00:01:00.000Z",
+        post: null,
+      }), { headers: { "Content-Type": "application/json" } });
+    };
+
+    await listMeshModerationCases("mesh/private", {
+      state: "appealed",
+      after: "cursor/1",
+      limit: 3,
+    });
+    await actOnModerationCase(
+      "mesh/private",
+      "case/1",
+      { action: "quarantine", idempotencyKey: "moderation-retry-1" },
+      "csrf-token",
+    );
+
+    assert.equal(
+      requests[0]?.path,
+      "/v1/meshes/mesh%2Fprivate/moderation?state=appealed&after=cursor%2F1&limit=3",
+    );
+    assert.equal(requests[0]?.init?.method, undefined);
+    assert.equal(
+      requests[1]?.path,
+      "/v1/meshes/mesh%2Fprivate/moderation/case%2F1",
+    );
+    assert.equal(requests[1]?.init?.method, "POST");
+    const headers = new Headers(requests[1]?.init?.headers);
+    assert.equal(headers.get("X-Meshr-CSRF"), "csrf-token");
+    assert.equal(headers.get("Idempotency-Key"), "moderation-retry-1");
+    assert.deepEqual(JSON.parse(String(requests[1]?.init?.body)), { action: "quarantine" });
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });

@@ -216,6 +216,61 @@ export interface MeshJoinRequest {
   resolvedAt: string | null;
 }
 
+export type ModerationCaseState = "queued" | "reviewing" | "resolved" | "appealed";
+
+export type ModerationCaseSeverity = "low" | "medium" | "high" | "critical";
+
+export type ModerationAction = "start_review" | "publish" | "quarantine" | "remove" | "redact";
+
+export type ModeratedPostState = "published" | "quarantined" | "removed" | "redacted";
+
+export interface ModeratedPost {
+  id: string;
+  meshId: string;
+  topicId: string;
+  agentId: string;
+  sessionId: string;
+  parentPostId: string | null;
+  body: string;
+  moderationState: ModeratedPostState;
+  moderationReason: string | null;
+  createdAt: string;
+  expiresAt: string | null;
+}
+
+export interface MeshModerationCase {
+  id: string;
+  postId: string;
+  meshId: string;
+  reason: string;
+  state: ModerationCaseState;
+  severity: ModerationCaseSeverity;
+  resolution: string | null;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt: string | null;
+  post: ModeratedPost | null;
+}
+
+export interface MeshModerationCasesPage {
+  cases: MeshModerationCase[];
+  nextCursor: string | null;
+}
+
+export interface ListMeshModerationCasesOptions {
+  state?: ModerationCaseState;
+  after?: string;
+  limit?: number;
+  signal?: AbortSignal;
+}
+
+export interface ActOnModerationCaseInput {
+  action: ModerationAction;
+  reason?: string;
+  /** Reuse this key when the client retries after an unknown response. */
+  idempotencyKey?: string;
+}
+
 export interface RequestedAgentProfile {
   name: string;
   handle: string;
@@ -702,6 +757,45 @@ export async function resolveMeshJoinRequest(
         "X-Meshr-CSRF": csrfToken,
       },
       body: JSON.stringify({ decision }),
+    },
+  );
+}
+
+export function listMeshModerationCases(
+  meshId: string,
+  options: ListMeshModerationCasesOptions = {},
+): Promise<MeshModerationCasesPage> {
+  const searchParams = new URLSearchParams();
+  if (options.state) searchParams.set("state", options.state);
+  if (options.after) searchParams.set("after", options.after);
+  if (options.limit !== undefined) searchParams.set("limit", String(options.limit));
+  const query = searchParams.size > 0 ? `?${searchParams.toString()}` : "";
+  return request<MeshModerationCasesPage>(
+    `/v1/meshes/${encodeURIComponent(meshId)}/moderation${query}`,
+    { signal: options.signal },
+  );
+}
+
+export function actOnModerationCase(
+  meshId: string,
+  caseId: string,
+  input: ActOnModerationCaseInput,
+  csrfToken: string,
+): Promise<MeshModerationCase> {
+  const { idempotencyKey: suppliedKey, ...payload } = input;
+  const idempotencyKey = suppliedKey
+    ?? globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return request<MeshModerationCase>(
+    `/v1/meshes/${encodeURIComponent(meshId)}/moderation/${encodeURIComponent(caseId)}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Meshr-CSRF": csrfToken,
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify(payload),
     },
   );
 }

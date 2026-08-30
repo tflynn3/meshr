@@ -1796,6 +1796,134 @@ button:focus-visible {
   border-radius: 6px;
   background: #f7f8f2;
 }
+.moderation-editor {
+  display: grid;
+  gap: 9px;
+}
+.moderation-count {
+  flex: none;
+  border: 1px solid #d7d9ce;
+  border-radius: 999px;
+  background: #f7f8f2;
+  padding: 4px 7px;
+  color: #66705c;
+  font-size: 7px;
+  font-weight: 700;
+}
+.moderation-list {
+  display: grid;
+  gap: 7px;
+}
+.moderation-case {
+  display: grid;
+  gap: 7px;
+  padding: 9px;
+  border: 1px solid #dde0d4;
+  border-radius: 7px;
+  background: #f9faf6;
+}
+.moderation-case-heading,
+.moderation-badges,
+.moderation-actions {
+  display: flex;
+  align-items: center;
+}
+.moderation-case-heading {
+  justify-content: space-between;
+  gap: 10px;
+}
+.moderation-case-heading strong,
+.moderation-case-heading small {
+  display: block;
+}
+.moderation-case-heading strong {
+  font-size: 8px;
+}
+.moderation-case-heading small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 6px;
+}
+.moderation-badges,
+.moderation-actions {
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.moderation-badge {
+  border: 1px solid #d5d8cc;
+  border-radius: 999px;
+  background: #fff;
+  padding: 3px 6px;
+  color: #68705f;
+  font-size: 6px;
+  font-weight: 750;
+  text-transform: capitalize;
+}
+.moderation-badge.severity-medium {
+  border-color: #e4cc83;
+  background: #fff8dc;
+  color: #765f18;
+}
+.moderation-badge.severity-high,
+.moderation-badge.severity-critical {
+  border-color: #e5a394;
+  background: #fff0ec;
+  color: #8b3e2e;
+}
+.moderation-post-copy,
+.moderation-reason {
+  margin: 0;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.moderation-post-copy {
+  display: -webkit-box;
+  color: #263023;
+  font-size: 8px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+.moderation-reason {
+  display: -webkit-box;
+  color: #757b70;
+  font-size: 7px;
+  line-height: 1.4;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.moderation-actions button {
+  border: 1px solid #c6c7c0;
+  border-radius: 5px;
+  background: #fff;
+  padding: 5px 7px;
+  color: #374033;
+  font-size: 7px;
+  font-weight: 650;
+}
+.moderation-actions button.danger {
+  color: #914635;
+}
+.moderation-actions button:disabled {
+  cursor: wait;
+  opacity: 0.5;
+}
+.moderation-empty,
+.moderation-notice,
+.moderation-error {
+  font-size: 7px;
+  line-height: 1.4;
+}
+.moderation-empty {
+  color: var(--muted);
+}
+.moderation-notice {
+  color: #5d6b21;
+}
+.moderation-error {
+  color: #a54f3e;
+}
 .topic-editor {
   display: grid;
   gap: 9px;
