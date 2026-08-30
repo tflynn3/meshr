@@ -19,10 +19,11 @@ import { managedRootPrompt, parseManagedBody } from "../live/managed.ts";
 import { assertLoopbackOllamaUrl, parseOllamaBody } from "../live/ollama.ts";
 import { runLiveMatrix } from "../live/matrix.ts";
 import { parseLiveMatrixOptions } from "../live/options.ts";
-import { runProcess } from "../live/process.ts";
+import { nativeHostEnvironment, runProcess } from "../live/process.ts";
 import { replyPrompt, rootPrompt, traceMarker } from "../live/prompts.ts";
 import {
   authorBindingEvidence,
+  configuredReleaseValidationTarget,
   selectRuntimeBindings,
 } from "../live/server.ts";
 import {
@@ -32,6 +33,21 @@ import {
 } from "../connector/types.ts";
 
 const projectRoot = process.cwd();
+
+test("release validation target requires a mesh/topic pair", () => {
+  assert.deepEqual(
+    configuredReleaseValidationTarget({
+      MESHR_RELEASE_VALIDATION_MESH_ID: "mesh-private",
+      MESHR_RELEASE_VALIDATION_TOPIC_ID: "topic-validation",
+    }),
+    { meshId: "mesh-private", topicId: "topic-validation" },
+  );
+  assert.deepEqual(configuredReleaseValidationTarget({}), {});
+  assert.throws(
+    () => configuredReleaseValidationTarget({ MESHR_RELEASE_VALIDATION_MESH_ID: "mesh-private" }),
+    /must be supplied together/,
+  );
+});
 
 function binding(
   runtime: ConnectorRuntime,
@@ -231,6 +247,17 @@ test("managed Codex invocation has no binding, credential, or MCP surface", () =
     }),
     { PATH: "/bin" },
   );
+  assert.deepEqual(
+    nativeHostEnvironment({
+      PATH: "/bin",
+      MESHR_RELEASE_RUNTIME_STATE_JSON: "secret",
+      GITHUB_TOKEN: "secret",
+      CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE: "/tmp/credentials",
+      GOOGLE_GHA_CREDS_PATH: "/tmp/gha-credentials",
+      ANTHROPIC_API_KEY: "provider-key",
+    }),
+    { PATH: "/bin", ANTHROPIC_API_KEY: "provider-key" },
+  );
   assert.equal(
     parseManagedBody(
       JSON.stringify({ body: `A bounded observation. ${marker}` }),
@@ -297,6 +324,17 @@ test("trace prompts require a root marker followed by a distinct reply marker", 
     new RegExp(traceMarker(trace, "reply").replace(/[\[\]]/g, "\\$&")),
   );
   assert.notEqual(traceMarker(trace, "root"), traceMarker(trace, "reply"));
+});
+
+test("release root prompts pin the private validation conversation", () => {
+  const prompt = rootPrompt("release-trace", {
+    meshId: "mesh-validation",
+    topicId: "topic-discoveries",
+  });
+  assert.match(prompt, /mesh-validation/);
+  assert.match(prompt, /topic-discoveries/);
+  assert.match(prompt, /Never choose a different mesh or conversation/);
+  assert.doesNotMatch(prompt, /for one joined mesh/);
 });
 
 test("Ollama accepts only loopback and never repairs a missing trace marker", () => {

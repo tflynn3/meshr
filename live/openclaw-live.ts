@@ -19,8 +19,12 @@ import {
   resolve,
 } from "node:path";
 import { pathToFileURL } from "node:url";
+import { MeshrApi } from "../connector/api.ts";
+import { ConnectorStateStore } from "../connector/state.ts";
 import type { ConnectorBinding, ConnectorState } from "../connector/types.ts";
-import { runProcess } from "./process.ts";
+import { nativeHostEnvironment, runProcess } from "./process.ts";
+import { captureEvidenceProvenance } from "./provenance.ts";
+import { observeNativeSessionOffline } from "./session-lifecycle.ts";
 import {
   authorBindingEvidence,
   discoverContext,
@@ -68,6 +72,10 @@ interface ProcessInput {
 
 export interface OpenClawLiveDependencies {
   runProcess: (input: ProcessInput) => Promise<ProcessEvidence>;
+  health: (
+    serverUrl: string,
+    timeoutMs: number,
+  ) => Promise<OpenClawLiveEvidence["serverHealth"][number]>;
   verifyIdentity: (
     binding: ConnectorBinding,
     timeoutMs: number,
@@ -80,6 +88,19 @@ export interface OpenClawLiveDependencies {
 
 const defaultDependencies: OpenClawLiveDependencies = {
   runProcess,
+  health: async (serverUrl, timeoutMs) => {
+    try {
+      return {
+        serverUrl,
+        reachable: true,
+        result: await new MeshrApi(serverUrl).health(
+          AbortSignal.timeout(Math.min(timeoutMs, 15_000)),
+        ),
+      };
+    } catch (error) {
+      return { serverUrl, reachable: false, error: safeError(error) };
+    }
+  },
   verifyIdentity,
   discoverContext,
   readTargetContext,
@@ -272,10 +293,45 @@ interface RuntimeToolRegistration {
   names: string[];
 }
 
+function configuredAttentionTools(state: unknown, agentId: string): string[] {
+  const bindings = isRecord(state) && Array.isArray(state.bindings)
+    ? state.bindings
+    : [];
+  const binding = bindings.find((candidate) =>
+    isRecord(candidate) && candidate.externalSubject === `openclaw:${agentId}`,
+  );
+  const profile = isRecord(binding) && isRecord(binding.requestedProfile)
+    ? binding.requestedProfile
+    : {};
+  const attention = isRecord(profile.attention) ? profile.attention : {};
+  const tools = [
+    "meshr_get_my_agent",
+    "meshr_appeal_post",
+    "meshr_reload_my_profile",
+  ];
+  const browse = attention.browse;
+  if (browse === "public" || browse === "joined") {
+    tools.push(
+      "meshr_discover_meshes",
+      "meshr_join_mesh",
+      "meshr_list_conversations",
+      "meshr_read_conversation",
+      "meshr_follow_conversation",
+      "meshr_observe_activity",
+    );
+  } else if (browse === "mentions") {
+    tools.push("meshr_observe_mentions");
+  }
+  if (attention.rootPosts === "autonomous") tools.push("meshr_publish_post");
+  if (attention.replies === "autonomous") tools.push("meshr_reply_to_post");
+  return tools;
+}
+
 async function validateRuntimeToolFactories(input: {
   config: JsonRecord;
   pluginConfig: JsonRecord;
   agentIds: [string, string];
+  expectedToolsByAgent: Map<string, readonly string[]>;
 }): Promise<string> {
   const entryPath = await resolveMeshrPluginEntry(input.config);
   const imported = (await import(
@@ -302,8 +358,16 @@ async function validateRuntimeToolFactories(input: {
       });
     },
   });
+  for (const toolName of OPENCLAW_MESHR_TOOLS) {
+    if (!registrations.some((candidate) => candidate.names.includes(toolName))) {
+      throw new Error(
+        `Meshr OpenClaw plugin did not register canonical runtime factory ${toolName}.`,
+      );
+    }
+  }
   for (const agentId of input.agentIds) {
-    for (const toolName of OPENCLAW_MESHR_TOOLS) {
+    const expectedTools = input.expectedToolsByAgent.get(agentId) ?? [];
+    for (const toolName of expectedTools) {
       const registration = registrations.find((candidate) =>
         candidate.names.includes(toolName),
       );
@@ -398,7 +462,7 @@ function validateMeshrOnlyToolPolicy(
       actual.size !== normalized.length ? "duplicate entries" : "",
     ].filter(Boolean);
     throw new Error(
-      `OpenClaw agent ${agentId} must allow exactly the ten Meshr plugin tools${details.length > 0 ? ` (${details.join("; ")})` : ""}.`,
+      `OpenClaw agent ${agentId} must allow exactly the ${OPENCLAW_MESHR_TOOLS.length} Meshr plugin tools${details.length > 0 ? ` (${details.join("; ")})` : ""}.`,
     );
   }
 }
@@ -432,6 +496,16 @@ export async function validateOpenClawPluginConfig(input: {
       "The OpenClaw Meshr plugin does not use the supplied session state file.",
     );
   }
+  const stateValue = await readJsonFile(
+    input.connectorStatePath,
+    "Meshr connector state",
+  );
+  const expectedToolsByAgent = new Map(
+    input.agentIds.map((agentId) => [
+      agentId,
+      configuredAttentionTools(stateValue, agentId),
+    ]),
+  );
   const agents = input.agentIds.map((agentId, index) => {
     const phase: OpenClawLivePhase = index === 0 ? "root" : "reply";
     const agent = configuredAgent(input.config as JsonRecord, agentId);
@@ -457,6 +531,7 @@ export async function validateOpenClawPluginConfig(input: {
     config: input.config,
     pluginConfig: plugin,
     agentIds: input.agentIds,
+    expectedToolsByAgent,
   });
   return {
     enabled: true,
@@ -472,7 +547,7 @@ export function buildOpenClawEnvironment(
   options: OpenClawLiveOptions,
   base: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
-  const environment = { ...base };
+  const environment = nativeHostEnvironment(base);
   delete environment.OPENCLAW_PROFILE;
   delete environment.OPENCLAW_CONTAINER;
   delete environment.MESHR_STATE_DIR;
@@ -678,6 +753,21 @@ function optionsWithResolvedPaths(options: OpenClawLiveOptions): OpenClawLiveOpt
   };
 }
 
+async function reloadActiveBinding(
+  statePath: string,
+  binding: ConnectorBinding,
+): Promise<ConnectorBinding> {
+  const current = await new ConnectorStateStore(dirname(statePath)).require(
+    binding.pairingId,
+  );
+  if (current.status !== "connected" || !current.agentToken || !current.sessionId) {
+    throw new Error(
+      `OpenClaw host did not leave an active session for binding ${binding.pairingId}.`,
+    );
+  }
+  return current;
+}
+
 export async function runOpenClawLive(
   suppliedOptions: OpenClawLiveOptions,
   suppliedDependencies: Partial<OpenClawLiveDependencies> = {},
@@ -687,8 +777,11 @@ export async function runOpenClawLive(
   const runId = `openclaw-${dependencies.uuid()}`;
   const traceId = `openclaw-${dependencies.uuid()}`;
   const startedAt = new Date().toISOString();
+  const provenance = await captureEvidenceProvenance(options.projectRoot);
   const evidence: OpenClawLiveEvidence = {
+    kind: "openclaw-live",
     schemaVersion: 1,
+    provenance,
     runId,
     traceId,
     startedAt,
@@ -702,6 +795,7 @@ export async function runOpenClawLive(
       connectorStatePath: options.connectorStatePath,
       privateStateValidated: false,
     },
+    serverHealth: [],
     agents: [],
     phases: [],
     outcome: "failed",
@@ -730,6 +824,13 @@ export async function runOpenClawLive(
       serverUrl: options.serverUrl,
     });
     const selectedServer = normalizeServerUrl(selected.root.serverUrl);
+    // Local fixture runs intentionally avoid a network dependency. Canary and
+    // production receipts, however, must bind the native runtime evidence to
+    // the same deployed release health endpoint that the release verifier
+    // checks before promotion.
+    if (provenance.environment !== "local") {
+      evidence.serverHealth = [await dependencies.health(selectedServer, options.timeoutMs)];
+    }
     evidence.plugin = await validateOpenClawPluginConfig({
       config: configValue,
       connectorStatePath: options.connectorStatePath,
@@ -761,6 +862,9 @@ export async function runOpenClawLive(
     ];
 
     const prerequisites: string[] = [];
+    if (provenance.environment !== "local" && evidence.serverHealth.some((health) => !health.reachable)) {
+      prerequisites.push("Meshr deployment health is not reachable from the OpenClaw acceptance runner.");
+    }
     if (!evidence.version.installed) {
       prerequisites.push("OpenClaw executable is unavailable.");
     }
@@ -885,6 +989,7 @@ export async function runOpenClawLive(
         execution,
         rootInvocation.plan.args,
       );
+      const rootHostExitedAt = new Date().toISOString();
       if (!processSucceeded(execution)) {
         throw new Error(
           execution.timedOut
@@ -896,16 +1001,41 @@ export async function runOpenClawLive(
                 : "OpenClaw root process did not return valid JSON.",
         );
       }
-      rootLocated = await dependencies.locateMarkedPost({
-        binding: selected.root,
-        marker: rootPhase.marker,
-        timeoutMs: options.timeoutMs,
-        parentPostId: null,
-        targetMeshId: target.meshId,
-        targetTopicId: target.topicId,
-      });
-      rootPhase.authorBinding = authorBindingEvidence(
+      // OpenClaw owns a fresh signed session per host process and persists its
+      // rotated bearer. Read that state before the harness performs post
+      // readback; the preflight token is intentionally superseded.
+      const activeRootBinding = await reloadActiveBinding(
+        options.connectorStatePath,
         selected.root,
+      );
+      rootPhase.binding = publicBinding(activeRootBinding);
+      const rootReadback = provenance.environment !== "local"
+        ? await observeNativeSessionOffline(
+            activeRootBinding,
+            () =>
+              dependencies.locateMarkedPost({
+                binding: activeRootBinding,
+                marker: rootPhase.marker,
+                timeoutMs: options.timeoutMs,
+                parentPostId: null,
+                targetMeshId: target.meshId,
+                targetTopicId: target.topicId,
+              }),
+            { hostExitedAt: rootHostExitedAt },
+          )
+        : undefined;
+      rootLocated =
+        rootReadback?.value ??
+        (await dependencies.locateMarkedPost({
+          binding: activeRootBinding,
+          marker: rootPhase.marker,
+          timeoutMs: options.timeoutMs,
+          parentPostId: null,
+          targetMeshId: target.meshId,
+          targetTopicId: target.topicId,
+        }));
+      rootPhase.authorBinding = authorBindingEvidence(
+        activeRootBinding,
         rootPhase.marker,
         rootLocated,
       );
@@ -917,6 +1047,11 @@ export async function runOpenClawLive(
           "Root post author does not match the plugin-backed Meshr binding.",
         );
       }
+      rootPhase.nativeSession = {
+        sessionId: activeRootBinding.sessionId!,
+        onlineVerifiedAt: new Date().toISOString(),
+        ...(rootReadback?.observation ?? {}),
+      };
       rootPhase.status = "passed";
       evidence.phases.push(rootPhase);
     } catch (error) {
@@ -971,6 +1106,7 @@ export async function runOpenClawLive(
         execution,
         replyInvocation.plan.args,
       );
+      const replyHostExitedAt = new Date().toISOString();
       if (!processSucceeded(execution)) {
         throw new Error(
           execution.timedOut
@@ -982,16 +1118,38 @@ export async function runOpenClawLive(
                 : "OpenClaw reply process did not return valid JSON.",
         );
       }
-      const located = await dependencies.locateMarkedPost({
-        binding: selected.reply,
-        marker: replyPhase.marker,
-        timeoutMs: options.timeoutMs,
-        parentPostId: rootLocated.post.id,
-        targetMeshId: rootLocated.post.meshId,
-        targetTopicId: rootLocated.post.topicId,
-      });
-      replyPhase.authorBinding = authorBindingEvidence(
+      const activeReplyBinding = await reloadActiveBinding(
+        options.connectorStatePath,
         selected.reply,
+      );
+      replyPhase.binding = publicBinding(activeReplyBinding);
+      const replyReadback = provenance.environment !== "local"
+        ? await observeNativeSessionOffline(
+            activeReplyBinding,
+            () =>
+              dependencies.locateMarkedPost({
+                binding: activeReplyBinding,
+                marker: replyPhase.marker,
+                timeoutMs: options.timeoutMs,
+                parentPostId: rootLocated.post.id,
+                targetMeshId: rootLocated.post.meshId,
+                targetTopicId: rootLocated.post.topicId,
+              }),
+            { hostExitedAt: replyHostExitedAt },
+          )
+        : undefined;
+      const located =
+        replyReadback?.value ??
+        (await dependencies.locateMarkedPost({
+          binding: activeReplyBinding,
+          marker: replyPhase.marker,
+          timeoutMs: options.timeoutMs,
+          parentPostId: rootLocated.post.id,
+          targetMeshId: rootLocated.post.meshId,
+          targetTopicId: rootLocated.post.topicId,
+        }));
+      replyPhase.authorBinding = authorBindingEvidence(
+        activeReplyBinding,
         replyPhase.marker,
         located,
       );
@@ -1003,6 +1161,11 @@ export async function runOpenClawLive(
           "Reply author does not match the plugin-backed Meshr binding.",
         );
       }
+      replyPhase.nativeSession = {
+        sessionId: activeReplyBinding.sessionId!,
+        onlineVerifiedAt: new Date().toISOString(),
+        ...(replyReadback?.observation ?? {}),
+      };
       replyPhase.status = "passed";
       evidence.outcome = "passed";
     } catch (error) {

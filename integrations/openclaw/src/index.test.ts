@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,20 +11,10 @@ import type {
   OpenClawPluginToolFactory,
 } from "openclaw/plugin-sdk/core";
 import { getToolPluginMetadata } from "openclaw/plugin-sdk/tool-plugin";
+import { MESHR_OPENCLAW_TOOL_ALLOWLIST } from "./contract.js";
 import entry from "./index.js";
 
-const expectedTools = [
-  "meshr_get_my_agent",
-  "meshr_reload_my_profile",
-  "meshr_discover_meshes",
-  "meshr_join_mesh",
-  "meshr_list_conversations",
-  "meshr_read_conversation",
-  "meshr_publish_post",
-  "meshr_reply_to_post",
-  "meshr_follow_conversation",
-  "meshr_observe_activity",
-];
+const expectedTools = [...MESHR_OPENCLAW_TOOL_ALLOWLIST];
 
 interface TestBinding {
   runtime: string;
@@ -108,7 +99,14 @@ function instantiatedToolNames(
   return expectedTools.filter((name) => instantiate(factories, name, context) !== null);
 }
 
-test("declares prefixed tools without an agentId parameter", () => {
+test("keeps the manifest, runtime metadata, and canonical contract in sync", async () => {
+  const manifest = JSON.parse(
+    await readFile(
+      fileURLToPath(new URL("../openclaw.plugin.json", import.meta.url)),
+      "utf8",
+    ),
+  ) as { contracts?: { tools?: unknown } };
+  assert.deepEqual(manifest.contracts?.tools, expectedTools);
   const metadata = getToolPluginMetadata(entry);
   assert.deepEqual(
     metadata?.tools.map((tool) => tool.name),
@@ -184,12 +182,13 @@ test("projects the selected binding attention policy into its tool surface", asy
 
   assert.deepEqual(
     instantiatedToolNames(factories, { agentId: "public-auto" }),
-    expectedTools,
+    expectedTools.filter((name) => name !== "meshr_observe_mentions"),
   );
   assert.deepEqual(
     instantiatedToolNames(factories, { agentId: "joined-split" }),
     [
       "meshr_get_my_agent",
+      "meshr_appeal_post",
       "meshr_reload_my_profile",
       "meshr_discover_meshes",
       "meshr_join_mesh",
@@ -204,15 +203,18 @@ test("projects the selected binding attention policy into its tool surface", asy
     instantiatedToolNames(factories, { agentId: "mentions-auto" }),
     [
       "meshr_get_my_agent",
+      "meshr_appeal_post",
       "meshr_reload_my_profile",
       "meshr_publish_post",
       "meshr_reply_to_post",
+      "meshr_observe_mentions",
     ],
   );
   assert.deepEqual(
     instantiatedToolNames(factories, { agentId: "public-draft" }),
     [
       "meshr_get_my_agent",
+      "meshr_appeal_post",
       "meshr_reload_my_profile",
       "meshr_discover_meshes",
       "meshr_join_mesh",
@@ -224,7 +226,7 @@ test("projects the selected binding attention policy into its tool surface", asy
   );
   assert.deepEqual(
     instantiatedToolNames(factories, { agentId: "invalid-policy" }),
-    ["meshr_get_my_agent", "meshr_reload_my_profile"],
+    ["meshr_get_my_agent", "meshr_appeal_post", "meshr_reload_my_profile"],
   );
 });
 
@@ -507,6 +509,7 @@ test("maps the complete agent tool surface to the current routes", async (t) => 
   };
 
   await invoke("meshr_get_my_agent", {});
+  await invoke("meshr_appeal_post", { postId: "moderated post", reason: "Context" });
   await invoke("meshr_discover_meshes", {});
   await invoke("meshr_join_mesh", { meshId: "mesh one" });
   await invoke("meshr_list_conversations", { meshId: "mesh one" });
@@ -524,6 +527,10 @@ test("maps the complete agent tool surface to the current routes", async (t) => 
     calls.map(({ url, method }) => ({ url, method })),
     [
       { url: "http://127.0.0.1:8787/v1/agent/profile", method: "GET" },
+      {
+        url: "http://127.0.0.1:8787/v1/agent/posts/moderated%20post/appeal",
+        method: "POST",
+      },
       { url: "http://127.0.0.1:8787/v1/agent/meshes", method: "GET" },
       {
         url: "http://127.0.0.1:8787/v1/agent/meshes/mesh%20one/join",
@@ -554,15 +561,54 @@ test("maps the complete agent tool surface to the current routes", async (t) => 
   );
   assert.equal(calls.every((call) => call.headers.get("authorization") === "Bearer token-alpha"), true);
   assert.equal(
-    calls.slice(5, 8).every((call) => /^meshr\.[a-f0-9]{64}$/.test(call.headers.get("idempotency-key") ?? "")),
+    calls.slice(6, 9).every((call) => /^meshr\.[a-f0-9]{64}$/.test(call.headers.get("idempotency-key") ?? "")),
     true,
   );
-  assert.deepEqual(calls[5].body, {
+  assert.match(calls[1].headers.get("idempotency-key") ?? "", /^meshr\.[a-f0-9]{64}$/);
+  assert.deepEqual(calls[1].body, { reason: "Context" });
+  assert.deepEqual(calls[6].body, {
     meshId: "mesh-1",
     topicId: "topic-1",
     body: "Post",
   });
-  assert.deepEqual(calls[6].body, { body: "Reply" });
+  assert.deepEqual(calls[7].body, { body: "Reply" });
+});
+
+test("maps mention-only attention to the scoped activity cursor", async (t) => {
+  const path = await stateFile(t, [
+    {
+      runtime: "openclaw",
+      externalSubject: "openclaw:mentions",
+      status: "connected",
+      serverUrl: "http://127.0.0.1:8787",
+      agentToken: "token-mentions",
+      requestedProfile: {
+        name: "Mentions",
+        handle: "mentions",
+        attention: { browse: "mentions", rootPosts: "never", replies: "never" },
+      },
+    },
+  ]);
+  const factories = registeredFactories({
+    baseUrl: "http://127.0.0.1:8787",
+    statePath: path,
+  });
+  const tool = instantiate(factories, "meshr_observe_mentions", { agentId: "mentions" });
+  assert.ok(tool);
+  let calledUrl = "";
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    calledUrl = String(input);
+    return new Response(JSON.stringify({ events: [], nextAfter: null }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  await tool.execute("mention-call", { after: "cursor_1", limit: 12 });
+  assert.equal(calledUrl, "http://127.0.0.1:8787/v1/agent/events?after=cursor_1&limit=12");
 });
 
 type JsonRecord = Record<string, unknown>;

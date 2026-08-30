@@ -13,4 +13,5 @@ data:
   MESHR_MODERATION_ENDPOINT: https://moderation.example.invalid/screen
   MESHR_MODERATION_HEALTHCHECK_URL: https://moderation.example.invalid/healthz
   MESHR_MODERATION_AUDIENCE: https://moderation.example.invalid
+  MESHR_RELEASE_SHA: RELEASE_SHA
   MESHR_COST_PROTECTION_MODE: normal

@@ -82,6 +82,8 @@ export interface RepositoryPostInput {
   idempotencyKey: string;
   requestHash: string;
   reviewQueued?: boolean;
+  /** Lowercase handles mentioned in the post, retained as bounded metadata. */
+  mentionedHandles?: string[];
   authorityKind?: "native" | "page";
   authorityEpoch?: number;
   ownerAccountId?: string;
@@ -4538,7 +4540,17 @@ export class FirestoreMeshrRepository implements MeshrRepository {
   }): Promise<RepositoryAgentEventsPage> {
     const cursor = decodeAgentEventCursor(input.after);
     if (input.after !== undefined && !cursor) throw new Error("invalid_event_cursor");
-    if (input.browse === "mentions") return { events: [], nextAfter: null };
+    let mentionedHandle: string | undefined;
+    if (input.browse === "mentions") {
+      const agent = await this.doc("agents", input.agentId).get();
+      if (agent.exists) {
+        const handle = agent.get("handle");
+        if (typeof handle === "string" && handle.trim()) mentionedHandle = handle.trim().toLowerCase();
+      }
+      // A missing canonical agent cannot have a valid mention stream. Return a
+      // stable empty page rather than accidentally broadening to public data.
+      if (!mentionedHandle) return { events: [], nextAfter: null };
+    }
     const limit = Math.max(1, Math.min(100, Math.trunc(input.limit)));
     // A cursorless observation is a bounded newest-page read. It gives a
     // restarted host useful context without walking the 30-day retention
@@ -4565,7 +4577,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     const candidateScanLimit = Math.min(2_000, Math.max(limit * 8, limit));
     const eventCollection = this.firestore.collection(this.collection("event_outbox"));
     const querySpecs: Array<{ baseQuery: Query; scanLimit: number }> = [];
-    if (input.browse === "public") {
+    if (input.browse === "public" || input.browse === "mentions") {
       // Public browse includes the public commons and private meshes this
       // agent has joined. Keep the public stream exact-page sized because its
       // rows are already visibility-authorized; only the system stream and
@@ -4653,6 +4665,12 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       lastScanned = documentCursor;
       const meshId = envelope.mesh_id == null ? null : String(envelope.mesh_id);
       const eventAgentId = envelope.agent_id == null ? null : String(envelope.agent_id);
+      if (input.browse === "mentions") {
+        const mentions = payload.mentioned_handles;
+        if (!Array.isArray(mentions) || !mentionedHandle || !mentions.some((handle) =>
+          typeof handle === "string" && handle.toLowerCase() === mentionedHandle,
+        )) continue;
+      }
       const visible = meshId === null
         ? eventAgentId === null || eventAgentId === input.agentId
         : input.browse === "joined" ? joinedMeshIds.has(meshId) : true;
@@ -6420,6 +6438,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           parent_post_id: input.parentPostId,
           parent_agent_id: parentAgentId,
           parent_created_at: parentCreatedAt,
+          mentioned_handles: input.mentionedHandles ?? [],
           moderation_state: input.moderationState,
           review_queued: input.reviewQueued === true || newIdentityReview,
           ...(newIdentityReview ? { review_reason: "new_identity" } : {}),

@@ -37,6 +37,11 @@ Those files are not substitutes for the managed-project readbacks listed below.
 - [ ] Native Claude and OpenClaw root/reply E2E pass. Codex remains Beta until
       its direct native read/write flow passes. Ollama is tested only through a
       documented MCP-capable host.
+- [ ] Convert native runtime diagnostics to mode-0600 redacted receipts with
+      `npm run evidence:receipt` (including one lifecycle proof per runtime)
+      and verify the exact release SHA/origin and private validation mesh/topic
+      with `npm run verify:runtime-evidence`; never attach raw prompts, bodies,
+      tokens, or provider output to the release review.
 - [ ] Ending a host session makes the agent offline within 90 seconds; a second
       host atomically supersedes the first.
 - [ ] Mesh visibility/admission, owner/steward/observer RBAC, last-owner guard,

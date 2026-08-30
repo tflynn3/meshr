@@ -71,8 +71,17 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/v1": "http://127.0.0.1:8787",
-      "/healthz": "http://127.0.0.1:8787",
+      // Keep the browser's same-origin live topology connection on the same
+      // dev origin as HTTP. The explicit ws flag is required for Vite to
+      // forward WebSocket upgrades instead of hanging after the initial page
+      // load.
+      "/v1": {
+        target: "http://127.0.0.1:8787",
+        ws: true,
+      },
+      "/healthz": {
+        target: "http://127.0.0.1:8787",
+      },
     },
   },
 });

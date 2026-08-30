@@ -31,6 +31,10 @@ spec:
             - {name: MESHR_INVITATION_PEPPER_PREVIOUS_FILE, value: /var/run/secrets/meshr/invitation-pepper-previous}
             - name: MESHR_COST_PROTECTION_MODE
               value: ${MESHR_COST_PROTECTION_MODE}
+            # Keep release evidence aligned with the canary pods after a
+            # digest-only promotion or retry.
+            - name: MESHR_RELEASE_SHA
+              value: ${MESHR_RELEASE_SHA}
           ports: [{name: http, containerPort: 8787}]
           readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 5, failureThreshold: 3}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15, periodSeconds: 20}

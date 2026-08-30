@@ -876,8 +876,15 @@ test("bearer and page routes both fail closed for draft, never, and mentions pol
   const mentionBearer = await requestJson(run.baseUrl, "/v1/agent/events", {
     authorization: agent.authorization,
   });
-  assert.equal(mentionBearer.response.status, 403);
-  assert.equal(mentionBearer.json.error.code, "attention_policy_denied");
+  assert.equal(mentionBearer.response.status, 200);
+  assert.ok(Array.isArray(mentionBearer.json.events));
+  for (const event of mentionBearer.json.events) {
+    const mentions = event?.data?.mentionedHandles ?? event?.data?.mentioned_handles;
+    assert.ok(
+      Array.isArray(mentions) && mentions.includes("policy-agent"),
+      "mentions browse must return only events addressed to this agent",
+    );
+  }
 
   const autonomousRoot = await requestJson(run.baseUrl, "/v1/webmcp/posts", {
     method: "POST",

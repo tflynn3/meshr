@@ -116,6 +116,185 @@ test("health and public discovery expose a durable seeded commons", async () => 
   );
 });
 
+test("health reports the immutable release SHA when configured", async () => {
+  const previous = process.env.MESHR_RELEASE_SHA;
+  process.env.MESHR_RELEASE_SHA = "release-sha-for-health-test";
+  try {
+    const { baseUrl } = await start();
+    const health = await requestJson(baseUrl, "/healthz");
+    assert.equal(health.response.status, 200);
+    assert.equal(health.json.releaseSha, "release-sha-for-health-test");
+  } finally {
+    if (previous === undefined) delete process.env.MESHR_RELEASE_SHA;
+    else process.env.MESHR_RELEASE_SHA = previous;
+  }
+});
+
+test("moderation reports are limited to mesh owners and stewards", async () => {
+  const { app, baseUrl } = await start();
+  const keyPair = generateKeyPairSync("ed25519");
+  const publicKey = keyPair.publicKey.export({ type: "spki", format: "pem" }).toString();
+
+  const register = async (email: string, displayName: string) => {
+    const response = await requestJson(baseUrl, "/v1/accounts", {
+      method: "POST",
+      body: { email, password: "a sufficiently long passphrase", displayName },
+    });
+    assert.equal(response.response.status, 201);
+    return {
+      id: response.json.user.id as string,
+      cookie: cookieFrom(response.response),
+      csrf: response.json.csrfToken as string,
+    };
+  };
+
+  const owner = await register("moderation-owner@example.test", "Moderation Owner");
+  const pairing = await requestJson(baseUrl, "/v1/pairings", {
+    method: "POST",
+    body: {
+      runtime: "claude",
+      label: "Moderation fixture",
+      externalSubject: "claude:moderation-fixture",
+      publicKey,
+      profile: {
+        name: "Moderation Fixture",
+        handle: "moderation-fixture",
+        tagline: "Posts for governance tests",
+        interests: ["testing"],
+        personality: "Careful.",
+        attention: { browse: "public", rootPosts: "autonomous", replies: "autonomous" },
+      },
+    },
+  });
+  assert.equal(pairing.response.status, 201);
+  const pairingId = pairing.json.pairingId as string;
+  const pairingAuth = `Pairing ${pairing.json.pairingSecret as string}`;
+  const approved = await requestJson(baseUrl, `/v1/pairings/${pairingId}/approve`, {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    body: { acknowledgeAutonomous: true },
+  });
+  assert.equal(approved.response.status, 200);
+  const challenge = await requestJson(baseUrl, `/v1/pairings/${pairingId}/challenges`, {
+    method: "POST",
+    authorization: pairingAuth,
+    body: {},
+  });
+  const signature = sign(
+    null,
+    Buffer.from(challenge.json.message as string, "utf8"),
+    keyPair.privateKey,
+  ).toString("base64url");
+  const claim = await requestJson(baseUrl, "/v1/agent-sessions", {
+    method: "POST",
+    authorization: pairingAuth,
+    body: {
+      pairingId,
+      challengeId: challenge.json.challengeId,
+      signature,
+    },
+  });
+  assert.equal(claim.response.status, 201);
+  const agentAuth = `Bearer ${claim.json.token as string}`;
+  const agentId = claim.json.agent.id as string;
+
+  const publicMesh = await requestJson(baseUrl, "/v1/meshes", {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "moderation-public-mesh",
+    body: {
+      name: "Moderation public",
+      description: "Public moderation fixture",
+      visibility: "public",
+      joinPolicy: "open",
+      agentIds: [agentId],
+    },
+  });
+  assert.equal(publicMesh.response.status, 201);
+  const publicMeshId = publicMesh.json.mesh.id as string;
+  const publicTopicId = publicMesh.json.topic.id as string;
+  const publicPost = await requestJson(baseUrl, "/v1/agent/posts", {
+    method: "POST",
+    authorization: agentAuth,
+    idempotencyKey: "moderation-public-post",
+    body: { meshId: publicMeshId, topicId: publicTopicId, body: "A reportable observation." },
+  });
+  assert.equal(publicPost.response.status, 201);
+  const publicPostId = publicPost.json.post.id as string;
+
+  const ownerReport = await requestJson(baseUrl, `/v1/posts/${publicPostId}/report`, {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    body: { reason: "Owner review" },
+  });
+  assert.equal(ownerReport.response.status, 202);
+  assert.equal(ownerReport.json.state, "queued");
+
+  const steward = await register("moderation-steward@example.test", "Moderation Steward");
+  app.database.sqlite.prepare(
+    `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
+     VALUES(?, ?, 'steward', ?, ?)`,
+  ).run(publicMeshId, steward.id, app.database.now(), app.database.now());
+  const stewardReport = await requestJson(baseUrl, `/v1/posts/${publicPostId}/report`, {
+    method: "POST",
+    cookie: steward.cookie,
+    csrf: steward.csrf,
+    body: { reason: "Steward review" },
+  });
+  assert.equal(stewardReport.response.status, 202);
+
+  const outsider = await register("moderation-outsider@example.test", "Public Reader");
+  const outsiderReport = await requestJson(baseUrl, `/v1/posts/${publicPostId}/report`, {
+    method: "POST",
+    cookie: outsider.cookie,
+    csrf: outsider.csrf,
+    body: { reason: "Should be rejected" },
+  });
+  assert.equal(outsiderReport.response.status, 403);
+  assert.equal(outsiderReport.json.error.code, "mesh_governance_denied");
+
+  const privateMesh = await requestJson(baseUrl, "/v1/meshes", {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "moderation-private-mesh",
+    body: {
+      name: "Moderation private",
+      description: "Private moderation fixture",
+      visibility: "private",
+      joinPolicy: "invite_only",
+      agentIds: [agentId],
+    },
+  });
+  assert.equal(privateMesh.response.status, 201);
+  const privateMeshId = privateMesh.json.mesh.id as string;
+  const privateTopicId = privateMesh.json.topic.id as string;
+  const privatePost = await requestJson(baseUrl, "/v1/agent/posts", {
+    method: "POST",
+    authorization: agentAuth,
+    idempotencyKey: "moderation-private-post",
+    body: { meshId: privateMeshId, topicId: privateTopicId, body: "A private reportable observation." },
+  });
+  assert.equal(privatePost.response.status, 201);
+  const privatePostId = privatePost.json.post.id as string;
+  const observer = await register("moderation-observer@example.test", "Private Reader");
+  app.database.sqlite.prepare(
+    `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
+     VALUES(?, ?, 'observer', ?, ?)`,
+  ).run(privateMeshId, observer.id, app.database.now(), app.database.now());
+  const observerReport = await requestJson(baseUrl, `/v1/posts/${privatePostId}/report`, {
+    method: "POST",
+    cookie: observer.cookie,
+    csrf: observer.csrf,
+    body: { reason: "Observers cannot govern" },
+  });
+  assert.equal(observerReport.response.status, 403);
+  assert.equal(observerReport.json.error.code, "mesh_governance_denied");
+});
+
 test("expired native renewal recovers deterministically and fences stale retries", async () => {
   const { app, baseUrl } = await start();
   const keyPair = generateKeyPairSync("ed25519");
@@ -424,7 +603,7 @@ test("durable projection refresh updates an existing moderation state", async ()
 });
 
 test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event polling work end to end", async () => {
-  const { app, baseUrl } = await start();
+  const { app, baseUrl, clock } = await start();
   const keyPair = generateKeyPairSync("ed25519");
   const publicKey = keyPair.publicKey.export({ type: "spki", format: "pem" }).toString();
   const definitionDigest = "a".repeat(64);
@@ -581,6 +760,20 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
   assert.equal(connectedEvent.type, "agent.connected");
   const agentToken = claim.json.token as string;
   const agentAuth = `Bearer ${agentToken}`;
+  const lastSeenBeforeProbe = (app.database.sqlite
+    .prepare("SELECT last_seen_at FROM agent_sessions WHERE session_id = ?")
+    .get(claim.json.sessionId) as { last_seen_at: string }).last_seen_at;
+  clock.advance(1_000);
+  const sessionProbe = await requestJson(baseUrl, "/v1/agent/session", {
+    authorization: agentAuth,
+  });
+  assert.equal(sessionProbe.response.status, 200);
+  assert.equal(sessionProbe.json.sessionId, claim.json.sessionId);
+  assert.equal(sessionProbe.json.status, "online");
+  const lastSeenAfterProbe = (app.database.sqlite
+    .prepare("SELECT last_seen_at FROM agent_sessions WHERE session_id = ?")
+    .get(claim.json.sessionId) as { last_seen_at: string }).last_seen_at;
+  assert.equal(lastSeenAfterProbe, lastSeenBeforeProbe);
   const storedSession = app.database.sqlite
     .prepare("SELECT token_hash, expires_at FROM agent_sessions WHERE agent_id = ?")
     .get(claim.json.agent.id) as { token_hash: string; expires_at: string };
@@ -1065,6 +1258,35 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
     .filter((event: any) => event.type === "post.created" || event.type === "reply.created")
     .every((event: any) => event.topicId === topicId));
   assert.ok(events.json.nextAfter > 0);
+
+  const mentionPolicy = await requestJson(
+    baseUrl,
+    `/v1/agents/${claim.json.agent.id}/profile`,
+    {
+      method: "PUT",
+      cookie,
+      csrf,
+      body: { profile: { attention: { browse: "mentions" } } },
+    },
+  );
+  assert.equal(mentionPolicy.response.status, 200);
+  const mentionPost = await requestJson(baseUrl, "/v1/agent/posts", {
+    method: "POST",
+    authorization: agentAuth,
+    idempotencyKey: "post-bramble-mention-001",
+    body: { meshId: "mesh-public", topicId, body: "A note for @bramble-live and @2fast_agent." },
+  });
+  assert.equal(mentionPost.response.status, 201);
+  const mentions = await requestJson(baseUrl, "/v1/agent/events?after=0", {
+    authorization: agentAuth,
+  });
+  assert.equal(mentions.response.status, 200);
+  assert.ok(mentions.json.events.length > 0);
+  assert.ok(mentions.json.events.every((event: any) =>
+    Array.isArray(event.data?.mentionedHandles) &&
+    event.data.mentionedHandles.includes("bramble-live") &&
+    event.data.mentionedHandles.includes("2fast_agent"),
+  ));
 
   const noHumanPostRoute = await requestJson(baseUrl, "/v1/posts", {
     method: "POST",

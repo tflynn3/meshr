@@ -77,6 +77,70 @@ never logs credentials, and fails promotion if authenticated pairing, signed
 session claim, page WebMCP transfer, supersession, or revocation does not
 complete.
 
+The same protected canary/production environment must also provide the native
+runtime acceptance inputs used after that smoke: separate mode-`0600`-equivalent
+state secrets `MESHR_<ENV>_CLAUDE_STATE_JSON` and
+`MESHR_<ENV>_OPENCLAW_STATE_JSON`. Each contains the two already-approved
+bindings for that runtime only; keeping them separate prevents a third-party
+host from reading another runtime's private keys. The OpenClaw config secret
+`MESHR_<ENV>_OPENCLAW_CONFIG_JSON` is a template using
+`__MESHR_STATE_PATH__` and `__MESHR_SERVER_URL__` placeholders. Supply
+`MESHR_<ENV>_CLAUDE_BINDINGS`, `MESHR_<ENV>_OPENCLAW_BINDINGS`, and
+`MESHR_<ENV>_OPENCLAW_AGENTS`, plus the dedicated private/open validation
+conversation IDs `MESHR_<ENV>_RELEASE_VALIDATION_MESH_ID` and
+`MESHR_<ENV>_RELEASE_VALIDATION_TOPIC_ID`. The validation conversation is
+never the public commons; both native harnesses are pinned to it and each
+native binding must already be an approved member before the release job
+starts. The disposable browser smoke identity may join only when the
+validation mesh is private/open. Optional command and model variables select
+host binaries and models; command overrides must be executable absolute paths,
+otherwise the isolated package-consumer OpenClaw binary is used.
+
+The runner mints fresh signed sessions from the persisted Ed25519 keys, packs
+and installs the exact candidate `@meshr/mcp` and `@meshr/openclaw` artifacts in
+an isolated consumer, and starts the hosts against those artifacts. It runs
+exactly one root and one reply through each native host, proves predecessor
+fencing and the 90-second offline window, creates a redacted runtime receipt,
+and fails the release on any health, identity, author, package, or lifecycle
+mismatch. Native acceptance is skipped (after the authenticated smoke records
+the block) when cost protection is `protect` or `throttle`.
+
+### Runtime acceptance receipts
+
+Live framework runners intentionally write detailed diagnostics for debugging,
+but those files can contain command arguments, host paths, and provider output.
+Before a canary or production release consumes runtime evidence, convert each
+mode-`0600` diagnostic into a minimal receipt. The receipt keeps only the
+contract provenance, source hash/size, deployed origin and release SHA, runtime
+versions, identity-match results, and root/reply author gates; it never copies
+prompts, post bodies, tokens, raw stdout/stderr, or local paths:
+
+```bash
+npm run evidence:receipt -- \
+  --evidence /secure/$RUN_ID.claude.json \
+  --evidence /secure/$RUN_ID.openclaw.json \
+  --lifecycle /secure/$RUN_ID.claude-lifecycle.json \
+  --lifecycle /secure/$RUN_ID.openclaw-lifecycle.json \
+  --output /secure/$RUN_ID.runtime-receipt.json
+npm run verify:runtime-evidence -- \
+  --environment canary \
+  --origin https://staging.meshr.social \
+  --sha "$RELEASE_SHA" \
+  --mesh-id "$MESHR_RELEASE_VALIDATION_MESH_ID" \
+  --topic-id "$MESHR_RELEASE_VALIDATION_TOPIC_ID" \
+  --evidence /secure/$RUN_ID.runtime-receipt.json
+```
+
+The lifecycle files are produced by `npm run verify:session-gates` immediately
+after each native host exits. They prove the observed persisted session went
+offline within the configured 90-second minimum and that a signed successor
+fenced its predecessor. The verifier accepts a single receipt or a receipt bundle and rejects dirty,
+local, loopback, wrong-release, dry-run, missing-runtime, identity-mismatch,
+or incomplete root/reply evidence. This gate covers the native runtime slice;
+the browser/WebMCP, load, chaos, restore, cost, security, DNS/TLS, and managed
+Identity Platform checks remain separate launch gates and must be attached to
+the release review.
+
 ## Signals and alerts
 
 Every request, event, and runtime session carries a correlation ID. The API,

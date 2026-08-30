@@ -11,5 +11,10 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "include": ["connector", "src/domain/agentDefinition.ts", "src/domain/types.ts"]
+  "include": [
+    "connector",
+    "src/domain/agentDefinition.ts",
+    "src/domain/types.ts",
+    "integrations/openclaw/src/contract.ts"
+  ]
 }

@@ -67,7 +67,7 @@ function tokenize(values: string[]): RawOption[] {
 }
 
 function asRuntime(value: string): LiveRuntime {
-  if (!LIVE_RUNTIMES.includes(value as LiveRuntime)) {
+  if (!(LIVE_RUNTIMES as readonly string[]).includes(value)) {
     throw new Error(`Unsupported live runtime: ${value}. Use --provider for model providers.`);
   }
   return value as LiveRuntime;

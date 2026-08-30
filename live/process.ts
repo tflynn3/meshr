@@ -4,6 +4,39 @@ import type { ProcessEvidence } from "./types.ts";
 const MAX_CAPTURE_CHARACTERS = 256_000;
 const FORCE_KILL_GRACE_MS = 1_000;
 
+/**
+ * Native hosts receive only their explicit session configuration. In
+ * particular, never pass Meshr release/CI variables (which can contain
+ * pairing secrets, tokens, or provider credentials) through the host's
+ * inherited environment.
+ */
+export function nativeHostEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return Object.fromEntries(
+    Object.entries(environment).filter(([name]) => {
+      const normalized = name.toUpperCase();
+      return (
+        !normalized.startsWith("MESHR_") &&
+        !normalized.startsWith("MCP_") &&
+        ![
+          "MESHR",
+          "MCP",
+          "GITHUB_TOKEN",
+          "ACTIONS_RUNTIME_TOKEN",
+          "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+          "CLOUDSDK_AUTH_ACCESS_TOKEN",
+          "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+          "GOOGLE_APPLICATION_CREDENTIALS",
+          "GOOGLE_GHA_CREDS_PATH",
+          "NPM_TOKEN",
+          "NODE_AUTH_TOKEN",
+        ].includes(normalized)
+      );
+    }),
+  );
+}
+
 function appendBounded(
   current: string,
   chunk: Buffer | string,
@@ -37,7 +70,7 @@ export async function runProcess(input: {
     let forceKillTimer: NodeJS.Timeout | undefined;
     const child = spawn(input.command, input.args, {
       cwd: input.cwd,
-      env: input.env ?? process.env,
+      env: nativeHostEnvironment(input.env ?? process.env),
       stdio: ["ignore", "pipe", "pipe"],
     });
 

@@ -2,19 +2,9 @@ import { execFile } from "node:child_process";
 import { normalizeMeshrServerUrl } from "./api";
 import { verifyBindingSession } from "./profileSync";
 import { ConnectorStateStore } from "./state";
+import { MESHR_OPENCLAW_TOOL_ALLOWLIST } from "../integrations/openclaw/src/contract.ts";
 
-export const MESHR_OPENCLAW_TOOL_ALLOWLIST = [
-  "meshr_get_my_agent",
-  "meshr_reload_my_profile",
-  "meshr_discover_meshes",
-  "meshr_join_mesh",
-  "meshr_list_conversations",
-  "meshr_read_conversation",
-  "meshr_publish_post",
-  "meshr_reply_to_post",
-  "meshr_follow_conversation",
-  "meshr_observe_activity",
-] as const;
+export { MESHR_OPENCLAW_TOOL_ALLOWLIST } from "../integrations/openclaw/src/contract.ts";
 
 export interface OpenClawCommandResult {
   stdout: string;

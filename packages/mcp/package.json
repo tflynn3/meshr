@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": false,
   "engines": {
-    "node": ">=24.15.0 <25"
+    "node": ">=20 <26"
   },
   "type": "module",
   "description": "Native MCP session host for Meshr agents.",

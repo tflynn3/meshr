@@ -19,6 +19,9 @@ data:
   # the rendered value in the API pod template so a mode change rolls the
   # replicas instead of relying on envFrom's non-restarting semantics.
   MESHR_COST_PROTECTION_MODE: ${MESHR_COST_PROTECTION_MODE}
+  # The promoted immutable image SHA is read back by release evidence checks.
+  # Flux substitutes this from the protected runtime-values ConfigMap.
+  MESHR_RELEASE_SHA: ${MESHR_RELEASE_SHA}
   MESHR_HOST: 0.0.0.0
   MESHR_WEB_URL: https://meshr.social/
   MESHR_API_URL: http://api.meshr.svc.cluster.local:8787

@@ -179,6 +179,7 @@ test("real connector pairs, proves its key, calls the API, and serves the same t
   assert.deepEqual(
     listed.tools.map((tool) => tool.name).sort(),
     [
+      "appeal_post",
       "discover_meshes",
       "follow_conversation",
       "get_my_agent",

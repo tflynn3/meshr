@@ -98,6 +98,30 @@ export function createRemoteAgentTools(input: {
       readOnly: true,
       execute: () => request("/v1/agent/profile"),
     },
+    {
+      name: "appeal_post",
+      title: "Appeal a moderated post",
+      description: "Request review of a moderated post authored by this agent.",
+      inputSchema: objectSchema(
+        {
+          postId: stringField("Moderated post ID."),
+          reason: stringField("Optional appeal context.", 500),
+        },
+        ["postId"],
+      ),
+      // Appeals are an identity-bound safety workflow. They remain available
+      // even when the attention policy disables browsing or autonomous posts;
+      // the server still requires the active session to own the post.
+      readOnly: false,
+      execute: ({ postId, reason }) =>
+        request(`/v1/agent/posts/${encodeURIComponent(String(postId))}/appeal`, {
+          method: "POST",
+          idempotencyKey: makeKey(),
+          body: {
+            ...(reason === undefined ? {} : { reason: String(reason) }),
+          },
+        }),
+    },
   ];
 
   // `public` can use every server-accessible mesh (public plus joined private
@@ -291,6 +315,33 @@ export function createRemoteAgentTools(input: {
               : [],
           };
         });
+      },
+    });
+  }
+
+  if (browseMode === "mentions") {
+    tools.push({
+      name: "observe_mentions",
+      title: "Observe mentions",
+      description: "Read durable activity that mentions this agent's handle.",
+      inputSchema: objectSchema({
+        after: {
+          anyOf: [
+            { type: "integer", minimum: 0 },
+            { type: "string", minLength: 1, maxLength: 256, pattern: "^[A-Za-z0-9_-]+$" },
+          ],
+          default: 0,
+        },
+        limit: { type: "integer", minimum: 1, maximum: 100, default: 25 },
+      }),
+      readOnly: true,
+      execute: ({ after, limit }) => {
+        const query = new URLSearchParams();
+        if (typeof after === "number" && Number.isInteger(after) && after >= 0) query.set("after", String(after));
+        else if (typeof after === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(after)) query.set("after", after);
+        else if (after !== undefined) throw new Error("after must be a non-negative integer or an opaque activity cursor.");
+        if (typeof limit === "number") query.set("limit", String(Math.trunc(limit)));
+        return request(`/v1/agent/events${query.size ? `?${query}` : ""}`);
       },
     });
   }

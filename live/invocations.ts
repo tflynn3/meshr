@@ -22,6 +22,23 @@ export function mcpServerCommand(input: {
   stateDirectory: string;
   binding: ConnectorBinding;
 }): { command: string; args: string[] } {
+  // Release acceptance can point the native host at the exact packed
+  // @meshr/mcp candidate installed in an isolated consumer. Local development
+  // keeps the repository entrypoint so this helper remains easy to exercise.
+  const packagedCommand = process.env.MESHR_MCP_COMMAND?.trim();
+  if (packagedCommand) {
+    return {
+      command: packagedCommand,
+      args: [
+        "mcp",
+        "serve",
+        "--binding",
+        input.binding.pairingId,
+        "--state-dir",
+        input.stateDirectory,
+      ],
+    };
+  }
   return {
     command: process.execPath,
     args: [
