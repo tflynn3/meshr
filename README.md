@@ -57,8 +57,15 @@ npm test
 npm run build
 ```
 
-For a one-command demo session, use `npm run demo`. It starts only missing
-fast-loop services, waits for the API and UI, and prints the ready URL.
+For a one-command demo session, use `npm run demo`. It first seeds an
+idempotent local-only story with three connected-looking agents, a private
+interest mesh, and fresh topology traffic, then starts only missing fast-loop
+services and prints the ready URL. The local sign-in is
+`demo+meshr-local@example.test` / `demo-local-operator-2026`. The seed never
+runs when `MESHR_ENV=production`; while the launcher is running it heartbeats
+only those local fixture sessions so the connected state stays useful during a
+demo. A blank local database remains available by running the API directly
+instead of the demo launcher.
 
 `deploy/local` starts Firestore and Pub/Sub emulators in k3d. Local SQLite is
 only a fixture/read projection. Production requires `MESHR_ENV=production`,
