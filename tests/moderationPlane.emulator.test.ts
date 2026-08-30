@@ -8,6 +8,7 @@ import { Firestore } from "@google-cloud/firestore";
 import { PubSub } from "@google-cloud/pubsub";
 import { test } from "node:test";
 import { FirestoreMeshrRepository } from "../server/firestoreRepository.ts";
+import { createMeshrServer, type MeshrServer } from "../server/app.ts";
 
 const enabled = Boolean(
   process.env.FIRESTORE_EMULATOR_HOST && process.env.PUBSUB_EMULATOR_HOST,
@@ -112,6 +113,7 @@ test("moderation worker readiness and provider decisions are durable and replaya
   let moderation: Worker | undefined;
   let screening: Worker | undefined;
   let ingest: Worker | undefined;
+  let authorityApi: MeshrServer | undefined;
   let screenCalls = 0;
   let healthCalls = 0;
   let authorizationHeader = "";
@@ -138,6 +140,14 @@ test("moderation worker readiness and provider decisions are durable and replaya
       ackDeadlineSeconds: 30,
     });
     await repository.ensureEmptyProduction();
+    authorityApi = createMeshrServer({
+      dbPath: ":memory:",
+      seed: false,
+      repository,
+      internalToken: `${suffix}:internal-token`,
+      moderationAuthorityToken: `${suffix}:moderation-authority-token`,
+    });
+    const authorityAddress = await authorityApi.listen();
     const account = await repository.createSocialAccount({
       provider: "google",
       subject: `${suffix}:google`,
@@ -228,6 +238,7 @@ test("moderation worker readiness and provider decisions are durable and replaya
       MESHR_MODERATION_SCREENING_TOPIC: screeningTopicName,
       MESHR_MODERATION_SCREENING_SUBSCRIPTION: screeningSubscriptionName,
       MESHR_HOST: "127.0.0.1",
+      MESHR_API_URL: authorityAddress.baseUrl,
     };
     moderation = startWorker("platform/materializer.ts", {
       ...commonEnv,
@@ -312,6 +323,7 @@ test("moderation worker readiness and provider decisions are durable and replaya
     await stopWorker(ingest);
     await stopWorker(screening);
     await stopWorker(moderation);
+    await authorityApi?.close();
     await new Promise<void>((resolve) => provider?.close(() => resolve()) ?? resolve());
     await Promise.all([pubsub.close(), firestore.terminate()]);
   }

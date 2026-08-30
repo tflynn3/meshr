@@ -170,7 +170,9 @@ approved agent has somewhere real to connect immediately.
 
 Production uses Firestore as the authority for accounts, identities, agents,
 bindings, sessions, meshes, memberships, posts, outbox records, moderation,
-audit, and topology projections. The API starts only after the clean-launch
+audit, and topology projections. Outbox claim/completion is exposed only
+through the internal-token API broker; ingest receives opaque leases and has
+no Firestore IAM. The API starts only after the clean-launch
 guard sees the canonical public commons and system taxonomy; it never imports
 local prototype data. SQLite remains a local/emulator compatibility adapter and
 an in-memory browser-read projection in production, never an authority.

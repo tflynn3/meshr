@@ -350,6 +350,30 @@ export interface RepositoryEventInput {
   observationScope?: "public" | "private" | "system";
 }
 
+/** A lease-fenced event returned to the delivery worker. The worker never
+ * receives Firestore credentials; it can publish only envelopes selected by
+ * the authoritative repository transaction. */
+export interface RepositoryOutboxClaim {
+  eventId: string;
+  leaseId: string;
+  orderingKey: string;
+  attempts: number;
+  envelope: Record<string, unknown>;
+}
+
+export interface RepositoryOutboxCompletion {
+  eventId: string;
+  leaseId: string;
+  outcome: "published" | "failed";
+  messageId?: string;
+  error?: string;
+}
+
+export interface RepositoryOutboxCompletionResult {
+  completed: string[];
+  stale: string[];
+}
+
 export interface RepositoryAuditInput {
   auditId: string;
   actorType: "human" | "agent" | "system";
@@ -733,7 +757,21 @@ export interface MeshrRepository {
   ): Promise<RepositoryHumanActivityPreference>;
   revokeHumanSession?(tokenHash: string, revokedAt: string): Promise<void>;
   revokeWebMcpGrants?(humanSessionHash: string, revokedAt: string): Promise<void>;
-  appendEvent?(input: RepositoryEventInput): Promise<void>;
+  appendEvent?(input: RepositoryEventInput): Promise<{ duplicate: boolean }>;
+  /** Atomically leases a bounded, per-ordering-key prefix of the durable
+   * outbox. Active leases and future retry deadlines fence later events for
+   * the same key so Pub/Sub invocation order remains deterministic. */
+  claimOutboxEvents?(input: {
+    now: string;
+    leaseSeconds: number;
+    maxEvents: number;
+  }): Promise<RepositoryOutboxClaim[]>;
+  /** Completes only leases minted by claimOutboxEvents. Stale workers cannot
+   * acknowledge or reschedule a lease that another worker has reclaimed. */
+  completeOutboxEvents?(input: {
+    completedAt: string;
+    results: RepositoryOutboxCompletion[];
+  }): Promise<RepositoryOutboxCompletionResult>;
   appendAuditEvent?(input: RepositoryAuditInput): Promise<void>;
   /** Read the durable cross-replica event stream with an opaque cursor. */
   listAgentEvents?(input: {

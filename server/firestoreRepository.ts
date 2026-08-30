@@ -35,6 +35,9 @@ import type {
   RepositoryPostRecord,
   RepositoryTopicPostsPage,
   RepositoryEventInput,
+  RepositoryOutboxClaim,
+  RepositoryOutboxCompletion,
+  RepositoryOutboxCompletionResult,
   RepositoryAuditInput,
   RepositoryMutationArtifacts,
   RepositoryModerationCase,
@@ -275,6 +278,10 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     string,
     { expiresAt: number; projection: RepositoryActivityProjection }
   >();
+  /** Process-local discovery cursor only; marker documents remain the durable
+   * source of truth, so a restart safely resumes from the oldest page. */
+  private outboxReadyCursor: DocumentSnapshot | undefined;
+  private outboxLegacyDiscoveryAt = 0;
   // Snapshot documents are aggregate-only and safe to share across callers
   // in this API process. Caching by mesh (rather than by an account's entire
   // visible-mesh set) prevents private-directory polling from multiplying the
@@ -2015,13 +2022,13 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     });
   }
 
-  async appendEvent(input: RepositoryEventInput): Promise<void> {
+  async appendEvent(input: RepositoryEventInput): Promise<{ duplicate: boolean }> {
     // Every event, including governance/session events without an agent or
     // mesh, enters the same durable outbox. A single envelope contract lets
     // the independent audit/moderation/topology/notification consumers see
     // the same immutable event stream and gives operators one replay path.
     const outboxRef = this.doc("event_outbox", input.eventId);
-    await this.firestore.runTransaction(async (transaction) => {
+    return this.firestore.runTransaction(async (transaction) => {
       const existing = await transaction.get(outboxRef);
       if (existing.exists) {
         const stored = existing.get("envelope");
@@ -2032,10 +2039,256 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         // safe to recreate/merge on an idempotent retry without maintaining a
         // hot per-mesh head document.
         this.queueOutboxReady(transaction, input.eventId, input.meshId, input.occurredAt);
-        return;
+        return { duplicate: true };
       }
       transaction.create(outboxRef, this.eventOutboxDocument(input));
       this.queueOutboxReady(transaction, input.eventId, input.meshId, input.occurredAt);
+      return { duplicate: false };
+    });
+  }
+
+  async claimOutboxEvents(input: {
+    now: string;
+    leaseSeconds: number;
+    maxEvents: number;
+  }): Promise<RepositoryOutboxClaim[]> {
+    const nowMs = Date.parse(input.now);
+    if (!Number.isFinite(nowMs)) throw new Error("invalid_outbox_claim_time");
+    const maxEvents = Math.max(1, Math.min(200, Math.trunc(input.maxEvents)));
+    const leaseSeconds = Math.max(5, Math.min(120, Math.trunc(input.leaseSeconds)));
+    const readyCollection = this.firestore.collection(this.collection("event_outbox_ready"));
+    const outboxCollection = this.firestore.collection(this.collection("event_outbox"));
+
+    // Discovery is deliberately separate from claiming: these snapshots are
+    // hints only. Every lease is re-read and compare-and-set inside the
+    // repository transaction below. An oldest cursor provides backlog
+    // fairness while a newest probe keeps fresh writes below the propagation
+    // target during a long recovery.
+    let oldestQuery = readyCollection
+      .where("status", "in", ["pending", "failed", "processing"])
+      .orderBy("created_at", "asc")
+      .limit(500);
+    if (this.outboxReadyCursor) oldestQuery = oldestQuery.startAfter(this.outboxReadyCursor);
+    const [oldest, newest] = await Promise.all([
+      oldestQuery.get(),
+      readyCollection
+        .where("status", "in", ["pending", "failed", "processing"])
+        .orderBy("created_at", "desc")
+        .limit(200)
+        .get(),
+    ]);
+    this.outboxReadyCursor = oldest.docs.length >= 500 ? oldest.docs.at(-1) : undefined;
+    const orderingKeys = new Set<string>();
+    for (const marker of [...oldest.docs, ...newest.docs]) {
+      const key = marker.get("ordering_key");
+      const meshId = marker.get("mesh_id");
+      orderingKeys.add(typeof key === "string" && key ? key : typeof meshId === "string" && meshId ? meshId : "system");
+    }
+    // Drain pre-marker rows during a rolling deployment without putting this
+    // compatibility query on the one-second hot path forever.
+    if (Date.now() - this.outboxLegacyDiscoveryAt >= 10_000) {
+      this.outboxLegacyDiscoveryAt = Date.now();
+      const legacy = await outboxCollection
+        .where("status", "in", ["pending", "failed"])
+        .orderBy("created_at", "asc")
+        .limit(500)
+        .get();
+      for (const event of legacy.docs) {
+        const meshId = event.get("mesh_id");
+        orderingKeys.add(typeof meshId === "string" && meshId ? meshId : "system");
+      }
+    }
+    const keys = [...orderingKeys].slice(0, maxEvents);
+    if (!keys.length) return [];
+
+    const baseQuota = Math.floor(maxEvents / keys.length);
+    let remainder = maxEvents % keys.length;
+    const claimedByKey = await Promise.all(keys.map(async (orderingKey) => {
+      const keyLimit = baseQuota + (remainder-- > 0 ? 1 : 0);
+      const meshValue = orderingKey === "system" ? null : orderingKey;
+      return this.firestore.runTransaction(async (transaction) => {
+        const [readyCandidates, legacyCandidates] = await Promise.all([
+          transaction.get(
+            readyCollection
+              .where("ordering_key", "==", orderingKey)
+              .where("status", "in", ["pending", "failed", "processing"])
+              .orderBy("created_at", "asc")
+              .limit(keyLimit + 25),
+          ),
+          transaction.get(
+            outboxCollection
+              .where("mesh_id", "==", meshValue)
+              .where("status", "in", ["pending", "failed"])
+              .orderBy("created_at", "asc")
+              .limit(keyLimit + 25),
+          ),
+        ]);
+        const readyEvents = await Promise.all(readyCandidates.docs.map(async (ready) => ({
+          ready,
+          event: await transaction.get(outboxCollection.doc(ready.id)),
+        })));
+        const candidateById = new Map<string, { event: DocumentSnapshot; ready?: DocumentSnapshot }>();
+        for (const candidate of readyEvents) {
+          if (candidate.event.exists) candidateById.set(candidate.event.id, candidate);
+        }
+        for (const event of legacyCandidates.docs) {
+          if (!candidateById.has(event.id)) candidateById.set(event.id, { event });
+        }
+        const ordered = [...candidateById.values()].sort((left, right) =>
+          String(left.event.get("created_at") ?? "").localeCompare(String(right.event.get("created_at") ?? "")) ||
+          left.event.id.localeCompare(right.event.id)
+        );
+        const selected: Array<{ event: DocumentSnapshot; ready?: DocumentSnapshot; leaseId: string }> = [];
+        for (const candidate of ordered) {
+          const status = candidate.event.get("status");
+          if (status === "published") {
+            if (candidate.ready?.get("status") !== "published") {
+              transaction.set(candidate.ready!.ref, {
+                status: "published",
+                updated_at: input.now,
+              }, { merge: true });
+            }
+            continue;
+          }
+          const leaseUntil = candidate.event.get("lease_until") ?? candidate.ready?.get("lease_until");
+          if (leaseUntil && Date.parse(String(leaseUntil)) > nowMs) break;
+          const nextAttemptAt = candidate.event.get("next_attempt_at") ?? candidate.ready?.get("next_attempt_at");
+          if (nextAttemptAt && Date.parse(String(nextAttemptAt)) > nowMs) break;
+          selected.push({ ...candidate, leaseId: randomUUID() });
+          if (selected.length >= keyLimit) break;
+        }
+        const leaseUntil = new Date(nowMs + leaseSeconds * 1_000).toISOString();
+        for (const candidate of selected) {
+          transaction.update(candidate.event.ref, {
+            lease_id: candidate.leaseId,
+            lease_until: leaseUntil,
+            last_attempt_at: input.now,
+            completed_lease_id: null,
+          });
+          if (candidate.ready) transaction.set(candidate.ready.ref, {
+            status: "processing",
+            lease_id: candidate.leaseId,
+            lease_until: leaseUntil,
+            completed_lease_id: null,
+            updated_at: input.now,
+          }, { merge: true });
+        }
+        return selected.map((candidate): RepositoryOutboxClaim => {
+          const rawEnvelope = candidate.event.get("envelope");
+          if (!rawEnvelope || typeof rawEnvelope !== "object" || Array.isArray(rawEnvelope)) {
+            throw new Error("invalid_outbox_envelope");
+          }
+          return {
+            eventId: candidate.event.id,
+            leaseId: candidate.leaseId,
+            orderingKey,
+            attempts: Number(candidate.event.get("attempts") ?? 0),
+            envelope: rawEnvelope as Record<string, unknown>,
+          };
+        });
+      });
+    }));
+    return claimedByKey.flat().slice(0, maxEvents);
+  }
+
+  async completeOutboxEvents(input: {
+    completedAt: string;
+    results: RepositoryOutboxCompletion[];
+  }): Promise<RepositoryOutboxCompletionResult> {
+    const completedAtMs = Date.parse(input.completedAt);
+    if (!Number.isFinite(completedAtMs)) throw new Error("invalid_outbox_completion_time");
+    if (input.results.length > 200) throw new Error("outbox_completion_limit_exceeded");
+    const uniqueIds = new Set(input.results.map((result) => result.eventId));
+    if (uniqueIds.size !== input.results.length) throw new Error("duplicate_outbox_completion");
+    const outboxRefs = input.results.map((result) => this.doc("event_outbox", result.eventId));
+    const readyRefs = input.results.map((result) => this.doc("event_outbox_ready", result.eventId));
+    return this.firestore.runTransaction(async (transaction) => {
+      const [outboxSnapshots, readySnapshots] = await Promise.all([
+        Promise.all(outboxRefs.map((reference) => transaction.get(reference))),
+        Promise.all(readyRefs.map((reference) => transaction.get(reference))),
+      ]);
+      const completed: string[] = [];
+      const stale: string[] = [];
+      for (let index = 0; index < input.results.length; index += 1) {
+        const result = input.results[index]!;
+        const outbox = outboxSnapshots[index]!;
+        const ready = readySnapshots[index]!;
+        if (
+          outbox.exists && outbox.get("status") === "published" &&
+          result.outcome === "published" &&
+          outbox.get("completed_lease_id") === result.leaseId &&
+          outbox.get("pubsub_message_id") === result.messageId
+        ) {
+          completed.push(result.eventId);
+          continue;
+        }
+        if (
+          outbox.exists && outbox.get("status") === "failed" &&
+          result.outcome === "failed" &&
+          outbox.get("completed_lease_id") === result.leaseId &&
+          outbox.get("lease_id") == null
+        ) {
+          completed.push(result.eventId);
+          continue;
+        }
+        if (!outbox.exists || outbox.get("lease_id") !== result.leaseId || outbox.get("status") === "published") {
+          stale.push(result.eventId);
+          continue;
+        }
+        const attempts = Number(outbox.get("attempts") ?? 0) + 1;
+        if (result.outcome === "published") {
+          const retentionAt = Timestamp.fromMillis(completedAtMs + RAW_EVENT_RETENTION_SECONDS * 1_000);
+          transaction.update(outbox.ref, {
+            status: "published",
+            pubsub_message_id: result.messageId,
+            published_at: input.completedAt,
+            retention_at: retentionAt,
+            attempts,
+            last_error: null,
+            completed_lease_id: result.leaseId,
+            lease_id: null,
+            lease_until: null,
+            next_attempt_at: null,
+          });
+          if (ready.exists) transaction.set(ready.ref, {
+            status: "published",
+            published_at: input.completedAt,
+            retention_at: retentionAt,
+            attempts,
+            last_error: null,
+            completed_lease_id: result.leaseId,
+            lease_id: null,
+            lease_until: null,
+            next_attempt_at: null,
+            updated_at: input.completedAt,
+          }, { merge: true });
+        } else {
+          const retrySeconds = Math.min(600, 2 ** Math.min(Math.max(0, attempts - 1), 10));
+          const nextAttemptAt = new Date(completedAtMs + retrySeconds * 1_000).toISOString();
+          const error = (result.error ?? "pubsub_publish_failed").slice(0, 1_000);
+          transaction.update(outbox.ref, {
+            status: "failed",
+            attempts,
+            last_error: error,
+            next_attempt_at: nextAttemptAt,
+            completed_lease_id: result.leaseId,
+            lease_id: null,
+            lease_until: null,
+          });
+          if (ready.exists) transaction.set(ready.ref, {
+            status: "failed",
+            attempts,
+            last_error: error,
+            next_attempt_at: nextAttemptAt,
+            completed_lease_id: result.leaseId,
+            lease_id: null,
+            lease_until: null,
+            updated_at: input.completedAt,
+          }, { merge: true });
+        }
+        completed.push(result.eventId);
+      }
+      return { completed, stale };
     });
   }
 

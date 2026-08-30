@@ -45,6 +45,8 @@ spec:
               value: ${MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID}
             - name: MESHR_IDENTITY_API_KEY_FILE
               value: /var/run/secrets/meshr/identity-api-key
+            - name: MESHR_INTERNAL_TOKEN_FILE
+              value: /var/run/secrets/meshr/internal-token
             - name: MESHR_MODERATION_AUTHORITY_TOKEN_FILE
               value: /var/run/secrets/meshr-moderation/moderation-authority-token
             - name: MESHR_RENEWAL_RECOVERY_SECRET_FILE
@@ -161,14 +163,15 @@ spec:
         - name: ingest
           image: ${EVENT_PLANE_IMAGE}
           args: ["ingest"]
-          envFrom: [{configMapRef: {name: meshr-runtime}}]
           env:
+            - name: GOOGLE_CLOUD_PROJECT
+              valueFrom: {configMapKeyRef: {name: meshr-runtime, key: GOOGLE_CLOUD_PROJECT}}
+            - name: MESHR_EVENTS_TOPIC
+              valueFrom: {configMapKeyRef: {name: meshr-runtime, key: MESHR_EVENTS_TOPIC}}
+            - name: MESHR_API_URL
+              valueFrom: {configMapKeyRef: {name: meshr-runtime, key: MESHR_API_URL}}
             - name: MESHR_INTERNAL_TOKEN_FILE
               value: /var/run/secrets/meshr/internal-token
-            - name: MESHR_FIRESTORE_DATABASE
-              value: ${MESHR_FIRESTORE_DATABASE}
-            - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
-              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}

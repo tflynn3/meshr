@@ -10,6 +10,7 @@ const deployment = (source: string, name: string): string => source
 
 test("OpenTofu keeps delivery workers out of the authority Firestore grant", () => {
   const tofu = read("infra/opentofu/main.tf");
+  const ingest = read("platform/ingest.ts");
   const authorityGrant = tofu.match(
     /resource "google_project_iam_member" "worker_firestore" \{([\s\S]*?)\n\}/,
   )?.[1];
@@ -27,6 +28,13 @@ test("OpenTofu keeps delivery workers out of the authority Firestore grant", () 
   assert.match(tofu, /name\s+=\s+"meshr-canary-notifications"/);
   assert.match(tofu, /database\s+=\s+google_firestore_database\.audit\.name/);
   assert.match(tofu, /database\s+=\s+google_firestore_database\.notifications\.name/);
+  assert.doesNotMatch(tofu, /resource "google_project_iam_member" "ingest_firestore"/);
+  assert.doesNotMatch(tofu, /resource "google_project_iam_member" "ingest_canary_firestore"/);
+  assert.match(tofu, /resource "google_secret_manager_secret_iam_member" "api_internal_token"/);
+  assert.match(tofu, /resource "google_secret_manager_secret_iam_member" "api_canary_internal_token"/);
+  assert.doesNotMatch(ingest, /createFirestore/);
+  assert.match(ingest, /internal\/v1\/outbox\/claim/);
+  assert.match(ingest, /internal\/v1\/outbox\/complete/);
 });
 
 test("production manifests make dedicated worker databases explicit", () => {
@@ -97,13 +105,16 @@ test("screening workers use the token-authenticated moderation authority route",
   for (const source of [productionApi, productionScreening, canaryApi, canaryScreening]) {
     assert.ok(source, "the API and screening deployments must be present");
     assert.match(source, /MESHR_MODERATION_AUTHORITY_TOKEN_FILE/);
-    assert.doesNotMatch(source, /MESHR_INTERNAL_TOKEN_FILE/);
   }
+  for (const source of [productionApi, canaryApi]) assert.match(source, /MESHR_INTERNAL_TOKEN_FILE/);
+  for (const source of [productionScreening, canaryScreening]) assert.doesNotMatch(source, /MESHR_INTERNAL_TOKEN_FILE/);
   for (const source of [productionLive, canaryLive, productionIntake, canaryIntake]) {
     assert.ok(source, "the live and intake deployments must be present");
     assert.doesNotMatch(source, /MESHR_MODERATION_AUTHORITY_TOKEN_FILE/);
   }
   assert.match(productionIngest, /MESHR_INTERNAL_TOKEN_FILE/);
+  assert.doesNotMatch(productionIngest, /MESHR_FIRESTORE_DATABASE/);
+  assert.doesNotMatch(productionIngest, /MESHR_TOPOLOGY_FIRESTORE_DATABASE/);
   assert.doesNotMatch(productionLive, /meshr-event-secrets/);
   assert.doesNotMatch(canaryLive, /meshr-event-secrets-canary/);
 });

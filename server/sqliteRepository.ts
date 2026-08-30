@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { CURRENT_SCHEMA_VERSION, MeshrDatabase } from "./database.ts";
 import { MESHR_CONTRACT_MAJOR } from "./contracts.ts";
 import { MAX_TOPICS_PER_MESH } from "./repository.ts";
@@ -32,10 +32,13 @@ import type {
   RepositoryHumanActivityPreferencePatch,
   RepositoryMutationArtifacts,
   RepositoryEventInput,
+  RepositoryOutboxClaim,
+  RepositoryOutboxCompletion,
+  RepositoryOutboxCompletionResult,
   RepositoryAuditInput,
 } from "./repository.ts";
 import type { Clock, RuntimeKind, SocialProvider } from "./types.ts";
-import { systemClock } from "./types.ts";
+import { publicRuntimeKind, systemClock } from "./types.ts";
 import { constantTimeStringEqual, hmacSha256 } from "./security.ts";
 
 const HUMAN_IDLE_SECONDS = 12 * 60 * 60;
@@ -4219,6 +4222,206 @@ export class SqliteMeshrRepository implements MeshrRepository {
         post,
         reviewQueued: input.reviewQueued === true || newIdentityReview,
       };
+    });
+  }
+
+  async appendEvent(input: RepositoryEventInput): Promise<{ duplicate: boolean }> {
+    return this.database.transaction(() => {
+      const existing = this.db.prepare(
+        `SELECT type, mesh_id, topic_id, agent_id, session_id, runtime_kind,
+                payload_json, created_at
+         FROM outbox_events WHERE event_id = ?`,
+      ).get(input.eventId) as {
+        type: string;
+        mesh_id: string | null;
+        topic_id: string | null;
+        agent_id: string | null;
+        session_id: string | null;
+        runtime_kind: RuntimeKind | null;
+        payload_json: string;
+        created_at: string;
+      } | undefined;
+      const runtimeKind = input.runtimeKind == null ? null : publicRuntimeKind(input.runtimeKind);
+      if (existing) {
+        const same = existing.type === input.type && existing.mesh_id === input.meshId &&
+          existing.topic_id === input.topicId && existing.agent_id === input.agentId &&
+          existing.session_id === input.sessionId && existing.runtime_kind === runtimeKind &&
+          existing.created_at === input.occurredAt &&
+          JSON.stringify(JSON.parse(existing.payload_json) as unknown) === JSON.stringify(input.payload);
+        if (!same) throw new Error("event_id_conflict");
+        return { duplicate: true };
+      }
+      this.db.prepare(
+        `INSERT INTO outbox_events(
+           event_id, schema_version, type, mesh_id, topic_id, agent_id, session_id,
+           runtime_kind, payload_json, status, attempts, created_at
+         ) VALUES(?, 1, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)`,
+      ).run(
+        input.eventId,
+        input.type,
+        input.meshId,
+        input.topicId,
+        input.agentId,
+        input.sessionId,
+        runtimeKind,
+        JSON.stringify(input.payload),
+        input.occurredAt,
+      );
+      return { duplicate: false };
+    });
+  }
+
+  async claimOutboxEvents(input: {
+    now: string;
+    leaseSeconds: number;
+    maxEvents: number;
+  }): Promise<RepositoryOutboxClaim[]> {
+    const nowMs = Date.parse(input.now);
+    if (!Number.isFinite(nowMs)) throw new Error("invalid_outbox_claim_time");
+    const maxEvents = Math.max(1, Math.min(200, Math.trunc(input.maxEvents)));
+    const leaseSeconds = Math.max(5, Math.min(120, Math.trunc(input.leaseSeconds)));
+    return this.database.transaction(() => {
+      type Row = {
+        event_id: string;
+        type: string;
+        mesh_id: string | null;
+        topic_id: string | null;
+        agent_id: string | null;
+        session_id: string | null;
+        runtime_kind: RuntimeKind | null;
+        payload_json: string;
+        attempts: number;
+        created_at: string;
+        next_attempt_at: string | null;
+        lease_until: string | null;
+      };
+      const candidates = this.db.prepare(
+        `SELECT event_id, type, mesh_id, topic_id, agent_id, session_id,
+                runtime_kind, payload_json, attempts, created_at,
+                next_attempt_at, lease_until
+         FROM outbox_events
+         WHERE status IN ('pending', 'failed')
+         ORDER BY created_at ASC, event_id ASC
+         LIMIT 5000`,
+      ).all() as unknown as Row[];
+      const blockedKeys = new Set<string>();
+      const selected: Array<Row & { orderingKey: string; leaseId: string }> = [];
+      for (const row of candidates) {
+        const orderingKey = row.mesh_id ?? "system";
+        if (blockedKeys.has(orderingKey)) continue;
+        const leaseUntilMs = row.lease_until ? Date.parse(row.lease_until) : NaN;
+        const retryAtMs = row.next_attempt_at ? Date.parse(row.next_attempt_at) : NaN;
+        if (
+          (Number.isFinite(leaseUntilMs) && leaseUntilMs > nowMs) ||
+          (Number.isFinite(retryAtMs) && retryAtMs > nowMs)
+        ) {
+          blockedKeys.add(orderingKey);
+          continue;
+        }
+        selected.push({ ...row, orderingKey, leaseId: randomUUID() });
+        if (selected.length >= maxEvents) break;
+      }
+      const leaseUntil = new Date(nowMs + leaseSeconds * 1_000).toISOString();
+      const update = this.db.prepare(
+        `UPDATE outbox_events
+         SET lease_id = ?, lease_until = ?, last_attempt_at = ?, completed_lease_id = NULL
+         WHERE event_id = ? AND status IN ('pending', 'failed')`,
+      );
+      for (const row of selected) update.run(row.leaseId, leaseUntil, input.now, row.event_id);
+      return selected.map((row) => {
+        const raw = JSON.parse(row.payload_json) as unknown;
+        const payload = raw && typeof raw === "object" && !Array.isArray(raw)
+          ? raw as Record<string, unknown>
+          : { value: raw };
+        return {
+          eventId: row.event_id,
+          leaseId: row.leaseId,
+          orderingKey: row.orderingKey,
+          attempts: row.attempts,
+          envelope: {
+            event_id: row.event_id,
+            schema_version: 1,
+            mesh_id: row.mesh_id,
+            agent_id: row.agent_id,
+            session_id: row.session_id,
+            runtime_kind: row.runtime_kind == null ? null : publicRuntimeKind(row.runtime_kind),
+            type: row.type,
+            occurred_at: row.created_at,
+            payload: { ...(row.topic_id ? { topic_id: row.topic_id } : {}), ...payload },
+          },
+        };
+      });
+    });
+  }
+
+  async completeOutboxEvents(input: {
+    completedAt: string;
+    results: RepositoryOutboxCompletion[];
+  }): Promise<RepositoryOutboxCompletionResult> {
+    const completedAtMs = Date.parse(input.completedAt);
+    if (!Number.isFinite(completedAtMs)) throw new Error("invalid_outbox_completion_time");
+    return this.database.transaction(() => {
+      const completed: string[] = [];
+      const stale: string[] = [];
+      for (const result of input.results) {
+        const current = this.db.prepare(
+          `SELECT status, attempts, lease_id, completed_lease_id, pubsub_message_id
+           FROM outbox_events WHERE event_id = ?`,
+        ).get(result.eventId) as {
+          status: string;
+          attempts: number;
+          lease_id: string | null;
+          completed_lease_id: string | null;
+          pubsub_message_id: string | null;
+        } | undefined;
+        if (
+          current?.status === "published" && result.outcome === "published" &&
+          current.completed_lease_id === result.leaseId &&
+          current.pubsub_message_id === result.messageId
+        ) {
+          completed.push(result.eventId);
+          continue;
+        }
+        if (!current || current.lease_id !== result.leaseId || current.status === "published") {
+          stale.push(result.eventId);
+          continue;
+        }
+        const attempts = current.attempts + 1;
+        if (result.outcome === "published") {
+          this.db.prepare(
+            `UPDATE outbox_events
+             SET status = 'published', attempts = ?, published_at = ?,
+                 pubsub_message_id = ?, completed_lease_id = ?, last_error = NULL,
+                 next_attempt_at = NULL, lease_id = NULL, lease_until = NULL
+             WHERE event_id = ? AND lease_id = ?`,
+          ).run(
+            attempts,
+            input.completedAt,
+            result.messageId ?? null,
+            result.leaseId,
+            result.eventId,
+            result.leaseId,
+          );
+        } else {
+          const retrySeconds = Math.min(600, 2 ** Math.min(Math.max(0, attempts - 1), 10));
+          const nextAttemptAt = new Date(completedAtMs + retrySeconds * 1_000).toISOString();
+          this.db.prepare(
+            `UPDATE outbox_events
+             SET status = 'failed', attempts = ?, last_error = ?, next_attempt_at = ?,
+                 completed_lease_id = ?, lease_id = NULL, lease_until = NULL
+             WHERE event_id = ? AND lease_id = ?`,
+          ).run(
+            attempts,
+            (result.error ?? "pubsub_publish_failed").slice(0, 1_000),
+            nextAttemptAt,
+            result.leaseId,
+            result.eventId,
+            result.leaseId,
+          );
+        }
+        completed.push(result.eventId);
+      }
+      return { completed, stale };
     });
   }
 

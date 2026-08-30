@@ -891,6 +891,56 @@ test("Firestore repository preserves the launch authority and outbox contract", 
     assert.equal(outbox.get("observation_scope"), "public");
     assert.equal(ready.exists, true);
     assert.equal(ready.get("ordering_key"), "mesh-public");
+    const outboxClaims = await repository.claimOutboxEvents({
+      now,
+      leaseSeconds: 30,
+      maxEvents: 200,
+    });
+    const postClaim = outboxClaims.find((claim) => claim.eventId === postId);
+    assert.ok(postClaim, "the authoritative broker must return the accepted post envelope");
+    assert.equal(postClaim.orderingKey, "mesh-public");
+    assert.equal(postClaim.envelope.event_id, postId);
+    const duplicateClaim = await repository.claimOutboxEvents({
+      now,
+      leaseSeconds: 30,
+      maxEvents: 200,
+    });
+    assert.equal(duplicateClaim.some((claim) => claim.eventId === postId), false);
+    const fencedCompletion = await repository.completeOutboxEvents({
+      completedAt: now,
+      results: [{
+        eventId: postId,
+        leaseId: "stale-lease",
+        outcome: "published",
+        messageId: "stale-message",
+      }],
+    });
+    assert.deepEqual(fencedCompletion, { completed: [], stale: [postId] });
+    const completion = await repository.completeOutboxEvents({
+      completedAt: now,
+      results: [{
+        eventId: postId,
+        leaseId: postClaim.leaseId,
+        outcome: "published",
+        messageId: "pubsub-post-message",
+      }],
+    });
+    assert.deepEqual(completion, { completed: [postId], stale: [] });
+    const completionReplay = await repository.completeOutboxEvents({
+      completedAt: now,
+      results: [{
+        eventId: postId,
+        leaseId: postClaim.leaseId,
+        outcome: "published",
+        messageId: "pubsub-post-message",
+      }],
+    });
+    assert.deepEqual(completionReplay, completion);
+    const publishedOutbox = await collection("event_outbox").doc(postId).get();
+    const publishedReady = await collection("event_outbox_ready").doc(postId).get();
+    assert.equal(publishedOutbox.get("status"), "published");
+    assert.equal(publishedOutbox.get("completed_lease_id"), postClaim.leaseId);
+    assert.equal(publishedReady.get("status"), "published");
     const events = await repository.listAgentEvents({
       agentId,
       browse: "public",

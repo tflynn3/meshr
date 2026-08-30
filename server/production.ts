@@ -10,7 +10,6 @@ export interface ProductionSettings {
   renewalRecoveryPreviousSecret?: string;
   invitationPepper?: string;
   invitationPepperPrevious?: string;
-  eventIngestUrl?: string;
   internalToken?: string;
   moderationAuthorityToken?: string;
 }
@@ -42,7 +41,6 @@ export function productionSettings(
     renewalRecoveryPreviousSecret,
     invitationPepper,
     invitationPepperPrevious,
-    eventIngestUrl: process.env.MESHR_EVENT_INGEST_URL?.trim(),
     internalToken: process.env.MESHR_INTERNAL_TOKEN?.trim(),
     moderationAuthorityToken: process.env.MESHR_MODERATION_AUTHORITY_TOKEN?.trim(),
   };
@@ -70,7 +68,7 @@ export function assertProductionSettings(settings: ProductionSettings): void {
   if (!usable(settings.renewalRecoveryPreviousSecret)) missing.push("MESHR_RENEWAL_RECOVERY_SECRET_PREVIOUS");
   if (!usable(settings.invitationPepper)) missing.push("MESHR_INVITATION_PEPPER");
   if (!usable(settings.invitationPepperPrevious)) missing.push("MESHR_INVITATION_PEPPER_PREVIOUS");
-  if (!usable(settings.eventIngestUrl)) missing.push("MESHR_EVENT_INGEST_URL");
+  if (!usable(settings.internalToken)) missing.push("MESHR_INTERNAL_TOKEN");
   if (!usable(settings.moderationAuthorityToken)) missing.push("MESHR_MODERATION_AUTHORITY_TOKEN");
   if (missing.length) {
     throw new Error(

@@ -33,6 +33,7 @@ spec:
             - {name: MESHR_CUTOVER_VALIDATION_AGENT_ID, value: "${MESHR_CUTOVER_VALIDATION_AGENT_ID}"}
             - {name: MESHR_CUTOVER_VALIDATION_SESSION_ID, value: "${MESHR_CUTOVER_VALIDATION_SESSION_ID}"}
             - {name: MESHR_IDENTITY_API_KEY_FILE, value: /var/run/secrets/meshr/identity-api-key}
+            - {name: MESHR_INTERNAL_TOKEN_FILE, value: /var/run/secrets/meshr/internal-token}
             - {name: MESHR_MODERATION_AUTHORITY_TOKEN_FILE, value: /var/run/secrets/meshr-moderation/moderation-authority-token}
             - {name: MESHR_RENEWAL_RECOVERY_SECRET_FILE, value: /var/run/secrets/meshr/renewal-recovery}
             - {name: MESHR_RENEWAL_RECOVERY_SECRET_PREVIOUS_FILE, value: /var/run/secrets/meshr/renewal-recovery-previous}

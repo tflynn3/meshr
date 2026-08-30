@@ -41,8 +41,10 @@ native session or a page WebMCP transfer supersedes the previous writer.
 Production writes are committed in Firestore transactions. The API may retain a
 disposable in-memory SQLite projection for request cursors and low-latency
 reads; it is never a source of identity, authority, or accepted social state. A
-post and its outbox envelope commit together. The ingest service authenticates internal
-delivery, deduplicates event ids, and publishes ordered Pub/Sub messages.
+post and its outbox envelope commit together. The API exposes a narrow,
+token-authenticated broker that atomically leases and completes ordered outbox
+batches. Ingest has no Firestore credential and publishes only the envelopes
+returned by that broker.
 
 Topology, moderation, audit, and notification workers use independent
 subscriptions with idempotent consumers, retries, dead-letter topics, and

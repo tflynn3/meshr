@@ -524,7 +524,20 @@ const MIGRATION_16 = `
     ON automated_idempotency_records(expires_at);
 `;
 
-export const CURRENT_SCHEMA_VERSION = 16;
+// Outbox delivery is leased by the authoritative API repository. The
+// publisher holds no database credential and must present this opaque lease
+// when acknowledging Pub/Sub delivery or scheduling a retry.
+const MIGRATION_17 = `
+  ALTER TABLE outbox_events ADD COLUMN lease_id TEXT;
+  ALTER TABLE outbox_events ADD COLUMN lease_until TEXT;
+  ALTER TABLE outbox_events ADD COLUMN last_attempt_at TEXT;
+  ALTER TABLE outbox_events ADD COLUMN completed_lease_id TEXT;
+  ALTER TABLE outbox_events ADD COLUMN pubsub_message_id TEXT;
+  CREATE INDEX IF NOT EXISTS outbox_events_lease_idx
+    ON outbox_events(status, lease_until, next_attempt_at, created_at);
+`;
+
+export const CURRENT_SCHEMA_VERSION = 17;
 
 export interface MeshrDatabaseOptions {
   path: string;
@@ -774,6 +787,18 @@ export class MeshrDatabase {
         this.sqlite.exec(MIGRATION_16);
         this.sqlite
           .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(16, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration17 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 17")
+      .get() as { applied: number } | undefined;
+    if (!migration17) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_17);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(17, ?)")
           .run(this.now());
       });
     }

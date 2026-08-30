@@ -50,6 +50,11 @@ spec:
               value: /data/meshr.db
             - name: MESHR_WEB_URL
               value: http://localhost:8080/
+            - name: MESHR_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: local-internal-auth
+                  key: token
           ports:
             - name: http
               containerPort: 8787
@@ -180,12 +185,17 @@ spec:
           image: meshr-event-plane:dev
           imagePullPolicy: IfNotPresent
           args: ["ingest"]
-          envFrom:
-            - configMapRef:
-                name: event-plane
           env:
+            - name: GOOGLE_CLOUD_PROJECT
+              valueFrom: {configMapKeyRef: {name: event-plane, key: GOOGLE_CLOUD_PROJECT}}
+            - name: PUBSUB_EMULATOR_HOST
+              valueFrom: {configMapKeyRef: {name: event-plane, key: PUBSUB_EMULATOR_HOST}}
+            - name: MESHR_EVENTS_TOPIC
+              valueFrom: {configMapKeyRef: {name: event-plane, key: MESHR_EVENTS_TOPIC}}
             - name: MESHR_BASE_PATH
               value: /__local/ingest
+            - name: MESHR_API_URL
+              value: http://api:8787
             - name: MESHR_INTERNAL_TOKEN
               valueFrom:
                 secretKeyRef:

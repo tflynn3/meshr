@@ -589,10 +589,6 @@ resource "terraform_data" "launch_guard" {
 
   lifecycle {
     precondition {
-      condition     = !(var.launch_mode || var.manage_production_dns_records) || var.accept_worker_authority_database_risk
-      error_message = "launch_mode=true or manage_production_dns_records=true requires explicit accept_worker_authority_database_risk=true after the security owner reviews the database-scoped worker IAM boundary."
-    }
-    precondition {
       condition     = !(var.launch_mode || var.manage_production_dns_records) || var.accept_projection_marker_writer_risk
       error_message = "launch_mode=true or manage_production_dns_records=true requires explicit accept_projection_marker_writer_risk=true after the security owner reviews the topology marker-writer boundary, or a separately restricted attestation service/database."
     }
@@ -3014,28 +3010,6 @@ resource "google_pubsub_subscription_iam_member" "canary_moderation_screening_wo
   member       = "serviceAccount:${google_service_account.canary_worker["moderation_screening_worker"].email}"
 }
 
-resource "google_project_iam_member" "ingest_firestore" {
-  project = var.project_id
-  role    = "roles/datastore.user"
-  member  = "serviceAccount:${google_service_account.ingest.email}"
-  condition {
-    title       = "ingest-authority-database"
-    description = "Production ingest can access only the authority Firestore database."
-    expression  = local.authority_firestore_iam_expression
-  }
-}
-
-resource "google_project_iam_member" "ingest_canary_firestore" {
-  project = var.project_id
-  role    = "roles/datastore.user"
-  member  = "serviceAccount:${google_service_account.ingest_canary.email}"
-  condition {
-    title       = "canary-ingest-firestore-database"
-    description = "Canary ingest can access only the isolated canary Firestore database."
-    expression  = "resource.name == 'projects/${var.project_id}/databases/meshr-canary'"
-  }
-}
-
 resource "google_pubsub_topic_iam_member" "ingest_publisher" {
   project = var.project_id
   topic   = google_pubsub_topic.events.name
@@ -3425,6 +3399,13 @@ resource "google_secret_manager_secret_iam_member" "api_identity_api_key" {
   member    = "serviceAccount:${google_service_account.api.email}"
 }
 
+resource "google_secret_manager_secret_iam_member" "api_internal_token" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.internal_token.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.api.email}"
+}
+
 resource "google_secret_manager_secret_iam_member" "api_moderation_authority_token" {
   project   = var.project_id
   secret_id = google_secret_manager_secret.moderation_authority_token.secret_id
@@ -3470,6 +3451,13 @@ resource "google_secret_manager_secret_iam_member" "api_invitation_pepper_previo
 resource "google_secret_manager_secret_iam_member" "api_canary_identity_api_key" {
   project   = var.project_id
   secret_id = google_secret_manager_secret.canary_identity_api_key.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.api_canary.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "api_canary_internal_token" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.canary_internal_token.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.api_canary.email}"
 }

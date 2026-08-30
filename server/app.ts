@@ -62,11 +62,13 @@ import type {
   RepositoryHumanActivityPreferencePatch,
   RepositoryMeshGovernancePatch,
   RepositoryEventInput,
+  RepositoryOutboxCompletion,
   RepositoryAuditInput,
   RepositoryWebMcpGrant,
 } from "./repository.ts";
 import type { RepositoryAccount, RepositoryPostInput } from "./firestoreRepository.ts";
 import { SqliteMeshrRepository } from "./sqliteRepository.ts";
+import { parseEventEnvelope } from "../platform/eventEnvelope.ts";
 
 const HUMAN_SESSION_SECONDS = 7 * 24 * 60 * 60;
 const HUMAN_IDLE_SECONDS = 12 * 60 * 60;
@@ -220,7 +222,7 @@ export interface MeshrServerOptions {
   invitationPepper?: string;
   /** Immediately previous invitation pepper retained during rotation. */
   invitationPepperPrevious?: string;
-  /** Legacy/local service token for the SQLite outbox fixture. */
+  /** Narrow service token used by the outbox delivery broker. */
   internalToken?: string;
   /** Dedicated token for automated moderation authority calls. */
   moderationAuthorityToken?: string;
@@ -1105,6 +1107,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       ? authorization.replace(/^Bearer\s+/i, "").trim()
       : "";
     if (!moderationAuthorityToken || !supplied || !constantTimeStringEqual(supplied, moderationAuthorityToken)) {
+      throw new ApiError(401, "internal_authentication_required", "A Meshr service token is required.");
+    }
+  };
+  const requireInternalService = (request: IncomingMessage): void => {
+    const authorization = request.headers.authorization;
+    const supplied = typeof authorization === "string"
+      ? authorization.replace(/^Bearer\s+/i, "").trim()
+      : "";
+    if (!internalToken || !supplied || !constantTimeStringEqual(supplied, internalToken)) {
       throw new ApiError(401, "internal_authentication_required", "A Meshr service token is required.");
     }
   };
@@ -4953,6 +4964,127 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           error instanceof Error ? error.message : "The Meshr dependencies are unavailable.",
         );
       }
+    }
+
+    // Delivery workers deliberately hold no Firestore credential. This
+    // token-authenticated broker is the only path that can lease and complete
+    // authoritative outbox rows, so a compromised publisher can emit only
+    // envelopes selected by the repository and cannot read any other state.
+    if (path === "/internal/v1/outbox/events" || path === "/internal/v1/outbox/claim" || path === "/internal/v1/outbox/complete") {
+      if (method !== "POST") throw new ApiError(404, "not_found", "Route not found.");
+      requireInternalService(request);
+      if (!roleInvitationStore.appendEvent || !roleInvitationStore.claimOutboxEvents || !roleInvitationStore.completeOutboxEvents) {
+        throw new ApiError(503, "outbox_store_unavailable", "The authoritative outbox is unavailable.");
+      }
+
+      if (path.endsWith("/events")) {
+        let envelope;
+        try {
+          envelope = parseEventEnvelope(await readJson(request), new Date(database.now()));
+        } catch (error) {
+          if (error instanceof ApiError) throw error;
+          const message = error instanceof Error ? error.message : "Event envelope is invalid.";
+          throw new ApiError(
+            message.startsWith("event_payload_too_large:") ? 413 : 400,
+            message.startsWith("event_payload_too_large:") ? "event_payload_too_large" : "invalid_event",
+            message,
+          );
+        }
+        const payload = envelope.payload as Record<string, unknown>;
+        const mesh = envelope.mesh_id && roleInvitationStore.findMeshById
+          ? await roleInvitationStore.findMeshById(envelope.mesh_id)
+          : null;
+        try {
+          const result = await roleInvitationStore.appendEvent({
+            eventId: envelope.event_id,
+            type: envelope.type,
+            meshId: envelope.mesh_id,
+            topicId: typeof payload.topic_id === "string" ? payload.topic_id : null,
+            agentId: envelope.agent_id,
+            sessionId: envelope.session_id ?? null,
+            runtimeKind: envelope.runtime_kind as RuntimeKind | null,
+            payload,
+            occurredAt: envelope.occurred_at,
+            observationScope: envelope.mesh_id == null
+              ? "system"
+              : mesh?.visibility === "public" ? "public" : "private",
+          });
+          return {
+            status: result.duplicate ? 200 : 202,
+            body: { accepted: true, duplicate: result.duplicate, event_id: envelope.event_id },
+          };
+        } catch (error) {
+          if (error instanceof Error && error.message === "event_id_conflict") {
+            throw new ApiError(409, "event_id_conflict", "That event ID already identifies a different event.");
+          }
+          throw error;
+        }
+      }
+
+      if (path.endsWith("/claim")) {
+        const input = asObject(await readJson(request), "outbox claim request");
+        for (const field of Object.keys(input)) {
+          if (field !== "maxEvents" && field !== "leaseSeconds") {
+            throw new ApiError(400, "invalid_request", `${field} is not allowed.`);
+          }
+        }
+        const maxEvents = input.maxEvents === undefined ? 200 : Number(input.maxEvents);
+        const leaseSeconds = input.leaseSeconds === undefined ? 30 : Number(input.leaseSeconds);
+        if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > 200) {
+          throw new ApiError(400, "invalid_request", "maxEvents must be an integer from 1 to 200.");
+        }
+        if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 5 || leaseSeconds > 120) {
+          throw new ApiError(400, "invalid_request", "leaseSeconds must be an integer from 5 to 120.");
+        }
+        const claims = await roleInvitationStore.claimOutboxEvents({
+          now: database.now(),
+          maxEvents,
+          leaseSeconds,
+        });
+        return { body: { claims } };
+      }
+
+      const input = asObject(await readJson(request), "outbox completion request");
+      for (const field of Object.keys(input)) {
+        if (field !== "results") throw new ApiError(400, "invalid_request", `${field} is not allowed.`);
+      }
+      if (!Array.isArray(input.results) || input.results.length < 1 || input.results.length > 200) {
+        throw new ApiError(400, "invalid_request", "results must contain 1 to 200 completions.");
+      }
+      const seen = new Set<string>();
+      const results = input.results.map((raw, index): RepositoryOutboxCompletion => {
+        const result = asObject(raw, `results[${index}]`);
+        for (const field of Object.keys(result)) {
+          if (!new Set(["eventId", "leaseId", "outcome", "messageId", "error"]).has(field)) {
+            throw new ApiError(400, "invalid_request", `results[${index}].${field} is not allowed.`);
+          }
+        }
+        const idPattern = /^[A-Za-z0-9._:-]{1,256}$/;
+        const eventId = requiredString(result, "eventId", { max: 128, pattern: idPattern });
+        const leaseId = requiredString(result, "leaseId", { max: 128, pattern: idPattern });
+        if (seen.has(eventId)) throw new ApiError(400, "invalid_request", "Each event may be completed once per request.");
+        seen.add(eventId);
+        if (result.outcome !== "published" && result.outcome !== "failed") {
+          throw new ApiError(400, "invalid_request", `results[${index}].outcome is invalid.`);
+        }
+        const messageId = optionalString(result, "messageId", 256);
+        const error = optionalString(result, "error", 1_000);
+        if (result.outcome === "published" && !messageId) {
+          throw new ApiError(400, "invalid_request", `results[${index}].messageId is required.`);
+        }
+        return {
+          eventId,
+          leaseId,
+          outcome: result.outcome,
+          ...(messageId ? { messageId } : {}),
+          ...(error ? { error } : {}),
+        };
+      });
+      const outcome = await roleInvitationStore.completeOutboxEvents({
+        completedAt: database.now(),
+        results,
+      });
+      return { body: outcome };
     }
 
     // Automated screening is an event-worker capability, not a second
