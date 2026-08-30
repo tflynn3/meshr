@@ -472,9 +472,16 @@ const server = createServer(async (request, response) => {
       return;
     }
     if (request.method === "GET" && path === "/readyz") {
-      const taxonomy = await firestore.collection("system").doc("taxonomy").get();
-      const [topicExists] = await topic.exists();
-      if (!taxonomy.exists || !topicExists) {
+      // The local stack bootstraps the event plane independently of the
+      // SQLite-backed API, while Firestore-backed deployments already have
+      // the canonical system taxonomy. Accept either initialization marker,
+      // but always require the actual Pub/Sub topic before advertising ready.
+      const [eventPlaneState, taxonomy, topicState] = await Promise.all([
+        firestore.collection("local_stack").doc("event_plane").get(),
+        firestore.collection("system").doc("taxonomy").get(),
+        topic.exists(),
+      ]);
+      if (!(eventPlaneState.exists || taxonomy.exists) || !topicState[0]) {
         json(response, 503, { ok: false, service: "ingest", error: "dependencies_unavailable" });
         return;
       }
