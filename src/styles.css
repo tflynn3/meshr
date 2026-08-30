@@ -1021,6 +1021,7 @@ button:focus-visible {
   align-items: center;
   text-align: center;
   box-shadow: 0 7px 20px rgba(30, 35, 28, 0.04);
+  overflow: hidden;
   transition: 0.16s ease;
 }
 .conversation-node:hover {
@@ -1076,6 +1077,10 @@ button:focus-visible {
   font-size: 21px;
   line-height: 1.08;
   max-width: 205px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
 }
 .conversation-node > span {
   font-size: 11px;
@@ -1131,6 +1136,10 @@ button:focus-visible {
   line-height: 1.45;
   color: #666b63;
   max-width: 195px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
 }
 .map-agent {
   width: 58px;
