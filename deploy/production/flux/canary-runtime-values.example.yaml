@@ -14,6 +14,9 @@ data:
   MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN: "1"
   MESHR_DATABASE_CUTOVER_MODE: off
   MESHR_CUTOVER_VALIDATION_MESH_ID: validation-mesh-id
+  MESHR_CUTOVER_VALIDATION_BINDING_ID: validation-binding-id
+  MESHR_CUTOVER_VALIDATION_AGENT_ID: validation-agent-id
+  MESHR_CUTOVER_VALIDATION_SESSION_ID: validation-session-id
   MESHR_MODERATION_ENDPOINT: https://moderation.example.invalid/screen
   MESHR_MODERATION_HEALTHCHECK_URL: https://moderation.example.invalid/healthz
   MESHR_MODERATION_AUDIENCE: https://moderation.example.invalid

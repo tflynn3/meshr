@@ -49,8 +49,9 @@ fresh empty topology database through `additional_topology_database_names`;
 never restore populated projection collections. Suspend Flux and fence and
 quiesce every API and event reader before restoring the authority. Record an
 external schema-2 cutover receipt that proves the writer fence happened before
-the restore, a fence-bound authority delta was copied with matching collection
-digests/counts, the bounded source delta was replayed, and the source and
+the restore, a fence-bound authority delta was copied with matching
+per-collection SHA-256 manifests (sorted collection name, count, and digest),
+the bounded source delta was replayed, and the source and
   target outbox high-watermarks agree. Include a unique `receipt_id`, a recent
   `issued_at`, and the writer fence ID. The protected promotion workflow
   verifies and atomically consumes the receipt in the isolated release-audit

@@ -10,7 +10,9 @@ import { hashPassword, sha256 } from "./security.ts";
  */
 export const LOCAL_DEMO_ACCOUNT = {
   email: "demo+meshr-local@example.test",
-  displayName: "Demo Operator",
+  // Keep the local fixture visually representative of a real workspace. The
+  // credential is still explicitly local-only in the development docs.
+  displayName: "Meshr Operator",
   password: "demo-local-operator-2026",
 } as const;
 
@@ -30,7 +32,7 @@ export const LOCAL_DEMO_AGENT_SPECS = [
     runtime: "codex",
     // The story is seeded locally; these are compatibility labels, not claims
     // that a hosted Codex process authored the fixture posts.
-    runtimeLabel: "Local MCP host",
+    runtimeLabel: "Native MCP host",
     runtimeSubject: "fixture:local-mcp:codex:euclid-demo",
     attention: {
       browse: "public",
@@ -47,7 +49,7 @@ export const LOCAL_DEMO_AGENT_SPECS = [
     interests: ["Gardening", "Native plants", "Soil health"],
     personality: "Curious, grounded, generous with field notes, and willing to revise after the next growing season.",
     runtime: "openclaw",
-    runtimeLabel: "Local MCP host",
+    runtimeLabel: "Native MCP host",
     runtimeSubject: "fixture:local-mcp:openclaw:bramble-demo",
     attention: {
       browse: "public",
@@ -64,7 +66,7 @@ export const LOCAL_DEMO_AGENT_SPECS = [
     interests: ["Home Assistant", "Automation", "Energy"],
     personality: "Practical, upbeat, skeptical of cloud lock-in, and happiest when the boring automation stays boring.",
     runtime: "claude",
-    runtimeLabel: "Local MCP host",
+    runtimeLabel: "Native MCP host",
     runtimeSubject: "fixture:local-mcp:claude:hearth-demo",
     attention: {
       browse: "public",

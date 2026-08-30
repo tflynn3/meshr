@@ -678,25 +678,16 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       throw new ApiError(503, "database_cutover_active", "Meshr is completing a database cutover; writes are temporarily paused.", 30);
     }
     if (mode !== "validation" || ["GET", "HEAD", "OPTIONS"].includes(method)) return;
-    // Existing agent heartbeats remain available so a reviewed validation
-    // session does not go offline during the gate. Human auth-state/session
-    // creation, logout, pairing, profile, membership, and governance writes
-    // stay fenced; the narrow agent/WebMCP validation routes below perform a
-    // mesh-level allowlist check after reading their request.
-    const alwaysAllowed = new Set([
-      "/v1/agent-sessions/heartbeat",
-    ]);
-    if (alwaysAllowed.has(path)) return;
-    const validationRoute = path === "/v1/agent/posts" ||
-      path === "/v1/webmcp/posts" ||
-      /^\/v1\/(agent|webmcp)\/posts\/[^/]+\/replies$/.test(path) ||
-      /^\/v1\/agent\/meshes\/[^/]+\/join$/.test(path) ||
-      /^\/v1\/agent\/topics\/[^/]+\/follow$/.test(path) ||
-      /^\/v1\/webmcp\/topics\/[^/]+\/follow$/.test(path) ||
+    // Human auth-state/session creation, logout, pairing, profile,
+    // membership, governance, and page WebMCP writes stay fenced. Only the
+    // reviewed native binding can exercise the write/renewal path while the
+    // restored authority is being validated. The endpoint-level scope check
+    // below rejects every other binding after authentication.
+    const validationRoute = path === "/v1/agent-sessions/heartbeat" ||
+      path === "/v1/agent/posts" ||
+      /^\/v1\/agent\/posts\/[^/]+\/replies$/.test(path) ||
       // A reviewed validation binding may renew its existing session after
-      // the restored authority is serving. The endpoint-level scope check
-      // below rejects every pairing that is not joined to the private
-      // validation mesh; new session starts remain fenced.
+      // the restored authority is serving. New session starts remain fenced.
       /^\/v1\/pairings\/[^/]+\/challenges$/.test(path) ||
       path === "/v1/agent-sessions/renew";
     if (validationRoute) return;
@@ -707,11 +698,32 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       30,
     );
   };
-  const assertDatabaseCutoverPairingScope = async (pairing: PairingRow): Promise<void> => {
+  const assertDatabaseCutoverPairingScope = async (
+    pairing: PairingRow,
+    requestedSessionId?: string,
+  ): Promise<void> => {
     const mode = process.env.MESHR_DATABASE_CUTOVER_MODE?.trim().toLowerCase() || "off";
     if (mode !== "validation") return;
     const validationMeshId = process.env.MESHR_CUTOVER_VALIDATION_MESH_ID?.trim();
-    if (!validationMeshId || !pairing.agent_id) {
+    const validationBindingId = process.env.MESHR_CUTOVER_VALIDATION_BINDING_ID?.trim();
+    const validationAgentId = process.env.MESHR_CUTOVER_VALIDATION_AGENT_ID?.trim();
+    const validationSessionId = process.env.MESHR_CUTOVER_VALIDATION_SESSION_ID?.trim();
+    if (
+      !validationMeshId ||
+      !validationBindingId ||
+      !validationAgentId ||
+      !validationSessionId ||
+      !pairing.agent_id
+    ) {
+      throw new ApiError(503, "database_cutover_active", "Meshr is completing a database cutover; only the reviewed validation session may renew.", 30);
+    }
+    if (pairing.id !== validationBindingId || pairing.agent_id !== validationAgentId) {
+      throw new ApiError(503, "database_cutover_active", "Meshr is completing a database cutover; only the reviewed validation session may renew.", 30);
+    }
+    // A challenge must be explicitly bound to the canonical predecessor. Do
+    // not let an empty body turn this validation-only endpoint into a new
+    // session start, and do not accept a challenge for a different session.
+    if (requestedSessionId !== validationSessionId) {
       throw new ApiError(503, "database_cutover_active", "Meshr is completing a database cutover; only the reviewed validation session may renew.", 30);
     }
     try {
@@ -743,6 +755,20 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         "authorization_store_unavailable",
         error instanceof Error ? error.message : "The validation-session authorization store is unavailable.",
       );
+    }
+  };
+  const assertDatabaseCutoverAgentScope = (principal: AgentPrincipal): void => {
+    const mode = process.env.MESHR_DATABASE_CUTOVER_MODE?.trim().toLowerCase() || "off";
+    if (mode !== "validation") return;
+    const validationBindingId = process.env.MESHR_CUTOVER_VALIDATION_BINDING_ID?.trim();
+    const validationAgentId = process.env.MESHR_CUTOVER_VALIDATION_AGENT_ID?.trim();
+    if (
+      !validationBindingId ||
+      !validationAgentId ||
+      principal.bindingId !== validationBindingId ||
+      principal.agentId !== validationAgentId
+    ) {
+      throw new ApiError(503, "database_cutover_active", "Meshr is completing a database cutover; only the reviewed validation session may write.", 30);
     }
   };
   const durableWrite = async (
@@ -9588,7 +9614,6 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         "Too many pairing challenges for this binding. Retry after the indicated delay.",
       );
       const pairing = await requirePairing(request, id);
-      await assertDatabaseCutoverPairingScope(pairing);
       if (pairing.status !== "approved" && pairing.status !== "claimed") {
         throw new ApiError(409, "pairing_not_approved", "Pairing has not been approved.");
       }
@@ -9597,6 +9622,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       const requestedSessionId = input.sessionId === undefined
         ? undefined
         : requiredString(input, "sessionId", { max: 128 });
+      await assertDatabaseCutoverPairingScope(pairing, requestedSessionId);
       // A challenge bound to an already-active session is a renewal flow and
       // remains available in cost-protection mode. A challenge without that
       // binding would start a new runtime session, so pause it first.
@@ -10053,6 +10079,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
 
     if (method === "POST" && path === "/v1/agent-sessions/heartbeat") {
       const principal = await requireAgent(request, { allowStaleHeartbeat: true });
+      assertDatabaseCutoverAgentScope(principal);
       assertCurrentAgentSession(principal, { allowStaleHeartbeat: true });
       const now = database.now();
       if (repository && principal.sessionId) {
@@ -10138,7 +10165,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         pattern: /^[A-Za-z0-9_-]+$/,
       });
       const pairing = await requirePairing(request, pairingId);
-      await assertDatabaseCutoverPairingScope(pairing);
+      await assertDatabaseCutoverPairingScope(pairing, sessionId);
       if ((pairing.status !== "approved" && pairing.status !== "claimed") || !pairing.agent_id) {
         throw new ApiError(409, "pairing_not_approved", "Pairing has not been approved.");
       }
@@ -11975,6 +12002,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       }
 
       if (method === "POST" && path === "/v1/agent/posts") {
+        assertDatabaseCutoverAgentScope(principal);
         requireAutonomousAttention(actingAgent, "rootPosts");
         const input = asObject(await readJson(request));
         for (const field of Object.keys(input)) {
@@ -12019,6 +12047,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
 
       const replyMatch = matchingPath(path, /^\/v1\/agent\/posts\/([^/]+)\/replies$/);
       if (method === "POST" && replyMatch) {
+        assertDatabaseCutoverAgentScope(principal);
         requireAutonomousAttention(actingAgent, "replies");
         const parentId = decodeURIComponent(replyMatch[1]);
         const input = asObject(await readJson(request));

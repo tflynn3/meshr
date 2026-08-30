@@ -65,7 +65,7 @@ function documentId(environment: string, generation: string): string {
   return `${ENVELOPE_DOCUMENT_PREFIX}${safeEnvironment}_${safeGeneration}`.slice(0, 1_500);
 }
 
-async function getCurrent(outputPath: string, generationOutputPath?: string): Promise<void> {
+export async function getCurrent(outputPath: string, generationOutputPath?: string): Promise<void> {
   // Always clear the requested output before reading the pointer. A reused
   // runner or a failed lookup must never leave an older encrypted envelope in
   // place for the caller to mistake for the current fixture.
@@ -114,7 +114,7 @@ async function getCurrent(outputPath: string, generationOutputPath?: string): Pr
   }
 }
 
-async function putStaged(inputPath: string, generation: string): Promise<void> {
+export async function putStaged(inputPath: string, generation: string): Promise<void> {
   const bytes = await readFile(resolve(inputPath));
   if (bytes.length === 0 || bytes.length > MAX_ENVELOPE_BYTES) {
     throw new Error("Protected fixture envelope has an invalid size.");
@@ -158,7 +158,7 @@ async function putStaged(inputPath: string, generation: string): Promise<void> {
   }
 }
 
-async function promote(inputGeneration: string, expectedGeneration: string): Promise<void> {
+export async function promote(inputGeneration: string, expectedGeneration: string): Promise<void> {
   const environment = environmentName();
   const firestore = new Firestore({ projectId: projectId(), databaseId: databaseName(environment) });
   const pointerRef = firestore.collection(COLLECTION).doc(POINTER_DOCUMENT);
@@ -173,6 +173,24 @@ async function promote(inputGeneration: string, expectedGeneration: string): Pro
       const currentGeneration = pointer.exists ? pointer.get("generation") : "";
       if (typeof currentGeneration !== "string") {
         throw new Error("Protected fixture pointer is malformed.");
+      }
+      // A lost response after a successful promotion is safe to retry. Keep
+      // the CAS guard for every other pointer value, but treat the requested
+      // generation already being current as an idempotent success after
+      // validating that the pointer still targets the expected envelope.
+      if (currentGeneration === inputGeneration) {
+        if (pointer.get("envelope_document") !== envelopeDocument) {
+          throw new Error("Protected fixture pointer is malformed.");
+        }
+        const currentEnvelope = await transaction.get(envelopeRef);
+        if (
+          !currentEnvelope.exists ||
+          currentEnvelope.get("environment") !== environment ||
+          currentEnvelope.get("generation") !== inputGeneration
+        ) {
+          throw new Error("Current protected fixture pointer target is missing or malformed.");
+        }
+        return;
       }
       if (currentGeneration !== expectedGeneration) {
         throw new Error(`Protected fixture pointer changed from expected generation ${expectedGeneration || "<empty>"}.`);
@@ -203,7 +221,7 @@ async function promote(inputGeneration: string, expectedGeneration: string): Pro
   }
 }
 
-async function prune(generation: string): Promise<void> {
+export async function prune(generation: string): Promise<void> {
   const environment = environmentName();
   const firestore = new Firestore({ projectId: projectId(), databaseId: databaseName(environment) });
   const pointerRef = firestore.collection(COLLECTION).doc(POINTER_DOCUMENT);
