@@ -4,6 +4,7 @@ import type { ConnectorBinding } from "./types";
 
 const execFileAsync = promisify(execFile);
 const KEYCHAIN_ACCOUNT = "meshr";
+const KEYCHAIN_COMMAND_TIMEOUT_MS = 10_000;
 
 export interface BindingCredentials {
   privateKeyPem: string;
@@ -38,7 +39,10 @@ type KeychainManifest = {
 export function osKeychainSupported(): boolean {
   if (process.platform !== "darwin") return false;
   try {
-    execFileSync("security", ["help"], { stdio: "ignore" });
+    execFileSync("security", ["help"], {
+      stdio: "ignore",
+      timeout: KEYCHAIN_COMMAND_TIMEOUT_MS,
+    });
     return true;
   } catch {
     return false;
@@ -158,13 +162,17 @@ export async function deleteBindingCredentials(ref: string): Promise<void> {
 
 async function deleteSecurityItem(service: string): Promise<void> {
   try {
-    await execFileAsync("security", [
-      "delete-generic-password",
-      "-a",
-      KEYCHAIN_ACCOUNT,
-      "-s",
-      service,
-    ]);
+    await execFileAsync(
+      "security",
+      [
+        "delete-generic-password",
+        "-a",
+        KEYCHAIN_ACCOUNT,
+        "-s",
+        service,
+      ],
+      { timeout: KEYCHAIN_COMMAND_TIMEOUT_MS },
+    );
   } catch (error) {
     const code = typeof error === "object" && error !== null && "code" in error
       ? String((error as { code?: unknown }).code)
@@ -188,14 +196,18 @@ function decodeChunks(chunks: string[]): string {
 }
 
 async function readSecurityValue(service: string): Promise<string> {
-  const result = await execFileAsync("security", [
-    "find-generic-password",
-    "-a",
-    KEYCHAIN_ACCOUNT,
-    "-s",
-    service,
-    "-w",
-  ]);
+  const result = await execFileAsync(
+    "security",
+    [
+      "find-generic-password",
+      "-a",
+      KEYCHAIN_ACCOUNT,
+      "-s",
+      service,
+      "-w",
+    ],
+    { timeout: KEYCHAIN_COMMAND_TIMEOUT_MS },
+  );
   return String(result.stdout).trim();
 }
 
@@ -216,13 +228,26 @@ async function runSecurityPrompt(args: string[], secret: string): Promise<void> 
     const child = spawn("security", args, {
       stdio: ["pipe", "ignore", "pipe"],
     });
+    let forceKill: NodeJS.Timeout | undefined;
+    const timeout = setTimeout(() => {
+      child.kill("SIGTERM");
+      forceKill = setTimeout(() => child.kill("SIGKILL"), 1_000);
+      forceKill.unref();
+    }, KEYCHAIN_COMMAND_TIMEOUT_MS);
+    timeout.unref();
     let stderr = "";
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
     });
-    child.on("error", () => reject(new Error("os_keychain_write_failed")));
+    child.on("error", () => {
+      clearTimeout(timeout);
+      if (forceKill) clearTimeout(forceKill);
+      reject(new Error("os_keychain_write_failed"));
+    });
     child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (forceKill) clearTimeout(forceKill);
       if (code === 0) {
         resolve();
         return;

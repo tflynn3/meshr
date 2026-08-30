@@ -136,3 +136,17 @@ test("duplicate exact connector identifiers fail with an actionable ambiguity er
     /Meshr session state is ambiguous.*pairing ID pair-duplicate/,
   );
 });
+
+test("credential storage mode rejects unsafe configuration typos", () => {
+  const previous = process.env.MESHR_CREDENTIAL_STORAGE;
+  process.env.MESHR_CREDENTIAL_STORAGE = "vault";
+  try {
+    assert.throws(
+      () => new ConnectorStateStore("/tmp/meshr-invalid-credential-mode"),
+      /MESHR_CREDENTIAL_STORAGE must be auto, keychain, or file/,
+    );
+  } finally {
+    if (previous === undefined) delete process.env.MESHR_CREDENTIAL_STORAGE;
+    else process.env.MESHR_CREDENTIAL_STORAGE = previous;
+  }
+});

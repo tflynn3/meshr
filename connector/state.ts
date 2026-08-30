@@ -53,6 +53,14 @@ export function defaultStateDirectory(): string {
   return override ? resolve(override) : join(homedir(), ".meshr", "session");
 }
 
+function configuredKeychainMode(): boolean | undefined {
+  const value = process.env.MESHR_CREDENTIAL_STORAGE?.trim().toLowerCase();
+  if (!value || value === "auto") return undefined;
+  if (value === "file") return false;
+  if (value === "keychain") return true;
+  throw new Error("MESHR_CREDENTIAL_STORAGE must be auto, keychain, or file.");
+}
+
 export class ConnectorStateStore {
   readonly directory: string;
   readonly path: string;
@@ -69,7 +77,7 @@ export class ConnectorStateStore {
     this.directory = resolve(directory);
     this.path = join(this.directory, "state.json");
     this.credentialBackend = options.credentialBackend ?? systemBindingCredentialBackend;
-    this.useKeychainOverride = options.useKeychain;
+    this.useKeychainOverride = options.useKeychain ?? configuredKeychainMode();
   }
 
   async load(): Promise<ConnectorState> {
