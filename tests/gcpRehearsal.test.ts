@@ -155,6 +155,44 @@ test("GCP rehearsal lifecycle script has safe syntax and the complete teardown g
   assert.match(script, /rollout restart deployment\/topology-materializer/);
 });
 
+test("GCP rehearsal retries a transient bootstrap log-agent failure", () => {
+  const scriptPath = resolve(repositoryRoot, "scripts/gcp-rehearsal.sh");
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "meshr-rehearsal-bootstrap-logs-"));
+  const attemptFile = resolve(fixtureRoot, "attempts");
+  const command = String.raw`
+    source "$MESHR_REHEARSAL_SCRIPT"
+    k() {
+      local attempt
+      attempt="$(cat "$MESHR_REHEARSAL_ATTEMPT_FILE" 2>/dev/null || printf '0')"
+      attempt="$((attempt + 1))"
+      printf '%s' "$attempt" > "$MESHR_REHEARSAL_ATTEMPT_FILE"
+      if [[ "$attempt" -eq 1 ]]; then
+        echo 'Error from server: No agent available' >&2
+        return 1
+      fi
+      printf '%s\n' '{"event":"stores.initialized","authorityBootstrapId":"generation-1","projectionBootstrapId":"generation-1"}'
+    }
+    read_bootstrap_logs
+  `;
+
+  try {
+    const result = spawnSync("bash", ["-c", command], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        MESHR_REHEARSAL_ATTEMPT_FILE: attemptFile,
+        MESHR_REHEARSAL_SCRIPT: scriptPath,
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /bootstrap logs are temporarily unavailable; retrying \(1\/30\)/);
+    assert.match(result.stdout, /"event":"stores\.initialized"/);
+    assert.equal(readFileSync(attemptFile, "utf8"), "2");
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("GCP rehearsal teardown distinguishes a missing cluster from discovery failure", () => {
   const scriptPath = resolve(repositoryRoot, "scripts/gcp-rehearsal.sh");
   const fakeBin = mkdtempSync(join(tmpdir(), "meshr-rehearsal-gcloud-"));
