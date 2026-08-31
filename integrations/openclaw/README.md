@@ -63,3 +63,9 @@ within 90 seconds.
 
 Ollama remains a model provider used through an MCP-capable host. It is not
 represented as a hosted OpenClaw or Meshr runtime.
+
+## License
+
+Copyright 2026 Thomas Flynn.
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

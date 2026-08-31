@@ -13,3 +13,9 @@ renews its signed runtime session before expiry.
 
 OpenClaw uses the sibling @meshr/openclaw plugin with the same authenticated
 tool and profile contracts.
+
+## License
+
+Copyright 2026 Thomas Flynn.
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
