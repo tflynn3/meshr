@@ -262,11 +262,12 @@ jobs:
 
       - name: Capture bounded failure diagnostics before teardown
         if: ${{ failure() }}
+        timeout-minutes: 5
         run: |
           set +e
           diagnostics="$RUNNER_TEMP/gcp-rehearsal-diagnostics"
           mkdir -p "$diagnostics"
-          bash scripts/gcp-rehearsal.sh status >"$diagnostics/status.txt" 2>&1
+          timeout 45s bash scripts/gcp-rehearsal.sh status >"$diagnostics/status.txt" 2>&1
           kubectl -n "$APP_NAMESPACE" get all,networkpolicy -o wide \
             --request-timeout=15s >"$diagnostics/resources.txt" 2>&1
           kubectl -n "$APP_NAMESPACE" get events \
@@ -287,25 +288,38 @@ jobs:
                 >"$diagnostics/${pod}-${container}-previous.log" 2>&1
             done
 
-      - name: Refresh Google Cloud credentials for teardown
-        if: ${{ always() && inputs.keep_cluster != true }}
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+      - name: Upload bounded rehearsal failure diagnostics
+        if: ${{ failure() }}
+        timeout-minutes: 5
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
-          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.SERVICE_ACCOUNT }}
+          name: gcp-rehearsal-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gcp-rehearsal-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
 
-      - name: Destroy the ephemeral GKE cluster
-        if: ${{ always() && inputs.keep_cluster != true }}
-        run: |
-          bash scripts/gcp-rehearsal.sh destroy-cluster
-          {
-            echo '### Cost control'
-            echo
-            echo "Ephemeral cluster \`$CLUSTER\` was deleted. The low-cost persistent foundation and immutable images remain."
-          } >> "$GITHUB_STEP_SUMMARY"
-
+  cleanup:
+    if: ${{ always() && needs.rehearse.result != 'skipped' }}
+    needs: rehearse
+    name: Destroy the ephemeral rehearsal cluster
+    environment: gcp-rehearsal
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GCP_REHEARSAL_PROJECT_ID: ${{ vars.GCP_REHEARSAL_PROJECT_ID }}
+      REGION: ${{ vars.REGION }}
+      CLUSTER: ${{ vars.CLUSTER }}
+      WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+      SERVICE_ACCOUNT: ${{ vars.SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ vars.GCP_REHEARSAL_PROJECT_ID }}
+      GCP_REGION: ${{ vars.REGION }}
+      GKE_CLUSTER: ${{ vars.CLUSTER }}
+    steps:
       - name: Record explicitly retained cluster
-        if: ${{ always() && inputs.keep_cluster == true }}
+        if: ${{ inputs.keep_cluster == true }}
         run: |
           {
             echo '### Cost control'
@@ -313,32 +327,82 @@ jobs:
             echo "Cluster \`$CLUSTER\` was explicitly retained by this manual run. The nightly cleanup safeguard will still delete it."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Capture teardown failure state
-        if: ${{ failure() }}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: ${{ inputs.keep_cluster != true }}
+        with:
+          persist-credentials: false
+
+      - name: Validate protected cleanup inputs
+        if: ${{ inputs.keep_cluster != true }}
+        run: |
+          set -euo pipefail
+          for name in GCP_REHEARSAL_PROJECT_ID REGION CLUSTER WORKLOAD_IDENTITY_PROVIDER SERVICE_ACCOUNT; do
+            test -n "${!name:-}" || {
+              echo "Set the protected gcp-rehearsal environment variable $name." >&2
+              exit 1
+            }
+          done
+          test "$REGION" = us-central1 || {
+            echo "REGION must be us-central1 for the meshr-rehearsal foundation." >&2
+            exit 1
+          }
+
+      - name: Authenticate to Google Cloud for teardown
+        if: ${{ inputs.keep_cluster != true }}
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+        if: ${{ inputs.keep_cluster != true }}
+
+      - name: Destroy the ephemeral GKE cluster
+        if: ${{ inputs.keep_cluster != true }}
+        run: |
+          set -euo pipefail
+          bash scripts/gcp-rehearsal.sh destroy-cluster
+          {
+            echo '### Cost control'
+            echo
+            echo "No ephemeral cluster named \`$CLUSTER\` remains in \`$REGION\`. The low-cost persistent foundation and immutable images remain."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Capture bounded teardown failure diagnostics
+        if: ${{ failure() && inputs.keep_cluster != true }}
+        timeout-minutes: 3
         run: |
           set +e
-          diagnostics="$RUNNER_TEMP/gcp-rehearsal-diagnostics"
+          diagnostics="$RUNNER_TEMP/gcp-rehearsal-cleanup-diagnostics"
           mkdir -p "$diagnostics"
-          gcloud container clusters describe "$CLUSTER" \
-            --region "$REGION" \
-            --project "$GCP_REHEARSAL_PROJECT_ID" \
-            --format=yaml >"$diagnostics/cluster-after-teardown.yaml" 2>&1
-          gcloud container operations list \
-            --region "$REGION" \
-            --project "$GCP_REHEARSAL_PROJECT_ID" \
-            --limit=20 \
-            --format='table(name,operationType,status,statusMessage)' \
-            >"$diagnostics/recent-cluster-operations.txt" 2>&1
-          printf 'run=%s attempt=%s sha=%s keep_cluster=%s\n' \
-            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" "${{ inputs.keep_cluster }}" \
+          printf 'run=%s attempt=%s sha=%s rehearsal_result=%s keep_cluster=%s\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" \
+            "${{ needs.rehearse.result }}" "${{ inputs.keep_cluster }}" \
             >"$diagnostics/run.txt"
+          if command -v gcloud >/dev/null 2>&1; then
+            gcloud auth list --filter=status:ACTIVE \
+              --format='table(account,status)' >"$diagnostics/active-auth.txt" 2>&1
+            timeout 30s gcloud container clusters describe "$CLUSTER" \
+              --region "$REGION" \
+              --project "$GCP_REHEARSAL_PROJECT_ID" \
+              --format=yaml >"$diagnostics/cluster-after-teardown.yaml" 2>&1
+            timeout 30s gcloud container operations list \
+              --region "$REGION" \
+              --project "$GCP_REHEARSAL_PROJECT_ID" \
+              --limit=20 \
+              --format='table(name,operationType,status,statusMessage)' \
+              >"$diagnostics/recent-cluster-operations.txt" 2>&1
+          else
+            echo "gcloud was unavailable in the cleanup job" >"$diagnostics/gcloud-unavailable.txt"
+          fi
 
-      - name: Upload bounded failure diagnostics
-        if: ${{ failure() }}
+      - name: Upload bounded teardown failure diagnostics
+        if: ${{ failure() && inputs.keep_cluster != true }}
+        timeout-minutes: 5
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
-          name: gcp-rehearsal-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/gcp-rehearsal-diagnostics
+          name: gcp-rehearsal-cleanup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gcp-rehearsal-cleanup-diagnostics
           if-no-files-found: ignore
           retention-days: 7
 

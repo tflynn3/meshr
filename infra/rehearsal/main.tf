@@ -400,30 +400,16 @@ resource "google_service_account_iam_member" "ci_act_as_gke_nodes" {
   member             = "serviceAccount:${google_service_account.ci.email}"
 }
 
-# The Google-managed PROJECT_ID.svc.id.goog identity pool does not exist until
-# the first Workload-Identity-enabled GKE cluster has been created. The
-# deployment lifecycle therefore installs each KSA -> GSA binding immediately
-# after cluster creation. Give CI only the three service-account permissions
-# required for that idempotent operation, scoped to the five workload GSAs.
-resource "google_project_iam_custom_role" "workload_identity_binder" {
-  project     = var.project_id
-  role_id     = "meshrRehearsalWorkloadIdentityBinder"
-  title       = "Meshr rehearsal workload identity binder"
-  description = "May read and update IAM policies on explicitly bound rehearsal workload service accounts."
-
-  permissions = [
-    "iam.serviceAccounts.get",
-    "iam.serviceAccounts.getIamPolicy",
-    "iam.serviceAccounts.setIamPolicy",
-  ]
-}
-
-resource "google_service_account_iam_member" "ci_bind_workload_identity" {
-  for_each = local.workload_accounts
+# GKE's project-scoped Workload Identity pool survives deletion of the last
+# cluster. The first rehearsal lifecycle established that pool; from then on,
+# Terraform can own these exact, stable namespace/KSA-name bindings without
+# giving deployment CI permission to rewrite workload service-account policy.
+resource "google_service_account_iam_member" "workload_identity" {
+  for_each = var.workload_identity_bindings_enabled ? local.workload_accounts : {}
 
   service_account_id = google_service_account.workload[each.key].name
-  role               = google_project_iam_custom_role.workload_identity_binder.name
-  member             = "serviceAccount:${google_service_account.ci.email}"
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[${local.kubernetes_namespace}/${each.value.kubernetes_service_account}]"
 }
 
 resource "google_project_iam_member" "firestore" {
@@ -460,6 +446,16 @@ resource "google_pubsub_subscription_iam_member" "topology_subscriber" {
   project      = var.project_id
   subscription = google_pubsub_subscription.topology.name
   role         = "roles/pubsub.subscriber"
+  member       = "serviceAccount:${google_service_account.workload["topology"].email}"
+}
+
+# Subscriber permits message consumption but not subscriptions.get. The
+# materializer readiness contract calls subscription.exists(), so grant the
+# metadata read only on this one topology subscription.
+resource "google_pubsub_subscription_iam_member" "topology_viewer" {
+  project      = var.project_id
+  subscription = google_pubsub_subscription.topology.name
+  role         = "roles/pubsub.viewer"
   member       = "serviceAccount:${google_service_account.workload["topology"].email}"
 }
 

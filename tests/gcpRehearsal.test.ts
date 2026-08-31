@@ -137,18 +137,7 @@ test("GCP rehearsal lifecycle script has safe syntax and the complete teardown g
   assert.match(script, /API_IMAGE must be supplied as an immutable image digest|API_IMAGE WEB_IMAGE EVENT_PLANE_IMAGE/);
   assert.match(script, /\.resourceLabels\.environment == "rehearsal"/);
   assert.match(script, /\.resourceLabels\.lifecycle == "ephemeral"/);
-  assert.match(script, /roles\/iam\.workloadIdentityUser/);
-  for (const ksa of [
-    "meshr-api",
-    "meshr-bootstrap",
-    "meshr-ingest",
-    "meshr-topology-materializer",
-    "meshr-live-gateway",
-  ]) {
-    assert.match(script, new RegExp(`\\|${ksa}`));
-  }
-  assert.match(script, /create_cluster\(\)[\s\S]*bind_workload_identity[\s\S]*Meshr Autopilot rehearsal cluster is ready/);
-  assert.match(script, /deploy\(\)[\s\S]*set_render_values\s+bind_workload_identity/);
+  assert.doesNotMatch(script, /add-iam-policy-binding|bind_workload_identity/);
   assert.match(script, /assert_rehearsal_cluster "\$\(cluster_json\)"[\s\S]*container clusters delete/);
   assert.match(script, /MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID/);
   assert.match(script, /rollout restart deployment\/topology-materializer/);
@@ -206,6 +195,20 @@ test("GCP rehearsal trust pins GitHub's immutable owner and repository subject",
   assert.doesNotMatch(
     terraform,
     /assertion\.sub == 'repo:\$\{local\.github_repository\}:environment:gcp-rehearsal'/,
+  );
+  assert.match(terraform, /resource "google_service_account_iam_member" "workload_identity"/);
+  assert.match(
+    terraform,
+    /serviceAccount:\$\{var\.project_id\}\.svc\.id\.goog\[\$\{local\.kubernetes_namespace\}\/\$\{each\.value\.kubernetes_service_account\}\]/,
+  );
+  assert.doesNotMatch(terraform, /iam\.serviceAccounts\.setIamPolicy|workload_identity_binder/);
+});
+
+test("GCP rehearsal topology identity can inspect its subscription for readiness", () => {
+  const terraform = readFileSync(resolve(repositoryRoot, "infra/rehearsal/main.tf"), "utf8");
+  assert.match(
+    terraform,
+    /resource "google_pubsub_subscription_iam_member" "topology_viewer"[\s\S]*role\s*=\s*"roles\/pubsub\.viewer"[\s\S]*google_service_account\.workload\["topology"\]\.email/,
   );
 });
 
