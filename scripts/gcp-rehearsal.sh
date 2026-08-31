@@ -35,11 +35,34 @@ cluster_json() {
     --format=json
 }
 
-cluster_exists() {
-  gcloud container clusters describe "$cluster_name" \
+cluster_presence() {
+  local error_file status
+  error_file="$(mktemp "${TMPDIR:-/tmp}/meshr-cluster-probe.XXXXXX")"
+  if gcloud container clusters describe "$cluster_name" \
     --project "$project_id" \
     --region "$region" \
-    --format='value(name)' >/dev/null 2>&1
+    --format='value(name)' >/dev/null 2>"$error_file"; then
+    rm -f "$error_file"
+    echo "present"
+    return 0
+  else
+    status=$?
+  fi
+
+  # A missing cluster is the only failure that is safe to reinterpret as
+  # absence. Authentication, authorization, API, quota, and network failures
+  # must stop both creation and teardown so CI cannot claim cleanup succeeded
+  # while a paid cluster may still be running.
+  if grep -Eq 'ResponseError: code=404|(^|[^A-Z_])NOT_FOUND([^A-Z_]|$)' "$error_file"; then
+    rm -f "$error_file"
+    echo "absent"
+    return 0
+  fi
+
+  cat "$error_file" >&2
+  rm -f "$error_file"
+  echo "unable to determine GKE rehearsal cluster presence" >&2
+  return "$status"
 }
 
 assert_rehearsal_cluster() {
@@ -68,7 +91,9 @@ connect_cluster() {
   require_project
   require_command gcloud
   require_command jq
-  if ! cluster_exists; then
+  local presence
+  presence="$(cluster_presence)"
+  if [[ "$presence" == "absent" ]]; then
     echo "GKE rehearsal cluster does not exist: $cluster_name ($region)" >&2
     return 1
   fi
@@ -86,9 +111,10 @@ create_cluster() {
   require_project
   require_command gcloud
   require_command jq
-  local node_service_account
+  local node_service_account presence
   node_service_account="${MESHR_REHEARSAL_NODE_GSA:-${NODE_SERVICE_ACCOUNT:-meshr-rehearsal-gke-nodes@${project_id}.iam.gserviceaccount.com}}"
-  if cluster_exists; then
+  presence="$(cluster_presence)"
+  if [[ "$presence" == "present" ]]; then
     assert_rehearsal_cluster "$(cluster_json)"
     echo "Meshr rehearsal cluster already exists: $cluster_name"
   else
@@ -433,7 +459,9 @@ status() {
   require_command gcloud
   require_command jq
   require_command kubectl
-  if ! cluster_exists; then
+  local presence
+  presence="$(cluster_presence)"
+  if [[ "$presence" == "absent" ]]; then
     echo "Meshr rehearsal cluster is absent: $cluster_name ($region)"
     return 0
   fi
@@ -450,7 +478,9 @@ destroy_cluster() {
   require_project
   require_command gcloud
   require_command jq
-  if ! cluster_exists; then
+  local presence
+  presence="$(cluster_presence)"
+  if [[ "$presence" == "absent" ]]; then
     echo "Meshr rehearsal cluster is already absent: $cluster_name ($region)"
     return 0
   fi

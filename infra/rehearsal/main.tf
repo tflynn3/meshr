@@ -93,7 +93,87 @@ locals {
     }
   }
 
+  # These are the composite indexes exercised by the managed event-path and
+  # restart proof. Emulators synthesize indexes automatically, so the GCP
+  # rehearsal must own them explicitly or an otherwise green local smoke can
+  # fail with FAILED_PRECONDITION in managed Firestore.
+  firestore_indexes = {
+    event_outbox_pending_created = {
+      database   = "authority"
+      collection = "event_outbox"
+      fields = [
+        { field_path = "status", order = "ASCENDING" },
+        { field_path = "created_at", order = "ASCENDING" },
+      ]
+    }
+    event_outbox_failed_retry = {
+      database   = "authority"
+      collection = "event_outbox"
+      fields = [
+        { field_path = "status", order = "ASCENDING" },
+        { field_path = "next_attempt_at", order = "ASCENDING" },
+      ]
+    }
+    event_outbox_mesh_status_created = {
+      database   = "authority"
+      collection = "event_outbox"
+      fields = [
+        { field_path = "mesh_id", order = "ASCENDING" },
+        { field_path = "status", order = "ASCENDING" },
+        { field_path = "created_at", order = "ASCENDING" },
+      ]
+    }
+    event_outbox_ready_ordering_status_created = {
+      database   = "authority"
+      collection = "event_outbox_ready"
+      fields = [
+        { field_path = "ordering_key", order = "ASCENDING" },
+        { field_path = "status", order = "ASCENDING" },
+        { field_path = "created_at", order = "ASCENDING" },
+      ]
+    }
+    event_outbox_ready_status_created = {
+      database   = "authority"
+      collection = "event_outbox_ready"
+      fields = [
+        { field_path = "status", order = "ASCENDING" },
+        { field_path = "created_at", order = "ASCENDING" },
+      ]
+    }
+    event_outbox_ready_status_created_desc = {
+      database   = "authority"
+      collection = "event_outbox_ready"
+      fields = [
+        { field_path = "status", order = "ASCENDING" },
+        { field_path = "created_at", order = "DESCENDING" },
+      ]
+    }
+    topology_activity_buckets_mesh_start = {
+      database   = "projections"
+      collection = "topology_activity_buckets"
+      fields = [
+        { field_path = "mesh_id", order = "ASCENDING" },
+        { field_path = "bucket_start", order = "ASCENDING" },
+      ]
+    }
+    topology_activity_buckets_compaction = {
+      database   = "projections"
+      collection = "topology_activity_buckets"
+      fields = [
+        { field_path = "recent_compacted_at", order = "ASCENDING" },
+        { field_path = "bucket_start", order = "ASCENDING" },
+        { field_path = "__name__", order = "ASCENDING" },
+      ]
+    }
+  }
+
   github_repository = "tflynn3/meshr"
+  # GitHub repositories created after 2026-07-15 use an immutable default OIDC
+  # subject. Keep the human-readable names for workflow_ref while pinning the
+  # security-sensitive subject to the non-reusable owner and repository IDs.
+  github_immutable_subject_prefix = (
+    "repo:tflynn3@${var.github_repository_owner_id}/meshr@${var.github_repository_id}"
+  )
   github_workflow_ref_prefix = (
     "${local.github_repository}/.github/workflows/gcp-rehearsal.yml@refs/heads/"
   )
@@ -198,6 +278,22 @@ resource "google_firestore_database" "database" {
   deletion_policy                   = "DELETE"
 
   depends_on = [google_project_service.required]
+}
+
+resource "google_firestore_index" "rehearsal" {
+  for_each = local.firestore_indexes
+
+  project    = var.project_id
+  database   = google_firestore_database.database[each.value.database].name
+  collection = each.value.collection
+
+  dynamic "fields" {
+    for_each = each.value.fields
+    content {
+      field_path = fields.value.field_path
+      order      = fields.value.order
+    }
+  }
 }
 
 resource "google_pubsub_topic" "events" {
@@ -396,7 +492,7 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   attribute_condition = join(" ", [
     "assertion.repository_id == '${var.github_repository_id}' &&",
     "assertion.repository_owner_id == '${var.github_repository_owner_id}' &&",
-    "assertion.sub == 'repo:${local.github_repository}:environment:gcp-rehearsal' &&",
+    "assertion.sub == '${local.github_immutable_subject_prefix}:environment:gcp-rehearsal' &&",
     "assertion.workflow_ref.startsWith('${local.github_workflow_ref_prefix}') &&",
     "(assertion.event_name == 'workflow_dispatch' || assertion.event_name == 'schedule' ||",
     "(assertion.event_name == 'push' && assertion.ref == 'refs/heads/feat/copyable-agent-setup'))",
