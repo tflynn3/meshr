@@ -1,4 +1,6 @@
-import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { lstat, mkdir, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -17,6 +19,33 @@ const emptyState = (): ConnectorState => ({
   version: CONNECTOR_STATE_VERSION,
   bindings: [],
 });
+
+const MAX_STATE_FILE_BYTES = 5 * 1024 * 1024;
+
+export type ConnectorAuthoritySnapshot = Pick<
+  ConnectorBinding,
+  "agentTokenExpiresAt" | "sessionId" | "bindingId" | "agentId"
+>;
+
+/** Raised when a retry would overwrite a newer runtime authority. */
+export class ConnectorStateConflictError extends Error {
+  constructor() {
+    super("Meshr session state changed while a runtime successor was pending.");
+    this.name = "ConnectorStateConflictError";
+  }
+}
+
+function sameAuthority(
+  binding: ConnectorBinding,
+  expected: ConnectorAuthoritySnapshot,
+): boolean {
+  return (
+    binding.agentTokenExpiresAt === expected.agentTokenExpiresAt &&
+    binding.sessionId === expected.sessionId &&
+    binding.bindingId === expected.bindingId &&
+    binding.agentId === expected.agentId
+  );
+}
 
 const viableStatuses = new Set<ConnectorBinding["status"]>([
   "pending",
@@ -61,6 +90,53 @@ function configuredKeychainMode(): boolean | undefined {
   throw new Error("MESHR_CREDENTIAL_STORAGE must be auto, keychain, or file.");
 }
 
+async function assertPrivateStateDirectory(path: string): Promise<void> {
+  if (path === "/" || path === homedir()) {
+    throw new Error("Meshr session state must be stored in a dedicated directory.");
+  }
+  const metadata = await lstat(path);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error("Meshr session state directory must be a regular directory.");
+  }
+  if (process.platform !== "win32" && (metadata.mode & 0o077) !== 0) {
+    throw new Error("Meshr session state directory must not be accessible by group or other users.");
+  }
+  assertNoMacAcl(path);
+}
+
+async function assertPrivateStateFile(path: string): Promise<void> {
+  const metadata = await lstat(path);
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    throw new Error("Meshr session state must be a regular file, not a symlink.");
+  }
+  if (metadata.size > MAX_STATE_FILE_BYTES) {
+    throw new Error("Meshr session state is unexpectedly large.");
+  }
+  if (process.platform !== "win32" && (metadata.mode & 0o077) !== 0) {
+    throw new Error("Meshr session state must not be readable by group or other users.");
+  }
+  assertNoMacAcl(path);
+}
+
+function assertNoMacAcl(path: string): void {
+  if (process.platform !== "darwin") return;
+  const aclError = new Error("Meshr session state must not have an access-control list.");
+  try {
+    const listing = execFileSync("/bin/ls", ["-lde", path], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 1_000,
+    });
+    const mode = listing.split(/\r?\n/, 1)[0] ?? "";
+    // macOS marks an ACL with '+' in the mode field. Extended attributes use
+    // '@' and do not grant access by themselves, so they remain acceptable.
+    if (/^[^\s]{10}\+/.test(mode)) throw aclError;
+  } catch (error) {
+    if (error === aclError) throw error;
+    throw new Error("Meshr session state ACL could not be verified safely.");
+  }
+}
+
 export class ConnectorStateStore {
   readonly directory: string;
   readonly path: string;
@@ -82,6 +158,8 @@ export class ConnectorStateStore {
 
   async load(): Promise<ConnectorState> {
     try {
+      await assertPrivateStateDirectory(this.directory);
+      await assertPrivateStateFile(this.path);
       const parsed = JSON.parse(await readFile(this.path, "utf8")) as ConnectorState;
       if (parsed.version !== CONNECTOR_STATE_VERSION || !Array.isArray(parsed.bindings)) {
         throw new Error("Unsupported Meshr session state format.");
@@ -114,23 +192,23 @@ export class ConnectorStateStore {
 
   private async saveUnlocked(state: ConnectorState): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    await assertPrivateStateDirectory(this.directory);
     const useKeychain = this.useKeychainOverride ?? this.credentialBackend.supported();
     if (!useKeychain && !fileFallbackWarned) {
       fileFallbackWarned = true;
       warnFileFallback();
     }
     const bindings = [] as Array<Record<string, unknown>>;
+    const keychainWrites: Array<{
+      credentialRef: string;
+      binding: ConnectorBinding;
+    }> = [];
     for (const binding of state.bindings) {
       if (!useKeychain) {
         bindings.push(binding as unknown as Record<string, unknown>);
         continue;
       }
       const credentialRef = credentialRefFor(binding);
-      await this.credentialBackend.save(credentialRef, {
-        privateKeyPem: binding.privateKeyPem,
-        pairingSecret: binding.pairingSecret,
-        ...(binding.agentToken ? { agentToken: binding.agentToken } : {}),
-      });
       const {
         privateKeyPem: _privateKeyPem,
         pairingSecret: _pairingSecret,
@@ -138,13 +216,35 @@ export class ConnectorStateStore {
         ...publicBinding
       } = binding;
       bindings.push({ ...publicBinding, credentialRef });
+      keychainWrites.push({ credentialRef, binding });
     }
-    const temporary = `${this.path}.${process.pid}.tmp`;
+    const serialized = `${JSON.stringify({ ...state, bindings }, null, 2)}\n`;
+    if (Buffer.byteLength(serialized, "utf8") > MAX_STATE_FILE_BYTES) {
+      throw new Error("Meshr session state is unexpectedly large.");
+    }
     const previous = useKeychain ? await this.readPersistedCredentialRefs() : new Set<string>();
-    await writeFile(temporary, `${JSON.stringify({ ...state, bindings }, null, 2)}\n`, {
-      mode: 0o600,
-    });
-    await rename(temporary, this.path);
+    for (const { credentialRef, binding } of keychainWrites) {
+      await this.credentialBackend.save(credentialRef, {
+        privateKeyPem: binding.privateKeyPem,
+        pairingSecret: binding.pairingSecret,
+        ...(binding.agentToken ? { agentToken: binding.agentToken } : {}),
+      });
+    }
+    const temporary = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      handle = await open(temporary, "wx", 0o600);
+      await handle.writeFile(serialized, { encoding: "utf8" });
+      await handle.sync();
+      await handle.chmod(0o600);
+      await handle.close();
+      handle = undefined;
+      await assertPrivateStateFile(temporary);
+      await rename(temporary, this.path);
+    } finally {
+      await handle?.close().catch(() => undefined);
+      await unlink(temporary).catch(() => undefined);
+    }
 
     if (useKeychain && this.credentialBackend.remove) {
       const retained = new Set(
@@ -169,14 +269,16 @@ export class ConnectorStateStore {
 
   private async readPersistedCredentialRefs(): Promise<Set<string>> {
     try {
+      await assertPrivateStateFile(this.path);
       const parsed = JSON.parse(await readFile(this.path, "utf8")) as ConnectorState;
       return new Set(
         (parsed.bindings ?? [])
           .map((binding) => (binding as ConnectorBinding & { credentialRef?: unknown }).credentialRef)
           .filter((ref): ref is string => typeof ref === "string"),
       );
-    } catch {
-      return new Set();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Set();
+      throw error;
     }
   }
 
@@ -229,9 +331,18 @@ export class ConnectorStateStore {
   async patch(
     selector: string,
     update: Partial<ConnectorBinding>,
+    options: {
+      expectedAuthorities?: readonly ConnectorAuthoritySnapshot[];
+    } = {},
   ): Promise<ConnectorBinding> {
     return this.withFileLock(async () => {
       const binding = await this.require(selector);
+      if (
+        options.expectedAuthorities &&
+        !options.expectedAuthorities.some((expected) => sameAuthority(binding, expected))
+      ) {
+        throw new ConnectorStateConflictError();
+      }
       const next = {
         ...binding,
         ...update,
@@ -246,8 +357,25 @@ export class ConnectorStateStore {
     });
   }
 
+  /** Check the current binding before a retry without mutating session state. */
+  async assertAuthority(
+    selector: string,
+    expectedAuthorities: readonly ConnectorAuthoritySnapshot[],
+  ): Promise<void> {
+    await this.withFileLock(async () => {
+      const binding = await this.require(selector);
+      if (!expectedAuthorities.some((expected) => sameAuthority(binding, expected))) {
+        throw new ConnectorStateConflictError();
+      }
+    });
+  }
+
   private async withFileLock<T>(operation: () => Promise<T>): Promise<T> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    // Validate the directory before opening a lock or touching any state. An
+    // attacker must not be able to swap the configured path for a symlink
+    // between the recursive mkdir and the first filesystem operation.
+    await assertPrivateStateDirectory(this.directory);
     const lockPath = `${this.path}.lock`;
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     for (let attempt = 0; attempt < 100; attempt += 1) {

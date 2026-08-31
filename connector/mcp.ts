@@ -3,7 +3,11 @@ import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { sign } from "node:crypto";
 import * as z from "zod/v4";
 import { MeshrApi, MeshrApiError } from "./api";
-import { ConnectorStateStore } from "./state";
+import {
+  ConnectorStateConflictError,
+  ConnectorStateStore,
+  type ConnectorAuthoritySnapshot,
+} from "./state";
 import { syncBindingDefinition } from "./profileSync";
 import { createRemoteAgentTools } from "./tools";
 import type { ConnectorBinding, ConnectorState } from "./types";
@@ -15,6 +19,57 @@ const textResult = (value: unknown) => ({
       ? (value as Record<string, unknown>)
       : undefined,
 });
+
+export interface RuntimeBindingPersistenceInput {
+  nextBinding: ConnectorBinding;
+  persist: () => Promise<ConnectorBinding>;
+  preflight?: () => Promise<void>;
+  onAdopt?: (binding: ConnectorBinding) => void;
+  required: boolean;
+  retryDelaysMs?: readonly number[];
+  sleep?: (delayMs: number) => Promise<void>;
+}
+
+/**
+ * Adopt a server-issued runtime successor before persisting it locally. A
+ * transient keychain/file failure must not make the live MCP session continue
+ * with the predecessor that the server has already fenced off.
+ */
+export async function persistRuntimeBindingWithRetry(
+  input: RuntimeBindingPersistenceInput,
+): Promise<{ binding: ConnectorBinding; persisted: boolean }> {
+  const delays = input.retryDelaysMs ?? (input.required ? [0, 250, 1_000] : [0]);
+  const sleep = input.sleep ?? ((delayMs: number) => new Promise((resolve) => setTimeout(resolve, delayMs)));
+  let adopted = false;
+  for (const delay of delays) {
+    if (delay) await sleep(delay);
+    try {
+      try {
+        await input.preflight?.();
+      } catch (error) {
+        if (error instanceof ConnectorStateConflictError) throw error;
+        // A local preflight can fail transiently (for example while a
+        // keychain/file is briefly unavailable). Still adopt the server-issued
+        // successor before attempting persistence so the live session never
+        // falls back to the fenced predecessor.
+      }
+      // Keep this adoption immediately adjacent to the durable write. If the
+      // preflight detects a newer authority, it throws before this process can
+      // expose the stale successor to its live MCP session.
+      if (!adopted) {
+        input.onAdopt?.(input.nextBinding);
+        adopted = true;
+      }
+      const persisted = await input.persist();
+      input.onAdopt?.(persisted);
+      return { binding: persisted, persisted: true };
+    } catch (error) {
+      if (error instanceof ConnectorStateConflictError) throw error;
+      // Keep the successor active in memory and retry the durable write.
+    }
+  }
+  return { binding: input.nextBinding, persisted: false };
+}
 
 export interface MeshrMcpServerSession {
   server: McpServer;
@@ -312,6 +367,10 @@ export async function serveBindingFromState(input: {
 }): Promise<void> {
   const store = new ConnectorStateStore(input.stateDirectory);
   let binding = await store.require(input.selector);
+  // Resolve handle aliases once. A host owns one pairing for its lifetime;
+  // repeatedly resolving a mutable handle during renewal could otherwise
+  // apply this session's successor token to a newer same-handle retry.
+  const runtimeSelector = binding.pairingId;
   if (
     (binding.status !== "connected" && binding.status !== "approved") ||
     (!binding.agentToken && (!binding.privateKeyPem || !binding.pairingSecret || !binding.pairingId))
@@ -323,7 +382,149 @@ export async function serveBindingFromState(input: {
     error instanceof MeshrApiError &&
     (error.code === "session_superseded" || error.message.includes("superseded"));
 
-  const renewStoredSession = async (options: { allowReclaim?: boolean } = {}): Promise<void> => {
+  let stopped = false;
+  let lifecycleTimer: ReturnType<typeof setInterval> | undefined;
+  const stopNativeSession = (message?: string): void => {
+    if (stopped) return;
+    stopped = true;
+    if (lifecycleTimer) clearInterval(lifecycleTimer);
+    if (message) process.stderr.write(`${message}\n`);
+  };
+  let updateLiveSession: ((nextBinding: ConnectorBinding) => void) | undefined;
+  type PendingPersistence = {
+    binding: ConnectorBinding;
+    expectedAuthorities: readonly ConnectorAuthoritySnapshot[];
+  };
+  let pendingPersistence: PendingPersistence | undefined;
+  const authoritySnapshot = (candidate: ConnectorBinding): ConnectorAuthoritySnapshot => ({
+    agentTokenExpiresAt: candidate.agentTokenExpiresAt,
+    sessionId: candidate.sessionId,
+    bindingId: candidate.bindingId,
+    agentId: candidate.agentId,
+  });
+  const persistRuntimeBinding = async (
+    nextBinding: ConnectorBinding,
+    options: {
+      required: boolean;
+      expectedAuthorities?: readonly ConnectorAuthoritySnapshot[];
+      /** Reconcile one local compare-and-set race, then fail closed. */
+      reconciled?: boolean;
+    },
+  ): Promise<void> => {
+    const expectedAuthorities = options.expectedAuthorities ?? [
+      authoritySnapshot(binding),
+      authoritySnapshot(nextBinding),
+    ];
+    let result: Awaited<ReturnType<typeof persistRuntimeBindingWithRetry>>;
+    try {
+      result = await persistRuntimeBindingWithRetry({
+        nextBinding,
+        required: options.required,
+        preflight: async () => {
+          await store.assertAuthority(runtimeSelector, expectedAuthorities);
+        },
+        persist: async () => {
+          try {
+            // Check the server fence immediately before the durable write. A
+            // transient network failure is retryable after successor adoption;
+            // a definitive supersession must stop without writing stale state.
+            await api.heartbeatAgentSession(nextBinding);
+          } catch (error) {
+            if (isSessionSuperseded(error)) throw new ConnectorStateConflictError();
+            throw error;
+          }
+          return store.patch(runtimeSelector, {
+            status: "connected",
+            agentToken: nextBinding.agentToken,
+            agentTokenExpiresAt: nextBinding.agentTokenExpiresAt,
+            sessionId: nextBinding.sessionId,
+            bindingId: nextBinding.bindingId,
+            agentId: nextBinding.agentId,
+          }, { expectedAuthorities });
+        },
+        onAdopt: (adopted) => {
+          // The server has already moved authority to this successor. Adopt it
+          // before touching local persistence so a failed keychain/file write
+          // can never leave this process using the superseded bearer.
+          binding = adopted;
+          updateLiveSession?.(binding);
+        },
+      });
+    } catch (error) {
+      if (!(error instanceof ConnectorStateConflictError)) throw error;
+      pendingPersistence = undefined;
+      // A concurrent native start can win the local compare-and-set after the
+      // server has accepted this successor. Give this candidate one chance to
+      // prove that it still owns server authority, then retry against the
+      // observed local generation. Only a definitive server supersession is
+      // terminal; a transient network error remains retryable.
+      try {
+        await api.heartbeatAgentSession(nextBinding);
+      } catch (heartbeatError) {
+        if (isSessionSuperseded(heartbeatError)) {
+          if (options.required) throw new Error("runtime_session_persistence_conflict");
+          stopNativeSession("[meshr] runtime session authority changed; stopping this native host.");
+          return;
+        }
+      }
+      if (!options.reconciled) {
+        try {
+          const observed = await store.require(runtimeSelector);
+          await persistRuntimeBinding(nextBinding, {
+            required: options.required,
+            expectedAuthorities: [
+              authoritySnapshot(observed),
+              authoritySnapshot(nextBinding),
+            ],
+            reconciled: true,
+          });
+          return;
+        } catch (reconcileError) {
+          if (!(reconcileError instanceof ConnectorStateConflictError)) throw reconcileError;
+        }
+      }
+      if (options.required) throw new Error("runtime_session_persistence_conflict");
+      stopNativeSession("[meshr] runtime session authority changed; stopping this native host.");
+      return;
+    }
+    pendingPersistence = result.persisted
+      ? undefined
+      : { binding: nextBinding, expectedAuthorities };
+    if (result.persisted) return;
+    process.stderr.write(
+      "[meshr] runtime session successor is active but local session state could not be persisted; retrying on the next lifecycle tick.\n",
+    );
+    if (options.required) {
+      // A boot-time successor without durable credentials cannot safely expose
+      // an MCP server. Throwing closes this host; the server's offline cutoff
+      // then removes the abandoned session authority.
+      throw new Error("runtime_session_persistence_failed");
+    }
+  };
+
+  const retryPendingPersistence = async (): Promise<void> => {
+    if (!pendingPersistence) return;
+    const pending = pendingPersistence;
+    await persistRuntimeBinding(pending.binding, {
+      required: false,
+      expectedAuthorities: pending.expectedAuthorities,
+    });
+  };
+
+  // Profile reloads and session heartbeats share one serialized lane. This
+  // prevents a reload that read an older projection from replacing a freshly
+  // renewed in-memory authority (or vice versa).
+  let lifecycleWork: Promise<void> = Promise.resolve();
+  const enqueueLifecycle = <T>(operation: () => Promise<T>): Promise<T> => {
+    const next = lifecycleWork.then(operation);
+    lifecycleWork = next.then(() => undefined, () => undefined);
+    return next;
+  };
+
+  const renewStoredSession = async (options: {
+    allowReclaim?: boolean;
+    persistence?: "required" | "best_effort";
+  } = {}): Promise<void> => {
     if (!binding.privateKeyPem || !binding.pairingSecret || !binding.pairingId) {
       throw new Error("Binding is missing signed renewal credentials.");
     }
@@ -365,13 +566,17 @@ export async function serveBindingFromState(input: {
       // pass allowReclaim:false and never take authority back.
       renewed = await signChallenge();
     }
-    binding = await store.patch(input.selector, {
+    const nextBinding: ConnectorBinding = {
+      ...binding,
       status: "connected",
       agentToken: renewed.token,
       agentTokenExpiresAt: renewed.expiresAt,
       sessionId: renewed.sessionId,
       bindingId: renewed.bindingId ?? binding.bindingId,
       agentId: renewed.agent.id,
+    };
+    await persistRuntimeBinding(nextBinding, {
+      required: options.persistence !== "best_effort",
     });
   };
   // A native host process owns one runtime session. Even when the state file
@@ -393,28 +598,32 @@ export async function serveBindingFromState(input: {
       challengeId: challenge.challengeId,
       signature,
     });
-    binding = await store.patch(input.selector, {
+    const nextBinding: ConnectorBinding = {
+      ...binding,
       status: "connected",
       agentToken: started.token,
       agentTokenExpiresAt: started.expiresAt,
       sessionId: started.sessionId,
       bindingId: started.bindingId ?? binding.bindingId,
       agentId: started.agent.id,
-    });
+    };
+    await persistRuntimeBinding(nextBinding, { required: true });
   }
   let initialSync;
   try {
     initialSync = await syncBindingDefinition({
-      selector: input.selector,
+      selector: runtimeSelector,
       store,
+      binding,
       allowIdentityChanges: true,
     });
   } catch (error) {
     if (!(error instanceof MeshrApiError) || ![401, 403, 404].includes(error.status)) throw error;
     await renewStoredSession();
     initialSync = await syncBindingDefinition({
-      selector: input.selector,
+      selector: runtimeSelector,
       store,
+      binding,
       allowIdentityChanges: true,
     });
   }
@@ -422,10 +631,12 @@ export async function serveBindingFromState(input: {
   const session = createMeshrMcpServerSession(
     binding,
     {
-      reloadProfile: async () => {
+      reloadProfile: () => enqueueLifecycle(async () => {
+        if (stopped) throw new Error("native_session_stopped");
         const result = await syncBindingDefinition({
-          selector: input.selector,
+          selector: runtimeSelector,
           store,
+          binding,
           allowIdentityChanges: true,
         });
         if (result.changed) {
@@ -440,12 +651,11 @@ export async function serveBindingFromState(input: {
           source_digest: result.profileReload?.source_digest ?? result.binding.definitionDigest,
           validation_failures: result.profileReload?.validation_failures ?? [],
         };
-      },
+      }),
     },
   );
+  updateLiveSession = (nextBinding) => session.updateBinding(nextBinding);
 
-  let stopped = false;
-  let lifecycleWork: Promise<void> = Promise.resolve();
   const lifecycleTick = async (): Promise<void> => {
     if (stopped || !binding.agentToken) return;
     let heartbeatSucceeded = false;
@@ -454,30 +664,26 @@ export async function serveBindingFromState(input: {
       heartbeatSucceeded = true;
     } catch (error) {
       if (isSessionSuperseded(error)) {
-        stopped = true;
-        clearInterval(lifecycleTimer);
-        process.stderr.write(
-          "[meshr] native session superseded; stopping renewal until this host is restarted.\n",
-        );
+        stopNativeSession("[meshr] native session superseded; stopping renewal until this host is restarted.");
         return;
       }
       // Treat network and supersession errors alike here. Renewal below is
       // signed and will either recover or leave the next tick to retry. The
       // renewal path is explicitly forbidden from reclaiming authority.
     }
+    // Do not retry a local successor write until the current bearer has passed
+    // the server fence. This closes the window where a page handoff or newer
+    // host could supersede the session between failed writes.
+    if (heartbeatSucceeded) await retryPendingPersistence();
+    if (stopped) return;
     try {
       const expiry = binding.agentTokenExpiresAt ? Date.parse(binding.agentTokenExpiresAt) : 0;
       if (!heartbeatSucceeded || !binding.sessionId || !Number.isFinite(expiry) || expiry - Date.now() <= 120_000) {
-        await renewStoredSession({ allowReclaim: false });
-        session.updateBinding(binding);
+        await renewStoredSession({ allowReclaim: false, persistence: "best_effort" });
       }
     } catch (error) {
       if (isSessionSuperseded(error)) {
-        stopped = true;
-        clearInterval(lifecycleTimer);
-        process.stderr.write(
-          "[meshr] native session superseded; stopping renewal until this host is restarted.\n",
-        );
+        stopNativeSession("[meshr] native session superseded; stopping renewal until this host is restarted.");
         return;
       }
       process.stderr.write(
@@ -485,14 +691,11 @@ export async function serveBindingFromState(input: {
       );
     }
   };
-  const lifecycleTimer = setInterval(() => {
-    lifecycleWork = lifecycleWork.then(lifecycleTick);
+  lifecycleTimer = setInterval(() => {
+    void enqueueLifecycle(lifecycleTick);
   }, 30_000);
   lifecycleTimer.unref();
-  const stopLifecycle = () => {
-    stopped = true;
-    clearInterval(lifecycleTimer);
-  };
+  const stopLifecycle = () => stopNativeSession();
   process.once("SIGINT", stopLifecycle);
   process.once("SIGTERM", stopLifecycle);
   const handle = serveStdio(() => session.server, {
