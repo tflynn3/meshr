@@ -51,6 +51,11 @@ store hosted deploy credentials. The `canary` and `production` release refs
 must be protected against ordinary pushes, force-pushes, and deletion. Canary and
 production use separate environment-scoped GitHub Apps; the workflow mints a
 short-lived installation token in each job from the matching App's private key.
+Store each release App's Client ID alongside its protected environment inputs as
+`MESHR_CANARY_RELEASE_APP_CLIENT_ID` or
+`MESHR_PRODUCTION_RELEASE_APP_CLIENT_ID`; the token action authenticates with
+that Client ID. Retain each numeric App ID and slug in the matching environment
+so the read-only preflight can verify the expected ruleset actor.
 Each branch ruleset must name only its own App integration as an `always`
 bypass actor, and the canary App cannot bypass production protections. The
 `production` GitHub environment must require reviewers and allow deployments
@@ -60,9 +65,11 @@ addition to the shared fixed-egress label; do not satisfy both labels with one
 persistent runner.
 
 Before the first release, create a repository-installed read-only GitHub App
-for the automated preflight (Administration, Actions, and Contents read only).
-Store its numeric ID/slug as repository variables
-`MESHR_PREFLIGHT_APP_ID`/`MESHR_PREFLIGHT_APP_SLUG` and its private key as the
+for the automated preflight (Administration, Actions, Contents, and Deployments
+read only, plus GitHub's required Metadata read permission).
+Store its numeric ID, Client ID, and slug as repository variables
+`MESHR_PREFLIGHT_APP_ID`, `MESHR_PREFLIGHT_APP_CLIENT_ID`, and
+`MESHR_PREFLIGHT_APP_SLUG`, and its private key as the
 `MESHR_PREFLIGHT_APP_PRIVATE_KEY` repository secret. CI mints a one-job token
 from that App before any deploy or release-write credential. Run the same
 read-only GitHub control preflight locally with an administrator-authenticated

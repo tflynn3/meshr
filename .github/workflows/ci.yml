@@ -38,7 +38,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -50,18 +50,20 @@ jobs:
       - name: Validate read-only preflight App inputs
         env:
           MESHR_PREFLIGHT_APP_ID: ${{ vars.MESHR_PREFLIGHT_APP_ID }}
+          MESHR_PREFLIGHT_APP_CLIENT_ID: ${{ vars.MESHR_PREFLIGHT_APP_CLIENT_ID }}
           MESHR_PREFLIGHT_APP_SLUG: ${{ vars.MESHR_PREFLIGHT_APP_SLUG }}
           MESHR_PREFLIGHT_APP_PRIVATE_KEY: ${{ secrets.MESHR_PREFLIGHT_APP_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           : "${MESHR_PREFLIGHT_APP_ID:?Set the repository MESHR_PREFLIGHT_APP_ID variable before release preflight}"
+          : "${MESHR_PREFLIGHT_APP_CLIENT_ID:?Set the repository MESHR_PREFLIGHT_APP_CLIENT_ID variable before release preflight}"
           : "${MESHR_PREFLIGHT_APP_SLUG:?Set the repository MESHR_PREFLIGHT_APP_SLUG variable before release preflight}"
           : "${MESHR_PREFLIGHT_APP_PRIVATE_KEY:?Set the repository MESHR_PREFLIGHT_APP_PRIVATE_KEY secret before release preflight}"
       - name: Mint read-only release preflight token
         id: preflight-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.MESHR_PREFLIGHT_APP_ID }}
+          client-id: ${{ vars.MESHR_PREFLIGHT_APP_CLIENT_ID }}
           private-key: ${{ secrets.MESHR_PREFLIGHT_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
@@ -79,11 +81,11 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with: {node-version: 24, cache: npm}
-      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
-      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+      - uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
       - run: npm ci
       - name: Audit JavaScript dependencies
         run: npm audit --audit-level=high
@@ -190,10 +192,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with: {node-version: 24, cache: npm}
-      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4
+      - uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
       - run: npm ci
       - name: Install pinned Bazelisk and k3d
         run: |
@@ -248,8 +250,8 @@ jobs:
           - node: "26.x"
             package: integrations/openclaw
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -282,7 +284,7 @@ jobs:
       moderation_adapter_digest: ${{ steps.resolve-bootstrap-digests.outputs.moderation_adapter }}
       web_digest: ${{ steps.resolve-bootstrap-digests.outputs.web }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Validate protected build inputs
         env:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
@@ -293,23 +295,23 @@ jobs:
           : "${GCP_PROJECT_ID:?Set the protected GCP_PROJECT_ID repository variable before an image build}"
           : "${GCP_BUILD_WORKLOAD_IDENTITY_PROVIDER:?Set the protected GCP_BUILD_WORKLOAD_IDENTITY_PROVIDER repository secret before an image build}"
           : "${GCP_BUILD_SERVICE_ACCOUNT:?Set the protected GCP_BUILD_SERVICE_ACCOUNT repository variable before an image build}"
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       # Refresh the short-lived WIF exchange immediately before each long
       # multi-architecture build. A build/push can outlive the GitHub OIDC
       # subject-token window on a cold runner.
       - name: Refresh GCP credentials before API image build
         id: api-build-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_BUILD_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_BUILD_SERVICE_ACCOUNT }}
           token_format: access_token
           access_token_lifetime: 3600s
       - name: Login to Artifact Registry for API build
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: oauth2accesstoken
@@ -325,14 +327,14 @@ jobs:
             --provenance=true --sbom=true --push .
       - name: Refresh GCP credentials before event-plane image build
         id: event-plane-build-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_BUILD_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_BUILD_SERVICE_ACCOUNT }}
           token_format: access_token
           access_token_lifetime: 3600s
       - name: Login to Artifact Registry for event-plane build
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: oauth2accesstoken
@@ -348,14 +350,14 @@ jobs:
             --provenance=true --sbom=true --push .
       - name: Refresh GCP credentials before moderation-adapter image build
         id: moderation-adapter-build-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_BUILD_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_BUILD_SERVICE_ACCOUNT }}
           token_format: access_token
           access_token_lifetime: 3600s
       - name: Login to Artifact Registry for moderation-adapter build
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: oauth2accesstoken
@@ -371,14 +373,14 @@ jobs:
             --provenance=true --sbom=true --push .
       - name: Refresh GCP credentials before web image build
         id: web-build-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_BUILD_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_BUILD_SERVICE_ACCOUNT }}
           token_format: access_token
           access_token_lifetime: 3600s
       - name: Login to Artifact Registry for web build
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: oauth2accesstoken
@@ -394,14 +396,14 @@ jobs:
             --provenance=true --sbom=true --push .
       - name: Refresh GCP credentials before image signing
         id: signing-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_BUILD_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_BUILD_SERVICE_ACCOUNT }}
           token_format: access_token
           access_token_lifetime: 3600s
       - name: Login to Artifact Registry for image signing
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: oauth2accesstoken
@@ -459,11 +461,11 @@ jobs:
       moderation_adapter_digest: ${{ steps.resolve.outputs.moderation_adapter }}
       web_digest: ${{ steps.resolve.outputs.web }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with: {node-version: 24, cache: npm}
       - name: Install release audit runtime
         run: npm ci --ignore-scripts --no-audit --no-fund
@@ -499,6 +501,7 @@ jobs:
           MESHR_CANARY_RELEASE_VALIDATION_MESH_ID: ${{ vars.MESHR_CANARY_RELEASE_VALIDATION_MESH_ID }}
           MESHR_CANARY_RELEASE_VALIDATION_TOPIC_ID: ${{ vars.MESHR_CANARY_RELEASE_VALIDATION_TOPIC_ID }}
           MESHR_CANARY_RELEASE_APP_ID: ${{ vars.MESHR_CANARY_RELEASE_APP_ID }}
+          MESHR_CANARY_RELEASE_APP_CLIENT_ID: ${{ vars.MESHR_CANARY_RELEASE_APP_CLIENT_ID }}
           MESHR_CANARY_RELEASE_APP_SLUG: ${{ vars.MESHR_CANARY_RELEASE_APP_SLUG }}
           MESHR_CANARY_RELEASE_APP_PRIVATE_KEY: ${{ secrets.MESHR_CANARY_RELEASE_APP_PRIVATE_KEY }}
         run: |
@@ -572,17 +575,18 @@ jobs:
             exit 1
           }
           : "${MESHR_CANARY_RELEASE_APP_ID:?Set the protected MESHR_CANARY_RELEASE_APP_ID canary variable before canary promotion}"
+          : "${MESHR_CANARY_RELEASE_APP_CLIENT_ID:?Set the protected MESHR_CANARY_RELEASE_APP_CLIENT_ID canary variable before canary promotion}"
           : "${MESHR_CANARY_RELEASE_APP_SLUG:?Set the protected MESHR_CANARY_RELEASE_APP_SLUG canary variable before canary promotion}"
           : "${MESHR_CANARY_RELEASE_APP_PRIVATE_KEY:?Set the protected MESHR_CANARY_RELEASE_APP_PRIVATE_KEY canary secret before canary promotion}"
-      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
-      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Mint short-lived canary release token
         id: canary-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.MESHR_CANARY_RELEASE_APP_ID }}
+          client-id: ${{ vars.MESHR_CANARY_RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.MESHR_CANARY_RELEASE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
@@ -595,7 +599,7 @@ jobs:
           test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
       - name: Refresh GCP credentials before pausing canary
         id: canary-pause-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
@@ -734,7 +738,7 @@ jobs:
           printf 'MESHR_CANARY_QUIESCED=true\n' >> "$GITHUB_ENV"
       - name: Refresh GCP credentials before resolving image digests
         id: canary-resolve-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
@@ -757,14 +761,14 @@ jobs:
           done
       - name: Refresh GCP credentials before registry verification
         id: canary-registry-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
           token_format: access_token
           access_token_lifetime: 3600s
       - name: Login to Artifact Registry for canary verification
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: oauth2accesstoken
@@ -919,7 +923,7 @@ jobs:
           }
       - name: Mint dedicated canary moderation adapter ID token
         id: canary-adapter-id-token
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
@@ -1005,7 +1009,7 @@ jobs:
             push "https://github.com/${GITHUB_REPOSITORY}.git" HEAD:canary
       - name: Refresh GCP credentials before applying canary inputs
         id: canary-apply-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
@@ -1591,7 +1595,7 @@ jobs:
             --generation "$MESHR_PROTECTED_FIXTURE_GENERATION"
       - name: Upload canary protected fixture state before rollout
         if: success() && steps.canary-apply.outputs.cost_protection_mode != 'normal'
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meshr-canary-protected-fixture-pre
           path: ${{ runner.temp }}/meshr-canary-protected-fixture-pre/protected-state.enc
@@ -1603,7 +1607,7 @@ jobs:
       - name: Refresh GCP credentials before resuming canary
         if: success()
         id: canary-resume-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
@@ -1796,7 +1800,7 @@ jobs:
       - name: Refresh GCP credentials before verifying canary rollout
         if: success()
         id: canary-verify-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
@@ -1890,7 +1894,7 @@ jobs:
       - name: Mint fresh canary moderation adapter ID token for post-deploy check
         if: success()
         id: canary-post-adapter-id-token
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
@@ -1910,7 +1914,7 @@ jobs:
       - name: Refresh GCP credentials before verifying canary edge
         if: success()
         id: canary-edge-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
@@ -2106,7 +2110,7 @@ jobs:
         run: echo 'MESHR_CANARY_PROTECTED_FIXTURE_DURABLE=true' >> "$GITHUB_ENV"
       - name: Upload canary protected fixture state after smoke
         if: success() && (steps.canary-apply.outputs.cost_protection_mode == 'protect' || steps.canary-apply.outputs.cost_protection_mode == 'throttle' || env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1')
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meshr-canary-protected-fixture-post
           path: ${{ runner.temp }}/meshr-canary-protected-fixture-post/protected-state.enc
@@ -2137,7 +2141,7 @@ jobs:
         run: bash scripts/run-native-release-acceptance.sh
       - name: Upload redacted canary runtime receipt
         if: success() && steps.canary-apply.outputs.cost_protection_mode == 'normal' && env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED != '1'
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meshr-canary-runtime-receipt-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/meshr-runtime-receipt.json
@@ -2152,7 +2156,7 @@ jobs:
       - name: Refresh GCP credentials before restoring canary
         if: success()
         id: canary-restore-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
@@ -2206,7 +2210,7 @@ jobs:
       - name: Refresh GCP credentials before reopening canary writes
         if: success() && env.MESHR_CANARY_DATABASE_CUTOVER_REQUIRED == '1'
         id: canary-reopen-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
@@ -2289,7 +2293,7 @@ jobs:
       - name: Refresh GCP credentials before restoring canary suspension
         if: success() && env.MESHR_CANARY_SUSPEND_RESTORE_PENDING == 'true'
         id: canary-suspend-restore-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
@@ -2426,7 +2430,7 @@ jobs:
       - name: Refresh GCP credentials before freezing canary
         if: failure()
         id: canary-freeze-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CANARY_DEPLOY_SERVICE_ACCOUNT }}
@@ -2581,11 +2585,11 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with: {node-version: 24, cache: npm}
       - name: Install release audit runtime
         run: npm ci --ignore-scripts --no-audit --no-fund
@@ -2621,6 +2625,7 @@ jobs:
           MESHR_PRODUCTION_RELEASE_VALIDATION_MESH_ID: ${{ vars.MESHR_PRODUCTION_RELEASE_VALIDATION_MESH_ID }}
           MESHR_PRODUCTION_RELEASE_VALIDATION_TOPIC_ID: ${{ vars.MESHR_PRODUCTION_RELEASE_VALIDATION_TOPIC_ID }}
           MESHR_PRODUCTION_RELEASE_APP_ID: ${{ vars.MESHR_PRODUCTION_RELEASE_APP_ID }}
+          MESHR_PRODUCTION_RELEASE_APP_CLIENT_ID: ${{ vars.MESHR_PRODUCTION_RELEASE_APP_CLIENT_ID }}
           MESHR_PRODUCTION_RELEASE_APP_SLUG: ${{ vars.MESHR_PRODUCTION_RELEASE_APP_SLUG }}
           MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY: ${{ secrets.MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY }}
         run: |
@@ -2686,16 +2691,17 @@ jobs:
             exit 1
           }
           : "${MESHR_PRODUCTION_RELEASE_APP_ID:?Set the protected MESHR_PRODUCTION_RELEASE_APP_ID production variable before production promotion}"
+          : "${MESHR_PRODUCTION_RELEASE_APP_CLIENT_ID:?Set the protected MESHR_PRODUCTION_RELEASE_APP_CLIENT_ID production variable before production promotion}"
           : "${MESHR_PRODUCTION_RELEASE_APP_SLUG:?Set the protected MESHR_PRODUCTION_RELEASE_APP_SLUG production variable before production promotion}"
           : "${MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY:?Set the protected MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY production secret before production promotion}"
-      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
-      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4
+      - uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
       - name: Mint short-lived production release token
         id: production-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.MESHR_PRODUCTION_RELEASE_APP_ID }}
+          client-id: ${{ vars.MESHR_PRODUCTION_RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
@@ -2703,7 +2709,7 @@ jobs:
           permission-workflows: write
       - name: Refresh GCP credentials before production registry verification
         id: production-registry-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
@@ -2712,7 +2718,7 @@ jobs:
       # The promotion job is a fresh runner. Use a one-hour OAuth token for
       # registry reads; the canary job's Docker credential helper is job-local.
       - name: Login to Artifact Registry for production verification
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: oauth2accesstoken
@@ -2829,7 +2835,7 @@ jobs:
           }
       - name: Mint dedicated production moderation adapter ID token
         id: production-adapter-id-token
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
@@ -2889,7 +2895,7 @@ jobs:
           test "$ready_revision" = "$CANDIDATE_REVISION" || { echo "Production candidate is not the latest ready revision." >&2; exit 1; }
       - name: Refresh GCP credentials before pausing production
         id: production-pause-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
@@ -3073,7 +3079,7 @@ jobs:
             push "https://github.com/${GITHUB_REPOSITORY}.git" HEAD:production
       - name: Refresh GCP credentials before applying production inputs
         id: production-apply-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
@@ -3661,7 +3667,7 @@ jobs:
             --generation "$MESHR_PROTECTED_FIXTURE_GENERATION"
       - name: Upload production protected fixture state before rollout
         if: success() && steps.production-apply.outputs.cost_protection_mode != 'normal'
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meshr-production-protected-fixture-pre
           path: ${{ runner.temp }}/meshr-production-protected-fixture-pre/protected-state.enc
@@ -3673,7 +3679,7 @@ jobs:
       - name: Refresh GCP credentials before resuming production
         if: success()
         id: production-resume-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
@@ -3865,7 +3871,7 @@ jobs:
       - name: Refresh GCP credentials before verifying production rollout
         if: success()
         id: production-verify-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
@@ -3956,7 +3962,7 @@ jobs:
       - name: Mint fresh production moderation adapter ID token for post-deploy check
         if: success()
         id: production-post-adapter-id-token
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
@@ -3976,7 +3982,7 @@ jobs:
       - name: Refresh GCP credentials before verifying production edge
         if: success()
         id: production-edge-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
@@ -4139,7 +4145,7 @@ jobs:
         run: echo 'MESHR_PRODUCTION_PROTECTED_FIXTURE_DURABLE=true' >> "$GITHUB_ENV"
       - name: Upload production protected fixture state after smoke
         if: success() && (steps.production-apply.outputs.cost_protection_mode == 'protect' || steps.production-apply.outputs.cost_protection_mode == 'throttle' || env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1')
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meshr-production-protected-fixture-post
           path: ${{ runner.temp }}/meshr-production-protected-fixture-post/protected-state.enc
@@ -4170,7 +4176,7 @@ jobs:
         run: bash scripts/run-native-release-acceptance.sh
       - name: Upload redacted production runtime receipt
         if: success() && steps.production-apply.outputs.cost_protection_mode == 'normal' && env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED != '1'
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meshr-production-runtime-receipt-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/meshr-runtime-receipt.json
@@ -4185,7 +4191,7 @@ jobs:
       - name: Refresh GCP credentials before restoring production
         if: success()
         id: production-restore-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
@@ -4239,7 +4245,7 @@ jobs:
       - name: Refresh GCP credentials before reopening production writes
         if: success() && env.MESHR_PRODUCTION_DATABASE_CUTOVER_REQUIRED == '1'
         id: production-reopen-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
@@ -4320,7 +4326,7 @@ jobs:
       - name: Refresh GCP credentials before restoring production suspension
         if: success() && env.MESHR_PRODUCTION_SUSPEND_RESTORE_PENDING == 'true'
         id: production-suspend-restore-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
@@ -4457,7 +4463,7 @@ jobs:
       - name: Refresh GCP credentials before freezing production
         if: failure()
         id: production-freeze-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
@@ -4598,9 +4604,9 @@ jobs:
       - name: Mint fresh production rollback token
         if: failure() && env.MESHR_PRODUCTION_CUTOVER_COMMIT_ATTEMPTED != 'true' && env.MESHR_PRODUCTION_PREVIOUS_RELEASE_SHA != '' && steps.release.outputs.release_sha != ''
         id: production-rollback-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.MESHR_PRODUCTION_RELEASE_APP_ID }}
+          client-id: ${{ vars.MESHR_PRODUCTION_RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.MESHR_PRODUCTION_RELEASE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
@@ -4608,7 +4614,7 @@ jobs:
       - name: Mint fresh GCP rollback credentials
         if: failure() && env.MESHR_PRODUCTION_CUTOVER_COMMIT_ATTEMPTED != 'true' && env.MESHR_PRODUCTION_PREVIOUS_RELEASE_SHA != '' && steps.release.outputs.release_sha != ''
         id: production-rollback-auth
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}

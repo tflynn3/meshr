@@ -31,6 +31,7 @@ const requiredRepositoryVariables = [
   "GCP_PROJECT_ID",
   "GCP_BUILD_SERVICE_ACCOUNT",
   "MESHR_PREFLIGHT_APP_ID",
+  "MESHR_PREFLIGHT_APP_CLIENT_ID",
   "MESHR_PREFLIGHT_APP_SLUG",
 ];
 const requiredEnvironmentInputs = {
@@ -49,6 +50,7 @@ const requiredEnvironmentInputs = {
       "MESHR_MODERATION_AUDIENCE",
       "MESHR_COST_PROTECTION_MODE",
       "MESHR_CANARY_RELEASE_APP_ID",
+      "MESHR_CANARY_RELEASE_APP_CLIENT_ID",
       "MESHR_CANARY_RELEASE_APP_SLUG",
     ],
   },
@@ -67,6 +69,7 @@ const requiredEnvironmentInputs = {
       "MESHR_MODERATION_AUDIENCE",
       "MESHR_COST_PROTECTION_MODE",
       "MESHR_PRODUCTION_RELEASE_APP_ID",
+      "MESHR_PRODUCTION_RELEASE_APP_CLIENT_ID",
       "MESHR_PRODUCTION_RELEASE_APP_SLUG",
     ],
   },
