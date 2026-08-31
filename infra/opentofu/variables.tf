@@ -239,8 +239,69 @@ variable "github_oauth_client_secret" {
 
 variable "github_repository" {
   type        = string
-  description = "GitHub owner/repository allowed to mint CI Workload Identity Federation tokens."
-  default     = "tflynn3/meshr"
+  description = "Canonical GitHub owner/repository that builds release artifacts. Pair it with the immutable numeric repository and owner IDs."
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", var.github_repository))
+    error_message = "github_repository must use the OWNER/REPOSITORY form."
+  }
+}
+
+variable "github_repository_id" {
+  type        = string
+  description = "Immutable numeric GitHub repository ID allowed to federate into the artifact-build identity."
+
+  validation {
+    condition     = can(regex("^[0-9]+$", var.github_repository_id))
+    error_message = "github_repository_id must contain only decimal digits."
+  }
+}
+
+variable "github_repository_owner_id" {
+  type        = string
+  description = "Immutable numeric GitHub repository-owner ID allowed to federate into the artifact-build identity."
+
+  validation {
+    condition     = can(regex("^[0-9]+$", var.github_repository_owner_id))
+    error_message = "github_repository_owner_id must contain only decimal digits."
+  }
+}
+
+variable "github_build_workflow_path" {
+  type        = string
+  description = "Repository-relative GitHub Actions workflow path allowed to mint the artifact-build identity."
+  default     = ".github/workflows/ci.yml"
+
+  validation {
+    condition = (
+      can(regex("^\\.github/workflows/[A-Za-z0-9_./-]+\\.ya?ml$", var.github_build_workflow_path)) &&
+      !strcontains(var.github_build_workflow_path, "..")
+    )
+    error_message = "github_build_workflow_path must name one YAML workflow below .github/workflows without parent traversal."
+  }
+}
+
+variable "github_deploy_identity" {
+  type = object({
+    repository          = string
+    repository_id       = string
+    repository_owner_id = string
+    workflow_path       = optional(string, ".github/workflows/ci.yml")
+  })
+  description = "Optional distinct GitHub repository and workflow allowed to deploy canary and production. Null reuses the artifact-build repository identity for self-hosted same-repository deployments."
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = var.github_deploy_identity == null ? true : (
+      can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", var.github_deploy_identity.repository)) &&
+      can(regex("^[0-9]+$", var.github_deploy_identity.repository_id)) &&
+      can(regex("^[0-9]+$", var.github_deploy_identity.repository_owner_id)) &&
+      can(regex("^\\.github/workflows/[A-Za-z0-9_./-]+\\.ya?ml$", var.github_deploy_identity.workflow_path)) &&
+      !strcontains(var.github_deploy_identity.workflow_path, "..")
+    )
+    error_message = "github_deploy_identity must provide OWNER/REPOSITORY, decimal repository and owner IDs, and one YAML workflow below .github/workflows without parent traversal."
+  }
 }
 
 variable "ci_service_account_id" {
