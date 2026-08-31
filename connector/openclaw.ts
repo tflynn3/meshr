@@ -35,8 +35,10 @@ const runOpenClawCommand: OpenClawCommandRunner = (command, args) =>
 
 function agentId(value: string): string {
   const normalized = value.trim();
-  if (!normalized || normalized.length > 128 || /[\u0000-\u001f\u007f]/.test(normalized)) {
-    throw new Error("OpenClaw agent ID must be 1 to 128 printable characters.");
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(normalized)) {
+    throw new Error(
+      "OpenClaw agent ID must be its canonical 1 to 64 character lowercase ID.",
+    );
   }
   return normalized;
 }
@@ -76,28 +78,24 @@ export async function configureOpenClawBinding(input: {
   const command = input.openClawCommand ?? "openclaw";
   const run = input.runCommand ?? runOpenClawCommand;
   const serverUrl = normalizeMeshrServerUrl(binding.serverUrl);
-  const listed = await run(command, ["config", "get", "agents.list", "--json"]);
+  const listed = await run(command, ["config", "get", "agents.entries", "--json"]);
   let agents: unknown;
   try {
     agents = JSON.parse(listed.stdout);
   } catch {
-    throw new Error("OpenClaw returned invalid JSON for agents.list.");
+    throw new Error("OpenClaw returned invalid JSON for agents.entries.");
   }
-  if (!Array.isArray(agents)) {
-    throw new Error("OpenClaw config must contain an agents.list array.");
+  if (!agents || typeof agents !== "object" || Array.isArray(agents)) {
+    throw new Error("OpenClaw config must contain an agents.entries object.");
   }
-  const matchingIndexes = agents.flatMap((candidate, index) => {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
-    return (candidate as Record<string, unknown>).id === selectedAgentId ? [index] : [];
-  });
-  if (matchingIndexes.length !== 1) {
-    throw new Error(
-      matchingIndexes.length === 0
-        ? `OpenClaw agent ${selectedAgentId} is not present in agents.list.`
-        : `OpenClaw agent ${selectedAgentId} appears more than once in agents.list.`,
-    );
+  const entries = agents as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(entries, selectedAgentId)) {
+    throw new Error(`OpenClaw agent ${selectedAgentId} is not present in agents.entries.`);
   }
-  const index = matchingIndexes[0]!;
+  const selectedEntry = entries[selectedAgentId];
+  if (!selectedEntry || typeof selectedEntry !== "object" || Array.isArray(selectedEntry)) {
+    throw new Error(`OpenClaw agent ${selectedAgentId} has an invalid agents.entries value.`);
+  }
   const operations = [
     { path: "plugins.entries.meshr.enabled", value: true },
     { path: "plugins.entries.meshr.config.baseUrl", value: serverUrl },
@@ -105,9 +103,9 @@ export async function configureOpenClawBinding(input: {
       path: "plugins.entries.meshr.config.statePath",
       value: input.store.path,
     },
-    { path: `agents.list[${index}].tools.profile`, value: "full" },
+    { path: `agents.entries.${selectedAgentId}.tools.profile`, value: "full" },
     {
-      path: `agents.list[${index}].tools.allow`,
+      path: `agents.entries.${selectedAgentId}.tools.allow`,
       value: MESHR_OPENCLAW_TOOL_ALLOWLIST,
     },
   ];
