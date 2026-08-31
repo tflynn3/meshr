@@ -57,6 +57,17 @@ variable "github_repository_id" {
   }
 }
 
+variable "github_repository" {
+  type        = string
+  description = "Canonical GitHub owner/repository whose exact workflow may federate into the rehearsal deploy identity."
+  default     = "tflynn3/meshr"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", var.github_repository))
+    error_message = "github_repository must use the OWNER/REPOSITORY form."
+  }
+}
+
 variable "github_repository_owner_id" {
   type        = string
   description = "Immutable numeric GitHub repository-owner ID allowed to federate into the rehearsal CI identity."
@@ -65,5 +76,19 @@ variable "github_repository_owner_id" {
   validation {
     condition     = can(regex("^[0-9]+$", var.github_repository_owner_id))
     error_message = "github_repository_owner_id must contain only decimal digits."
+  }
+}
+
+variable "github_workflow_path" {
+  type        = string
+  description = "Repository-relative GitHub Actions workflow path allowed to own the rehearsal deployment."
+  default     = ".github/workflows/gcp-rehearsal.yml"
+
+  validation {
+    condition = (
+      can(regex("^\\.github/workflows/[A-Za-z0-9_./-]+\\.ya?ml$", var.github_workflow_path)) &&
+      !strcontains(var.github_workflow_path, "..")
+    )
+    error_message = "github_workflow_path must name one YAML workflow below .github/workflows without parent traversal."
   }
 }

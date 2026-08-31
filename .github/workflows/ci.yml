@@ -32,7 +32,7 @@ env:
 
 jobs:
   release-preflight:
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    if: vars.MESHR_HOSTED_RELEASES_ENABLED == 'true' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -269,8 +269,8 @@ jobs:
         run: node scripts/package-consumer-smoke.mjs "${{ matrix.package }}"
 
   build:
-    needs: [verify, local-stack, package-engines, release-preflight]
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    needs: [verify, local-stack, package-engines]
+    if: vars.MESHR_MANAGED_BUILD_ENABLED == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -437,7 +437,7 @@ jobs:
 
   canary:
     needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.bootstrap_build_only != true)
+    if: vars.MESHR_HOSTED_RELEASES_ENABLED == 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.bootstrap_build_only != true)
     environment: canary
     concurrency:
       group: meshr-canary-promotion
@@ -587,6 +587,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
+          permission-workflows: write
       - name: Reject a stale main candidate
         run: |
           set -euo pipefail
@@ -2566,7 +2567,7 @@ jobs:
 
   promote:
     needs: canary
-    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.release_sha == github.sha && inputs.bootstrap_build_only != true
+    if: vars.MESHR_HOSTED_RELEASES_ENABLED == 'true' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.release_sha == github.sha && inputs.bootstrap_build_only != true
     environment: production
     concurrency:
       group: meshr-production-promotion
@@ -2699,6 +2700,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
+          permission-workflows: write
       - name: Refresh GCP credentials before production registry verification
         id: production-registry-auth
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2

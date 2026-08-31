@@ -27,7 +27,7 @@ env:
 
 jobs:
   rehearse:
-    if: github.event_name == 'workflow_dispatch'
+    if: vars.MESHR_PUBLIC_REHEARSAL_ENABLED == 'true' && github.event_name == 'workflow_dispatch'
     name: Build, deploy, and smoke
     environment: gcp-rehearsal
     runs-on: ubuntu-latest
@@ -295,7 +295,7 @@ jobs:
           retention-days: 7
 
   cleanup:
-    if: ${{ always() && needs.rehearse.result != 'skipped' }}
+    if: ${{ always() && vars.MESHR_PUBLIC_REHEARSAL_ENABLED == 'true' && needs.rehearse.result != 'skipped' }}
     needs: rehearse
     name: Destroy the ephemeral rehearsal cluster
     environment: gcp-rehearsal
@@ -403,7 +403,7 @@ jobs:
           retention-days: 7
 
   nightly-cleanup:
-    if: github.event_name == 'schedule'
+    if: vars.MESHR_PUBLIC_REHEARSAL_ENABLED == 'true' && github.event_name == 'schedule'
     name: Nightly destroy safeguard
     environment: gcp-rehearsal
     runs-on: ubuntu-latest

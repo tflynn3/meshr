@@ -9,6 +9,11 @@ DNS record, certificate, or public service. The `gcp-rehearsal.yml` workflow
 owns the ephemeral Autopilot cluster and deletes it in a separate always-run
 cleanup job with its own time budget.
 
+The official hosted deployment runs that lifecycle from the private operations
+repository. The public `gcp-rehearsal.yml` remains a self-hosting example and
+is inert unless `MESHR_PUBLIC_REHEARSAL_ENABLED=true` is explicitly configured
+in the repository that owns it.
+
 ## Bootstrap and remote state
 
 Use a dedicated rehearsal project. Project creation, its billing-account link,
@@ -85,18 +90,26 @@ The destroy command validates the cluster's name, region, Autopilot mode,
 Workload Identity pool, and rehearsal labels before deletion. Subsequent plans
 and rehearsals require no bootstrap exception.
 
-The numeric GitHub repository and owner IDs default to this repository's
-immutable IDs (`1348689949` and `19698887`). The provider accepts only
-`workflow_dispatch` or `schedule` tokens from the exact
-`tflynn3/meshr/.github/workflows/gcp-rehearsal.yml@refs/heads/main` workflow
-reference. The OIDC subject must name the protected `gcp-rehearsal` GitHub
-environment. This rejects pushes, branch variants, other workflow paths, and
-jobs that omit the environment. Configure GitHub with the provider and CI
-service-account outputs, not a key.
+The GitHub repository name, numeric repository/owner IDs, and workflow path
+default to this public repository's immutable identity. For the hosted service,
+override all four values so only the private operations workflow can deploy:
+
+```hcl
+github_repository          = "OWNER/meshr-ops"
+github_repository_id       = "IMMUTABLE_PRIVATE_REPOSITORY_ID"
+github_repository_owner_id = "IMMUTABLE_OWNER_ID"
+github_workflow_path        = ".github/workflows/deploy.yml"
+```
+
+The provider accepts only `workflow_dispatch` or `schedule` tokens from that
+exact workflow on `main`. The OIDC subject must name the protected
+`gcp-rehearsal` GitHub environment. This rejects pushes, branch variants, other
+workflow paths, and jobs that omit the environment. Configure GitHub with the
+provider and CI service-account outputs, not a key.
 
 GitHub repositories created after 2026-07-15 use an immutable default OIDC
 subject that embeds both numeric IDs. Keep the provider subject in the form
-`repo:tflynn3@OWNER_ID/meshr@REPOSITORY_ID:environment:gcp-rehearsal`; the
+`repo:OWNER@OWNER_ID/REPOSITORY@REPOSITORY_ID:environment:gcp-rehearsal`; the
 older name-only subject is rejected even though the separate numeric claim
 checks still pass.
 

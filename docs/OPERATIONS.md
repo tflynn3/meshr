@@ -36,11 +36,19 @@ local/emulator evidence from the managed-project launch gates.
 
 ## Release controls
 
-Production promotion is never chained from a push to `main`. The CI workflow
-builds and canary-tests commits automatically, but the production job runs only
-from an explicit `workflow_dispatch` on `main` with `release_sha` equal to the
-checked-out commit. The `canary` and `production` release refs must be
-protected against ordinary pushes, force-pushes, and deletion. Canary and
+Production promotion is never chained from a push to `main`. For the hosted
+service, the public repository verifies source while the private
+`tflynn3/meshr-ops` workflow accepts only an exact, green commit at the tip of
+protected public `main`. The no-public-surface rehearsal builds, signs,
+deploys, exercises, and tears down that exact commit from the private workflow.
+Hosted canary and production remain manual protected-environment actions.
+
+The public workflow retains build and promotion jobs as a self-hosting
+template, but they are inert unless an operator explicitly sets
+`MESHR_MANAGED_BUILD_ENABLED=true` and `MESHR_HOSTED_RELEASES_ENABLED=true` in
+that repository. The official hosted repository does not set those flags or
+store hosted deploy credentials. The `canary` and `production` release refs
+must be protected against ordinary pushes, force-pushes, and deletion. Canary and
 production use separate environment-scoped GitHub Apps; the workflow mints a
 short-lived installation token in each job from the matching App's private key.
 Each branch ruleset must name only its own App integration as an `always`

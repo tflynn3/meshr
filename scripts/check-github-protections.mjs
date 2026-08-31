@@ -87,6 +87,17 @@ function fail(message) {
   throw new Error(message);
 }
 
+function readBypassActors(ruleset, options = {}) {
+  if (!Object.prototype.hasOwnProperty.call(ruleset, "bypass_actors")) {
+    if (options.allowUnreadable) return { actors: [], readable: false };
+    fail(options.errorMessage || "GitHub ruleset bypass actors are not readable.");
+  }
+  return {
+    actors: Array.isArray(ruleset.bypass_actors) ? ruleset.bypass_actors : [],
+    readable: true,
+  };
+}
+
 /** Match GitHub's ref-name glob syntax for the small set used by release rules. */
 function matchesRefPattern(value, target, kind) {
   if (typeof value !== "string") return false;
@@ -233,7 +244,7 @@ function assertBranchProtection(repo, targetBranch, { requireVerify }) {
   };
 }
 
-function assertReleaseRuleset(repo, targetBranch, expectedAppId) {
+function assertReleaseRuleset(repo, targetBranch, expectedAppId, options = {}) {
   const summaries = ghApi(`repos/${repo}/rulesets?includes_parents=true&per_page=100`);
   if (summaries.__error) fail(`Cannot inspect GitHub rulesets: ${summaries.__error}`);
   if (!Array.isArray(summaries)) fail(`GitHub returned an invalid ruleset list for ${repo}.`);
@@ -272,14 +283,19 @@ function assertReleaseRuleset(repo, targetBranch, expectedAppId) {
     if (!rules.some((rule) => rule?.type === "non_fast_forward")) {
       fail(`Every active ruleset applying to ${targetBranch} must reject force-pushes.`);
     }
-    // The release App is part of the promotion trust boundary. If the
-    // preflight identity cannot read bypass actors, fail closed instead of
-    // allowing a mutable release ref to advance on an unverified assumption.
-    const hasBypassActorsField = Object.prototype.hasOwnProperty.call(candidate, "bypass_actors");
-    if (!hasBypassActorsField) {
-      fail(`Every ruleset applying to ${targetBranch} must expose bypass actors to the release preflight identity.`);
+    // The release App is part of the promotion trust boundary. Full/admin
+    // checks fail closed when bypass actors are hidden. The automated
+    // read-only metadata check records that limitation explicitly and leaves
+    // bypass verification to the documented administrator bootstrap check.
+    const bypass = readBypassActors(candidate, {
+      allowUnreadable: options.allowUnreadableBypassActors,
+      errorMessage: `Every ruleset applying to ${targetBranch} must expose bypass actors to the release preflight identity.`,
+    });
+    if (!bypass.readable) {
+      bypassActorsReadable = false;
+      continue;
     }
-    const bypassActors = Array.isArray(candidate.bypass_actors) ? candidate.bypass_actors : [];
+    const bypassActors = bypass.actors;
     const integrationActors = bypassActors.filter((actor) =>
       (actor?.actor_type === "Integration" || Number(actor?.actor_type) === 1) &&
       actor?.bypass_mode === "always",
@@ -335,7 +351,7 @@ function assertDistinctReleaseAppIds(canaryId, productionId) {
   return { canaryId, productionId };
 }
 
-function assertReleaseTagRuleset(repo) {
+function assertReleaseTagRuleset(repo, options = {}) {
   const summaries = ghApi(`repos/${repo}/rulesets?includes_parents=true&per_page=100`);
   if (summaries.__error) fail(`Cannot inspect GitHub tag rulesets: ${summaries.__error}`);
   if (!Array.isArray(summaries)) fail(`GitHub returned an invalid ruleset list for ${repo}.`);
@@ -353,11 +369,17 @@ function assertReleaseTagRuleset(repo) {
     if (!hasNoDeletion || !hasNoRewrite) {
       fail("The v* tag ruleset must reject deletion and non-fast-forward updates.");
     }
-    const hasBypassActorsField = Object.prototype.hasOwnProperty.call(detail, "bypass_actors");
-    if (!hasBypassActorsField) {
-      fail("The immutable v* tag ruleset must expose bypass actors to the release preflight identity.");
+    const bypass = readBypassActors(detail, {
+      allowUnreadable: options.allowUnreadableBypassActors,
+      errorMessage: "The immutable v* tag ruleset must expose bypass actors to the release preflight identity.",
+    });
+    if (!bypass.readable) {
+      bypassActorsReadable = false;
+      const includes = detail?.conditions?.ref_name?.include ?? [];
+      matching.push({ rulesetId: detail.id, pattern: includes });
+      continue;
     }
-    const bypassActors = Array.isArray(detail.bypass_actors) ? detail.bypass_actors : [];
+    const bypassActors = bypass.actors;
     if (bypassActors.length) {
       fail("The immutable v* tag ruleset must not grant bypass actors.");
     }
@@ -393,10 +415,14 @@ function main() {
 
   const releaseApps = metadataOnly ? null : assertDistinctReleaseApps();
   const releaseRulesets = [
-    assertReleaseRuleset(repository, "canary", releaseApps?.canaryId),
-    assertReleaseRuleset(repository, "production", releaseApps?.productionId),
+    assertReleaseRuleset(repository, "canary", releaseApps?.canaryId, {
+      allowUnreadableBypassActors: metadataOnly,
+    }),
+    assertReleaseRuleset(repository, "production", releaseApps?.productionId, {
+      allowUnreadableBypassActors: metadataOnly,
+    }),
   ];
-  if (metadataOnly) {
+  if (metadataOnly && releaseRulesets.every((ruleset) => ruleset.bypassActorsReadable)) {
     // Metadata mode still proves the canary and production release Apps are
     // distinct. It only skips checking protected secret/variable names.
     assertDistinctReleaseAppIds(
@@ -404,7 +430,9 @@ function main() {
       Number(releaseRulesets[1]?.bypassAppId),
     );
   }
-  const releaseTagRuleset = assertReleaseTagRuleset(repository);
+  const releaseTagRuleset = assertReleaseTagRuleset(repository, {
+    allowUnreadableBypassActors: metadataOnly,
+  });
 
   // The automated metadata preflight runs with a dedicated read-only GitHub
   // App. Environment-scoped credential names are checked by the protected
@@ -417,6 +445,10 @@ function main() {
       environments: [canary, production, npm],
       releaseRulesets,
       releaseTagRuleset,
+      requiresAdminBypassVerification: [
+        ...releaseRulesets,
+        releaseTagRuleset,
+      ].some((ruleset) => !ruleset.bypassActorsReadable),
       metadataOnly: true,
     }, null, 2));
     return;
@@ -477,4 +509,5 @@ export {
   assertDistinctReleaseAppIds,
   isNamespaceWideReleaseTagRule,
   matchesRefPattern,
+  readBypassActors,
 };

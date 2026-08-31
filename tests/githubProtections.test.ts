@@ -5,6 +5,7 @@ import {
   assertDistinctReleaseAppIds,
   isNamespaceWideReleaseTagRule,
   matchesRefPattern,
+  readBypassActors,
 } from "../scripts/check-github-protections.mjs";
 
 test("GitHub ref matching honors exact refs, wildcards, and exclusion precedence", () => {
@@ -36,4 +37,19 @@ test("canary and production release identities must be distinct", () => {
   });
   assert.throws(() => assertDistinctReleaseAppIds(101, 101), /distinct integrations/);
   assert.throws(() => assertDistinctReleaseAppIds(0, 202), /positive integers/);
+});
+
+test("read-only preflight reports hidden bypass actors without granting write access", () => {
+  assert.deepEqual(readBypassActors({}, { allowUnreadable: true }), {
+    actors: [],
+    readable: false,
+  });
+  assert.deepEqual(readBypassActors({ bypass_actors: [{ actor_id: 101 }] }), {
+    actors: [{ actor_id: 101 }],
+    readable: true,
+  });
+  assert.throws(
+    () => readBypassActors({}, { errorMessage: "admin verification required" }),
+    /admin verification required/,
+  );
 });
