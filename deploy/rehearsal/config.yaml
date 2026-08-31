@@ -19,7 +19,11 @@ data:
   MESHR_NOTIFICATIONS_FIRESTORE_DATABASE: ${MESHR_REHEARSAL_NOTIFICATIONS_DATABASE}
   MESHR_MODERATION_FIRESTORE_DATABASE: ${MESHR_REHEARSAL_MODERATION_DATABASE}
   MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID: pending
-  MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN: "1"
+  # A genuinely new authority has no bootstrap marker, so the repository
+  # always scans its projection database on first launch. Routine rehearsals
+  # reuse the attested generation left by the previous successful run; forcing
+  # another empty-store scan would reject the topology written by that run.
+  MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN: "0"
   MESHR_COST_PROTECTION_MODE: protect
   MESHR_RELEASE_SHA: ${MESHR_REHEARSAL_RELEASE_SHA}
   MESHR_HOST: 0.0.0.0

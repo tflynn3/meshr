@@ -99,6 +99,11 @@ test("GCP rehearsal uses Workload Identity and distinct managed Firestore databa
   assert.equal(config.data.MESHR_ENV, "production");
   assert.equal(config.data.MESHR_STORAGE, "firestore");
   assert.equal(config.data.MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID, "pending");
+  assert.equal(
+    config.data.MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN,
+    "0",
+    "routine rehearsals must reuse the existing attested projection generation",
+  );
   assert.equal(config.data.MESHR_EVENTS_TOPIC, "${MESHR_REHEARSAL_EVENTS_TOPIC}");
   assert.equal(config.data.MESHR_TOPOLOGY_SUBSCRIPTION, "${MESHR_REHEARSAL_TOPOLOGY_SUBSCRIPTION}");
   const databaseValues = [
