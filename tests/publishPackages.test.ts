@@ -1,6 +1,32 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { test } from "node:test";
 import { planPublication } from "../scripts/publish-npm-packages.mjs";
+
+const repositoryRoot = resolve(import.meta.dirname, "..");
+
+test("OpenClaw publication advertises only engine-strict dependency bands", () => {
+  const packageJson = JSON.parse(
+    readFileSync(resolve(repositoryRoot, "integrations/openclaw/package.json"), "utf8"),
+  );
+  const workflow = readFileSync(
+    resolve(repositoryRoot, ".github/workflows/ci.yml"),
+    "utf8",
+  );
+  assert.equal(
+    packageJson.engines?.node,
+    ">=22.22.3 <23 || >=24.15.0 <25 || >=26.0.0 <27",
+  );
+  assert.match(
+    workflow,
+    /- node: "26\.x"\s+package: integrations\/openclaw/,
+  );
+  assert.doesNotMatch(
+    workflow,
+    /- node: "25\.x"\s+package: integrations\/openclaw/,
+  );
+});
 
 test("resumable npm publication skips a verified first package and publishes the missing second package", () => {
   const artifacts = [
