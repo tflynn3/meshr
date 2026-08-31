@@ -1,0 +1,419 @@
+name: GCP deployment rehearsal
+
+on:
+  # One-time pre-merge bootstrap. Remove this branch trigger after the first
+  # managed deployment proof; durable runs use dispatch or the nightly guard.
+  push:
+    branches: [feat/copyable-agent-setup]
+  workflow_dispatch:
+    inputs:
+      keep_cluster:
+        description: "Keep the ephemeral rehearsal cluster after this run (the nightly safeguard still deletes it)"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # A queued cleanup shares the rehearsal concurrency lock, so it cannot
+    # delete the cluster from underneath a running manual rehearsal.
+    - cron: "17 9 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: meshr-gcp-rehearsal
+  cancel-in-progress: false
+
+env:
+  REGISTRY: us-central1-docker.pkg.dev
+  ARTIFACT_REPOSITORY: meshr-rehearsal
+  APP_NAMESPACE: meshr-rehearsal
+
+jobs:
+  rehearse:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/feat/copyable-agent-setup')
+    name: Build, deploy, and smoke
+    environment: gcp-rehearsal
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # These are protected GitHub environment variables. Authentication uses
+      # GitHub OIDC -> Google Workload Identity Federation; no service-account
+      # key is stored in GitHub.
+      GCP_REHEARSAL_PROJECT_ID: ${{ vars.GCP_REHEARSAL_PROJECT_ID }}
+      REGION: ${{ vars.REGION }}
+      CLUSTER: ${{ vars.CLUSTER }}
+      WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+      SERVICE_ACCOUNT: ${{ vars.SERVICE_ACCOUNT }}
+      NODE_SERVICE_ACCOUNT: ${{ vars.NODE_SERVICE_ACCOUNT }}
+      # Runtime-script compatibility aliases.
+      GCP_PROJECT_ID: ${{ vars.GCP_REHEARSAL_PROJECT_ID }}
+      GCP_REGION: ${{ vars.REGION }}
+      GKE_CLUSTER: ${{ vars.CLUSTER }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate protected rehearsal inputs
+        run: |
+          set -euo pipefail
+          for name in \
+            GCP_REHEARSAL_PROJECT_ID REGION CLUSTER \
+            WORKLOAD_IDENTITY_PROVIDER SERVICE_ACCOUNT NODE_SERVICE_ACCOUNT; do
+            test -n "${!name:-}" || {
+              echo "Set the protected gcp-rehearsal environment variable $name." >&2
+              exit 1
+            }
+          done
+          test "$REGION" = us-central1 || {
+            echo "REGION must be us-central1 for the meshr-rehearsal Artifact Registry foundation." >&2
+            exit 1
+          }
+
+      - name: Authenticate to Google Cloud without a service-account key
+        id: registry-auth
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Verify the persistent rehearsal foundation
+        run: |
+          set -euo pipefail
+          gcloud artifacts repositories describe "$ARTIFACT_REPOSITORY" \
+            --location us-central1 \
+            --project "$GCP_REHEARSAL_PROJECT_ID" \
+            --format='value(name)' >/dev/null
+
+      - name: Login to Artifact Registry
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: oauth2accesstoken
+          password: ${{ steps.registry-auth.outputs.access_token }}
+
+      - name: Install smoke-test dependencies and pinned Bazelisk
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm install --global --ignore-scripts @bazel/bazelisk@1.28.1
+          if ! command -v envsubst >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends gettext-base
+          fi
+          bazelisk version
+
+      - name: Build and push linux/amd64 rehearsal images
+        env:
+          IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          for image in api event-plane web; do
+            docker buildx build \
+              --platform linux/amd64 \
+              --file "deploy/images/${image}.Dockerfile" \
+              --tag "$REGISTRY/$GCP_REHEARSAL_PROJECT_ID/$ARTIFACT_REPOSITORY/$image:$IMAGE_TAG" \
+              --provenance=mode=max \
+              --sbom=true \
+              --push .
+          done
+
+      - name: Refresh registry credentials before signing
+        id: signing-auth
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+
+      - name: Refresh Artifact Registry login before signing
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: oauth2accesstoken
+          password: ${{ steps.signing-auth.outputs.access_token }}
+
+      - name: Resolve, sign, and verify immutable image digests
+        id: images
+        env:
+          IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          certificate_identity="https://github.com/${GITHUB_WORKFLOW_REF}"
+          {
+            echo '### Rehearsal image supply chain'
+            echo '| Image | Signed immutable reference |'
+            echo '| --- | --- |'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for image in api event-plane web; do
+            tagged="$REGISTRY/$GCP_REHEARSAL_PROJECT_ID/$ARTIFACT_REPOSITORY/$image:$IMAGE_TAG"
+            digest="$(gcloud artifacts docker images describe "$tagged" \
+              --project "$GCP_REHEARSAL_PROJECT_ID" \
+              --format='value(image_summary.digest)')"
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+              echo "Artifact Registry returned an invalid digest for $image: $digest" >&2
+              exit 1
+            }
+            immutable="$REGISTRY/$GCP_REHEARSAL_PROJECT_ID/$ARTIFACT_REPOSITORY/$image@$digest"
+            cosign sign --yes "$immutable"
+            cosign verify "$immutable" \
+              --certificate-identity "$certificate_identity" \
+              --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' >/dev/null
+            key="${image//-/_}"
+            echo "$key=$digest" >> "$GITHUB_OUTPUT"
+            printf '| `%s` | `%s` |\n' "$image" "$immutable" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      # Refresh WIF credentials after the builds so cluster provisioning,
+      # deployment, and smoke do not depend on an almost-expired access token.
+      - name: Refresh Google Cloud credentials for deployment
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.SERVICE_ACCOUNT }}
+
+      - name: Create the ephemeral GKE cluster
+        run: bash scripts/gcp-rehearsal.sh create-cluster
+
+      - name: Deploy signed immutable images
+        env:
+          API_IMAGE: ${{ env.REGISTRY }}/${{ vars.GCP_REHEARSAL_PROJECT_ID }}/${{ env.ARTIFACT_REPOSITORY }}/api@${{ steps.images.outputs.api }}
+          EVENT_PLANE_IMAGE: ${{ env.REGISTRY }}/${{ vars.GCP_REHEARSAL_PROJECT_ID }}/${{ env.ARTIFACT_REPOSITORY }}/event-plane@${{ steps.images.outputs.event_plane }}
+          WEB_IMAGE: ${{ env.REGISTRY }}/${{ vars.GCP_REHEARSAL_PROJECT_ID }}/${{ env.ARTIFACT_REPOSITORY }}/web@${{ steps.images.outputs.web }}
+        run: bash scripts/gcp-rehearsal.sh deploy
+
+      - name: Verify the rehearsal has no public Kubernetes surface
+        run: |
+          set -euo pipefail
+          violations=()
+
+          while IFS= read -r object; do
+            test -z "$object" || violations+=("$object")
+          done < <(kubectl -n "$APP_NAMESPACE" get ingress.networking.k8s.io -o name)
+
+          if kubectl api-resources \
+            --api-group=gateway.networking.k8s.io \
+            --namespaced=true \
+            -o name | grep -Fxq 'gateways.gateway.networking.k8s.io'; then
+            while IFS= read -r object; do
+              test -z "$object" || violations+=("$object")
+            done < <(kubectl -n "$APP_NAMESPACE" get gateways.gateway.networking.k8s.io -o name)
+          fi
+
+          while IFS= read -r service; do
+            test -z "$service" || violations+=("service/$service")
+          done < <(
+            kubectl -n "$APP_NAMESPACE" get services -o json |
+              jq -r '
+                .items[] |
+                select(
+                  (.spec.type // "ClusterIP") != "ClusterIP" or
+                  ((.spec.externalIPs // []) | length) != 0 or
+                  (.spec.loadBalancerIP // "") != "" or
+                  ([.spec.ports[]? | has("nodePort")] | any)
+                ) |
+                "\(.metadata.name)=\(.spec.type // "ClusterIP")"
+              '
+          )
+
+          if ((${#violations[@]})); then
+            printf 'Public-surface policy violation: %s\n' "${violations[@]}" >&2
+            exit 1
+          fi
+          {
+            echo '### Private deployment boundary'
+            echo
+            echo "Namespace \`$APP_NAMESPACE\` has no Ingress, no Gateway, and only ClusterIP Services."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run the deployed event-path smoke
+        run: bash scripts/gcp-rehearsal.sh smoke
+
+      - name: Restart workloads and rerun smoke
+        run: bash scripts/gcp-rehearsal.sh restart-smoke
+
+      - name: Record successful rehearsal
+        run: |
+          {
+            echo '### Rehearsal result'
+            echo
+            echo "Build, signed-digest deployment, private-surface validation, smoke, and restart-smoke passed for \`$GITHUB_SHA\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Capture bounded failure diagnostics before teardown
+        if: ${{ failure() }}
+        run: |
+          set +e
+          diagnostics="$RUNNER_TEMP/gcp-rehearsal-diagnostics"
+          mkdir -p "$diagnostics"
+          bash scripts/gcp-rehearsal.sh status >"$diagnostics/status.txt" 2>&1
+          kubectl -n "$APP_NAMESPACE" get all,networkpolicy -o wide \
+            --request-timeout=15s >"$diagnostics/resources.txt" 2>&1
+          kubectl -n "$APP_NAMESPACE" get events \
+            --sort-by=.metadata.creationTimestamp \
+            --request-timeout=15s 2>&1 | tail -n 300 >"$diagnostics/events.txt"
+          kubectl -n "$APP_NAMESPACE" describe pods \
+            --request-timeout=15s 2>&1 | tail -n 3000 >"$diagnostics/pods-describe.txt"
+
+          kubectl -n "$APP_NAMESPACE" get pods -o json --request-timeout=15s 2>/dev/null |
+            jq -r '.items[] | .metadata.name as $pod | (.spec.initContainers[]?.name, .spec.containers[]?.name) | [$pod, .] | @tsv' |
+            head -n 40 |
+            while IFS=$'\t' read -r pod container; do
+              kubectl -n "$APP_NAMESPACE" logs "$pod" -c "$container" \
+                --tail=300 --timestamps --request-timeout=15s \
+                >"$diagnostics/${pod}-${container}.log" 2>&1
+              kubectl -n "$APP_NAMESPACE" logs "$pod" -c "$container" \
+                --previous --tail=100 --timestamps --request-timeout=15s \
+                >"$diagnostics/${pod}-${container}-previous.log" 2>&1
+            done
+
+      - name: Refresh Google Cloud credentials for teardown
+        if: ${{ always() && inputs.keep_cluster != true }}
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.SERVICE_ACCOUNT }}
+
+      - name: Destroy the ephemeral GKE cluster
+        if: ${{ always() && inputs.keep_cluster != true }}
+        run: |
+          bash scripts/gcp-rehearsal.sh destroy-cluster
+          {
+            echo '### Cost control'
+            echo
+            echo "Ephemeral cluster \`$CLUSTER\` was deleted. The low-cost persistent foundation and immutable images remain."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record explicitly retained cluster
+        if: ${{ always() && inputs.keep_cluster == true }}
+        run: |
+          {
+            echo '### Cost control'
+            echo
+            echo "Cluster \`$CLUSTER\` was explicitly retained by this manual run. The nightly cleanup safeguard will still delete it."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Capture teardown failure state
+        if: ${{ failure() }}
+        run: |
+          set +e
+          diagnostics="$RUNNER_TEMP/gcp-rehearsal-diagnostics"
+          mkdir -p "$diagnostics"
+          gcloud container clusters describe "$CLUSTER" \
+            --region "$REGION" \
+            --project "$GCP_REHEARSAL_PROJECT_ID" \
+            --format=yaml >"$diagnostics/cluster-after-teardown.yaml" 2>&1
+          gcloud container operations list \
+            --region "$REGION" \
+            --project "$GCP_REHEARSAL_PROJECT_ID" \
+            --limit=20 \
+            --format='table(name,operationType,status,statusMessage)' \
+            >"$diagnostics/recent-cluster-operations.txt" 2>&1
+          printf 'run=%s attempt=%s sha=%s keep_cluster=%s\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" "${{ inputs.keep_cluster }}" \
+            >"$diagnostics/run.txt"
+
+      - name: Upload bounded failure diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: gcp-rehearsal-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gcp-rehearsal-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+
+  nightly-cleanup:
+    if: github.event_name == 'schedule'
+    name: Nightly destroy safeguard
+    environment: gcp-rehearsal
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GCP_REHEARSAL_PROJECT_ID: ${{ vars.GCP_REHEARSAL_PROJECT_ID }}
+      REGION: ${{ vars.REGION }}
+      CLUSTER: ${{ vars.CLUSTER }}
+      WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+      SERVICE_ACCOUNT: ${{ vars.SERVICE_ACCOUNT }}
+      NODE_SERVICE_ACCOUNT: ${{ vars.NODE_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ vars.GCP_REHEARSAL_PROJECT_ID }}
+      GCP_REGION: ${{ vars.REGION }}
+      GKE_CLUSTER: ${{ vars.CLUSTER }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate protected cleanup inputs
+        run: |
+          set -euo pipefail
+          for name in GCP_REHEARSAL_PROJECT_ID REGION CLUSTER WORKLOAD_IDENTITY_PROVIDER SERVICE_ACCOUNT; do
+            test -n "${!name:-}" || {
+              echo "Set the protected gcp-rehearsal environment variable $name." >&2
+              exit 1
+            }
+          done
+          test "$REGION" = us-central1 || {
+            echo "REGION must be us-central1 for the meshr-rehearsal foundation." >&2
+            exit 1
+          }
+      - name: Authenticate to Google Cloud without a service-account key
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+      - name: Destroy any leftover rehearsal cluster
+        run: |
+          set -euo pipefail
+          bash scripts/gcp-rehearsal.sh destroy-cluster
+          {
+            echo '### Nightly rehearsal cleanup'
+            echo
+            echo "No ephemeral cluster named \`$CLUSTER\` remains in \`$REGION\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Capture bounded cleanup failure diagnostics
+        if: ${{ failure() }}
+        run: |
+          set +e
+          diagnostics="$RUNNER_TEMP/gcp-rehearsal-cleanup-diagnostics"
+          mkdir -p "$diagnostics"
+          gcloud container clusters describe "$CLUSTER" \
+            --region "$REGION" \
+            --project "$GCP_REHEARSAL_PROJECT_ID" \
+            --format=yaml >"$diagnostics/cluster.yaml" 2>&1
+          gcloud container operations list \
+            --region "$REGION" \
+            --project "$GCP_REHEARSAL_PROJECT_ID" \
+            --limit=20 \
+            --format='table(name,operationType,status,statusMessage)' \
+            >"$diagnostics/recent-cluster-operations.txt" 2>&1
+      - name: Upload bounded cleanup failure diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: gcp-rehearsal-cleanup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gcp-rehearsal-cleanup-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
