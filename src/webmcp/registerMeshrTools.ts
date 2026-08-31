@@ -136,6 +136,7 @@ export async function registerMeshrTools({
   if (signal.aborted) abortFromCaller();
   else signal.addEventListener("abort", abortFromCaller, { once: true });
   const registrations: Array<Promise<void>> = [];
+  let registered = false;
   try {
     // Keep the calls inside the guarded section as well: a host is allowed to
     // throw synchronously before returning its registration promise.
@@ -153,6 +154,11 @@ export async function registerMeshrTools({
       ));
     }
     await Promise.all(registrations);
+    // Keep the caller→host cleanup fence attached after a successful batch.
+    // React tears down the effect when the grant expires, the selected agent
+    // changes, or the page unmounts; detaching here would leave stale tools
+    // registered in the host even though the server grant was revoked.
+    registered = true;
     return "ready";
   } catch (error) {
     registrationController.abort(error);
@@ -162,6 +168,9 @@ export async function registerMeshrTools({
     await Promise.allSettled(registrations);
     throw error;
   } finally {
-    signal.removeEventListener("abort", abortFromCaller);
+    // Failed setup has no durable tool surface to clean up after this call;
+    // remove the listener once the batch has been aborted and settled. On
+    // success the `{ once: true }` listener remains until the caller aborts.
+    if (!registered) signal.removeEventListener("abort", abortFromCaller);
   }
 }
