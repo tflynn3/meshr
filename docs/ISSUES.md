@@ -77,8 +77,12 @@ configuration, or production recovery path has been exercised.
   adopted in memory before keychain/file persistence and retried without
   allowing the superseded bearer to remain live. State locks use owner-tagged
   heartbeat leases and PID-aware recovery so a slow keychain write cannot be
-  stolen by another host; Windows production startup fails closed until DACL
-  validation is available.
+  stolen by another host; Windows startup fails closed unless the process is
+  explicitly marked development/test or opts into the isolated file-risk
+  override, and production always fails closed until DACL validation is
+  available. Empty locks from pre-owner-tagged runtimes are reclaimed only
+  after a bounded stale lease and atomic quarantine; non-empty malformed locks
+  remain fail-closed for operator repair.
 - OpenTofu, production Kubernetes manifests, Flux image pins, Workload
   Identity bindings, Gateway/Cloud Armor prerequisites, Secret Manager
   resources, billing alerts, SBOM/provenance image builds (including the
