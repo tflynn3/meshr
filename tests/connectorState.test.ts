@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, utimes, writeFile
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { ConnectorStateStore } from "../connector/state.ts";
+import { assertNativeStatePlatform, ConnectorStateStore } from "../connector/state.ts";
 import {
   CONNECTOR_STATE_VERSION,
   type ConnectorBinding,
@@ -151,6 +151,19 @@ test("credential storage mode rejects unsafe configuration typos", () => {
   }
 });
 
+test("Windows native state fails closed unless explicitly opted into a non-production mode", () => {
+  assert.throws(
+    () => assertNativeStatePlatform("win32", undefined, undefined),
+    /not enabled on Windows without an explicit development or file-risk opt-in/,
+  );
+  assert.doesNotThrow(() => assertNativeStatePlatform("win32", "development", undefined));
+  assert.doesNotThrow(() => assertNativeStatePlatform("win32", undefined, "allow"));
+  assert.throws(
+    () => assertNativeStatePlatform("win32", "production", "allow"),
+    /not production-supported on Windows/,
+  );
+});
+
 test("connector state refuses insecure directories, files, and symlinks", async (t) => {
   if (process.platform === "win32") return;
   const directory = await mkdtemp(join(tmpdir(), "meshr-state-boundary-test-"));
@@ -250,4 +263,21 @@ test("connector state never steals a stale lock owned by a live process", async 
   );
   const retained = JSON.parse(await readFile(lockPath, "utf8")) as { owner?: string };
   assert.equal(retained.owner, "live-test-owner");
+});
+
+test("connector state migrates a stale empty legacy lock", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "meshr-state-legacy-lock-test-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const lockPath = join(directory, "state.json.lock");
+  await writeFile(lockPath, "", { mode: 0o600 });
+  const staleAt = new Date(Date.now() - 60_000);
+  await utimes(lockPath, staleAt, staleAt);
+
+  const store = new ConnectorStateStore(directory, { useKeychain: false });
+  await store.save({ version: CONNECTOR_STATE_VERSION, bindings: [] });
+  assert.deepEqual(JSON.parse(await readFile(join(directory, "state.json"), "utf8")), {
+    version: CONNECTOR_STATE_VERSION,
+    bindings: [],
+  });
+  await assert.rejects(readFile(lockPath), { code: "ENOENT" });
 });

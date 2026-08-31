@@ -45,6 +45,11 @@ Open <http://127.0.0.1:5173/>. Press Ctrl-C to stop only the processes started
 by that command. The isolated k3d loop remains available separately at
 <http://localhost:8080/>.
 
+Windows native hosts are development-only until DACL validation is available.
+They fail closed unless `MESHR_ENV=development` (or the explicit
+`MESHR_WINDOWS_FILE_STATE=allow` override for an isolated CI/test host) is set;
+production always fails closed.
+
 The GKE-shaped loop runs Meshr in a local Kubernetes cluster:
 
 ```bash

@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, open, readFile, rename, stat, unlink } from "node:fs/promises";
+import { lstat, link, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -100,13 +100,32 @@ function configuredKeychainMode(): boolean | undefined {
   throw new Error("MESHR_CREDENTIAL_STORAGE must be auto, keychain, or file.");
 }
 
-function assertNativeStatePlatform(): void {
-  const environment = process.env.MESHR_ENV?.trim().toLowerCase();
-  if (process.platform === "win32" && environment === "production") {
+export function assertNativeStatePlatform(
+  platform: NodeJS.Platform = process.platform,
+  configuredEnvironment = process.env.MESHR_ENV,
+  configuredWindowsOptIn = process.env.MESHR_WINDOWS_FILE_STATE,
+): void {
+  if (platform !== "win32") return;
+  const environment = configuredEnvironment?.trim().toLowerCase();
+  const windowsOptIn = configuredWindowsOptIn?.trim().toLowerCase();
+  if (environment === "production") {
     throw new Error(
       "Meshr native credential storage is not production-supported on Windows until DACL validation is available.",
     );
   }
+  // Windows DACL validation is intentionally not guessed. A developer, test,
+  // or explicitly isolated host may opt into the permission-0600 file backend,
+  // but an unlabelled process fails closed rather than silently storing
+  // credentials with unknown ACLs.
+  if (
+    ["development", "test", "ci", "local"].includes(environment ?? "") ||
+    windowsOptIn === "allow"
+  ) {
+    return;
+  }
+  throw new Error(
+    "Meshr native credential storage is not enabled on Windows without an explicit development or file-risk opt-in. Set MESHR_ENV=development (or MESHR_WINDOWS_FILE_STATE=allow for an isolated host).",
+  );
 }
 
 async function assertPrivateStateDirectory(path: string): Promise<void> {
@@ -188,10 +207,11 @@ function processIsAlive(pid: number): boolean {
 async function reclaimStaleStateLock(path: string): Promise<boolean> {
   let before;
   try {
-    before = await stat(path);
+    before = await lstat(path);
   } catch {
     return false;
   }
+  if (!before.isFile() || before.isSymbolicLink()) return false;
   if (Date.now() - before.mtimeMs <= STATE_LOCK_STALE_AFTER_MS) return false;
 
   let contents: string;
@@ -201,10 +221,40 @@ async function reclaimStaleStateLock(path: string): Promise<boolean> {
     return false;
   }
   const record = parseStateLockRecord(contents);
-  // A lock without our owner record may belong to an older runtime or an
-  // interrupted write. Do not evict it automatically: there is no safe way to
-  // prove that its owner is gone, so an operator must remove it explicitly.
-  if (!record) return false;
+  if (!record) {
+    // Before owner-tagged locks, a crash between open() and the first write
+    // left an empty lock behind. Only migrate that exact legacy shape after a
+    // stale lease and a second inode/size check. Non-empty malformed locks
+    // remain fail-closed because they could belong to an unknown runtime.
+    if (before.size !== 0) return false;
+    let afterLegacy;
+    try {
+      afterLegacy = await lstat(path);
+    } catch {
+      return true;
+    }
+    if (
+      !afterLegacy.isFile() ||
+      afterLegacy.isSymbolicLink() ||
+      afterLegacy.dev !== before.dev ||
+      afterLegacy.ino !== before.ino ||
+      afterLegacy.mtimeMs !== before.mtimeMs ||
+      afterLegacy.size !== before.size
+    ) {
+      return false;
+    }
+    const quarantine = `${path}.legacy.${randomUUID()}`;
+    try {
+      // Rename is the atomic claim. The quarantine is immediately removed so
+      // recovery changes neither the active lock path nor the state store.
+      await rename(path, quarantine);
+      await unlink(quarantine).catch(() => undefined);
+      return true;
+    } catch {
+      await unlink(quarantine).catch(() => undefined);
+      return false;
+    }
+  }
   // A live owner may be blocked in a long credential operation even when the
   // mtime is old. Never steal a lock from a process that still exists.
   if (processIsAlive(record.pid)) return false;
@@ -214,11 +264,20 @@ async function reclaimStaleStateLock(path: string): Promise<boolean> {
   // inspecting it. PID fencing handles the remaining process-alive case.
   let after;
   try {
-    after = await stat(path);
+    after = await lstat(path);
   } catch {
     return true;
   }
-  if (after.mtimeMs !== before.mtimeMs || after.size !== before.size) return false;
+  if (
+    !after.isFile() ||
+    after.isSymbolicLink() ||
+    after.dev !== before.dev ||
+    after.ino !== before.ino ||
+    after.mtimeMs !== before.mtimeMs ||
+    after.size !== before.size
+  ) {
+    return false;
+  }
   try {
     await unlink(path);
     return true;
@@ -493,17 +552,37 @@ export class ConnectorStateStore {
     } satisfies StateLockRecord)}\n`;
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     for (let attempt = 0; attempt < STATE_LOCK_ATTEMPTS; attempt += 1) {
+      const temporary = `${lockPath}.${process.pid}.${randomUUID()}.tmp`;
+      let temporaryHandle: Awaited<ReturnType<typeof open>> | undefined;
+      let published = false;
       try {
-        handle = await open(lockPath, "wx", 0o600);
-        await handle.writeFile(lockRecord, { encoding: "utf8" });
-        await handle.sync();
-        await handle.chmod(0o600);
+        // Fully initialize the owner record before publishing the lock path.
+        // Hard-link creation is atomic and avoids the crash window between
+        // open("wx") and the first write that can strand an empty lock.
+        temporaryHandle = await open(temporary, "wx", 0o600);
+        await temporaryHandle.writeFile(lockRecord, { encoding: "utf8" });
+        await temporaryHandle.sync();
+        await temporaryHandle.chmod(0o600);
+        await temporaryHandle.close();
+        temporaryHandle = undefined;
+        await link(temporary, lockPath);
+        published = true;
+        await unlink(temporary).catch(() => undefined);
+        handle = await open(lockPath, "r+");
         break;
       } catch (error) {
-        if (handle) {
-          await handle.close().catch(() => undefined);
-          handle = undefined;
-          await unlink(lockPath).catch(() => undefined);
+        await temporaryHandle?.close().catch(() => undefined);
+        await unlink(temporary).catch(() => undefined);
+        if (published) {
+          // If opening our published inode failed, release it only when the
+          // owner token still matches. A successor or stale-lock recovery may
+          // have already replaced the path.
+          try {
+            const current = parseStateLockRecord(await readFile(lockPath, "utf8"));
+            if (current?.owner === owner) await unlink(lockPath);
+          } catch {
+            // Preserve the original acquisition error.
+          }
           throw error;
         }
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;

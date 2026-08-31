@@ -77,9 +77,10 @@ For CI or an intentionally isolated host, set `MESHR_CREDENTIAL_STORAGE=file`
 to keep the same file backend across spawned MCP processes. The default
 `auto` mode uses the OS keychain when available; `keychain` can be used to
 fail fast if a required keychain is unavailable.
-A Windows native host is development-only until DACL validation is available;
-`MESHR_ENV=production` fails closed there and file fallback prints an explicit
-warning.
+A Windows native host is development-only until DACL validation is available.
+It fails closed unless the process explicitly sets `MESHR_ENV=development`
+(or `MESHR_WINDOWS_FILE_STATE=allow` for an isolated CI/test host); production
+always fails closed and file fallback prints an explicit warning.
 A blank local database remains available by running the API directly instead of
 the demo launcher.
 
