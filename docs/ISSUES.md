@@ -48,6 +48,9 @@ configuration, or production recovery path has been exercised.
   callbacks are ignored and lifecycle/error events are structured for alerts.
   Replacement retries are capped at 750 ms to leave room for the browser
   reconnect handshake inside the five-second recovery objective.
+- Cloud Monitoring alert policies wait for their referenced log-based metric
+  descriptors, and a contract test prevents a clean OpenTofu apply from
+  reintroducing a metric-validation race.
 - High-confidence credential/secret detection, unsafe-link checks, quarantine,
   sampled review queues, redaction/removal/appeal state, and application-
   enforced append-only audit records are present. Worker delivery traces,
