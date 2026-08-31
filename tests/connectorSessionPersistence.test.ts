@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { persistRuntimeBindingWithRetry } from "../connector/mcp.ts";
+import { persistRuntimeBindingWithRetry, serveBindingFromState } from "../connector/mcp.ts";
 import {
   ConnectorStateConflictError,
   ConnectorStateStore,
@@ -256,4 +256,19 @@ test("a compare-and-set race can reconcile against the observed successor author
   });
   assert.equal(reconciled.sessionId, successor.sessionId);
   assert.equal((await store.require(original.pairingId)).agentToken, successor.agentToken);
+});
+
+test("native startup rejects a token-only persisted binding", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "meshr-session-token-only-test-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = new ConnectorStateStore(directory, { useKeychain: false });
+  const tokenOnly = nextBinding();
+  delete tokenOnly.privateKeyPem;
+  delete tokenOnly.pairingSecret;
+  await store.upsert(tokenOnly);
+
+  await assert.rejects(
+    serveBindingFromState({ selector: tokenOnly.pairingId, stateDirectory: directory }),
+    /not ready for a signed session/,
+  );
 });
