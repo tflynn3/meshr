@@ -80,10 +80,10 @@ test("OpenClaw configuration targets the exact agent and installs the exact Mesh
       calls.push(args);
       if (args[0] === "config" && args[1] === "get") {
         return {
-          stdout: JSON.stringify([
-            { id: "main" },
-            { id: "garden-main", tools: { profile: "coding" } },
-          ]),
+          stdout: JSON.stringify({
+            main: {},
+            "garden-main": { tools: { profile: "coding" } },
+          }),
           stderr: "",
         };
       }
@@ -92,7 +92,7 @@ test("OpenClaw configuration targets the exact agent and installs the exact Mesh
   });
 
   assert.equal(events[0], "verify-bearer");
-  assert.deepEqual(calls[0], ["config", "get", "agents.list", "--json"]);
+  assert.deepEqual(calls[0], ["config", "get", "agents.entries", "--json"]);
   assert.equal(calls[1]?.[0], "config");
   assert.equal(calls[1]?.[1], "set");
   assert.equal(calls[1]?.[2], "--batch-json");
@@ -110,9 +110,9 @@ test("OpenClaw configuration targets the exact agent and installs the exact Mesh
       path: "plugins.entries.meshr.config.statePath",
       value: store.path,
     },
-    { path: "agents.list[1].tools.profile", value: "full" },
+    { path: "agents.entries.garden-main.tools.profile", value: "full" },
     {
-      path: "agents.list[1].tools.allow",
+      path: "agents.entries.garden-main.tools.allow",
       value: MESHR_OPENCLAW_TOOL_ALLOWLIST,
     },
   ]);
@@ -125,4 +125,56 @@ test("OpenClaw configuration targets the exact agent and installs the exact Mesh
     toolAllowlist: MESHR_OPENCLAW_TOOL_ALLOWLIST,
   });
   assert.equal(JSON.stringify({ calls, configured }).includes("agent-token"), false);
+});
+
+test("OpenClaw configuration rejects non-canonical agent IDs before reading local state", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "meshr-openclaw-setup-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = new ConnectorStateStore(directory, { useKeychain: false });
+  let commandRan = false;
+
+  await assert.rejects(
+    configureOpenClawBinding({
+      selector: "bramble",
+      openClawAgentId: "garden.main",
+      store,
+      runCommand: async () => {
+        commandRan = true;
+        return { stdout: "", stderr: "" };
+      },
+    }),
+    /canonical 1 to 64 character lowercase ID/,
+  );
+  assert.equal(commandRan, false);
+});
+
+test("OpenClaw configuration fails closed when the keyed agent entry is absent", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "meshr-openclaw-setup-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = new ConnectorStateStore(directory, { useKeychain: false });
+  await store.upsert(openClawBinding());
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ agent: { id: "agent-bramble", handle: "bramble" } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  await assert.rejects(
+    configureOpenClawBinding({
+      selector: "bramble",
+      openClawAgentId: "garden-main",
+      store,
+      runCommand: async (_command, args) => {
+        if (args[0] === "config" && args[1] === "get") {
+          return { stdout: JSON.stringify({ main: {} }), stderr: "" };
+        }
+        throw new Error("configuration must stop before a write");
+      },
+    }),
+    /not present in agents\.entries/,
+  );
 });
