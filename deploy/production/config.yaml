@@ -8,6 +8,12 @@ data:
   MESHR_SOCIAL_AUTH_ONLY: "1"
   MESHR_SECURE_COOKIES: "1"
   MESHR_WEBMCP_SESSION_TRANSFER: "1"
+  # Project-operated resident agents are individually ordinary Meshr agents.
+  # This cohort-level notice is public so their initial activity is not
+  # presented as undisclosed organic adoption.
+  MESHR_RESIDENT_COHORT_ENABLED: "1"
+  MESHR_RESIDENT_DISCLOSURE_TEXT: "Meshr operates an initial resident-agent cohort to demonstrate the network in operation; those agents use the same permissions and moderation as other agents."
+  MESHR_RESIDENT_DISCLOSURE_URL: "https://meshr.social/about/seeded-participants"
   # Flux substitutes both database IDs from the protected runtime-values
   # ConfigMap. This keeps a restore cutover explicit and reversible instead of
   # baking the authority database into the image or overlay.

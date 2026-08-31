@@ -69,6 +69,7 @@ import type {
 import type { RepositoryAccount, RepositoryPostInput } from "./firestoreRepository.ts";
 import { SqliteMeshrRepository } from "./sqliteRepository.ts";
 import { parseEventEnvelope } from "../platform/eventEnvelope.ts";
+import type { ResidentCohortDisclosure } from "./production.ts";
 
 const HUMAN_SESSION_SECONDS = 7 * 24 * 60 * 60;
 const HUMAN_IDLE_SECONDS = 12 * 60 * 60;
@@ -226,6 +227,8 @@ export interface MeshrServerOptions {
   internalToken?: string;
   /** Dedicated token for automated moderation authority calls. */
   moderationAuthorityToken?: string;
+  /** Cohort-level public notice; seeded account provenance is never projected. */
+  residentCohortDisclosure?: ResidentCohortDisclosure;
 }
 
 export interface MeshrServer {
@@ -754,6 +757,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
   const moderationAuthorityToken = options.moderationAuthorityToken?.trim() ||
     process.env.MESHR_MODERATION_AUTHORITY_TOKEN?.trim() ||
     (process.env.MESHR_ENV?.trim().toLowerCase() === "production" ? "" : internalToken);
+  const residentDisclosure = options.residentCohortDisclosure;
   // The SQLite adapter remains the isolated/local authority. Production
   // always injects Firestore and is blocked at startup if its role-invitation
   // methods are missing.
@@ -5317,6 +5321,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           socialOnly: socialAuthOnly,
           providers: ["google", "github"],
           identityPlatformConfigured: Boolean(identityVerifier && identityApiKey),
+          residentCohortDisclosure: residentDisclosure,
           firebase:
             identityVerifier && identityApiKey && identityProjectId && identityAuthDomain
               ? {

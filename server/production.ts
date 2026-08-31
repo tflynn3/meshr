@@ -12,6 +12,62 @@ export interface ProductionSettings {
   invitationPepperPrevious?: string;
   internalToken?: string;
   moderationAuthorityToken?: string;
+  /** Public, cohort-level notice for project-operated resident agents. */
+  residentCohortEnabled: boolean;
+  residentDisclosureText?: string;
+  residentDisclosureUrl?: string;
+}
+
+export interface ResidentCohortDisclosure {
+  text: string;
+  url: string;
+}
+
+export const RESIDENT_COHORT_POLICY_PATH = "/about/seeded-participants";
+export const RESIDENT_COHORT_POLICY_MARKER = "meshr-seeded-participants-policy-v1";
+
+/**
+ * Resolve the public resident-cohort notice. Individual resident principals
+ * remain ordinary accounts; this site-level disclosure prevents the initial
+ * project-operated activity from being presented as undisclosed organic
+ * adoption.
+ */
+export function residentCohortDisclosure(
+  enabled: boolean,
+  text: string | undefined,
+  url: string | undefined,
+): ResidentCohortDisclosure | undefined {
+  if (!enabled) return undefined;
+  const normalizedText = text?.trim() ?? "";
+  const normalizedUrl = url?.trim() ?? "";
+  if (normalizedText.length < 20 || normalizedText.length > 280) {
+    throw new Error(
+      "MESHR_RESIDENT_DISCLOSURE_TEXT must be between 20 and 280 characters when the resident cohort is enabled.",
+    );
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(normalizedUrl);
+  } catch {
+    throw new Error(
+      "MESHR_RESIDENT_DISCLOSURE_URL must be an absolute HTTPS URL when the resident cohort is enabled.",
+    );
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error(
+      "MESHR_RESIDENT_DISCLOSURE_URL must be an absolute HTTPS URL when the resident cohort is enabled.",
+    );
+  }
+  if (
+    parsed.pathname !== RESIDENT_COHORT_POLICY_PATH ||
+    parsed.search !== "" ||
+    parsed.hash !== ""
+  ) {
+    throw new Error(
+      `MESHR_RESIDENT_DISCLOSURE_URL must point to the served ${RESIDENT_COHORT_POLICY_PATH} policy page.`,
+    );
+  }
+  return { text: normalizedText, url: parsed.toString() };
 }
 
 export function productionSettings(
@@ -29,6 +85,7 @@ export function productionSettings(
   const renewalRecoveryPreviousSecret = process.env.MESHR_RENEWAL_RECOVERY_SECRET_PREVIOUS?.trim();
   const invitationPepper = process.env.MESHR_INVITATION_PEPPER?.trim();
   const invitationPepperPrevious = process.env.MESHR_INVITATION_PEPPER_PREVIOUS?.trim();
+  const residentCohortEnabled = process.env.MESHR_RESIDENT_COHORT_ENABLED?.trim() === "1";
   return {
     environment: normalizedEnvironment,
     storage,
@@ -43,6 +100,9 @@ export function productionSettings(
     invitationPepperPrevious,
     internalToken: process.env.MESHR_INTERNAL_TOKEN?.trim(),
     moderationAuthorityToken: process.env.MESHR_MODERATION_AUTHORITY_TOKEN?.trim(),
+    residentCohortEnabled,
+    residentDisclosureText: process.env.MESHR_RESIDENT_DISCLOSURE_TEXT?.trim(),
+    residentDisclosureUrl: process.env.MESHR_RESIDENT_DISCLOSURE_URL?.trim(),
   };
 }
 
@@ -52,6 +112,11 @@ export function assertProductionSettings(settings: ProductionSettings): void {
     throw new Error("MESHR_COST_PROTECTION_MODE must be normal, protect, or throttle.");
   }
   if (settings.environment !== "production") return;
+  residentCohortDisclosure(
+    settings.residentCohortEnabled,
+    settings.residentDisclosureText,
+    settings.residentDisclosureUrl,
+  );
   const missing: string[] = [];
   const usable = (value: string | undefined): value is string => Boolean(
     value &&

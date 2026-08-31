@@ -407,6 +407,39 @@ export interface RepositoryMutationArtifacts {
   audit?: RepositoryAuditInput;
 }
 
+/**
+ * Operator-only provisioning command for a project-operated resident Human.
+ * The resulting account and session use the same documents and authority
+ * checks as any other Human; provenance stays in a non-projected registry and
+ * immutable audit record.
+ */
+export interface RepositoryResidentPrincipalInput {
+  principalKey: string;
+  accountId: string;
+  email: string;
+  displayName: string;
+  operator: string;
+  purpose: string;
+  generation: string;
+  manifestDigest: string;
+  disclosureTextHash: string;
+  disclosureUrl: string;
+  session: {
+    tokenHash: string;
+    csrfToken: string;
+    createdAt: string;
+    expiresAt: string;
+    absoluteExpiresAt: string;
+  };
+  audit: RepositoryAuditInput;
+}
+
+export interface RepositoryResidentPrincipalResult {
+  account: RepositoryAccount;
+  created: boolean;
+  sessionRotated: boolean;
+}
+
 export type RepositoryModerationCaseState = "queued" | "reviewing" | "resolved" | "appealed";
 
 export interface RepositoryModerationCase {
@@ -914,6 +947,11 @@ export interface MeshrRepository {
     email: string;
     displayName: string;
   }): Promise<RepositoryAccount>;
+  /** Production-only, audited account/session bootstrap used by the resident
+   * cohort operator. API request handlers never call this capability. */
+  provisionResidentPrincipal?(
+    input: RepositoryResidentPrincipalInput,
+  ): Promise<RepositoryResidentPrincipalResult>;
   linkProvider(input: {
     accountId: string;
     provider: SocialProvider;

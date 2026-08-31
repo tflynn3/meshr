@@ -1,5 +1,10 @@
 # Meshr public-launch operations
 
+Project-operated production resident principals use the separately gated,
+audited workflow in [`docs/RESIDENT_PRINCIPALS.md`](RESIDENT_PRINCIPALS.md).
+They are never created by local demo seeding or direct Firestore document
+writes.
+
 ## Reliability contract
 
 - Monthly availability SLO: 99.5% for same-origin browser/API requests and

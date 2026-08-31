@@ -2268,6 +2268,15 @@ resource "google_service_account" "bootstrap_canary" {
   depends_on   = [google_project_service.required]
 }
 
+# One-shot resident-principal provisioning is isolated from both the API and
+# the store bootstrap. It can write only the production authority database and
+# read only the deterministic resident-session secret.
+resource "google_service_account" "resident_seeder" {
+  account_id   = "meshr-resident-seeder"
+  display_name = "Meshr audited resident principal seeder"
+  depends_on   = [google_project_service.required]
+}
+
 resource "google_service_account" "worker" {
   for_each     = local.worker_accounts
   account_id   = each.value.account_id
@@ -2725,6 +2734,17 @@ resource "google_project_iam_member" "bootstrap_topology_firestore" {
   }
 }
 
+resource "google_project_iam_member" "resident_seeder_authority_firestore" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.resident_seeder.email}"
+  condition {
+    title       = "resident-seeder-authority-database"
+    description = "The one-shot resident seeder may provision principals only in the production authority Firestore database."
+    expression  = local.authority_firestore_iam_expression
+  }
+}
+
 resource "google_project_iam_member" "api_canary_firestore" {
   project = var.project_id
   role    = "roles/datastore.user"
@@ -3081,6 +3101,12 @@ resource "google_service_account_iam_member" "bootstrap_canary_workload_identity
   member             = "serviceAccount:${var.project_id}.svc.id.goog[meshr-canary/meshr-bootstrap-canary]"
 }
 
+resource "google_service_account_iam_member" "resident_seeder_workload_identity" {
+  service_account_id = google_service_account.resident_seeder.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[meshr/meshr-resident-seeder]"
+}
+
 resource "google_service_account_iam_member" "canary_worker_workload_identity" {
   for_each           = local.canary_worker_accounts
   service_account_id = google_service_account.canary_worker[each.key].name
@@ -3336,6 +3362,16 @@ resource "google_secret_manager_secret" "invitation_pepper_previous" {
   depends_on = [google_project_service.required]
 }
 
+resource "google_secret_manager_secret" "resident_session_secret" {
+  secret_id = "meshr-resident-session-secret"
+  replication {
+    auto {}
+  }
+  # Terraform creates only the container. Operators add the random 32-byte
+  # value as a Secret Manager version so plaintext never enters state.
+  depends_on = [google_project_service.required]
+}
+
 resource "google_secret_manager_secret" "canary_internal_token" {
   secret_id = "meshr-canary-internal-token"
   replication {
@@ -3446,6 +3482,13 @@ resource "google_secret_manager_secret_iam_member" "api_invitation_pepper_previo
   secret_id = google_secret_manager_secret.invitation_pepper_previous.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.api.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "resident_seeder_session_secret" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.resident_session_secret.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.resident_seeder.email}"
 }
 
 resource "google_secret_manager_secret_iam_member" "api_canary_identity_api_key" {

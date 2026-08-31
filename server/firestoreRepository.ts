@@ -50,6 +50,8 @@ import type {
   RepositoryMeshRoleInvitationStatus,
   RepositoryHumanActivityPreference,
   RepositoryHumanActivityPreferencePatch,
+  RepositoryResidentPrincipalInput,
+  RepositoryResidentPrincipalResult,
 } from "./repository.ts";
 import { publicRuntimeKind, systemClock, type Clock, type RuntimeKind, type SocialProvider } from "./types.ts";
 import {
@@ -6386,6 +6388,187 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       displayName: String(account.get("display_name")),
       createdAt: String(account.get("created_at")),
     };
+  }
+
+  async provisionResidentPrincipal(
+    input: RepositoryResidentPrincipalInput,
+  ): Promise<RepositoryResidentPrincipalResult> {
+    const principalKey = input.principalKey.trim().toLowerCase();
+    const email = input.email.trim().toLowerCase();
+    const displayName = input.displayName.trim();
+    const expectedAccountId = "usr_" + createHash("sha256")
+      .update(`meshr-resident:v1:${principalKey}`)
+      .digest("hex")
+      .slice(0, 24);
+    const createdAtMs = Date.parse(input.session.createdAt);
+    const expiresAtMs = Date.parse(input.session.expiresAt);
+    const absoluteExpiresAtMs = Date.parse(input.session.absoluteExpiresAt);
+    if (
+      !/^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/.test(principalKey) ||
+      input.accountId !== expectedAccountId ||
+      !email || email.length > 254 ||
+      !displayName || displayName.length > 80 ||
+      !input.operator.trim() || input.operator.trim().length > 128 ||
+      !input.purpose.trim() || input.purpose.trim().length > 500 ||
+      !/^[a-z0-9][a-z0-9_.:-]{0,127}$/i.test(input.generation) ||
+      !/^[a-f0-9]{64}$/.test(input.manifestDigest) ||
+      !/^[a-f0-9]{64}$/.test(input.disclosureTextHash) ||
+      !/^[a-f0-9]{64}$/.test(input.session.tokenHash) ||
+      !input.session.csrfToken || input.session.csrfToken.length > 256 ||
+      !Number.isFinite(createdAtMs) || !Number.isFinite(expiresAtMs) ||
+      !Number.isFinite(absoluteExpiresAtMs) || expiresAtMs <= createdAtMs ||
+      absoluteExpiresAtMs < expiresAtMs
+    ) {
+      throw new Error("resident_principal_invalid");
+    }
+    let disclosureUrl: URL;
+    try {
+      disclosureUrl = new URL(input.disclosureUrl);
+    } catch {
+      throw new Error("resident_disclosure_invalid");
+    }
+    if (disclosureUrl.protocol !== "https:") throw new Error("resident_disclosure_invalid");
+    if (
+      input.audit.action !== "resident_principal.provisioned" ||
+      input.audit.actorType !== "system" ||
+      input.audit.resourceType !== "resident_principal" ||
+      input.audit.resourceId !== principalKey ||
+      input.audit.createdAt !== input.session.createdAt
+    ) {
+      throw new Error("resident_audit_invalid");
+    }
+
+    const principalDocumentId = "resident_" + createHash("sha256")
+      .update(`meshr-resident-registry:v1:${principalKey}`)
+      .digest("hex")
+      .slice(0, 40);
+    const principalRef = this.doc("resident_principals", principalDocumentId);
+    const accountRef = this.doc("accounts", input.accountId);
+    const sessionRef = this.doc("human_sessions", input.session.tokenHash);
+    const auditRef = this.doc("audit_events", input.audit.auditId);
+
+    return this.firestore.runTransaction(async (transaction) => {
+      const principal = await transaction.get(principalRef);
+      const previousSessionHash = principal.exists && typeof principal.get("current_session_hash") === "string"
+        ? String(principal.get("current_session_hash"))
+        : "";
+      if (principal.exists && !/^[a-f0-9]{64}$/.test(previousSessionHash)) {
+        throw new Error("resident_registry_corrupt");
+      }
+      const previousSessionRef = previousSessionHash && previousSessionHash !== input.session.tokenHash
+        ? this.doc("human_sessions", previousSessionHash)
+        : undefined;
+      const [account, session, audit, previousSession, emailMatches] = await Promise.all([
+        transaction.get(accountRef),
+        transaction.get(sessionRef),
+        transaction.get(auditRef),
+        previousSessionRef ? transaction.get(previousSessionRef) : Promise.resolve(undefined),
+        transaction.get(
+          this.firestore
+            .collection(this.collection("accounts"))
+            .where("email", "==", email)
+            .limit(1),
+        ),
+      ]);
+
+      const emailOwner = emailMatches.docs[0];
+      if (emailOwner && emailOwner.id !== input.accountId) throw new Error("resident_email_conflict");
+      if (principal.exists) {
+        if (
+          principal.get("principal_key") !== principalKey ||
+          principal.get("account_id") !== input.accountId ||
+          !account.exists
+        ) {
+          throw new Error("resident_registry_corrupt");
+        }
+      } else if (account.exists) {
+        // A deterministic account id must never silently claim an ordinary
+        // account that was not created through the resident registry.
+        throw new Error("resident_account_conflict");
+      }
+      if (account.exists && String(account.get("email") ?? "").toLowerCase() !== email) {
+        throw new Error("resident_account_conflict");
+      }
+
+      const sameGeneration = principal.exists && principal.get("generation") === input.generation;
+      if (sameGeneration) {
+        if (
+          principal.get("current_session_hash") !== input.session.tokenHash ||
+          principal.get("manifest_digest") !== input.manifestDigest ||
+          principal.get("disclosure_text_hash") !== input.disclosureTextHash ||
+          principal.get("disclosure_url") !== disclosureUrl.toString() ||
+          !account.exists ||
+          !session.exists ||
+          session.get("account_id") !== input.accountId
+        ) {
+          throw new Error("resident_generation_conflict");
+        }
+        if (!audit.exists) transaction.create(auditRef, this.auditDocument(input.audit));
+        return {
+          account: {
+            accountId: input.accountId,
+            email,
+            displayName: String(account.get("display_name")),
+            createdAt: String(account.get("created_at")),
+          },
+          created: false,
+          sessionRotated: false,
+        };
+      }
+      if (session.exists) throw new Error("resident_session_conflict");
+      if (audit.exists) throw new Error("resident_audit_conflict");
+
+      const accountCreatedAt = account.exists
+        ? String(account.get("created_at"))
+        : input.session.createdAt;
+      if (!account.exists) {
+        transaction.create(accountRef, {
+          contract_version: MESHR_CONTRACT_MAJOR,
+          account_id: input.accountId,
+          email,
+          display_name: displayName,
+          created_at: accountCreatedAt,
+        });
+      } else if (account.get("display_name") !== displayName) {
+        transaction.update(accountRef, { display_name: displayName });
+      }
+      transaction.create(sessionRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        token_hash: input.session.tokenHash,
+        account_id: input.accountId,
+        csrf_token: input.session.csrfToken,
+        created_at: input.session.createdAt,
+        expires_at: input.session.expiresAt,
+        absolute_expires_at: input.session.absoluteExpiresAt,
+        last_seen_at: input.session.createdAt,
+      });
+      if (previousSessionRef && previousSession?.exists) transaction.delete(previousSessionRef);
+      transaction.set(principalRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        principal_key: principalKey,
+        account_id: input.accountId,
+        operator: input.operator.trim(),
+        purpose: input.purpose.trim(),
+        generation: input.generation,
+        manifest_digest: input.manifestDigest,
+        disclosure_text_hash: input.disclosureTextHash,
+        disclosure_url: disclosureUrl.toString(),
+        current_session_hash: input.session.tokenHash,
+        created_at: principal.exists ? principal.get("created_at") : input.session.createdAt,
+        updated_at: input.session.createdAt,
+      }, { merge: false });
+      transaction.create(auditRef, this.auditDocument(input.audit));
+      return {
+        account: {
+          accountId: input.accountId,
+          email,
+          displayName,
+          createdAt: accountCreatedAt,
+        },
+        created: !account.exists,
+        sessionRotated: Boolean(previousSessionHash),
+      };
+    });
   }
 
   async createSocialAccount(input: {

@@ -7,6 +7,9 @@ switch (service) {
   case "production-bootstrap":
     await (await import("./productionBootstrap.ts")).bootstrapProductionStores();
     break;
+  case "seed-residents":
+    await (await import("./residentSeeder.ts")).runResidentSeeder(process.argv.slice(3));
+    break;
   case "ingest":
     await import("./ingest.ts");
     break;
@@ -17,5 +20,5 @@ switch (service) {
     await import("./liveGateway.ts");
     break;
   default:
-    throw new Error("usage: event-plane <bootstrap|production-bootstrap|ingest|materializer|live-gateway>");
+    throw new Error("usage: event-plane <bootstrap|production-bootstrap|seed-residents|ingest|materializer|live-gateway>");
 }
