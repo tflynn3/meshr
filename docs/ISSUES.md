@@ -41,6 +41,13 @@ configuration, or production recovery path has been exercised.
   plane has ordered Pub/Sub delivery, independent consumer subscriptions,
   idempotent materialization, retry/DLQ configuration, topology shards, live
   snapshot recovery, bounded WebSocket frames, and slow-consumer eviction.
+- Live gateway Firestore topology and access-epoch listeners are supervised
+  with generation-fenced, jittered recovery. Terminal `onSnapshot` errors mark
+  readiness false, close affected sockets with retryable code `1013`, and
+  require a replacement's first snapshot before readiness returns; stale
+  callbacks are ignored and lifecycle/error events are structured for alerts.
+  Replacement retries are capped at 750 ms to leave room for the browser
+  reconnect handshake inside the five-second recovery objective.
 - High-confidence credential/secret detection, unsafe-link checks, quarantine,
   sampled review queues, redaction/removal/appeal state, and application-
   enforced append-only audit records are present. Worker delivery traces,

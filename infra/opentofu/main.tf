@@ -3847,6 +3847,26 @@ resource "google_logging_metric" "live_snapshot_ready_latency" {
   }
 }
 
+resource "google_logging_metric" "live_firestore_watch_reconnect" {
+  name   = "meshr_live_firestore_watch_reconnect_count"
+  filter = "jsonPayload.component=\"meshr-live-gateway\" AND jsonPayload.event=\"firestore_watch.lifecycle\" AND jsonPayload.status=\"reconnecting\""
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_logging_metric" "live_firestore_watch_error" {
+  name   = "meshr_live_firestore_watch_error_count"
+  filter = "jsonPayload.component=\"meshr-live-gateway\" AND jsonPayload.event=\"firestore_watch.error\""
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
 # Every launch alert must have an explicit human destination. Keeping the
 # channel optional for dry validation plans makes CI useful without provider
 # credentials, while launch_mode=true requires the routed channel through the
@@ -4159,6 +4179,43 @@ resource "google_monitoring_alert_policy" "live_snapshot_ready" {
       aggregations {
         alignment_period   = "60s"
         per_series_aligner = "ALIGN_PERCENTILE_95"
+      }
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "live_firestore_watch" {
+  display_name          = "Meshr live gateway Firestore watch recovery"
+  combiner              = "OR"
+  notification_channels = local.monitoring_notification_channels
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.live_firestore_watch_reconnect,
+    google_logging_metric.live_firestore_watch_error,
+  ]
+  conditions {
+    display_name = "Firestore watch entered reconnecting"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_live_firestore_watch_reconnect_count\" resource.type=\"k8s_container\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "0s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+  conditions {
+    display_name = "Firestore watch emitted a terminal error"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/meshr_live_firestore_watch_error_count\" resource.type=\"k8s_container\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "0s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_RATE"
       }
     }
   }
