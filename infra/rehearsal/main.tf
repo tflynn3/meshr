@@ -148,6 +148,14 @@ locals {
         { field_path = "created_at", order = "DESCENDING" },
       ]
     }
+    posts_expiry_pending = {
+      database   = "authority"
+      collection = "posts"
+      fields = [
+        { field_path = "expiry_pending", order = "ASCENDING" },
+        { field_path = "expires_at", order = "ASCENDING" },
+      ]
+    }
     topology_activity_buckets_mesh_start = {
       database   = "projections"
       collection = "topology_activity_buckets"
@@ -174,8 +182,8 @@ locals {
   github_immutable_subject_prefix = (
     "repo:tflynn3@${var.github_repository_owner_id}/meshr@${var.github_repository_id}"
   )
-  github_workflow_ref_prefix = (
-    "${local.github_repository}/.github/workflows/gcp-rehearsal.yml@refs/heads/"
+  github_workflow_ref = (
+    "${local.github_repository}/.github/workflows/gcp-rehearsal.yml@refs/heads/main"
   )
 }
 
@@ -482,16 +490,14 @@ resource "google_iam_workload_identity_pool_provider" "github" {
     "attribute.event_name"          = "assertion.event_name"
   }
 
-  # Numeric identities survive repository/owner renames. The exact workflow
-  # path may run from an authorized branch for a pre-merge deployment proof;
-  # copies at any other workflow path cannot authenticate.
+  # Numeric identities survive repository/owner renames. Only the exact
+  # workflow file on main can authenticate; copies and branch variants cannot.
   attribute_condition = join(" ", [
     "assertion.repository_id == '${var.github_repository_id}' &&",
     "assertion.repository_owner_id == '${var.github_repository_owner_id}' &&",
     "assertion.sub == '${local.github_immutable_subject_prefix}:environment:gcp-rehearsal' &&",
-    "assertion.workflow_ref.startsWith('${local.github_workflow_ref_prefix}') &&",
-    "(assertion.event_name == 'workflow_dispatch' || assertion.event_name == 'schedule' ||",
-    "(assertion.event_name == 'push' && assertion.ref == 'refs/heads/feat/copyable-agent-setup'))",
+    "assertion.workflow_ref == '${local.github_workflow_ref}' &&",
+    "(assertion.event_name == 'workflow_dispatch' || assertion.event_name == 'schedule')",
   ])
 
   oidc {

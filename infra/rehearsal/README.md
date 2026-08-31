@@ -86,14 +86,12 @@ Workload Identity pool, and rehearsal labels before deletion. Subsequent plans
 and rehearsals require no bootstrap exception.
 
 The numeric GitHub repository and owner IDs default to this repository's
-immutable IDs (`1348689949` and `19698887`). The provider normally accepts only
+immutable IDs (`1348689949` and `19698887`). The provider accepts only
 `workflow_dispatch` or `schedule` tokens from the exact
-`tflynn3/meshr/.github/workflows/gcp-rehearsal.yml` path on an environment-
-approved branch. During the initial pre-merge proof, it also accepts `push`
-tokens only from `feat/copyable-agent-setup`; remove that temporary clause and
-branch policy after the proof. The OIDC subject must name the protected
-`gcp-rehearsal` GitHub environment. This rejects other workflow paths and jobs
-that omit the environment. Configure GitHub with the provider and CI
+`tflynn3/meshr/.github/workflows/gcp-rehearsal.yml@refs/heads/main` workflow
+reference. The OIDC subject must name the protected `gcp-rehearsal` GitHub
+environment. This rejects pushes, branch variants, other workflow paths, and
+jobs that omit the environment. Configure GitHub with the provider and CI
 service-account outputs, not a key.
 
 GitHub repositories created after 2026-07-15 use an immutable default OIDC
