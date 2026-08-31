@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import YAML from "yaml";
 
@@ -151,6 +152,61 @@ test("GCP rehearsal lifecycle script has safe syntax and the complete teardown g
   assert.match(script, /assert_rehearsal_cluster "\$\(cluster_json\)"[\s\S]*container clusters delete/);
   assert.match(script, /MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID/);
   assert.match(script, /rollout restart deployment\/topology-materializer/);
+});
+
+test("GCP rehearsal teardown distinguishes a missing cluster from discovery failure", () => {
+  const scriptPath = resolve(repositoryRoot, "scripts/gcp-rehearsal.sh");
+  const fakeBin = mkdtempSync(join(tmpdir(), "meshr-rehearsal-gcloud-"));
+  const fakeGcloud = resolve(fakeBin, "gcloud");
+  writeFileSync(
+    fakeGcloud,
+    '#!/usr/bin/env bash\nprintf "%s\\n" "${FAKE_GCLOUD_ERROR}" >&2\nexit 1\n',
+  );
+  chmodSync(fakeGcloud, 0o755);
+
+  const runDestroy = (error: string) =>
+    spawnSync("bash", [scriptPath, "destroy-cluster"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        FAKE_GCLOUD_ERROR: error,
+        GCP_PROJECT_ID: "example-rehearsal-project",
+        PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+      },
+    });
+
+  try {
+    const unauthorized = runDestroy(
+      "ERROR: (gcloud.container.clusters.describe) ResponseError: code=403, message=Permission denied",
+    );
+    assert.notEqual(unauthorized.status, 0);
+    assert.match(unauthorized.stderr, /unable to determine GKE rehearsal cluster presence/);
+    assert.doesNotMatch(unauthorized.stdout, /already absent/);
+
+    const absent = runDestroy(
+      "ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not found",
+    );
+    assert.equal(absent.status, 0, absent.stderr);
+    assert.match(absent.stdout, /already absent/);
+  } finally {
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test("GCP rehearsal trust pins GitHub's immutable owner and repository subject", () => {
+  const terraform = readFileSync(resolve(repositoryRoot, "infra/rehearsal/main.tf"), "utf8");
+  assert.match(
+    terraform,
+    /repo:tflynn3@\$\{var\.github_repository_owner_id\}\/meshr@\$\{var\.github_repository_id\}/,
+  );
+  assert.match(
+    terraform,
+    /assertion\.sub == '\$\{local\.github_immutable_subject_prefix\}:environment:gcp-rehearsal'/,
+  );
+  assert.doesNotMatch(
+    terraform,
+    /assertion\.sub == 'repo:\$\{local\.github_repository\}:environment:gcp-rehearsal'/,
+  );
 });
 
 test("stack smoke keeps same-origin defaults and accepts four component URLs", () => {
