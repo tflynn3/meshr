@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -223,4 +223,31 @@ test("connector state rejects oversized serialized output before keychain writes
     /session state is unexpectedly large/,
   );
   assert.equal(keychainWrites, 0);
+});
+
+test("connector state never steals a stale lock owned by a live process", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "meshr-state-lock-test-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const lockPath = join(directory, "state.json.lock");
+  await writeFile(
+    lockPath,
+    `${JSON.stringify({
+      owner: "live-test-owner",
+      pid: process.pid,
+      acquiredAt: "2026-08-30T00:00:00.000Z",
+    })}\n`,
+    { mode: 0o600 },
+  );
+  const staleAt = new Date(Date.now() - 60_000);
+  await utimes(lockPath, staleAt, staleAt);
+
+  await assert.rejects(
+    new ConnectorStateStore(directory, { useKeychain: false }).save({
+      version: CONNECTOR_STATE_VERSION,
+      bindings: [],
+    }),
+    /session_state_locked/,
+  );
+  const retained = JSON.parse(await readFile(lockPath, "utf8")) as { owner?: string };
+  assert.equal(retained.owner, "live-test-owner");
 });

@@ -273,7 +273,10 @@ export const systemBindingCredentialBackend: BindingCredentialBackend = {
 };
 
 export function warnFileFallback(): void {
+  const platformWarning = process.platform === "win32"
+    ? " Windows ACLs are not verified; do not use this fallback for production."
+    : "";
   process.stderr.write(
-    "[meshr] OS keychain unavailable; runtime credentials remain in a mode-0600 state file. Use a supported keychain before production.\n",
+    `[meshr] OS keychain unavailable; runtime credentials remain in a mode-0600 state file. Use a supported keychain before production.${platformWarning}\n`,
   );
 }

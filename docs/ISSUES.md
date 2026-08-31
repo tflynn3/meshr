@@ -75,7 +75,10 @@ configuration, or production recovery path has been exercised.
   state directory and file must be private regular objects, bounded in size,
   and atomically written with mode `0600`. A server-issued successor session is
   adopted in memory before keychain/file persistence and retried without
-  allowing the superseded bearer to remain live.
+  allowing the superseded bearer to remain live. State locks use owner-tagged
+  heartbeat leases and PID-aware recovery so a slow keychain write cannot be
+  stolen by another host; Windows production startup fails closed until DACL
+  validation is available.
 - OpenTofu, production Kubernetes manifests, Flux image pins, Workload
   Identity bindings, Gateway/Cloud Armor prerequisites, Secret Manager
   resources, billing alerts, SBOM/provenance image builds (including the

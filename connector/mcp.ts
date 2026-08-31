@@ -373,7 +373,9 @@ export async function serveBindingFromState(input: {
   const runtimeSelector = binding.pairingId;
   if (
     (binding.status !== "connected" && binding.status !== "approved") ||
-    (!binding.agentToken && (!binding.privateKeyPem || !binding.pairingSecret || !binding.pairingId))
+    !binding.privateKeyPem ||
+    !binding.pairingSecret ||
+    !binding.pairingId
   ) {
     throw new Error(`Binding ${input.selector} is not ready for a signed session.`);
   }
@@ -467,6 +469,11 @@ export async function serveBindingFromState(input: {
           return;
         }
       }
+      // The candidate came from a successful server session create/renewal.
+      // Adopt it before any shared-state read so a local I/O failure cannot
+      // leave this process using the predecessor that the server fenced off.
+      binding = nextBinding;
+      updateLiveSession?.(binding);
       if (!options.reconciled) {
         try {
           const observed = await store.require(runtimeSelector);
@@ -480,11 +487,21 @@ export async function serveBindingFromState(input: {
           });
           return;
         } catch (reconcileError) {
-          if (!(reconcileError instanceof ConnectorStateConflictError)) throw reconcileError;
+          if (!(reconcileError instanceof ConnectorStateConflictError)) {
+            pendingPersistence = { binding: nextBinding, expectedAuthorities };
+            process.stderr.write(
+              `[meshr] runtime session successor is active but local state reconciliation failed: ${reconcileError instanceof Error ? reconcileError.message : String(reconcileError)}\n`,
+            );
+            if (options.required) throw new Error("runtime_session_persistence_failed");
+            return;
+          }
         }
       }
+      pendingPersistence = { binding: nextBinding, expectedAuthorities };
       if (options.required) throw new Error("runtime_session_persistence_conflict");
-      stopNativeSession("[meshr] runtime session authority changed; stopping this native host.");
+      process.stderr.write(
+        "[meshr] runtime session successor is active but local state is still newer; retrying on the next lifecycle tick.\n",
+      );
       return;
     }
     pendingPersistence = result.persisted
@@ -585,7 +602,7 @@ export async function serveBindingFromState(input: {
   // authority. The server's authority fence supersedes the old session
   // atomically; subsequent lifecycle ticks use fenced renewal only.
   if (!binding.privateKeyPem || !binding.pairingSecret || !binding.pairingId) {
-    if (!binding.agentToken) throw new Error("Binding is missing signed session credentials.");
+    throw new Error("Binding is missing signed session credentials.");
   } else {
     const challenge = await api.createChallenge(binding);
     const signature = sign(
@@ -674,7 +691,19 @@ export async function serveBindingFromState(input: {
     // Do not retry a local successor write until the current bearer has passed
     // the server fence. This closes the window where a page handoff or newer
     // host could supersede the session between failed writes.
-    if (heartbeatSucceeded) await retryPendingPersistence();
+    if (heartbeatSucceeded) {
+      try {
+        await retryPendingPersistence();
+      } catch (error) {
+        if (isSessionSuperseded(error)) {
+          stopNativeSession("[meshr] native session superseded; stopping renewal until this host is restarted.");
+          return;
+        }
+        process.stderr.write(
+          `[meshr] native session state retry failed: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
+    }
     if (stopped) return;
     try {
       const expiry = binding.agentTokenExpiresAt ? Date.parse(binding.agentTokenExpiresAt) : 0;

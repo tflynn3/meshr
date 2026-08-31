@@ -21,6 +21,16 @@ const emptyState = (): ConnectorState => ({
 });
 
 const MAX_STATE_FILE_BYTES = 5 * 1024 * 1024;
+const STATE_LOCK_STALE_AFTER_MS = 30_000;
+const STATE_LOCK_HEARTBEAT_MS = 5_000;
+const STATE_LOCK_ATTEMPTS = 100;
+const STATE_LOCK_RETRY_MS = 50;
+
+type StateLockRecord = {
+  owner: string;
+  pid: number;
+  acquiredAt: string;
+};
 
 export type ConnectorAuthoritySnapshot = Pick<
   ConnectorBinding,
@@ -90,6 +100,15 @@ function configuredKeychainMode(): boolean | undefined {
   throw new Error("MESHR_CREDENTIAL_STORAGE must be auto, keychain, or file.");
 }
 
+function assertNativeStatePlatform(): void {
+  const environment = process.env.MESHR_ENV?.trim().toLowerCase();
+  if (process.platform === "win32" && environment === "production") {
+    throw new Error(
+      "Meshr native credential storage is not production-supported on Windows until DACL validation is available.",
+    );
+  }
+}
+
 async function assertPrivateStateDirectory(path: string): Promise<void> {
   if (path === "/" || path === homedir()) {
     throw new Error("Meshr session state must be stored in a dedicated directory.");
@@ -137,6 +156,94 @@ function assertNoMacAcl(path: string): void {
   }
 }
 
+function parseStateLockRecord(value: string): StateLockRecord | undefined {
+  try {
+    const parsed = JSON.parse(value) as Partial<StateLockRecord>;
+    if (
+      typeof parsed.owner !== "string" ||
+      !parsed.owner ||
+      typeof parsed.pid !== "number" ||
+      !Number.isInteger(parsed.pid) ||
+      parsed.pid <= 0 ||
+      typeof parsed.acquiredAt !== "string"
+    ) {
+      return undefined;
+    }
+    return parsed as StateLockRecord;
+  } catch {
+    return undefined;
+  }
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but is not signalable by this user.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function reclaimStaleStateLock(path: string): Promise<boolean> {
+  let before;
+  try {
+    before = await stat(path);
+  } catch {
+    return false;
+  }
+  if (Date.now() - before.mtimeMs <= STATE_LOCK_STALE_AFTER_MS) return false;
+
+  let contents: string;
+  try {
+    contents = await readFile(path, "utf8");
+  } catch {
+    return false;
+  }
+  const record = parseStateLockRecord(contents);
+  // A lock without our owner record may belong to an older runtime or an
+  // interrupted write. Do not evict it automatically: there is no safe way to
+  // prove that its owner is gone, so an operator must remove it explicitly.
+  if (!record) return false;
+  // A live owner may be blocked in a long credential operation even when the
+  // mtime is old. Never steal a lock from a process that still exists.
+  if (processIsAlive(record.pid)) return false;
+
+  // Recheck the inode metadata after reading the owner record. This closes the
+  // common race where the owner heartbeat refreshed the lease while we were
+  // inspecting it. PID fencing handles the remaining process-alive case.
+  let after;
+  try {
+    after = await stat(path);
+  } catch {
+    return true;
+  }
+  if (after.mtimeMs !== before.mtimeMs || after.size !== before.size) return false;
+  try {
+    await unlink(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function releaseStateLock(
+  handle: Awaited<ReturnType<typeof open>>,
+  path: string,
+  owner: string,
+  heartbeat: ReturnType<typeof setInterval>,
+): Promise<void> {
+  clearInterval(heartbeat);
+  await handle.close().catch(() => undefined);
+  try {
+    const record = parseStateLockRecord(await readFile(path, "utf8"));
+    // If stale recovery installed a replacement owner, leave its lock alone.
+    if (record?.owner === owner) await unlink(path);
+  } catch {
+    // The lock may already have been reclaimed by a successor.
+  }
+}
+
 export class ConnectorStateStore {
   readonly directory: string;
   readonly path: string;
@@ -150,6 +257,7 @@ export class ConnectorStateStore {
       useKeychain?: boolean;
     } = {},
   ) {
+    assertNativeStatePlatform();
     this.directory = resolve(directory);
     this.path = join(this.directory, "state.json");
     this.credentialBackend = options.credentialBackend ?? systemBindingCredentialBackend;
@@ -377,28 +485,41 @@ export class ConnectorStateStore {
     // between the recursive mkdir and the first filesystem operation.
     await assertPrivateStateDirectory(this.directory);
     const lockPath = `${this.path}.lock`;
+    const owner = randomUUID();
+    const lockRecord = `${JSON.stringify({
+      owner,
+      pid: process.pid,
+      acquiredAt: new Date().toISOString(),
+    } satisfies StateLockRecord)}\n`;
     let handle: Awaited<ReturnType<typeof open>> | undefined;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+    for (let attempt = 0; attempt < STATE_LOCK_ATTEMPTS; attempt += 1) {
       try {
         handle = await open(lockPath, "wx", 0o600);
+        await handle.writeFile(lockRecord, { encoding: "utf8" });
+        await handle.sync();
+        await handle.chmod(0o600);
         break;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        try {
-          const lockStat = await stat(lockPath);
-          if (Date.now() - lockStat.mtimeMs > 30_000) await unlink(lockPath);
-        } catch {
-          // The owner may have released the lock between stat and unlink.
+        if (handle) {
+          await handle.close().catch(() => undefined);
+          handle = undefined;
+          await unlink(lockPath).catch(() => undefined);
+          throw error;
         }
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        await reclaimStaleStateLock(lockPath);
+        await new Promise((resolve) => setTimeout(resolve, STATE_LOCK_RETRY_MS));
       }
     }
     if (!handle) throw new Error("session_state_locked");
+    const heartbeat = setInterval(() => {
+      void handle?.utimes(new Date(), new Date()).catch(() => undefined);
+    }, STATE_LOCK_HEARTBEAT_MS);
+    heartbeat.unref();
     try {
       return await operation();
     } finally {
-      await handle.close().catch(() => undefined);
-      await unlink(lockPath).catch(() => undefined);
+      await releaseStateLock(handle, lockPath, owner, heartbeat);
     }
   }
 }
