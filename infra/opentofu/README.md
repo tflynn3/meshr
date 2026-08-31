@@ -190,7 +190,38 @@ role-invitation lookup, while newly issued credentials always use the primary
 slot. Do not remove the previous slot during either rolling deploy.
 
 OpenTofu creates separate keyless GitHub Actions identities for artifact builds,
-canary promotion, and production promotion. Set the
+canary promotion, and production promotion. Set `github_repository`,
+`github_repository_id`, and `github_repository_owner_id` to the canonical source
+repository before applying; all three are required. The numeric IDs are the
+immutable federation boundary, while `github_build_workflow_path` completes the
+exact workflow-ref claim. Self-hosters can keep `github_deploy_identity=null`
+to authorize canary and production from that same repository and workflow.
+The IDs for a public repository are available from GitHub's API:
+
+```bash
+gh api repos/OWNER/REPOSITORY \
+  --jq '{repository_id: (.id | tostring), repository_owner_id: (.owner.id | tostring)}'
+```
+
+To keep the public Meshr repository responsible only for builds while a private
+operations repository owns hosted canary/production changes, provide the full
+deploy identity instead:
+
+```hcl
+github_deploy_identity = {
+  repository          = "OWNER/meshr-ops"
+  repository_id       = "IMMUTABLE_NUMERIC_REPOSITORY_ID"
+  repository_owner_id = "IMMUTABLE_NUMERIC_OWNER_ID"
+  workflow_path       = ".github/workflows/deploy.yml"
+}
+```
+
+Both deploy providers remain bound to `main` and their matching protected
+`canary` or `production` environment. A private deploy workflow must verify and
+promote the immutable signed digests emitted by the public build; this setting
+does not extract or generate that workflow.
+
+Then set the
 `github_actions_workload_identity_provider` and `ci_service_account` outputs as
 the protected `GCP_BUILD_WORKLOAD_IDENTITY_PROVIDER` secret and
 `GCP_BUILD_SERVICE_ACCOUNT` repository variable. Set
@@ -202,9 +233,12 @@ environment. Set `github_actions_deploy_workload_identity_provider` and
 `ci_deploy_service_account` as the protected
 `GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER` secret and
 `GCP_DEPLOY_SERVICE_ACCOUNT` repository variable. The deploy providers accept
-only this repository's matching environment, `main` ref, and exact workflow
-path, and each service account can read GKE or mutate only its own Flux input
-ConfigMaps. The build identity can write images but cannot touch the cluster.
+only the configured immutable repository/owner IDs, environment, `main` ref,
+and exact workflow path. Build and deploy use different pool attributes, so a
+deploy token cannot inherit the Artifact Registry writer even when both
+workflows share one repository. Each deploy service account can read GKE or
+mutate only its own Flux input ConfigMaps; the build identity can write images
+but cannot touch the cluster.
 Also set `GCP_PROJECT_ID`, `GKE_CLUSTER`, `GKE_LOCATION`, `MESHR_CANARY_URL`
 (for example `https://staging.meshr.social`),
 `MESHR_FIRESTORE_DATABASE`, `MESHR_AUDIT_FIRESTORE_DATABASE`,

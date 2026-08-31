@@ -1,0 +1,8 @@
+# Changes to deployment authority and release automation require review from
+# the canonical repository owner. GitHub branch protection must separately
+# require code-owner review for these assignments to become an enforcement gate.
+/.github/CODEOWNERS @tflynn3
+/.github/workflows/ @tflynn3
+/deploy/ @tflynn3
+/infra/ @tflynn3
+/scripts/ @tflynn3

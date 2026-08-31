@@ -3,6 +3,15 @@ dist/
 bazel-*
 *.tsbuildinfo
 .terraform/
+*.tfplan
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+!*.example.tfvars
+!*.example.tfvars.json
+!*.tfvars.example
+!*.tfvars.json.example
 .DS_Store
 .env
 .env.*

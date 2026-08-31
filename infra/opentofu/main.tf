@@ -482,6 +482,16 @@ data "google_project" "current" {
 }
 
 locals {
+  github_build_identity = {
+    repository          = var.github_repository
+    repository_id       = var.github_repository_id
+    repository_owner_id = var.github_repository_owner_id
+    workflow_path       = var.github_build_workflow_path
+  }
+  github_deploy_identity     = var.github_deploy_identity == null ? local.github_build_identity : var.github_deploy_identity
+  github_build_workflow_ref  = "${local.github_build_identity.repository}/${local.github_build_identity.workflow_path}@refs/heads/main"
+  github_deploy_workflow_ref = "${local.github_deploy_identity.repository}/${local.github_deploy_identity.workflow_path}@refs/heads/main"
+
   # Keep a no-credentials validation plan useful, but make the explicit launch
   # apply fail before it can create a partial public service without either
   # social provider or its spend alerts.
@@ -2450,9 +2460,11 @@ resource "google_cloud_run_v2_service" "moderation_adapter_canary" {
   depends_on = [google_project_service.required]
 }
 
-# GitHub Actions uses keyless Workload Identity Federation. The attribute
-# condition is intentionally repository-scoped so a token from another
-# repository cannot impersonate the release identity.
+# GitHub Actions uses keyless Workload Identity Federation. Numeric owner and
+# repository IDs are immutable across renames and cannot be reclaimed after a
+# transfer or deletion. Build and deploy use distinct mapped attributes so a
+# pool-wide principal-set grant cannot cross those authority boundaries, even
+# when self-hosters keep both workflows in one repository.
 resource "google_iam_workload_identity_pool" "github_actions" {
   project                   = var.project_id
   workload_identity_pool_id = "meshr-github-actions"
@@ -2467,15 +2479,20 @@ resource "google_iam_workload_identity_pool_provider" "github_actions" {
   workload_identity_pool_provider_id = "github"
   display_name                       = "GitHub OIDC"
   attribute_mapping = {
-    "google.subject"       = "assertion.sub"
-    "attribute.repository" = "assertion.repository"
-    "attribute.ref"        = "assertion.ref"
-    "attribute.actor"      = "assertion.actor"
+    "google.subject"                = "assertion.sub"
+    "attribute.build_repository_id" = "assertion.repository_id"
+    "attribute.ref"                 = "assertion.ref"
+    "attribute.actor"               = "assertion.actor"
   }
   # Artifact builds are limited to the protected main workflow as well. A
   # branch-dispatched build must not be able to mint a signed image that the
   # production promotion job would later accept for a known main SHA.
-  attribute_condition = "assertion.repository == '${var.github_repository}' && assertion.ref == 'refs/heads/main' && assertion.workflow_ref == '${var.github_repository}/.github/workflows/ci.yml@refs/heads/main'"
+  attribute_condition = join(" ", [
+    "assertion.repository_id == '${local.github_build_identity.repository_id}' &&",
+    "assertion.repository_owner_id == '${local.github_build_identity.repository_owner_id}' &&",
+    "assertion.ref == 'refs/heads/main' &&",
+    "assertion.workflow_ref == '${local.github_build_workflow_ref}'",
+  ])
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
   }
@@ -2494,11 +2511,17 @@ resource "google_iam_workload_identity_pool_provider" "github_actions_deploy" {
     "google.subject" = "assertion.sub"
     # Include the protected GitHub environment in the mapped attribute. IAM
     # principalSet bindings are pool-wide (not provider-scoped), so the
-    # environment suffix prevents a canary token from impersonating the
-    # production deploy identity.
-    "attribute.release" = "assertion.repository + ':' + assertion.environment"
+    # deploy-only attribute prevents build tokens from impersonating a deploy
+    # identity, while the suffix separates canary from production.
+    "attribute.release" = "assertion.repository_id + ':' + assertion.environment"
   }
-  attribute_condition = "assertion.repository == '${var.github_repository}' && assertion.environment == 'production' && assertion.ref == 'refs/heads/main' && assertion.workflow_ref == '${var.github_repository}/.github/workflows/ci.yml@refs/heads/main'"
+  attribute_condition = join(" ", [
+    "assertion.repository_id == '${local.github_deploy_identity.repository_id}' &&",
+    "assertion.repository_owner_id == '${local.github_deploy_identity.repository_owner_id}' &&",
+    "assertion.environment == 'production' &&",
+    "assertion.ref == 'refs/heads/main' &&",
+    "assertion.workflow_ref == '${local.github_deploy_workflow_ref}'",
+  ])
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
   }
@@ -2524,9 +2547,15 @@ resource "google_iam_workload_identity_pool_provider" "github_actions_canary_dep
   display_name                       = "GitHub OIDC canary promotion"
   attribute_mapping = {
     "google.subject"    = "assertion.sub"
-    "attribute.release" = "assertion.repository + ':' + assertion.environment"
+    "attribute.release" = "assertion.repository_id + ':' + assertion.environment"
   }
-  attribute_condition = "assertion.repository == '${var.github_repository}' && assertion.environment == 'canary' && assertion.ref == 'refs/heads/main' && assertion.workflow_ref == '${var.github_repository}/.github/workflows/ci.yml@refs/heads/main'"
+  attribute_condition = join(" ", [
+    "assertion.repository_id == '${local.github_deploy_identity.repository_id}' &&",
+    "assertion.repository_owner_id == '${local.github_deploy_identity.repository_owner_id}' &&",
+    "assertion.environment == 'canary' &&",
+    "assertion.ref == 'refs/heads/main' &&",
+    "assertion.workflow_ref == '${local.github_deploy_workflow_ref}'",
+  ])
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
   }
@@ -2542,19 +2571,19 @@ resource "google_service_account" "ci_canary_deploy" {
 resource "google_service_account_iam_member" "ci_workload_identity" {
   service_account_id = google_service_account.ci.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_actions.name}/attribute.repository/${var.github_repository}"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_actions.name}/attribute.build_repository_id/${local.github_build_identity.repository_id}"
 }
 
 resource "google_service_account_iam_member" "ci_deploy_workload_identity" {
   service_account_id = google_service_account.ci_deploy.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_actions.name}/attribute.release/${var.github_repository}:production"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_actions.name}/attribute.release/${local.github_deploy_identity.repository_id}:production"
 }
 
 resource "google_service_account_iam_member" "ci_canary_deploy_workload_identity" {
   service_account_id = google_service_account.ci_canary_deploy.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_actions.name}/attribute.release/${var.github_repository}:canary"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_actions.name}/attribute.release/${local.github_deploy_identity.repository_id}:canary"
 }
 
 # Release jobs record cost-protection transitions in a dedicated Firestore
