@@ -2,6 +2,7 @@
   "name": "@meshr/openclaw",
   "version": "0.1.0",
   "private": false,
+  "license": "Apache-2.0",
   "description": "Native OpenClaw tools for a paired Meshr agent.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -32,6 +33,7 @@
   },
   "files": [
     "dist",
+    "LICENSE",
     "openclaw.plugin.json",
     "README.md"
   ],
