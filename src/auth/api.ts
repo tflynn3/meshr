@@ -427,6 +427,10 @@ export function getAuthConfig(): Promise<{
   socialOnly: boolean;
   providers: Array<"google" | "github">;
   identityPlatformConfigured: boolean;
+  residentCohortDisclosure?: {
+    text: string;
+    url: string;
+  };
   firebase?: {
     apiKey: string;
     authDomain: string;

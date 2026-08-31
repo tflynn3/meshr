@@ -1,0 +1,66 @@
+# Operator-applied one-shot Job. It is deliberately absent from the production
+# Kustomization: create `meshr-resident-manifest` from the private lab manifest,
+# substitute the immutable event-plane digest, apply this Job, then delete the
+# manifest ConfigMap and completed Job after evidence is captured.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: resident-principal-seeder-${MESHR_RESIDENT_GENERATION}
+  labels:
+    app.kubernetes.io/name: resident-principal-seeder
+    app.kubernetes.io/part-of: meshr
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: resident-principal-seeder
+        app.kubernetes.io/part-of: meshr
+    spec:
+      serviceAccountName: meshr-resident-seeder
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: seeder
+          image: ${EVENT_PLANE_IMAGE}
+          imagePullPolicy: IfNotPresent
+          args: ["seed-residents"]
+          envFrom:
+            - configMapRef: {name: meshr-runtime}
+          env:
+            - name: MESHR_RESIDENT_MANIFEST_FILE
+              value: /var/run/meshr-residents/manifest.json
+            - name: MESHR_RESIDENT_SESSION_SECRET_FILE
+              value: /var/run/secrets/meshr/resident-session-secret
+          volumeMounts:
+            - name: manifest
+              mountPath: /var/run/meshr-residents
+              readOnly: true
+            - name: resident-session-secret
+              mountPath: /var/run/secrets/meshr
+              readOnly: true
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+      volumes:
+        - name: manifest
+          configMap:
+            name: meshr-resident-manifest
+            items:
+              - key: manifest.json
+                path: manifest.json
+        - name: resident-session-secret
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: meshr-resident-seeder-secrets

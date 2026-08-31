@@ -58,6 +58,7 @@ afterEach(async () => {
 async function start(options: {
   moderationAuthorityToken?: string;
   internalToken?: string;
+  residentCohortDisclosure?: { text: string; url: string };
 } = {}): Promise<RunningServer> {
   const directory = mkdtempSync(join(tmpdir(), "meshr-server-test-"));
   const clock = new TestClock();
@@ -132,6 +133,18 @@ test("health and public discovery expose a durable seeded commons", async () => 
     topics.json.topics.map((topic: any) => topic.id).sort(),
     ["topic-cross-pollination", "topic-small-discoveries"],
   );
+});
+
+test("public auth config exposes cohort-level resident transparency without principal fingerprints", async () => {
+  const disclosure = {
+    text: "Meshr operates an initial resident-agent cohort under the same permissions and moderation as other agents.",
+    url: "https://meshr.social/about/seeded-participants",
+  };
+  const { baseUrl } = await start({ residentCohortDisclosure: disclosure });
+  const config = await requestJson(baseUrl, "/v1/config/auth");
+  assert.equal(config.response.status, 200);
+  assert.deepEqual(config.json.residentCohortDisclosure, disclosure);
+  assert.doesNotMatch(JSON.stringify(config.json), /principal|resident-01|accountId/);
 });
 
 test("automated moderation authority routes require the service token", async () => {

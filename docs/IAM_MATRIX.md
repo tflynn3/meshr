@@ -11,6 +11,7 @@ needed by a workload.
 | --- | --- | --- | --- |
 | API (`meshr-api`) | `meshr-api` | Authority Firestore read/write including the lease-fenced outbox broker; topology Firestore aggregate read; Identity Platform verification; API-only Secret Manager values plus the internal delivery and dedicated moderation-authority tokens | Pub/Sub publish/subscribe, moderation provider APIs, audit-only CI paths, all topology writes |
 | One-shot store bootstrap (`meshr-bootstrap`) | `meshr-bootstrap` | Authority Firestore initialization and topology `projection_bootstrap/default` attestation during an explicit bootstrap Job | Runtime API traffic, Pub/Sub, moderation provider APIs, continued intended bootstrap operations after the Job completes |
+| One-shot resident seeder (`meshr-resident-seeder`) | `meshr-resident-seeder` | Production authority Firestore read/write for ordinary accounts, rotating Human sessions, the private resident registry, and immutable audit records; read only the resident-session derivation secret | Topology/worker databases, Identity Platform, API/runtime secrets, Pub/Sub, moderation providers, long-running deployment |
 | Live gateway (`meshr-live-gateway`) | `meshr-live-gateway` | Aggregate topology Firestore read; internal API authorization call | Authority Firestore, posts, accounts, sessions, moderation, audit, Pub/Sub publish, all Secret Manager values |
 | Ingest (`meshr-ingest`) | `meshr-ingest` | Claim and complete lease-fenced outbox batches through the token-authenticated API broker; publish to the matching `mesh-events` topic; topic metadata read; internal token | Firestore, browser credentials, topology database, moderation provider |
 | Topology materializer (`meshr-topology-materializer`) | `meshr-topology` | Subscribe to the topology event subscription; aggregate topology database read/write; bounded event trace | Authority account/session data, moderation provider, Secret Manager |
@@ -60,10 +61,12 @@ decisions cross the API's revision-fenced route.
 
 Secret Manager stores the Identity Platform browser key, the API/ingest outbox
 broker token, the dedicated moderation-authority token, renewal-
-recovery primary/previous keys, invitation-pepper primary/previous keys, and
+recovery primary/previous keys, invitation-pepper primary/previous keys, the
+resident-session derivation key, and
 separate canary values. The GKE Secret Manager CSI provider mounts only the
-paths each KSA needs; only API and ingest receive the outbox token, while only
-API and the screening worker receive the moderation-authority token.
+paths each KSA needs; only API and ingest receive the outbox token, only API
+and the screening worker receive the moderation-authority token, and only the
+one-shot resident seeder receives the resident-session derivation key.
 
 Rotate recovery and invitation keys in two complete rollouts: populate the
 `*-previous` version with the new value, roll all replicas to `{old,new}`, then

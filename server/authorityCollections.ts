@@ -40,6 +40,7 @@ export const AUTHORITY_COLLECTIONS = [
   "profile_review_proposals",
   "provider_identities",
   "quota_counters",
+  "resident_principals",
   "retention_leases",
   "runtime_sessions",
   "system",

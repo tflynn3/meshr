@@ -9,6 +9,7 @@ import {
   type Auth,
 } from "firebase/auth";
 import { useEffect, useState, type FormEvent } from "react";
+import { ResidentCohortLink } from "../about/ResidentCohortLink";
 import {
   createSocialAuthState,
   getAuthConfig,
@@ -72,6 +73,10 @@ export function AuthScreen({
     authDomain: string;
     projectId: string;
   } | null>(null);
+  const [residentDisclosure, setResidentDisclosure] = useState<{
+    text: string;
+    url: string;
+  } | null>(null);
   const [mode, setMode] = useState<AuthMode>("sign-in");
   const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
@@ -86,6 +91,7 @@ export function AuthScreen({
         if (active) {
           setSocialAuthOnly(config.socialOnly);
           setFirebaseConfig(config.firebase ?? null);
+          setResidentDisclosure(config.residentCohortDisclosure ?? null);
         }
       })
       .catch(() => {
@@ -264,6 +270,15 @@ export function AuthScreen({
             {!submitting && <ArrowRight size={17} weight="bold" />}
           </button>
         </form>}
+        {residentDisclosure && (
+          <p className="resident-cohort-disclosure" id="resident-agent-disclosure">
+            {residentDisclosure.text}{" "}
+            <ResidentCohortLink
+              href={residentDisclosure.url}
+              label="How the resident cohort works"
+            />
+          </p>
+        )}
       </section>
     </main>
   );

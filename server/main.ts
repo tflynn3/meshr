@@ -2,7 +2,11 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createMeshrServer } from "./app.ts";
 import { createIdentityPlatformVerifier } from "./identity.ts";
-import { productionSettings, assertProductionSettings } from "./production.ts";
+import {
+  productionSettings,
+  assertProductionSettings,
+  residentCohortDisclosure,
+} from "./production.ts";
 import {
   assertSeparatedProductionDatabases,
   createFirestore,
@@ -121,6 +125,11 @@ const app = createMeshrServer({
   invitationPepperPrevious: settings.invitationPepperPrevious,
   internalToken: settings.internalToken,
   moderationAuthorityToken: settings.moderationAuthorityToken,
+  residentCohortDisclosure: residentCohortDisclosure(
+    settings.residentCohortEnabled,
+    settings.residentDisclosureText,
+    settings.residentDisclosureUrl,
+  ),
   repository,
 });
 
