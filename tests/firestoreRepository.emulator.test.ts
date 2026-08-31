@@ -1624,6 +1624,65 @@ test("Firestore launch bootstrap refuses stale data in an isolated topology data
   }
 });
 
+test("Firestore bootstrap reuses a matching projection generation with retained topology", {
+  skip: !process.env.FIRESTORE_EMULATOR_HOST,
+}, async () => {
+  const projectId = process.env.GOOGLE_CLOUD_PROJECT?.trim() || "meshr-emulator";
+  const authority = new Firestore({ projectId, databaseId: "(default)" });
+  const topologyDatabaseId = `meshr-topology-repeat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const topology = new Firestore({ projectId, databaseId: topologyDatabaseId });
+  const prefix = `launch_repeat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const authorityNames = ["system", "meshes", "topics"];
+  const topologyNames = ["projection_bootstrap", "topology_shards"];
+  try {
+    const firstBootstrap = new FirestoreMeshrRepository({
+      firestore: authority,
+      topologyFirestore: topology,
+      collectionPrefix: prefix,
+      invitationPepper: `${prefix}:pepper`,
+      projectionBootstrapWriter: true,
+      forceProjectionBootstrapScan: false,
+    });
+    await firstBootstrap.ensureEmptyProduction();
+
+    const authorityMarkerRef = authority.collection(`${prefix}_system`).doc("bootstrap");
+    const projectionMarkerRef = topology.collection(`${prefix}_projection_bootstrap`).doc("default");
+    const authorityBootstrapId = (await authorityMarkerRef.get()).get("bootstrap_id");
+    assert.equal((await projectionMarkerRef.get()).get("authority_bootstrap_id"), authorityBootstrapId);
+
+    const retainedShardRef = topology.collection(`${prefix}_topology_shards`).doc("mesh-public:0");
+    await retainedShardRef.set({ mesh_id: "mesh-public" });
+
+    // A recreated bootstrap Job must trust the matching generation marker.
+    // The retained shard belongs to that generation and is not stale
+    // pre-launch data, so a routine rehearsal neither rejects nor deletes it.
+    const repeatBootstrap = new FirestoreMeshrRepository({
+      firestore: authority,
+      topologyFirestore: topology,
+      collectionPrefix: prefix,
+      invitationPepper: `${prefix}:pepper`,
+      projectionBootstrapWriter: true,
+      forceProjectionBootstrapScan: false,
+    });
+    await repeatBootstrap.ensureEmptyProduction();
+    await repeatBootstrap.checkReady();
+
+    assert.equal((await retainedShardRef.get()).exists, true);
+    assert.equal((await projectionMarkerRef.get()).get("authority_bootstrap_id"), authorityBootstrapId);
+  } finally {
+    for (const name of authorityNames) {
+      const collection = authority.collection(`${prefix}_${name}`);
+      if (!(await collection.get()).empty) await authority.recursiveDelete(collection);
+    }
+    for (const name of topologyNames) {
+      const collection = topology.collection(`${prefix}_${name}`);
+      if (!(await collection.get()).empty) await topology.recursiveDelete(collection);
+    }
+    await authority.terminate();
+    await topology.terminate();
+  }
+});
+
 test("Firestore API bootstrap is read-only until the protected store job attests projections", {
   skip: !process.env.FIRESTORE_EMULATOR_HOST,
 }, async () => {

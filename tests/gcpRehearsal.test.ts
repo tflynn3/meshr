@@ -121,6 +121,13 @@ test("GCP rehearsal uses Workload Identity and distinct managed Firestore databa
   assert.ok(bootstrap);
   assert.deepEqual(bootstrap.spec?.template?.spec?.containers?.[0]?.args, ["production-bootstrap"]);
   assert.equal(bootstrap.spec?.template?.spec?.serviceAccountName, "meshr-bootstrap");
+
+  const terraform = readFileSync(resolve(repositoryRoot, "infra/rehearsal/main.tf"), "utf8");
+  assert.match(
+    terraform,
+    /posts_expiry_pending\s*=\s*\{[\s\S]*?collection\s*=\s*"posts"[\s\S]*?field_path\s*=\s*"expiry_pending"[\s\S]*?field_path\s*=\s*"expires_at"/,
+    "the rehearsal must provision the post-retention index exercised by the API sweep",
+  );
 });
 
 test("GCP rehearsal lifecycle script has safe syntax and the complete teardown gate", () => {
@@ -189,6 +196,10 @@ test("GCP rehearsal teardown distinguishes a missing cluster from discovery fail
 
 test("GCP rehearsal trust pins GitHub's immutable owner and repository subject", () => {
   const terraform = readFileSync(resolve(repositoryRoot, "infra/rehearsal/main.tf"), "utf8");
+  const workflow = readFileSync(
+    resolve(repositoryRoot, ".github/workflows/gcp-rehearsal.yml"),
+    "utf8",
+  );
   assert.match(
     terraform,
     /repo:tflynn3@\$\{var\.github_repository_owner_id\}\/meshr@\$\{var\.github_repository_id\}/,
@@ -207,6 +218,17 @@ test("GCP rehearsal trust pins GitHub's immutable owner and repository subject",
     /serviceAccount:\$\{var\.project_id\}\.svc\.id\.goog\[\$\{local\.kubernetes_namespace\}\/\$\{each\.value\.kubernetes_service_account\}\]/,
   );
   assert.doesNotMatch(terraform, /iam\.serviceAccounts\.setIamPolicy|workload_identity_binder/);
+  assert.match(
+    terraform,
+    /\$\{local\.github_repository\}\/\.github\/workflows\/gcp-rehearsal\.yml@refs\/heads\/main/,
+  );
+  assert.match(terraform, /assertion\.workflow_ref == '\$\{local\.github_workflow_ref\}'/);
+  assert.doesNotMatch(terraform, /workflow_ref\.startsWith|feat\/copyable-agent-setup/);
+  assert.doesNotMatch(terraform, /assertion\.event_name == 'push'/);
+  assert.doesNotMatch(workflow, /^\s*push:\s*$/m);
+  assert.doesNotMatch(workflow, /feat\/copyable-agent-setup/);
+  assert.match(workflow, /if: github\.event_name == 'workflow_dispatch'/);
+  assert.match(workflow, /if: github\.event_name == 'schedule'/);
 });
 
 test("GCP rehearsal topology identity can inspect its subscription for readiness", () => {

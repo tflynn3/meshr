@@ -1,10 +1,6 @@
 name: GCP deployment rehearsal
 
 on:
-  # One-time pre-merge bootstrap. Remove this branch trigger after the first
-  # managed deployment proof; durable runs use dispatch or the nightly guard.
-  push:
-    branches: [feat/copyable-agent-setup]
   workflow_dispatch:
     inputs:
       keep_cluster:
@@ -31,7 +27,7 @@ env:
 
 jobs:
   rehearse:
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/feat/copyable-agent-setup')
+    if: github.event_name == 'workflow_dispatch'
     name: Build, deploy, and smoke
     environment: gcp-rehearsal
     runs-on: ubuntu-latest
