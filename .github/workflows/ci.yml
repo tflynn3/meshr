@@ -220,8 +220,8 @@ jobs:
 
   # Validate the published package engine contracts on every supported Node
   # line. The root application intentionally targets Node 24, while the
-  # standalone MCP package supports the tested Node 20-25 range and the OpenClaw plugin follows
-  # OpenClaw's supported 22/24/25 lines.
+  # standalone MCP package supports the tested Node 20-25 range. OpenClaw's
+  # dependency closure installs strictly on the tested Node 22/24/26 lines.
   package-engines:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -245,7 +245,7 @@ jobs:
             package: integrations/openclaw
           - node: "24.x"
             package: integrations/openclaw
-          - node: "25.x"
+          - node: "26.x"
             package: integrations/openclaw
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

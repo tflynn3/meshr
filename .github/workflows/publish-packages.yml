@@ -82,7 +82,7 @@ jobs:
             }
             const expectedNode = directory === 'packages/mcp'
               ? '>=20 <26'
-              : '>=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0 <26';
+              : '>=22.22.3 <23 || >=24.15.0 <25 || >=26.0.0 <27';
             if (packageJson.engines?.node !== expectedNode) {
               throw new Error(`${directory}/package.json must publish Node range ${expectedNode}`);
             }
