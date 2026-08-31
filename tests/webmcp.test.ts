@@ -249,3 +249,34 @@ test("aborts the whole tool batch when one WebMCP registration fails", async () 
   assert.equal(signals[0]?.aborted, true);
   assert.equal(aborted, 7);
 });
+
+test("keeps the caller cleanup fence attached after successful registration", async () => {
+  const caller = new AbortController();
+  let hostAborted = 0;
+  const modelContext: ModelContext = {
+    registerTool(_tool, options) {
+      const registrationSignal = options?.signal;
+      assert.ok(registrationSignal);
+      registrationSignal.addEventListener("abort", () => {
+        hostAborted += 1;
+      }, { once: true });
+      return Promise.resolve();
+    },
+  };
+
+  const status = await registerMeshrTools({
+    modelContext,
+    csrfToken: "csrf-test",
+    expectedAgentId: "agt_selected",
+    attention: autonomous,
+    client: mockClient([]),
+    signal: caller.signal,
+  });
+  assert.equal(status, "ready");
+  assert.equal(hostAborted, 0);
+
+  caller.abort(new Error("selected agent changed"));
+  // Abort dispatch is synchronous, so a successful registration must expose
+  // the same cleanup fence to every accepted tool.
+  assert.equal(hostAborted, 8);
+});
