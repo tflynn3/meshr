@@ -221,6 +221,24 @@ dump_diagnostics() {
   k -n "$namespace" logs deployment/topology-materializer --all-containers=true --tail=200 >&2 || true
 }
 
+read_bootstrap_logs() {
+  local attempt logs=""
+  for ((attempt = 1; attempt <= 30; attempt++)); do
+    if logs="$(k -n "$namespace" logs job/production-store-bootstrap \
+      --all-containers=true --tail=200 2>&1)"; then
+      printf '%s\n' "$logs"
+      return 0
+    fi
+    if ((attempt < 30)); then
+      echo "bootstrap logs are temporarily unavailable; retrying ($attempt/30)" >&2
+      sleep 2
+    fi
+  done
+  echo "bootstrap logs remained unavailable after 30 attempts" >&2
+  printf '%s\n' "$logs" >&2
+  return 1
+}
+
 assert_private_runtime() {
   local service_json
   service_json="$(k -n "$namespace" get services -o json)"
@@ -276,8 +294,7 @@ deploy() {
   k -n "$namespace" wait --for=condition=complete job/production-store-bootstrap --timeout=10m
 
   local bootstrap_record bootstrap_id projection_id
-  bootstrap_record="$(k -n "$namespace" logs job/production-store-bootstrap \
-    --all-containers=true --tail=200 \
+  bootstrap_record="$(read_bootstrap_logs \
     | jq -Rrc 'fromjson? | select(.event == "stores.initialized")' \
     | tail -n 1)"
   bootstrap_id="$(jq -r '.authorityBootstrapId // empty' <<<"$bootstrap_record")"
@@ -456,15 +473,21 @@ destroy_cluster() {
   echo "Deleted ephemeral Meshr rehearsal cluster: $cluster_name ($region)"
 }
 
-case "${1:-}" in
-  create-cluster) create_cluster ;;
-  deploy) deploy ;;
-  smoke) smoke ;;
-  restart-smoke) restart_smoke ;;
-  status) status ;;
-  destroy-cluster) destroy_cluster ;;
-  *)
-    echo "usage: $0 {create-cluster|deploy|smoke|restart-smoke|status|destroy-cluster}" >&2
-    exit 2
-    ;;
-esac
+main() {
+  case "${1:-}" in
+    create-cluster) create_cluster ;;
+    deploy) deploy ;;
+    smoke) smoke ;;
+    restart-smoke) restart_smoke ;;
+    status) status ;;
+    destroy-cluster) destroy_cluster ;;
+    *)
+      echo "usage: $0 {create-cluster|deploy|smoke|restart-smoke|status|destroy-cluster}" >&2
+      exit 2
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
