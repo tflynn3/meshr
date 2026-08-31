@@ -65,11 +65,13 @@ export async function verifyBindingSession(
 export async function syncBindingDefinition(input: {
   selector: string;
   store: ConnectorStateStore;
+  /** Use the live in-memory authority instead of re-reading shared state. */
+  binding?: ConnectorBinding;
   definitionPath?: string;
   /** A reload may propose identity changes; normal verification rejects a mismatch. */
   allowIdentityChanges?: boolean;
 }): Promise<ProfileSyncResult> {
-  const binding = await input.store.require(input.selector);
+  const binding = input.binding ?? await input.store.require(input.selector);
   if (binding.status !== "connected" || !binding.agentToken) {
     throw new Error(`Binding ${input.selector} is not connected.`);
   }
@@ -144,7 +146,10 @@ export async function syncBindingDefinition(input: {
       requestedProfile: serverProfile,
     });
     return {
-      binding: updated,
+      // A profile refresh may race a runtime renewal. Keep the live session
+      // authority from the caller rather than adopting token/session fields
+      // read from the shared file after the profile write.
+      binding: input.binding ? { ...updated, ...runtimeAuthority(binding) } : updated,
       changed: true,
       response,
     };
@@ -234,5 +239,26 @@ export async function syncBindingDefinition(input: {
           : [],
       }
     : undefined;
-  return { binding: updated, changed: true, response, profileReload };
+  return {
+    binding: input.binding ? { ...updated, ...runtimeAuthority(binding) } : updated,
+    changed: true,
+    response,
+    profileReload,
+  };
+}
+
+function runtimeAuthority(binding: ConnectorBinding): Pick<
+  ConnectorBinding,
+  "privateKeyPem" | "pairingSecret" | "agentToken" | "agentTokenExpiresAt" | "sessionId" | "bindingId" | "agentId" | "status"
+> {
+  return {
+    privateKeyPem: binding.privateKeyPem,
+    pairingSecret: binding.pairingSecret,
+    agentToken: binding.agentToken,
+    agentTokenExpiresAt: binding.agentTokenExpiresAt,
+    sessionId: binding.sessionId,
+    bindingId: binding.bindingId,
+    agentId: binding.agentId,
+    status: binding.status,
+  };
 }

@@ -71,6 +71,11 @@ configuration, or production recovery path has been exercised.
   `reload_my_profile`; no separate machine-side service is required.
   Ollama is documented as a provider through an MCP-capable host. Codex writes
   remain Beta until the direct native write exchange passes.
+- Native session state is now fail-closed at the local trust boundary: the
+  state directory and file must be private regular objects, bounded in size,
+  and atomically written with mode `0600`. A server-issued successor session is
+  adopted in memory before keychain/file persistence and retried without
+  allowing the superseded bearer to remain live.
 - OpenTofu, production Kubernetes manifests, Flux image pins, Workload
   Identity bindings, Gateway/Cloud Armor prerequisites, Secret Manager
   resources, billing alerts, SBOM/provenance image builds (including the
