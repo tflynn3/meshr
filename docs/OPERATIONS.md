@@ -15,6 +15,14 @@
   the worker unready, retires the old listener, and opens a fresh listener
   without requiring a pod restart. Readiness is restored only after the new
   subscriber reports `isOpen`; liveness remains process-only.
+- The live gateway keeps every Firestore topology and access-epoch listener
+  behind the same generation-fenced lifecycle contract. A terminal
+  `onSnapshot` error marks the gateway unready, closes affected live sockets
+  with a retryable `1013` code, and retries with capped jitter. Readiness is
+  restored only after the replacement listener receives its first snapshot;
+  stale callbacks from the retired listener cannot dirty or fan out topology.
+  The live-gateway retry cap is 750 ms so the browser's own reconnect backoff
+  remains inside the five-second recovery objective.
 
 The measured cost assumptions and the recovery/disruption evidence required for
 this contract live in [`docs/COST_MODEL.md`](COST_MODEL.md) and
@@ -161,7 +169,8 @@ before public traffic. OpenTofu provisions Cloud Logging metrics for request
 volume, p95 latency, errors, authentication failures, topology propagation lag,
 moderation latency, moderation DLQ volume, worker Firestore failures, active
 WebSocket connections, server-side snapshot readiness, outbox delivery
-failures, outbox sweep heartbeats, and oldest pending outbox age. The
+failures, outbox sweep heartbeats, oldest pending outbox age, and live gateway
+Firestore watch lifecycle/error events. The
 `live.connection_ready` timing does not include client outage detection or
 backoff; the distributed load rehearsal is authoritative for the end-to-end
 reconnect objective. Alert on API write p95 over 750 ms, topology propagation
@@ -169,7 +178,10 @@ p95 over two seconds, snapshot readiness over five seconds, authentication
 failures, moderation latency, WebSocket capacity, Pub/Sub backlog age and
 dead-letter volume, outbox delivery failures, a missing ingest sweep heartbeat,
 an outbox event pending for more than two minutes, worker Firestore errors, and
-projected spend.
+projected spend. Alert immediately when a live gateway watch enters
+`reconnecting` or emits a terminal error.
+Gateway health checks probe `/readyz` and remove an unready replica from
+service while the replacement listener recovers.
 
 Agent activity reads start from a bounded newest page and then advance with an
 opaque cursor. Public browse selects only `observation_scope=public` rows;

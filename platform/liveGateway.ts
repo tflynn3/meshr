@@ -3,6 +3,12 @@ import { createHash } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import { createFirestore, eventPlaneConfig } from "./googleClients.ts";
 import { liveCredentialValue, liveSourceAddress } from "./liveConnectionIdentity.ts";
+import {
+  FIRESTORE_WATCH_RECONNECT_BASE_MS,
+  FIRESTORE_WATCH_RECONNECT_MAX_MS,
+  FirestoreWatchSupervisor,
+  type FirestoreWatchStatus,
+} from "./firestoreWatchSupervisor.ts";
 import { ExpiringCache } from "./topologyCache.ts";
 
 /**
@@ -105,9 +111,12 @@ const activeCredentialCounts = new Map<string, number>();
 const activeIpCounts = new Map<string, number>();
 const pendingCredentialCounts = new Map<string, number>();
 const pendingIpCounts = new Map<string, number>();
-const topologyWatchers = new Map<string, () => void>();
+const topologyWatchers = new Map<string, FirestoreWatchSupervisor<unknown>>();
 const topologyGenerations = new Map<string, number>();
 let pendingConnectionCount = 0;
+
+let accessEpochWatch: FirestoreWatchSupervisor<unknown> | undefined;
+let liveAccessWatch: FirestoreWatchSupervisor<unknown> | undefined;
 
 function connectionKey(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 32);
@@ -221,13 +230,13 @@ function logConnectionGauge(): void {
 }
 
 function stopTopologyWatcher(meshId: string): void {
-  const stop = topologyWatchers.get(meshId);
-  if (!stop) return;
+  const watcher = topologyWatchers.get(meshId);
+  if (!watcher) return;
   topologyWatchers.delete(meshId);
   topologyGenerations.delete(meshId);
   snapshotCache.invalidate(meshId);
   activityCache.delete(meshId);
-  stop();
+  watcher.stop();
 }
 
 function json(response: ServerResponse, status: number, body: unknown): void {
@@ -558,6 +567,7 @@ const server = createServer(async (request, response) => {
         clients: clients.size,
         maxClients,
         authenticated: !allowAnonymousLocal,
+        firestore_watches: firestoreWatchSummary(),
       });
       return;
     }
@@ -570,11 +580,26 @@ const server = createServer(async (request, response) => {
           signal: AbortSignal.timeout(3_000),
         }).then((result) => result.ok).catch(() => false),
       ]);
-      if (!projectionRead || !apiReady) {
-        json(response, 503, { ok: false, service: "live-gateway", error: "dependencies_unavailable" });
+      const watchSummary = firestoreWatchSummary();
+      const activeMeshWatchers = [...topologyWatchers.values()];
+      const watchesReady =
+        accessEpochWatch?.isReady === true &&
+        liveAccessWatch?.isReady === true &&
+        activeMeshWatchers.every((watcher) => watcher.isReady);
+      if (!projectionRead || !apiReady || !watchesReady) {
+        json(response, 503, {
+          ok: false,
+          service: "live-gateway",
+          error: !projectionRead || !apiReady ? "dependencies_unavailable" : "firestore_watches_unavailable",
+          firestore_watches: watchSummary,
+        });
         return;
       }
-      json(response, 200, { ok: true, service: "live-gateway" });
+      json(response, 200, {
+        ok: true,
+        service: "live-gateway",
+        firestore_watches: watchSummary,
+      });
       return;
     }
     if (!originAllowed(request)) {
@@ -750,12 +775,95 @@ function meshHasSubscribers(meshId: string): boolean {
   return false;
 }
 
+interface FirestoreWatchDocumentChange {
+  doc: {
+    id: string;
+    get(field: string): unknown;
+  };
+}
+
+interface FirestoreWatchSnapshot {
+  docChanges(): FirestoreWatchDocumentChange[];
+}
+
+function isFirestoreWatchSnapshot(value: unknown): value is FirestoreWatchSnapshot {
+  return typeof value === "object" && value !== null &&
+    "docChanges" in value && typeof value.docChanges === "function";
+}
+
+function watchErrorDetails(error: unknown): { name: string; message: string } {
+  if (error instanceof Error) return { name: error.name, message: error.message };
+  return { name: "UnknownError", message: String(error) };
+}
+
+function logWatchState(
+  state: { name: string; status: FirestoreWatchStatus; reconnectAttempt: number },
+  meshId?: string,
+): void {
+  console.log(JSON.stringify({
+    component: "meshr-live-gateway",
+    event: "firestore_watch.lifecycle",
+    watch: state.name,
+    ...(meshId ? { mesh_id: meshId } : {}),
+    status: state.status,
+    reconnect_attempt: state.reconnectAttempt,
+  }));
+}
+
+function firestoreWatchSummary(): {
+  access_epochs: FirestoreWatchStatus;
+  live_access: FirestoreWatchStatus;
+  active_meshes: number;
+  reconnecting_meshes: number;
+  not_ready_meshes: number;
+} {
+  const meshStatuses = [...topologyWatchers.values()];
+  return {
+    access_epochs: accessEpochWatch?.status ?? "starting",
+    live_access: liveAccessWatch?.status ?? "starting",
+    active_meshes: meshStatuses.length,
+    reconnecting_meshes: meshStatuses.filter((watcher) => watcher.status === "reconnecting").length,
+    not_ready_meshes: meshStatuses.filter((watcher) => !watcher.isReady).length,
+  };
+}
+
+function logWatchError(watch: string, error: unknown, meshId?: string): void {
+  console.error(JSON.stringify({
+    component: "meshr-live-gateway",
+    event: "firestore_watch.error",
+    watch,
+    ...(meshId ? { mesh_id: meshId } : {}),
+    error: watchErrorDetails(error),
+  }));
+}
+
+function closeClients(
+  predicate: (state: ClientState) => boolean,
+  reason: string,
+): void {
+  for (const [socket, state] of clients) {
+    if (!predicate(state)) continue;
+    try {
+      socket.close(1013, reason);
+    } catch {
+      // A socket may have completed its close handshake between the iteration
+      // and this call. The close handler remains the source of truth for
+      // connection accounting in that case.
+    }
+  }
+}
+
 function startTopologyWatcher(meshId: string): void {
   if (topologyWatchers.has(meshId)) return;
-  const stop = firestore.collection("topology_shards")
-    .where("mesh_id", "==", meshId)
-    .onSnapshot(
-      (snapshot) => {
+  const watcher = new FirestoreWatchSupervisor<unknown>({
+    name: `topology:${meshId}`,
+    create: (onSnapshot, onError) => firestore.collection("topology_shards")
+      .where("mesh_id", "==", meshId)
+      .onSnapshot(
+        (snapshot) => onSnapshot(snapshot),
+        onError,
+      ),
+    onSnapshot: () => {
         if (!meshHasSubscribers(meshId)) return;
         // The listener is the dirty signal. Invalidate the warm values before
         // scheduling the coalesced refresh; otherwise a lone event inside the
@@ -765,16 +873,33 @@ function startTopologyWatcher(meshId: string): void {
         // rate.
         markTopologyDirty(meshId);
         scheduleMeshRefresh(meshId);
-      },
-      (error) => console.error("topology mesh watch failed", { mesh_id: meshId, error }),
-    );
-  topologyWatchers.set(meshId, stop);
+    },
+    onError: (error) => {
+      logWatchError("topology", error, meshId);
+      // A terminal watch error means the projection can no longer prove that
+      // the next frame is fresh. Ask clients to reconnect rather than serving
+      // an indefinitely stale topology while the bounded replacement starts.
+      closeClients((state) => state.meshId === meshId, "topology stream reconnecting");
+    },
+    onStateChange: (state) => logWatchState(state, meshId),
+    shouldReconnect: () => meshHasSubscribers(meshId),
+    reconnectBaseMs: FIRESTORE_WATCH_RECONNECT_BASE_MS,
+    reconnectMaxMs: FIRESTORE_WATCH_RECONNECT_MAX_MS,
+  });
+  topologyWatchers.set(meshId, watcher);
+  watcher.start();
 }
 
 async function refreshMesh(meshId: string): Promise<void> {
   if (!meshHasSubscribers(meshId)) return;
+  const watcher = topologyWatchers.get(meshId);
+  // A terminal Firestore error retires the listener before asking sockets to
+  // reconnect. Do not let a refresh timer that was queued before that error
+  // fan out a stale projection during the close handshake.
+  if (!watcher?.isReady) return;
   const readGeneration = topologyGeneration(meshId);
   const snapshotValue = await readSnapshot(meshId);
+  if (!topologyWatchers.get(meshId)?.isReady) return;
   const refreshGeneration = topologyGeneration(meshId);
   const cursor = snapshotCursor(snapshotValue ?? undefined);
   const candidates = [...clients.entries()].filter(([, state]) => state.meshId === meshId);
@@ -794,6 +919,7 @@ async function refreshMesh(meshId: string): Promise<void> {
         authorization: publicRepresentative.state.authorization,
       })
     : null;
+  if (!topologyWatchers.get(meshId)?.isReady) return;
   for (const { socket, state, allowed } of authorized) {
     if (!allowed || cursor <= state.cursor) continue;
     state.cursor = cursor;
@@ -830,19 +956,34 @@ function scheduleMeshRefresh(meshId: string): void {
 
 // Access epochs are written only for mesh visibility, role, and admission
 // events. They invalidate the short per-socket authorization cache without
-// forcing a Firestore/API read for every ordinary post fan-out.
-const stopWatchingAccessEpochs = firestore.collection("mesh_access_epochs").onSnapshot(
-  (snapshot) => {
+// forcing a Firestore/API read for every ordinary post fan-out. The supervisor
+// recreates the listener after a terminal error and keeps readiness false until
+// the replacement's first snapshot arrives.
+accessEpochWatch = new FirestoreWatchSupervisor<unknown>({
+  name: "mesh_access_epochs",
+  create: (onSnapshot, onError) => firestore.collection("mesh_access_epochs").onSnapshot(
+    (snapshot) => onSnapshot(snapshot),
+    onError,
+  ),
+  onSnapshot: (value) => {
+    if (!isFirestoreWatchSnapshot(value)) return;
     const changedMeshes = new Set(
-      snapshot.docChanges().map((change) => String(change.doc.get("mesh_id") ?? change.doc.id)),
+      value.docChanges().map((change) => String(change.doc.get("mesh_id") ?? change.doc.id)),
     );
     if (!changedMeshes.size) return;
     for (const [, state] of clients) {
       if (changedMeshes.has(state.meshId)) markAuthDirty(state);
     }
   },
-  (error) => console.error("mesh access epoch watch failed", error),
-);
+  onError: (error) => {
+    logWatchError("mesh_access_epochs", error);
+    closeClients(() => true, "authorization stream reconnecting");
+  },
+  onStateChange: (state) => logWatchState(state),
+  reconnectBaseMs: FIRESTORE_WATCH_RECONNECT_BASE_MS,
+  reconnectMaxMs: FIRESTORE_WATCH_RECONNECT_MAX_MS,
+});
+accessEpochWatch.start();
 
 // Human logout, WebMCP revocation, agent disconnect, and native-session
 // supersession can affect sockets without a mesh event. Global changes dirty
@@ -852,9 +993,15 @@ const stopWatchingAccessEpochs = firestore.collection("mesh_access_epochs").onSn
 // as a non-sensitive ordered event into this projection database. Watch the
 // projection unconditionally: production deliberately separates the two
 // databases, while local mode points both handles at the same database.
-const stopWatchingLiveAccess = firestore.collection("live_access_epochs").onSnapshot(
-  (snapshot) => {
-    for (const change of snapshot.docChanges()) {
+liveAccessWatch = new FirestoreWatchSupervisor<unknown>({
+  name: "live_access_epochs",
+  create: (onSnapshot, onError) => firestore.collection("live_access_epochs").onSnapshot(
+    (snapshot) => onSnapshot(snapshot),
+    onError,
+  ),
+  onSnapshot: (value) => {
+    if (!isFirestoreWatchSnapshot(value)) return;
+    for (const change of value.docChanges()) {
       const agentId = typeof change.doc.get("agent_id") === "string"
         ? String(change.doc.get("agent_id"))
         : undefined;
@@ -865,8 +1012,15 @@ const stopWatchingLiveAccess = firestore.collection("live_access_epochs").onSnap
       }
     }
   },
-  (error) => console.error("live access epoch watch failed", error),
-);
+  onError: (error) => {
+    logWatchError("live_access_epochs", error);
+    closeClients(() => true, "authorization stream reconnecting");
+  },
+  onStateChange: (state) => logWatchState(state),
+  reconnectBaseMs: FIRESTORE_WATCH_RECONNECT_BASE_MS,
+  reconnectMaxMs: FIRESTORE_WATCH_RECONNECT_MAX_MS,
+});
+liveAccessWatch.start();
 
 const authorizationRecheck = setInterval(() => {
   if (allowAnonymousLocal) return;
@@ -908,10 +1062,10 @@ async function shutdown(): Promise<void> {
   clearInterval(connectionGauge);
   for (const timer of pendingMeshRefreshes.values()) clearTimeout(timer);
   pendingMeshRefreshes.clear();
-  for (const stop of topologyWatchers.values()) stop();
+  for (const watcher of topologyWatchers.values()) watcher.stop();
   topologyWatchers.clear();
-  stopWatchingAccessEpochs();
-  stopWatchingLiveAccess();
+  accessEpochWatch?.stop();
+  liveAccessWatch?.stop();
   for (const socket of clients.keys()) socket.close(1001, "server shutdown");
   await new Promise<void>((resolve, reject) =>
     server.close((error) => (error ? reject(error) : resolve())),
