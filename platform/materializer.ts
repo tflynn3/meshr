@@ -11,6 +11,10 @@ import {
 import { readProjectionBootstrap } from "../server/projectionBootstrap.ts";
 import { loadRuntimeSecrets } from "./runtimeSecrets.ts";
 import {
+  SubscriptionSupervisor,
+  type ManagedSubscription,
+} from "./subscriptionSupervisor.ts";
+import {
   type AuthorityCollection,
   type WorkerCollection,
 } from "../server/authorityCollections.ts";
@@ -55,6 +59,12 @@ const moderationScreeningTopic = pubsub.topic(config.moderationScreeningTopic, {
 const port = Number(process.env.MESHR_PORT ?? "8080");
 const host = process.env.MESHR_HOST?.trim() || "0.0.0.0";
 type Consumer = "topology" | "moderation" | "moderation-screening" | "audit" | "notifications";
+type MaterializerMessage = {
+  data: Buffer;
+  id: string;
+  ack(): void;
+  nack(): void;
+};
 // Keep the process-facing consumer names stable even though the config uses
 // camelCase keys for its typed fields. In particular, the dedicated
 // moderation screening worker must subscribe to its own queue rather than
@@ -85,8 +95,26 @@ const selectedSubscriptions = requestedConsumer
   : subscriptions;
 const activeSubscriptions = selectedSubscriptions.map(([consumer, name]) => ({
   consumer,
-  subscription: pubsub.subscription(name, {
-    flowControl: { maxMessages: consumer === "topology" ? 50 : 25 },
+  name,
+  supervisor: new SubscriptionSupervisor<MaterializerMessage>({
+    name,
+    create: () => pubsub.subscription(name, {
+      flowControl: { maxMessages: consumer === "topology" ? 50 : 25 },
+    }) as ManagedSubscription<MaterializerMessage>,
+    onMessage: (message) => enqueueMessage(consumer, message),
+    onError: (error) => console.error(JSON.stringify({
+      component: "meshr-materializer",
+      event: "subscription.lifecycle_error",
+      consumer,
+      error: error instanceof Error ? error.message : String(error),
+    })),
+    onStateChange: (state) => console.log(JSON.stringify({
+      component: "meshr-materializer",
+      event: "subscription.lifecycle",
+      consumer,
+      status: state.status,
+      reconnect_attempt: state.reconnectAttempt,
+    })),
   }),
 }));
 const productionTopologyConsumer =
@@ -1269,13 +1297,6 @@ async function processMessage(
 // budget so Pub/Sub can apply its delivery-attempt/DLQ policy. Queued
 // successors are nacked as well, leaving the ordering-key fence and eventual
 // resume decision to Pub/Sub (an in-memory gate cannot observe DLQ completion).
-type MaterializerMessage = {
-  data: Buffer;
-  id: string;
-  ack(): void;
-  nack(): void;
-};
-
 type OrderedMessageQueue = {
   tail: Promise<void>;
   /** Messages already handed to this key but not yet started. */
@@ -2238,10 +2259,7 @@ async function waitForProductionTopologyBootstrap(): Promise<void> {
 
 async function startSubscriptions(): Promise<void> {
   await waitForProductionTopologyBootstrap();
-  for (const { consumer, subscription } of activeSubscriptions) {
-    subscription.on("message", (message) => enqueueMessage(consumer, message));
-    subscription.on("error", (error) => console.error(`${consumer} subscription error`, error));
-  }
+  for (const { supervisor } of activeSubscriptions) supervisor.start();
 
   if (requestedConsumer === "moderation-screening" && moderationEndpoint && moderationSweepFallback) {
     moderationSweepTimer = setInterval(() => {
@@ -2288,7 +2306,11 @@ const server = createServer((request, response) => {
       JSON.stringify({
         ok: true,
         service: "topology-materializer",
-        subscriptions: activeSubscriptions.map(({ consumer }) => consumer),
+        subscriptions: activeSubscriptions.map(({ consumer, supervisor }) => ({
+          consumer,
+          status: supervisor.status,
+          reconnectAttempt: supervisor.attempt,
+        })),
       }),
     );
     return;
@@ -2335,10 +2357,15 @@ const server = createServer((request, response) => {
         : moderationFirestore.collection(authorityCollection("processed_events")).limit(1).get();
     void Promise.all([
       dependencyCheck,
-      ...activeSubscriptions.map(({ subscription }) => subscription.exists()),
+      ...activeSubscriptions.map(async ({ name, supervisor }) => {
+        const [exists] = await pubsub.subscription(name).exists();
+        return { exists, ready: supervisor.isReady };
+      }),
     ])
       .then(async ([dependency, ...subscriptionResults]) => {
-        const subscriptionsReady = subscriptionResults.every((result) => result[0] === true);
+        const subscriptionsReady = subscriptionResults.every((result) =>
+          result.exists && result.ready,
+        );
         if (!dependency || !subscriptionsReady) {
           response.writeHead(503, { "content-type": "application/json" });
           response.end(JSON.stringify({
@@ -2393,7 +2420,7 @@ async function shutdown(): Promise<void> {
   if (moderationSweepTimer) clearInterval(moderationSweepTimer);
   if (activityCompactionTimer) clearInterval(activityCompactionTimer);
   if (activitySnapshotTimer) clearInterval(activitySnapshotTimer);
-  await Promise.all(activeSubscriptions.map(({ subscription }) => subscription.close()));
+  await Promise.all(activeSubscriptions.map(({ supervisor }) => supervisor.stop()));
   await Promise.allSettled([...orderedMessageQueues.values()].map((state) => state.tail));
   await new Promise<void>((resolve, reject) =>
     server.close((error) => (error ? reject(error) : resolve())),

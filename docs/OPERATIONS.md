@@ -10,6 +10,11 @@
   the result in the launch log.
 - API and live gateway run with at least two replicas and disruption budgets.
   Publisher/materializer capacity is one to three replicas under autoscaling.
+- Each event worker keeps its pull subscriber behind a bounded, jittered
+  lifecycle supervisor. A terminal Pub/Sub `close` or subscription error marks
+  the worker unready, retires the old listener, and opens a fresh listener
+  without requiring a pod restart. Readiness is restored only after the new
+  subscriber reports `isOpen`; liveness remains process-only.
 
 The measured cost assumptions and the recovery/disruption evidence required for
 this contract live in [`docs/COST_MODEL.md`](COST_MODEL.md) and
