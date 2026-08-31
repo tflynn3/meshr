@@ -26,6 +26,42 @@ export interface ResidentCohortDisclosure {
 export const RESIDENT_COHORT_POLICY_PATH = "/about/seeded-participants";
 export const RESIDENT_COHORT_POLICY_MARKER = "meshr-seeded-participants-policy-v1";
 
+const MINIMUM_PRODUCTION_SECRET_BYTES = 32;
+const SECRET_PLACEHOLDER_PATTERNS = [
+  /^(?:replace(?:[_\s-]?me)?|change(?:[_\s-]?me)?|placeholder|example|sample|dummy|test|todo|secret|password|token|pepper)(?:[_\s-].*)?$/i,
+  /^(?:your|insert|enter|set)(?:[_\s-]+).*(?:secret|token|pepper|password|key)(?:[_\s-].*)?$/i,
+  /^(?:meshr[_\s-]?local|local[_\s-]?development)(?:[_\s-].*)?$/i,
+  /^\$\{[^}]+\}$/,
+  /^<[^>]+>$/,
+];
+
+function isRepeatedSecretPattern(value: string): boolean {
+  const symbols = [...value];
+  for (let width = 1; width <= Math.floor(symbols.length / 2); width += 1) {
+    if (symbols.length % width !== 0) continue;
+    const pattern = symbols.slice(0, width);
+    if (symbols.every((symbol, index) => symbol === pattern[index % width])) return true;
+  }
+  return false;
+}
+
+/**
+ * Startup cannot prove that an operator generated a value unpredictably, but
+ * it can reject representations that are too short for 256-bit material and
+ * obvious development/template values. This check deliberately counts UTF-8
+ * bytes because Secret Manager values are byte strings, not JavaScript code
+ * units.
+ */
+function usableProductionSecret(value: string | undefined): value is string {
+  const normalized = value?.trim() ?? "";
+  return Boolean(
+    normalized &&
+      Buffer.byteLength(normalized, "utf8") >= MINIMUM_PRODUCTION_SECRET_BYTES &&
+      !SECRET_PLACEHOLDER_PATTERNS.some((pattern) => pattern.test(normalized)) &&
+      !isRepeatedSecretPattern(normalized),
+  );
+}
+
 /**
  * Resolve the public resident-cohort notice. Individual resident principals
  * remain ordinary accounts; this site-level disclosure prevents the initial
@@ -117,28 +153,42 @@ export function assertProductionSettings(settings: ProductionSettings): void {
     settings.residentDisclosureText,
     settings.residentDisclosureUrl,
   );
-  const missing: string[] = [];
+  const invalid: string[] = [];
   const usable = (value: string | undefined): value is string => Boolean(
     value &&
       value.trim() &&
       !/^(?:REPLACE(?:_|$)|PROJECT_ID$|\$\{[^}]+\})/i.test(value.trim()),
   );
-  if (settings.storage !== "firestore") missing.push("MESHR_STORAGE=firestore");
-  if (!settings.socialAuthOnly) missing.push("MESHR_SOCIAL_AUTH_ONLY=1");
-  if (!settings.secureCookies) missing.push("MESHR_SECURE_COOKIES=1");
-  if (!settings.webMcpTransfersSession) missing.push("MESHR_WEBMCP_SESSION_TRANSFER=1");
-  if (!usable(settings.identityProjectId)) missing.push("MESHR_IDENTITY_PROJECT_ID or GOOGLE_CLOUD_PROJECT");
-  if (!usable(settings.identityApiKey)) missing.push("MESHR_IDENTITY_API_KEY");
-  if (!usable(settings.renewalRecoverySecret)) missing.push("MESHR_RENEWAL_RECOVERY_SECRET");
-  if (!usable(settings.renewalRecoveryPreviousSecret)) missing.push("MESHR_RENEWAL_RECOVERY_SECRET_PREVIOUS");
-  if (!usable(settings.invitationPepper)) missing.push("MESHR_INVITATION_PEPPER");
-  if (!usable(settings.invitationPepperPrevious)) missing.push("MESHR_INVITATION_PEPPER_PREVIOUS");
-  if (!usable(settings.internalToken)) missing.push("MESHR_INTERNAL_TOKEN");
-  if (!usable(settings.moderationAuthorityToken)) missing.push("MESHR_MODERATION_AUTHORITY_TOKEN");
-  if (missing.length) {
+  if (settings.storage !== "firestore") invalid.push("MESHR_STORAGE=firestore");
+  if (!settings.socialAuthOnly) invalid.push("MESHR_SOCIAL_AUTH_ONLY=1");
+  if (!settings.secureCookies) invalid.push("MESHR_SECURE_COOKIES=1");
+  if (!settings.webMcpTransfersSession) invalid.push("MESHR_WEBMCP_SESSION_TRANSFER=1");
+  if (!usable(settings.identityProjectId)) invalid.push("MESHR_IDENTITY_PROJECT_ID or GOOGLE_CLOUD_PROJECT");
+  if (!usable(settings.identityApiKey)) invalid.push("MESHR_IDENTITY_API_KEY");
+  if (!usableProductionSecret(settings.renewalRecoverySecret)) invalid.push("MESHR_RENEWAL_RECOVERY_SECRET");
+  if (!usableProductionSecret(settings.renewalRecoveryPreviousSecret)) invalid.push("MESHR_RENEWAL_RECOVERY_SECRET_PREVIOUS");
+  if (!usableProductionSecret(settings.invitationPepper)) invalid.push("MESHR_INVITATION_PEPPER");
+  if (!usableProductionSecret(settings.invitationPepperPrevious)) invalid.push("MESHR_INVITATION_PEPPER_PREVIOUS");
+  if (!usableProductionSecret(settings.internalToken)) invalid.push("MESHR_INTERNAL_TOKEN");
+  if (!usableProductionSecret(settings.moderationAuthorityToken)) invalid.push("MESHR_MODERATION_AUTHORITY_TOKEN");
+  if (
+    usableProductionSecret(settings.renewalRecoverySecret) &&
+    usableProductionSecret(settings.renewalRecoveryPreviousSecret) &&
+    settings.renewalRecoverySecret.trim() === settings.renewalRecoveryPreviousSecret.trim()
+  ) {
+    invalid.push("MESHR_RENEWAL_RECOVERY_SECRET and MESHR_RENEWAL_RECOVERY_SECRET_PREVIOUS must differ");
+  }
+  if (
+    usableProductionSecret(settings.invitationPepper) &&
+    usableProductionSecret(settings.invitationPepperPrevious) &&
+    settings.invitationPepper.trim() === settings.invitationPepperPrevious.trim()
+  ) {
+    invalid.push("MESHR_INVITATION_PEPPER and MESHR_INVITATION_PEPPER_PREVIOUS must differ");
+  }
+  if (invalid.length) {
     throw new Error(
       "Production Meshr startup is blocked until these settings are configured: " +
-        missing.join(", "),
+        invalid.join(", "),
     );
   }
 }
