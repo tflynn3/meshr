@@ -130,8 +130,6 @@ create_cluster() {
   gcloud container clusters get-credentials "$cluster_name" \
     --project "$project_id" \
     --region "$region" >/dev/null
-  set_workload_identity_values
-  bind_workload_identity
   echo "Meshr Autopilot rehearsal cluster is ready: $cluster_name ($region)"
 }
 
@@ -141,41 +139,6 @@ set_workload_identity_values() {
   export MESHR_REHEARSAL_INGEST_GSA="${MESHR_REHEARSAL_INGEST_GSA:-meshr-rehearsal-ingest@${project_id}.iam.gserviceaccount.com}"
   export MESHR_REHEARSAL_TOPOLOGY_GSA="${MESHR_REHEARSAL_TOPOLOGY_GSA:-meshr-rehearsal-topology@${project_id}.iam.gserviceaccount.com}"
   export MESHR_REHEARSAL_LIVE_GSA="${MESHR_REHEARSAL_LIVE_GSA:-meshr-rehearsal-live@${project_id}.iam.gserviceaccount.com}"
-}
-
-bind_workload_identity() {
-  local service_account ksa member attempt
-  member="serviceAccount:${project_id}.svc.id.goog"
-  while IFS='|' read -r service_account ksa; do
-    for attempt in $(seq 1 10); do
-      if gcloud iam service-accounts add-iam-policy-binding "$service_account" \
-        --project "$project_id" \
-        --role roles/iam.workloadIdentityUser \
-        --member "${member}[${namespace}/${ksa}]" \
-        --condition=None \
-        --quiet >/dev/null 2>&1; then
-        break
-      fi
-      if (( attempt == 10 )); then
-        # Repeat once without suppressing stderr so a real permission or
-        # principal error remains actionable in the workflow log.
-        gcloud iam service-accounts add-iam-policy-binding "$service_account" \
-          --project "$project_id" \
-          --role roles/iam.workloadIdentityUser \
-          --member "${member}[${namespace}/${ksa}]" \
-          --condition=None \
-          --quiet >/dev/null
-        break
-      fi
-      sleep 3
-    done
-  done <<EOF
-${MESHR_REHEARSAL_API_GSA}|meshr-api
-${MESHR_REHEARSAL_BOOTSTRAP_GSA}|meshr-bootstrap
-${MESHR_REHEARSAL_INGEST_GSA}|meshr-ingest
-${MESHR_REHEARSAL_TOPOLOGY_GSA}|meshr-topology-materializer
-${MESHR_REHEARSAL_LIVE_GSA}|meshr-live-gateway
-EOF
 }
 
 set_render_values() {
@@ -301,7 +264,6 @@ deploy() {
   require_immutable_images
   connect_cluster
   set_render_values
-  bind_workload_identity
   trap dump_diagnostics ERR
 
   k apply -f "$repo_root/deploy/rehearsal/namespace.yaml" >/dev/null

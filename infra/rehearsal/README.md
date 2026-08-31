@@ -6,8 +6,8 @@ named Firestore databases, one ordered Pub/Sub topology subscription, keyless
 GitHub federation, split runtime identities, and a project-scoped $25 monthly
 budget alert. It deliberately creates no GKE cluster, load balancer, public IP,
 DNS record, certificate, or public service. The `gcp-rehearsal.yml` workflow
-owns the ephemeral Autopilot cluster and must delete it in an always-run cleanup
-step.
+owns the ephemeral Autopilot cluster and deletes it in a separate always-run
+cleanup job with its own time budget.
 
 ## Bootstrap and remote state
 
@@ -36,7 +36,15 @@ gcloud storage buckets update "gs://$REHEARSAL_STATE_BUCKET" --versioning
 Restrict bucket IAM to the infrastructure operators. Do not put credentials in
 `.tfvars`; Terraform uses Application Default Credentials from `gcloud auth
 application-default login`, while GitHub later uses Workload Identity
-Federation. This stack never creates a service-account JSON key.
+Federation. Set the ADC quota project to the rehearsal project so a stale local
+quota project cannot make the GCS backend fail even when bucket IAM is correct:
+
+```bash
+gcloud auth application-default login
+gcloud auth application-default set-quota-project "$TF_VAR_project_id"
+```
+
+This stack never creates a service-account JSON key.
 
 ## Plan and apply
 
@@ -50,14 +58,49 @@ terraform -chdir=infra/rehearsal apply rehearsal.tfplan
 terraform -chdir=infra/rehearsal output
 ```
 
+There is one fresh-project bootstrap boundary. Google's managed
+`PROJECT_ID.svc.id.goog` pool does not exist until the first
+Workload-Identity-enabled GKE cluster has existed, and GKE then retains the pool
+after cluster deletion. On a brand-new project only, replace the normal plan and
+apply above with this bounded bootstrap sequence:
+
+```bash
+terraform -chdir=infra/rehearsal plan \
+  -var=workload_identity_bindings_enabled=false \
+  -out=rehearsal-bootstrap.tfplan
+terraform -chdir=infra/rehearsal apply rehearsal-bootstrap.tfplan
+
+export GCP_PROJECT_ID="$TF_VAR_project_id"
+export GCP_REGION="us-central1"
+export GKE_CLUSTER="meshr-rehearsal"
+export NODE_SERVICE_ACCOUNT="$(terraform -chdir=infra/rehearsal output -raw gke_node_service_account_email)"
+bash scripts/gcp-rehearsal.sh create-cluster
+bash scripts/gcp-rehearsal.sh destroy-cluster
+
+terraform -chdir=infra/rehearsal plan -out=rehearsal.tfplan
+terraform -chdir=infra/rehearsal apply rehearsal.tfplan
+```
+
+The destroy command validates the cluster's name, region, Autopilot mode,
+Workload Identity pool, and rehearsal labels before deletion. Subsequent plans
+and rehearsals require no bootstrap exception.
+
 The numeric GitHub repository and owner IDs default to this repository's
-immutable IDs (`1348689949` and `19698887`). The provider accepts only
+immutable IDs (`1348689949` and `19698887`). The provider normally accepts only
 `workflow_dispatch` or `schedule` tokens from the exact
-`tflynn3/meshr/.github/workflows/gcp-rehearsal.yml` path on a branch, and the
-OIDC subject must name the protected `gcp-rehearsal` GitHub environment. This
-permits only branches allowed by that environment while rejecting tokens from
-other workflow files or jobs that omit the environment. Configure GitHub with
-the provider and CI service-account outputs, not a key.
+`tflynn3/meshr/.github/workflows/gcp-rehearsal.yml` path on an environment-
+approved branch. During the initial pre-merge proof, it also accepts `push`
+tokens only from `feat/copyable-agent-setup`; remove that temporary clause and
+branch policy after the proof. The OIDC subject must name the protected
+`gcp-rehearsal` GitHub environment. This rejects other workflow paths and jobs
+that omit the environment. Configure GitHub with the provider and CI
+service-account outputs, not a key.
+
+GitHub repositories created after 2026-07-15 use an immutable default OIDC
+subject that embeds both numeric IDs. Keep the provider subject in the form
+`repo:tflynn3@OWNER_ID/meshr@REPOSITORY_ID:environment:gcp-rehearsal`; the
+older name-only subject is rejected even though the separate numeric claim
+checks still pass.
 
 The CI service account can push only to `meshr-rehearsal`, consume enabled
 services, create/delete GKE clusters inside the dedicated project, and act as
@@ -66,16 +109,13 @@ the dedicated node service account. It has `roles/container.admin`, rather than
 but cannot apply the Kubernetes API objects used by the rehearsal deployment.
 The node identity can pull only from that repository.
 
-The Google-managed `PROJECT_ID.svc.id.goog` identity pool does not exist until
-the first Workload-Identity-enabled GKE cluster exists. The workflow therefore
-installs the five KSA-to-GSA `roles/iam.workloadIdentityUser` bindings after it
-creates and verifies the Autopilot cluster. A custom role gives CI only
-`iam.serviceAccounts.get`, `getIamPolicy`, and `setIamPolicy`, and that role is
-bound on only the five rehearsal workload service accounts. The lifecycle
-script uses deterministic account names and namespace `meshr-rehearsal`, so the
-operation is idempotent and cannot bind an arbitrary service account. Firestore
-roles are conditioned to one named database, and Pub/Sub roles are attached to
-one topic or subscription.
+After that one-time pool bootstrap, Terraform owns five exact, stable
+KSA-to-GSA `roles/iam.workloadIdentityUser` bindings. Deployment CI cannot
+rewrite workload service-account policy or impersonate those service accounts.
+Firestore roles are conditioned to one named database, and Pub/Sub roles are
+attached to one topic or subscription. The topology identity additionally has
+metadata-read permission on only its own subscription because the runtime
+readiness contract verifies that subscription before reporting ready.
 
 The budget notifies the billing account's default IAM recipients at 50%, 90%,
 and 100% of `monthly_budget_usd` (default `$25`). It is an alert, not a hard cap;

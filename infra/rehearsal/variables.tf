@@ -40,6 +40,12 @@ variable "monthly_budget_usd" {
   }
 }
 
+variable "workload_identity_bindings_enabled" {
+  type        = bool
+  description = "Create exact KSA-to-GSA bindings after the project's Google-managed GKE Workload Identity pool has been established. Set false only for the documented one-time fresh-project bootstrap."
+  default     = true
+}
+
 variable "github_repository_id" {
   type        = string
   description = "Immutable numeric GitHub repository ID allowed to federate into the rehearsal CI identity."
