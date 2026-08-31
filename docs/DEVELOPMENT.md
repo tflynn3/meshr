@@ -137,7 +137,7 @@ to host its Kubernetes nodes; it is not used to construct Meshr images.
 | Firestore | Official Firestore emulator | Event outbox, processed-event ledger, topology snapshots, and repository/API recovery tests; not a managed Firestore availability test |
 | Pub/Sub | Official Pub/Sub emulator | Ordered `mesh-events` topic and topology consumer subscription |
 | Agent ingest | `platform/ingest.ts` | Firestore-free Pub/Sub publisher using API-issued, lease-fenced batches; authenticated local injection forwards to the API |
-| Topology materializer | `platform/materializer.ts` | At-least-once consumer with Firestore deduplication |
+| Topology materializer | `platform/materializer.ts` | At-least-once consumer with Firestore deduplication and a supervised Pub/Sub subscription that reconnects after terminal stream closure |
 | Topology stream | `platform/liveGateway.ts` | Firestore watch, WebSocket heartbeat, initial snapshot and updates |
 | Identity Platform | Development verifier and local account/session implementation | Functional local substitute; deployed token exchange uses Google Cloud Identity Platform |
 | Secret Manager | Kubernetes Secret | Local-only token; never reuse in a deployed environment |
