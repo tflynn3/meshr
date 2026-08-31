@@ -175,15 +175,17 @@ locals {
     }
   }
 
-  github_repository = "tflynn3/meshr"
+  github_repository_parts = split("/", var.github_repository)
+  github_repository_owner = local.github_repository_parts[0]
+  github_repository_name  = local.github_repository_parts[1]
   # GitHub repositories created after 2026-07-15 use an immutable default OIDC
   # subject. Keep the human-readable names for workflow_ref while pinning the
   # security-sensitive subject to the non-reusable owner and repository IDs.
   github_immutable_subject_prefix = (
-    "repo:tflynn3@${var.github_repository_owner_id}/meshr@${var.github_repository_id}"
+    "repo:${local.github_repository_owner}@${var.github_repository_owner_id}/${local.github_repository_name}@${var.github_repository_id}"
   )
   github_workflow_ref = (
-    "${local.github_repository}/.github/workflows/gcp-rehearsal.yml@refs/heads/main"
+    "${var.github_repository}/${var.github_workflow_path}@refs/heads/main"
   )
 }
 
