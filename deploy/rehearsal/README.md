@@ -40,18 +40,21 @@ bash scripts/gcp-rehearsal.sh destroy-cluster
 account. Database, topic, subscription, and workload service-account
 variables also have deterministic defaults matching `infra/rehearsal`.
 
-After the cluster exists, both `create-cluster` and `deploy` idempotently add
+After the documented one-time project-pool bootstrap, Terraform owns
 `roles/iam.workloadIdentityUser` on each workload GSA for its exact
-`meshr-rehearsal/<KSA>` principal. These pool-dependent bindings intentionally
-live here instead of Terraform: the first foundation apply must succeed before
-any `${GCP_PROJECT_ID}.svc.id.goog` workload pool exists.
+`meshr-rehearsal/<KSA>` principal. The lifecycle script does not rewrite
+service-account IAM policy.
 
 `deploy` replaces the one-shot `production-store-bootstrap` Job, reads its
 structured generation attestation, patches
 `MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID`, and restarts the topology worker with
-that exact fence before it waits for all five rollouts. `restart-smoke` proves
-that the event, deduplication, and materialized projection survive a restart of
-every application workload.
+that exact fence before it waits for all five rollouts. A genuinely new
+authority still receives the production clean-launch scan because its missing
+authority marker makes that scan mandatory. Later cluster recreations keep
+`MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=0` and reuse the existing attested
+generation; retained topology from a successful rehearsal is not mistaken for
+pre-launch contamination. `restart-smoke` proves that the event, deduplication,
+and materialized projection survive a restart of every application workload.
 
 `destroy-cluster` refuses to delete unless the live target is an Autopilot
 cluster with the expected Workload Identity pool and all three labels
