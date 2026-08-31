@@ -1,0 +1,44 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: production-store-bootstrap
+  labels:
+    app.kubernetes.io/name: store-bootstrap
+    app.kubernetes.io/component: bootstrap
+    app.kubernetes.io/part-of: meshr
+spec:
+  backoffLimit: 4
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: store-bootstrap
+        app.kubernetes.io/component: bootstrap
+        app.kubernetes.io/part-of: meshr
+    spec:
+      serviceAccountName: meshr-bootstrap
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: store-bootstrap
+          image: ${EVENT_PLANE_IMAGE}
+          imagePullPolicy: IfNotPresent
+          args: ["production-bootstrap"]
+          envFrom:
+            - configMapRef: {name: meshr-runtime}
+          env:
+            - name: MESHR_INVITATION_PEPPER
+              valueFrom: {secretKeyRef: {name: meshr-runtime-secrets, key: invitation-pepper}}
+            - name: MESHR_INVITATION_PEPPER_PREVIOUS
+              valueFrom: {secretKeyRef: {name: meshr-runtime-secrets, key: invitation-pepper-previous}}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi, ephemeral-storage: 64Mi}
+            limits: {cpu: 250m, memory: 256Mi, ephemeral-storage: 256Mi}

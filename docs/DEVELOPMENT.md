@@ -85,6 +85,63 @@ with Homebrew k3d 5.8.3 contains an invalid `confd` executable.
 brew install bazelisk docker colima qemu k3d kubectl
 ```
 
+## Private managed-GCP rehearsal
+
+The `GCP deployment rehearsal` workflow is the managed-cloud acceptance loop
+before any public launch. It builds Linux AMD64 API, event-plane, and web
+images, pushes immutable digests to Artifact Registry, signs and verifies them
+with GitHub OIDC, creates an ephemeral GKE Autopilot cluster, and deploys the
+production Firestore/Pub/Sub runtime with GKE Workload Identity. The workflow
+then proves the API/web/ingest/materializer/live event path, restarts all five
+workloads, proves deduplication and recovery, and deletes the cluster by
+default.
+
+This rehearsal intentionally creates no Ingress, Gateway, external IP,
+certificate, or DNS record. Its five Services are `ClusterIP` only; smoke
+traffic reaches them through four runner-local `kubectl port-forward`
+connections. It therefore proves managed Firestore, managed Pub/Sub,
+Artifact Registry, keyless GitHub-to-GCP authentication, pod Workload Identity,
+and restart recovery without creating a public-facing product. It does not
+accept Identity Platform providers, public routing, Cloud Armor, certificate,
+multi-replica, load, backup/restore, or regional-failure behavior.
+
+The durable, low-cost foundation lives in `infra/rehearsal`: the image
+repository, five named Firestore databases, Pub/Sub topic/subscription,
+least-privilege service accounts, GitHub Workload Identity Federation, remote
+Terraform state, and a project-scoped budget alert. Follow
+`infra/rehearsal/README.md` to bootstrap or change it. A clean live plan is:
+
+```bash
+TF_VAR_project_id=PROJECT_ID \
+TF_VAR_billing_account_id=BILLING_ACCOUNT_ID \
+GOOGLE_CLOUD_PROJECT=PROJECT_ID \
+GOOGLE_CLOUD_QUOTA_PROJECT=PROJECT_ID \
+terraform -chdir=infra/rehearsal plan
+```
+
+The GitHub environment `gcp-rehearsal` supplies `GCP_REHEARSAL_PROJECT_ID`,
+`REGION`, `CLUSTER`, `WORKLOAD_IDENTITY_PROVIDER`, `SERVICE_ACCOUNT`, and
+`NODE_SERVICE_ACCOUNT`. It stores no Google service-account key. Once the
+workflow is present on the default branch, start a normal disposable run with:
+
+```bash
+gh workflow run gcp-rehearsal.yml --ref main -f keep_cluster=false
+```
+
+`keep_cluster=true` is a diagnostic exception, not the normal path. An
+always-run teardown removes the cluster after both success and failure, and a
+nightly destroy-only job removes a deliberately retained or interrupted
+cluster. The deletion script refuses any cluster that does not match the
+expected name, region, Autopilot/Workload-Identity settings, and all three
+rehearsal lifecycle labels.
+
+For an authorized local diagnostic run against an existing rehearsal cluster,
+export `GCP_PROJECT_ID`, `GCP_REGION`, and `GKE_CLUSTER`, then use
+`scripts/gcp-rehearsal.sh status`, `smoke`, or `destroy-cluster`. `deploy`
+additionally requires `API_IMAGE`, `EVENT_PLANE_IMAGE`, and `WEB_IMAGE` as full
+Artifact Registry references ending in `@sha256:<64 lowercase hex digits>`.
+Do not point this lifecycle script at a production cluster.
+
 ## Commands
 
 | Command | Effect |
@@ -97,6 +154,8 @@ brew install bazelisk docker colima qemu k3d kubectl
 | `npm run local:smoke` | Prove web/API routing and the ingest to Pub/Sub to materializer to Firestore to WebSocket path, including duplicate suppression. |
 | `npm run local:down` | Delete only the `meshr-local` k3d cluster. The isolated Colima VM remains available. |
 | `npm run test:firestore` | Run the production Firestore repository conformance test against `FIRESTORE_EMULATOR_HOST` (the CI job starts the official emulator). |
+| `scripts/gcp-rehearsal.sh status` | Inspect only the label-gated ephemeral GKE rehearsal and verify its Kubernetes surface remains private. |
+| `scripts/gcp-rehearsal.sh destroy-cluster` | Delete only the identity- and label-gated ephemeral GKE rehearsal cluster. |
 
 After code changes, run `npm run local:up` again. Bazel reuses unchanged actions
 and OCI layers, then k3d receives the rebuilt archives before the deployments
@@ -254,11 +313,14 @@ git diff --check
 ```
 
 Passing repository tests does not prove the local cluster. Passing the smoke
-test proves the current local cluster path, not GKE Workload Identity, Gateway,
-Certificate Manager, Cloud Armor, Cloudflare, managed-service durability, or a
-physical regional-failure recovery exercise. The public-launch checklist in
-`docs/LAUNCH_CHECKLIST.md` remains the acceptance source of truth for those
-boundaries.
+test proves the current local cluster path, not GKE Workload Identity or
+managed-service behavior. A successful GCP rehearsal adds managed Firestore,
+Pub/Sub, Artifact Registry, GKE Workload Identity, and restart evidence, but
+still does not prove Gateway, Certificate Manager, Cloud Armor, Cloudflare,
+public Identity Platform sign-in, multi-replica load, managed-service
+durability, backup/restore, or a regional-failure recovery exercise. The
+public-launch checklist in `docs/LAUNCH_CHECKLIST.md` remains the acceptance
+source of truth for those boundaries.
 
 ## Troubleshooting
 

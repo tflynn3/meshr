@@ -3,7 +3,20 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { WebSocket } from "ws";
 
-const baseUrl = process.env.MESHR_LOCAL_URL?.trim() || "http://localhost:8080";
+const sameOriginBaseUrl = (process.env.MESHR_LOCAL_URL?.trim() || "http://localhost:8080")
+  .replace(/\/+$/, "");
+const componentUrl = (localName: string, genericName: string, fallback: string): string =>
+  (process.env[localName]?.trim() || process.env[genericName]?.trim() || fallback)
+    .replace(/\/+$/, "");
+const apiBaseUrl = componentUrl("MESHR_LOCAL_API_URL", "MESHR_SMOKE_API_URL", sameOriginBaseUrl);
+const webBaseUrl = componentUrl("MESHR_LOCAL_WEB_URL", "MESHR_SMOKE_WEB_URL", sameOriginBaseUrl);
+const ingestBaseUrl = componentUrl(
+  "MESHR_LOCAL_INGEST_URL",
+  "MESHR_SMOKE_INGEST_URL",
+  `${sameOriginBaseUrl}/__local/ingest`,
+);
+const liveBaseUrl = componentUrl("MESHR_LOCAL_LIVE_URL", "MESHR_SMOKE_LIVE_URL", sameOriginBaseUrl);
+const webOrigin = new URL(webBaseUrl).origin;
 const token = process.env.MESHR_LOCAL_INTERNAL_TOKEN?.trim() || "meshr-local-development-only";
 const meshId = "mesh-public";
 
@@ -44,11 +57,11 @@ async function postEventWithRetry(
   throw new Error(`event ingest did not recover after restart: ${String(lastError)}`);
 }
 
-const health = await json(await fetch(`${baseUrl}/healthz`));
+const health = await json(await fetch(`${apiBaseUrl}/healthz`));
 assert.equal(health.status, "ok");
 assert.equal(health.database, "ok");
 
-const root = await fetch(`${baseUrl}/`);
+const root = await fetch(`${webBaseUrl}/`);
 assert.equal(root.status, 200);
 assert.match(await root.text(), /<div id="root"><\/div>/);
 
@@ -59,14 +72,14 @@ for (const [path, expectedId] of [
     "https://meshr.social/schemas/meshr/v1/contracts.schema.json",
   ],
 ] as const) {
-  const response = await fetch(`${baseUrl}${path}`);
+  const response = await fetch(`${webBaseUrl}${path}`);
   assert.equal(response.status, 200, `${path} was not published`);
   assert.match(response.headers.get("content-type") ?? "", /json/);
   const schema = (await response.json()) as Record<string, unknown>;
   assert.equal(schema.$id, expectedId, `${path} returned the application shell`);
 }
 
-const websocketUrl = new URL("/v1/live", baseUrl.replace(/^http/, "ws"));
+const websocketUrl = new URL("/v1/live", liveBaseUrl.replace(/^http/, "ws"));
 websocketUrl.searchParams.set("meshId", meshId);
 const messages: Array<Record<string, unknown>> = [];
 async function connectWebSocketWithRetry(url: URL): Promise<WebSocket> {
@@ -76,7 +89,7 @@ async function connectWebSocketWithRetry(url: URL): Promise<WebSocket> {
   // error (including a transient 502/504) as retryable so the restart smoke
   // proves recovery rather than racing endpoint propagation.
   for (let attempt = 0; attempt < 60; attempt += 1) {
-    const candidate = new WebSocket(url);
+    const candidate = new WebSocket(url, { origin: webOrigin });
     // Register the frame handler before waiting for `open`. The gateway can
     // send the initial snapshot immediately after the upgrade, so attaching
     // the handler only after this helper resolves would lose that first frame
@@ -125,7 +138,7 @@ const initial = await new Promise<Record<string, unknown>>((resolve, reject) => 
 assert.equal(initial.type, "topology.snapshot");
 const initialSnapshot = initial.snapshot as Record<string, unknown> | null;
 const beforeCount = Number(initialSnapshot?.event_count ?? 0);
-const eventUrl = `${baseUrl}/__local/ingest/v1/events`;
+const eventUrl = `${ingestBaseUrl}/v1/events`;
 const headers = {
   authorization: `Bearer ${token}`,
   "content-type": "application/json",
@@ -152,7 +165,10 @@ if (replayFile) {
   );
   const replayResponse = await postEventWithRetry(eventUrl, headers, replayEvent);
   assert.equal(replayResponse.duplicate, true, "restart lost event deduplication state");
-  const replaySnapshotResponse = await json(await fetch(`${baseUrl}/v1/live/snapshots/${meshId}`));
+  const replaySnapshotResponse = await json(await fetch(
+    `${liveBaseUrl}/v1/live/snapshots/${meshId}`,
+    { headers: { origin: webOrigin } },
+  ));
   const replaySnapshot = replaySnapshotResponse.snapshot as Record<string, unknown> | null;
   assert.ok(replaySnapshot, "restart smoke returned no replay snapshot");
   assert.equal(
@@ -194,7 +210,10 @@ assert.equal(projected.event_count, beforeCount + 1);
 const duplicate = await postEventWithRetry(eventUrl, headers, envelope);
 assert.equal(duplicate.duplicate, true);
 
-const snapshotResponse = await json(await fetch(`${baseUrl}/v1/live/snapshots/${meshId}`));
+const snapshotResponse = await json(await fetch(
+  `${liveBaseUrl}/v1/live/snapshots/${meshId}`,
+  { headers: { origin: webOrigin } },
+));
 const snapshot = snapshotResponse.snapshot as Record<string, unknown> | null;
 assert.ok(snapshot, "live snapshot endpoint returned no snapshot");
 assert.equal(snapshot.latest_event_id, envelope.event_id);
