@@ -3884,7 +3884,10 @@ resource "google_monitoring_alert_policy" "http_latency" {
   display_name          = "Meshr API write p95 latency"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.http_write_request_latency,
+  ]
   conditions {
     display_name = "write latency above launch target"
     condition_threshold {
@@ -3904,7 +3907,10 @@ resource "google_monitoring_alert_policy" "http_errors" {
   display_name          = "Meshr API HTTP errors"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.http_error_count,
+  ]
   conditions {
     display_name = "server and authorization errors"
     condition_threshold {
@@ -3924,7 +3930,10 @@ resource "google_monitoring_alert_policy" "auth_failures" {
   display_name          = "Meshr authentication failures"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.auth_failure_count,
+  ]
   conditions {
     display_name = "authentication failures above baseline"
     condition_threshold {
@@ -3944,7 +3953,10 @@ resource "google_monitoring_alert_policy" "topology_lag" {
   display_name          = "Meshr topology propagation lag"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.topology_propagation_lag,
+  ]
   conditions {
     display_name = "topology p95 lag above two seconds"
     condition_threshold {
@@ -3964,7 +3976,10 @@ resource "google_monitoring_alert_policy" "live_disconnects" {
   display_name          = "Meshr live gateway disconnects"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.live_disconnect_count,
+  ]
   conditions {
     display_name = "gateway disconnects above baseline"
     condition_threshold {
@@ -3984,7 +3999,10 @@ resource "google_monitoring_alert_policy" "outbox_failures" {
   display_name          = "Meshr outbox delivery failures"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.outbox_failure_count,
+  ]
   conditions {
     display_name = "outbox failures present"
     condition_threshold {
@@ -4004,7 +4022,10 @@ resource "google_monitoring_alert_policy" "outbox_pending_stall" {
   display_name          = "Meshr outbox pending stall"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.outbox_pending_stall_count,
+  ]
   conditions {
     display_name = "oldest outbox event exceeds two minutes"
     condition_threshold {
@@ -4024,7 +4045,10 @@ resource "google_monitoring_alert_policy" "outbox_heartbeat_missing" {
   display_name          = "Meshr outbox sweep heartbeat missing"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.outbox_sweep_heartbeat_count,
+  ]
   conditions {
     display_name = "no ingest sweep heartbeat"
     condition_absent {
@@ -4042,7 +4066,10 @@ resource "google_monitoring_alert_policy" "store_unavailable" {
   display_name          = "Meshr durable store unavailable"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.store_unavailable_count,
+  ]
   conditions {
     display_name = "authority or projection store errors"
     condition_threshold {
@@ -4062,7 +4089,10 @@ resource "google_monitoring_alert_policy" "moderation_failures" {
   display_name          = "Meshr moderation adapter failures"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.moderation_failure_count,
+  ]
   conditions {
     display_name = "moderation provider errors"
     condition_threshold {
@@ -4085,7 +4115,10 @@ resource "google_monitoring_alert_policy" "moderation_latency" {
   display_name          = "Meshr moderation provider p95 latency"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.moderation_request_latency,
+  ]
   conditions {
     display_name = "moderation p95 above two seconds"
     condition_threshold {
@@ -4105,7 +4138,10 @@ resource "google_monitoring_alert_policy" "moderation_dlq" {
   display_name          = "Meshr moderation dead-letter volume"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.moderation_dlq_count,
+  ]
   conditions {
     display_name = "moderation items dead-lettered"
     condition_threshold {
@@ -4128,7 +4164,10 @@ resource "google_monitoring_alert_policy" "worker_firestore_errors" {
   display_name          = "Meshr worker Firestore errors"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.worker_firestore_error_count,
+  ]
   conditions {
     display_name = "worker Firestore failures present"
     condition_threshold {
@@ -4148,7 +4187,10 @@ resource "google_monitoring_alert_policy" "live_active_connections" {
   display_name          = "Meshr live gateway connection capacity"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.live_active_connections,
+  ]
   conditions {
     display_name = "active WebSocket connections near per-pod ceiling"
     condition_threshold {
@@ -4168,7 +4210,10 @@ resource "google_monitoring_alert_policy" "live_snapshot_ready" {
   display_name          = "Meshr live snapshot readiness"
   combiner              = "OR"
   notification_channels = local.monitoring_notification_channels
-  depends_on            = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_logging_metric.live_snapshot_ready_latency,
+  ]
   conditions {
     display_name = "snapshot readiness p95 above five seconds"
     condition_threshold {
