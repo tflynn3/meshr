@@ -11,7 +11,7 @@ test("mandatory moderation readiness probes an authenticated health endpoint and
   let authorizationCalls = 0;
   const probe = createModerationReadinessProbe({
     endpoint: "https://moderation.example.test/screen",
-    healthcheckUrl: "https://moderation.example.test/healthz",
+    healthcheckUrl: "https://moderation.example.test/health",
     auth: "static",
     token: "provider-token",
     required: true,
@@ -22,7 +22,7 @@ test("mandatory moderation readiness probes an authenticated health endpoint and
     },
     fetchImpl: (async (input, init) => {
       calls += 1;
-      assert.equal(String(input), "https://moderation.example.test/healthz");
+      assert.equal(String(input), "https://moderation.example.test/health");
       assert.equal((init?.headers as Headers).get("authorization"), "Bearer provider-token");
       assert.equal((init?.headers as Headers).get("x-meshr-contract-version"), "1");
       return { ok: true, status: 204 } as Response;
@@ -46,7 +46,7 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
   assert.equal(
     moderationReadinessConfigError({
       endpoint: "http://moderation.example.test/screen",
-      healthcheckUrl: "http://moderation.example.test/healthz",
+      healthcheckUrl: "http://moderation.example.test/health",
       auth: "adc",
       required: true,
       environment: "production",
@@ -56,7 +56,7 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
   assert.equal(
     moderationReadinessConfigError({
       endpoint: `${taggedOrigin}/screen`,
-      healthcheckUrl: `${taggedOrigin}/healthz`,
+      healthcheckUrl: `${taggedOrigin}/health`,
       auth: "static",
       token: "provider-token",
       audience,
@@ -70,7 +70,7 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
   assert.equal(
     moderationReadinessConfigError({
       endpoint: `${taggedOrigin}/screen`,
-      healthcheckUrl: `${taggedOrigin}/healthz`,
+      healthcheckUrl: `${taggedOrigin}/health`,
       auth: "adc",
       token: "stale-static-token",
       tokenType: "id_token",
@@ -95,7 +95,7 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
   assert.equal(
     moderationReadinessConfigError({
       endpoint: "https://moderation.example.test/screen",
-      healthcheckUrl: "https://moderation.example.test/healthz",
+      healthcheckUrl: "https://moderation.example.test/health",
       auth: "none",
       required: true,
       environment: "production",
@@ -105,7 +105,7 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
   assert.equal(
     moderationReadinessConfigError({
       endpoint: "https://moderation.example.test/screen",
-      healthcheckUrl: "https://health.example.test/healthz",
+      healthcheckUrl: "https://health.example.test/health",
       auth: "adc",
       tokenType: "id_token",
       audience,
@@ -119,7 +119,7 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
   assert.equal(
     moderationReadinessConfigError({
       endpoint: "https://moderation.example.test/screen",
-      healthcheckUrl: "https://moderation.example.test/healthz",
+      healthcheckUrl: "https://moderation.example.test/health",
       auth: "adc",
       tokenType: "id_token",
       required: true,
@@ -130,7 +130,7 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
   assert.equal(
     moderationReadinessConfigError({
       endpoint: `${taggedOrigin}/screen`,
-      healthcheckUrl: `${taggedOrigin}/healthz`,
+      healthcheckUrl: `${taggedOrigin}/health`,
       auth: "adc",
       tokenType: "id_token",
       audience,
@@ -143,7 +143,7 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
   assert.equal(
     moderationReadinessConfigError({
       endpoint: `${taggedOrigin}/screen`,
-      healthcheckUrl: `${taggedOrigin}/healthz`,
+      healthcheckUrl: `${taggedOrigin}/health`,
       auth: "adc",
       tokenType: "id_token",
       audience,
@@ -156,7 +156,7 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
   );
   const exactTaggedConfig = {
     endpoint: `${taggedOrigin}/screen`,
-    healthcheckUrl: `${taggedOrigin}/healthz`,
+    healthcheckUrl: `${taggedOrigin}/health`,
     auth: "adc" as const,
     tokenType: "id_token" as const,
     audience,
@@ -166,6 +166,15 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
     environment: "production",
   };
   assert.equal(moderationReadinessConfigError(exactTaggedConfig), undefined);
+  for (const reservedPath of ["healthz", "readyz"]) {
+    assert.equal(
+      moderationReadinessConfigError({
+        ...exactTaggedConfig,
+        healthcheckUrl: `${taggedOrigin}/${reservedPath}`,
+      }),
+      "moderation_revision_url_mismatch",
+    );
+  }
   assert.equal(
     revisionTag.length + 3 + new URL(audience).hostname.split(".")[0]!.length,
     62,
@@ -189,7 +198,7 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
       ...exactTaggedConfig,
       revisionTag: `r-${releaseSha.slice(0, 14)}`,
       endpoint: `https://r-${releaseSha.slice(0, 14)}---${audience.slice("https://".length)}/screen`,
-      healthcheckUrl: `https://r-${releaseSha.slice(0, 14)}---${audience.slice("https://".length)}/healthz`,
+      healthcheckUrl: `https://r-${releaseSha.slice(0, 14)}---${audience.slice("https://".length)}/health`,
     }),
     "moderation_revision_tag_mismatch",
   );
@@ -197,21 +206,21 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
     [
       {
         endpoint: `${audience}/screen`,
-        healthcheckUrl: `${audience}/healthz`,
+        healthcheckUrl: `${audience}/health`,
       },
       "moderation_revision_url_mismatch",
     ],
     [
       {
         endpoint: `https://r-${"b".repeat(20)}---meshr-moderation-adapter-123456789012.us-central1.run.app/screen`,
-        healthcheckUrl: `https://r-${"b".repeat(20)}---meshr-moderation-adapter-123456789012.us-central1.run.app/healthz`,
+        healthcheckUrl: `https://r-${"b".repeat(20)}---meshr-moderation-adapter-123456789012.us-central1.run.app/health`,
       },
       "moderation_revision_url_mismatch",
     ],
     [
       {
         endpoint: `https://${revisionTag}---foreign-123456789012.us-central1.run.app/screen`,
-        healthcheckUrl: `https://${revisionTag}---foreign-123456789012.us-central1.run.app/healthz`,
+        healthcheckUrl: `https://${revisionTag}---foreign-123456789012.us-central1.run.app/health`,
       },
       "moderation_revision_url_mismatch",
     ],
@@ -228,7 +237,7 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
     [
       {
         endpoint: `https://${revisionTag}---meshr-moderation-adapter-123456789012.us-central1.run.app:8443/screen`,
-        healthcheckUrl: `https://${revisionTag}---meshr-moderation-adapter-123456789012.us-central1.run.app:8443/healthz`,
+        healthcheckUrl: `https://${revisionTag}---meshr-moderation-adapter-123456789012.us-central1.run.app:8443/health`,
       },
       "moderation_revision_url_mismatch",
     ],
@@ -243,7 +252,7 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
       {
         audience: audience.replace("https://", "https://xx"),
         endpoint: `${taggedOrigin.replace("---", "---xx")}/screen`,
-        healthcheckUrl: `${taggedOrigin.replace("---", "---xx")}/healthz`,
+        healthcheckUrl: `${taggedOrigin.replace("---", "---xx")}/health`,
       },
       "moderation_audience_invalid",
     ],
@@ -271,14 +280,14 @@ test("mandatory moderation readiness rejects incomplete or insecure production c
       revisionTag: canaryTag,
       audience: canaryAudience,
       endpoint: `${canaryTaggedOrigin}/screen`,
-      healthcheckUrl: `${canaryTaggedOrigin}/healthz`,
+      healthcheckUrl: `${canaryTaggedOrigin}/health`,
     }),
     undefined,
   );
   assert.equal(
     moderationReadinessConfigError({
       endpoint: "https://moderation.example.test/screen",
-      healthcheckUrl: "https://moderation.example.test/healthz",
+      healthcheckUrl: "https://moderation.example.test/health",
       auth: "adc",
       tokenType: "access_token",
       required: true,
@@ -308,7 +317,7 @@ test("moderation readiness fails closed when ADC or the provider is unavailable"
   const taggedOrigin = `https://${revisionTag}---meshr-moderation-adapter-123456789012.us-central1.run.app`;
   const authFailure = createModerationReadinessProbe({
     endpoint: `${taggedOrigin}/screen`,
-    healthcheckUrl: `${taggedOrigin}/healthz`,
+    healthcheckUrl: `${taggedOrigin}/health`,
     auth: "adc",
     tokenType: "id_token",
     audience,
@@ -328,7 +337,7 @@ test("moderation readiness fails closed when ADC or the provider is unavailable"
 
   const providerFailure = createModerationReadinessProbe({
     endpoint: `${taggedOrigin}/screen`,
-    healthcheckUrl: `${taggedOrigin}/healthz`,
+    healthcheckUrl: `${taggedOrigin}/health`,
     auth: "adc",
     tokenType: "id_token",
     audience,
@@ -354,7 +363,7 @@ test("production moderation readiness attests the adapter contract and release",
   const makeProbe = (response: Response, environment = "production") =>
     createModerationReadinessProbe({
       endpoint: `${taggedOrigin}/screen`,
-      healthcheckUrl: `${taggedOrigin}/healthz`,
+      healthcheckUrl: `${taggedOrigin}/health`,
       auth: "adc",
       tokenType: "id_token",
       audience,

@@ -1253,7 +1253,7 @@ test("qualification substitution inputs are admission-gated and injection-safe",
   );
   assert.match(expressions, /MESHR_MODERATION_REVISION_TAG \+ '---'/);
   assert.match(expressions, /split\('https:\/\/'\)\[1\] \+ '\/screen'/);
-  assert.match(expressions, /split\('https:\/\/'\)\[1\] \+ '\/healthz'/);
+  assert.match(expressions, /split\('https:\/\/'\)\[1\] \+ '\/health'/);
   assert.match(
     expressions,
     /object\.data\.MESHR_MODERATION_AUDIENCE == '\$\{MESHR_MODERATION_AUDIENCE\}'/,
@@ -1495,7 +1495,7 @@ test("release transaction accepts only the release-tagged Cloud Run adapter orig
     MESHR_MODERATION_AUDIENCE: stableOrigin,
     MESHR_MODERATION_ENDPOINT: `${taggedOrigin}/screen`,
     MESHR_MODERATION_FIRESTORE_DATABASE: "meshr-moderation",
-    MESHR_MODERATION_HEALTHCHECK_URL: `${taggedOrigin}/healthz`,
+    MESHR_MODERATION_HEALTHCHECK_URL: `${taggedOrigin}/health`,
     MESHR_MODERATION_RELEASE_SHA: releaseSha,
     MESHR_MODERATION_REVISION_TAG: revisionTag,
     MESHR_NOTIFICATIONS_FIRESTORE_DATABASE: "meshr-notifications",
@@ -1529,7 +1529,7 @@ test("release transaction accepts only the release-tagged Cloud Run adapter orig
         ...runtime,
         MESHR_MODERATION_AUDIENCE: boundaryStableOrigin,
         MESHR_MODERATION_ENDPOINT: `${boundaryTaggedOrigin}/screen`,
-        MESHR_MODERATION_HEALTHCHECK_URL: `${boundaryTaggedOrigin}/healthz`,
+        MESHR_MODERATION_HEALTHCHECK_URL: `${boundaryTaggedOrigin}/health`,
       }).status,
       0,
     );
@@ -1537,17 +1537,17 @@ test("release transaction accepts only the release-tagged Cloud Run adapter orig
       {
         ...runtime,
         MESHR_MODERATION_ENDPOINT: `${stableOrigin}/screen`,
-        MESHR_MODERATION_HEALTHCHECK_URL: `${stableOrigin}/healthz`,
+        MESHR_MODERATION_HEALTHCHECK_URL: `${stableOrigin}/health`,
       },
       {
         ...runtime,
         MESHR_MODERATION_ENDPOINT: `https://r-${"b".repeat(20)}---${stableOrigin.slice("https://".length)}/screen`,
-        MESHR_MODERATION_HEALTHCHECK_URL: `https://r-${"b".repeat(20)}---${stableOrigin.slice("https://".length)}/healthz`,
+        MESHR_MODERATION_HEALTHCHECK_URL: `https://r-${"b".repeat(20)}---${stableOrigin.slice("https://".length)}/health`,
       },
       {
         ...runtime,
         MESHR_MODERATION_ENDPOINT: `${taggedOrigin.replace("meshr-moderation-adapter", "foreign-adapter")}/screen`,
-        MESHR_MODERATION_HEALTHCHECK_URL: `${taggedOrigin.replace("meshr-moderation-adapter", "foreign-adapter")}/healthz`,
+        MESHR_MODERATION_HEALTHCHECK_URL: `${taggedOrigin.replace("meshr-moderation-adapter", "foreign-adapter")}/health`,
       },
       {
         ...runtime,
@@ -1561,7 +1561,7 @@ test("release transaction accepts only the release-tagged Cloud Run adapter orig
       {
         ...runtime,
         MESHR_MODERATION_ENDPOINT: `${taggedOrigin}:8443/screen`,
-        MESHR_MODERATION_HEALTHCHECK_URL: `${taggedOrigin}:8443/healthz`,
+        MESHR_MODERATION_HEALTHCHECK_URL: `${taggedOrigin}:8443/health`,
       },
       { ...runtime, MESHR_MODERATION_AUDIENCE: `${stableOrigin}/` },
       { ...runtime, MESHR_MODERATION_AUDIENCE: `${stableOrigin}?alias=1` },
@@ -1584,7 +1584,7 @@ test("release transaction accepts only the release-tagged Cloud Run adapter orig
           "https://xx",
         ),
         MESHR_MODERATION_ENDPOINT: `${taggedOrigin.replace("---", "---xx")}/screen`,
-        MESHR_MODERATION_HEALTHCHECK_URL: `${taggedOrigin.replace("---", "---xx")}/healthz`,
+        MESHR_MODERATION_HEALTHCHECK_URL: `${taggedOrigin.replace("---", "---xx")}/health`,
       },
       { ...runtime, MESHR_MODERATION_REVISION_TAG: `r-${"b".repeat(20)}` },
       { ...runtime, EXTRA_RUNTIME_KEY: "forbidden" },

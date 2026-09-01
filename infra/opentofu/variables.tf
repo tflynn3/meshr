@@ -90,7 +90,7 @@ variable "production_image" {
 
 variable "moderation_adapter_image" {
   type        = string
-  description = "Immutable Cloud Run image digest for the Model Armor/Sensitive Data Protection moderation adapter. The adapter must expose authenticated /healthz and /screen endpoints. Required for launch_mode=true or private_moderation_adapter_mode=true; null keeps validation plans resource-free."
+  description = "Immutable Cloud Run image digest for the Model Armor/Sensitive Data Protection moderation adapter. The adapter must expose authenticated /health and /screen endpoints. Required for launch_mode=true or private_moderation_adapter_mode=true; null keeps validation plans resource-free."
   default     = null
   nullable    = true
 

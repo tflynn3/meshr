@@ -119,8 +119,8 @@ test("moderation adapter health is authenticated and fails closed on provider er
   const { server, url } = await listen(provider, { requireCallerAuth: true });
   t.after(() => server.close());
 
-  assert.equal((await fetch(`${url}/healthz`)).status, 401);
-  const response = await fetch(`${url}/healthz`, {
+  assert.equal((await fetch(`${url}/health`)).status, 401);
+  const response = await fetch(`${url}/health`, {
     headers: { authorization: "Bearer caller-id-token" },
   });
   assert.equal(response.status, 503);
@@ -153,7 +153,7 @@ test("production adapter health attests its exact release and contract", async (
   });
   t.after(() => server.close());
 
-  for (const path of ["healthz", "readyz"]) {
+  for (const path of ["health", "healthz", "readyz"]) {
     const response = await fetch(`${url}/${path}`, {
       headers: { authorization: "Bearer caller-id-token" },
     });

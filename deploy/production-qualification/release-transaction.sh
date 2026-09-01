@@ -197,7 +197,7 @@ validate_release_inputs() {
         (.MESHR_MODERATION_AUDIENCE | ltrimstr("https://")) + "/screen") and
     .MESHR_MODERATION_HEALTHCHECK_URL ==
       ("https://" + .MESHR_MODERATION_REVISION_TAG + "---" +
-        (.MESHR_MODERATION_AUDIENCE | ltrimstr("https://")) + "/healthz") and
+        (.MESHR_MODERATION_AUDIENCE | ltrimstr("https://")) + "/health") and
     ([
       .MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID,
       .MESHR_CUTOVER_VALIDATION_MESH_ID,

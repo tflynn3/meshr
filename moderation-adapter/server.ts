@@ -89,7 +89,8 @@ export function createModerationAdapterServer(options: ModerationAdapterOptions)
       });
       return;
     }
-    if (request.method === "GET" && (path === "/healthz" || path === "/readyz")) {
+    if (request.method === "GET" &&
+        (path === "/health" || path === "/healthz" || path === "/readyz")) {
       if (!authorized(request, options)) {
         logRequest(path, 401, startedAt);
         json(response, 401, { error: { code: "authentication_required" } });
