@@ -53,7 +53,9 @@ type FixtureMutation =
   | "wrong-dockerfile-directory"
   | "legacy-invocation-id"
   | "missing-build-arg"
-  | "unexpected-build-arg";
+  | "missing-root-build-arg"
+  | "unexpected-build-arg"
+  | "unexpected-root-build-arg";
 
 function runFixture(
   mutation?: FixtureMutation,
@@ -167,6 +169,16 @@ function runFixture(
                     },
                     request: {
                       args: {
+                        ...(fixtureImage.moderationWitness
+                          ? mutation === "missing-root-build-arg"
+                            ? {}
+                            : {
+                                "build-arg:MESHR_MODERATION_RELEASE_SHA":
+                                  sourceSha,
+                              }
+                          : mutation === "unexpected-root-build-arg"
+                            ? { "build-arg:UNREVIEWED": "value" }
+                            : {}),
                         "vcs:localdir:context": ".",
                         "vcs:localdir:dockerfile":
                           mutation === "wrong-dockerfile-directory"
@@ -547,6 +559,7 @@ test("adapter image verifier rejects broken descriptors, configs, and attestatio
     "wrong-dockerfile-directory",
     "legacy-invocation-id",
     "missing-build-arg",
+    "missing-root-build-arg",
   ] as const) {
     const result = runFixture(mutation);
     assert.notEqual(result.status, 0, `${mutation} unexpectedly passed`);
@@ -554,10 +567,15 @@ test("adapter image verifier rejects broken descriptors, configs, and attestatio
 });
 
 test("release image verifier rejects undeclared build arguments on non-adapter images", () => {
-  const result = runFixture("unexpected-build-arg", {
-    name: "api",
-    dockerfile: "deploy/images/api.Dockerfile",
-    moderationWitness: false,
-  });
-  assert.notEqual(result.status, 0);
+  for (const mutation of [
+    "unexpected-build-arg",
+    "unexpected-root-build-arg",
+  ] as const) {
+    const result = runFixture(mutation, {
+      name: "api",
+      dockerfile: "deploy/images/api.Dockerfile",
+      moderationWitness: false,
+    });
+    assert.notEqual(result.status, 0, `${mutation} unexpectedly passed`);
+  }
 });
