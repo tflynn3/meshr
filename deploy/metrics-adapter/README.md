@@ -14,7 +14,7 @@ this identity.
 The HPA controller receives only the one Pub/Sub metric through the
 Meshr-owned `meshr-external-metrics-reader` ClusterRole and binding. Do not use
 the generic `external-metrics-reader` name: GKE owns and reconciles that role
-with wildcard external-metric access.
+with wildcard external-metric access, and Meshr does not bind it.
 
 Apply the adapter after the cluster and OpenTofu service-account output exist:
 

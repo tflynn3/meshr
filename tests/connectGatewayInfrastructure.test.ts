@@ -620,6 +620,15 @@ test("metrics adapter RBAC cannot collide with GKE-managed external metric acces
     false,
     "Meshr manifests must not own GKE's external-metrics-reader objects",
   );
+  assert.equal(
+    resources.some(
+      (resource) =>
+        resource.kind === "ClusterRoleBinding" &&
+        resource.roleRef?.name === "external-metrics-reader",
+    ),
+    false,
+    "Meshr manifests must not bind GKE's wildcard external metrics role",
+  );
 });
 
 test("restricted Flux controller can reconcile only overlay resource kinds", () => {

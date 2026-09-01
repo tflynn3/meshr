@@ -136,6 +136,32 @@ kubectl -n custom-metrics rollout status \
   deployment/custom-metrics-stackdriver-adapter --timeout=5m
 kubectl wait --for=condition=Available \
   apiservice/v1beta1.external.metrics.k8s.io --timeout=5m
+kubectl get clusterrole meshr-external-metrics-reader -o json \
+  | jq -e '.rules == [{
+      apiGroups: ["external.metrics.k8s.io"],
+      resources: ["pubsub.googleapis.com|subscription|num_undelivered_messages"],
+      verbs: ["list", "get", "watch"]
+    }]'
+kubectl get clusterrolebindings -o json \
+  | jq -e '
+      ([.items[] | select(.metadata.name == "meshr-external-metrics-reader")] | length) == 1 and
+      ([.items[] | select(.metadata.name == "meshr-external-metrics-reader")][0] |
+        .roleRef == {
+          apiGroup: "rbac.authorization.k8s.io",
+          kind: "ClusterRole",
+          name: "meshr-external-metrics-reader"
+        } and
+        .subjects == [{
+          kind: "ServiceAccount",
+          name: "horizontal-pod-autoscaler",
+          namespace: "kube-system"
+        }]) and
+      (all(.items[];
+        .roleRef.name != "external-metrics-reader" or
+        all(.subjects[]?;
+          .kind != "ServiceAccount" or
+          .name != "horizontal-pod-autoscaler" or
+          .namespace != "kube-system")))'
 ```
 
 ### Install the reviewed Flux controllers
