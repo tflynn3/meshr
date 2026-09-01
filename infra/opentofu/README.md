@@ -464,7 +464,7 @@ etag-CAS workflow owns every later change:
    revision, so a private promotion must not stage a duplicate revision for the
    same SHA. Later promotions stage the reviewed digest as a no-traffic
    revision, bind its deterministic tag without retargeting any active or
-   previous tag, and hand the tagged `/screen` and `/healthz` URLs to the
+   previous tag, and hand the tagged `/screen` and `/health` URLs to the
    Kubernetes release transaction. The ID-token audience remains the stable
    `moderation_adapter_url`. Qualification switches to the separate read-only
    identity to verify and invoke the revision; it cannot update Cloud Run,
@@ -761,8 +761,8 @@ adapter's dedicated service accounts receive `roles/modelarmor.user` and
 `roles/dlp.user`; production/canary event-plane workers receive only
 `roles/run.invoker` on their matching adapter service. The adapter calls both
 Model Armor and Sensitive Data Protection using short-lived ADC credentials and
-exposes bounded authenticated `/screen` and side-effect-free `/healthz` and
-`/readyz` endpoints. For production, set `MESHR_MODERATION_ENDPOINT` and
+exposes bounded authenticated `/screen` and side-effect-free `/health`,
+`/healthz`, and `/readyz` endpoints. For production, set `MESHR_MODERATION_ENDPOINT` and
 `MESHR_MODERATION_HEALTHCHECK_URL` from the same immutable tagged revision URL,
 while `MESHR_MODERATION_AUDIENCE` remains the stable Cloud Run service URI.
 Canary uses its independently verified environment-specific values. Worker

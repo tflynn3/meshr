@@ -112,7 +112,7 @@ export function moderationReadinessConfigError(options: Pick<ModerationReadiness
         }
         const taggedOrigin = `https://${revisionTag}---${audience.hostname}`;
         if (trim(options.endpoint) !== `${taggedOrigin}/screen` ||
-            trim(options.healthcheckUrl) !== `${taggedOrigin}/healthz`) {
+            trim(options.healthcheckUrl) !== `${taggedOrigin}/health`) {
           return "moderation_revision_url_mismatch";
         }
       } else if (audience.origin !== endpoint.origin) {

@@ -445,11 +445,11 @@ rather than guessing it, and prove the stable URI does not route to that
 candidate before the Kubernetes pointer changes. Prove the tag resolves to
 that exact revision, digest, runtime
 service account, and allowlisted configuration; reject any Cloud Run override
-of the image-baked source SHA. Authenticated `/healthz` must return the same
+of the image-baked source SHA. Authenticated `/health` must return the same
 full SHA with `x-meshr-contract-version: 1`, after which the promoter re-reads
 the service, revision, tag URI, and concurrency token before the Kubernetes
 CAS. Set the endpoint and health values to that returned origin's exact
-`/screen` and `/healthz` paths. The traffic tag is
+`/screen` and `/health` paths. The traffic tag is
 mutable external routing state, not an immutable release object; admission
 proves only the runtime map's deterministic tag and URL relationship. Retain
 and re-verify both active and previous tags around the Kubernetes pointer CAS.

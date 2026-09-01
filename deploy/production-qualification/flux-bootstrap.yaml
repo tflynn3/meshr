@@ -260,7 +260,7 @@ spec:
               object.data.MESHR_MODERATION_AUDIENCE.split('https://')[1] + '/screen' &&
           object.data.MESHR_MODERATION_HEALTHCHECK_URL ==
             'https://' + object.data.MESHR_MODERATION_REVISION_TAG + '---' +
-              object.data.MESHR_MODERATION_AUDIENCE.split('https://')[1] + '/healthz' &&
+              object.data.MESHR_MODERATION_AUDIENCE.split('https://')[1] + '/health' &&
           object.data.MESHR_RELEASE_SHA.matches('^[a-f0-9]{40}$') &&
           object.metadata.name.split('-')[3] == object.data.MESHR_RELEASE_SHA &&
           ((object.metadata.name.split('-')[2] == 'b' &&
