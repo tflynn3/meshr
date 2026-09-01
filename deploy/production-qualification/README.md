@@ -137,7 +137,7 @@ kubectl -n custom-metrics rollout status \
 kubectl wait --for=condition=Available \
   apiservice/v1beta1.external.metrics.k8s.io --timeout=5m
 kubectl get clusterrole meshr-external-metrics-reader -o json \
-  | jq -e '.rules == [{
+  | jq -e '(.aggregationRule // null) == null and .rules == [{
       apiGroups: ["external.metrics.k8s.io"],
       resources: ["pubsub.googleapis.com|subscription|num_undelivered_messages"],
       verbs: ["list", "get", "watch"]

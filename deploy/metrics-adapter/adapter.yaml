@@ -184,9 +184,8 @@ metadata:
   name: meshr-external-metrics-reader
 rules:
   - apiGroups: [external.metrics.k8s.io]
-    # HPA needs only the one queue-depth metric exposed by this adapter. Keep
-    # the cluster-scoped reader resource-limited rather than granting access
-    # to every external metric installed by another workload.
+    # Meshr's compatibility grant covers only its queue-depth metric. GKE's
+    # separately managed HPA controller policy can independently be broader.
     resources: ["pubsub.googleapis.com|subscription|num_undelivered_messages"]
     verbs: [list, get, watch]
 ---

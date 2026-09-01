@@ -592,6 +592,7 @@ test("metrics adapter RBAC cannot collide with GKE-managed external metric acces
   );
   const [role] = roles;
   const [binding] = bindings;
+  assert.equal(role.aggregationRule, undefined);
   assert.deepEqual(role.rules, [
     {
       apiGroups: ["external.metrics.k8s.io"],

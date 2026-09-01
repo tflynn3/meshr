@@ -11,10 +11,11 @@ OpenTofu creates a dedicated Google service account with only
 cluster-scoped Kubernetes service account. The application workers do not use
 this identity.
 
-The HPA controller receives only the one Pub/Sub metric through the
-Meshr-owned `meshr-external-metrics-reader` ClusterRole and binding. Do not use
-the generic `external-metrics-reader` name: GKE owns and reconciles that role
-with wildcard external-metric access, and Meshr does not bind it.
+Meshr's own compatibility grant covers only the one Pub/Sub metric through the
+uniquely named `meshr-external-metrics-reader` ClusterRole and binding. It does
+not mutate or bind GKE's generic `external-metrics-reader` addon role. The
+Kubernetes-managed HPA controller policy independently has broader external-
+metric read access, because Kubernetes RBAC grants are additive.
 
 Apply the adapter after the cluster and OpenTofu service-account output exist:
 
