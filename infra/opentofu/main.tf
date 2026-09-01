@@ -3922,10 +3922,21 @@ resource "google_identity_platform_config" "default" {
     "staging.${var.zone_name}",
     "${var.project_id}.firebaseapp.com",
   ]
+  multi_tenant {
+    allow_tenants = false
+  }
   sign_in {
     # Meshr deliberately keeps provider identities separate until the human
     # explicitly links both identities in the signed-in account.
     allow_duplicate_emails = true
+    email {
+      enabled           = false
+      password_required = false
+    }
+    phone_number {
+      enabled            = false
+      test_phone_numbers = {}
+    }
   }
   depends_on = [google_project_service.required]
 }
