@@ -18,6 +18,16 @@ def meshr_normalize_flux_pod_template:
       .
     end;
 
+# GKE adds this annotation to Services that it enrolls in container-native
+# load balancing. Normalize only the exact observed ingress enrollment; a
+# different value or any additional annotation remains in the signed contract.
+def meshr_normalize_flux_source_service_annotations:
+  if .["cloud.google.com/neg"]? == "{\"ingress\":true}" then
+    del(.["cloud.google.com/neg"])
+  else
+    .
+  end;
+
 # GKE adds this selector to ValidatingAdmissionPolicy match constraints so
 # tenant policies cannot affect its managed namespaces. The Meshr release
 # namespaces must remain selected by the NotIn expression.

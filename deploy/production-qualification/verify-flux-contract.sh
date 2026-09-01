@@ -94,7 +94,8 @@ pod_template_contract_sha() {
 # all signed metadata labels and the rest of the Service spec, including the
 # exact selector and port mapping, remain in the normalized hash.
 source_service_contract_sha() {
-  jq -cS '
+  jq -L "$script_directory" -cS '
+    include "gke-autopilot-contract";
     def strip_default($key; $value):
       if (has($key) | not) or .[$key] == $value then
         del(.[$key])
@@ -106,7 +107,8 @@ source_service_contract_sha() {
       kind,
       metadata: {
         annotations: ((.metadata.annotations // {}) |
-          del(."kubectl.kubernetes.io/last-applied-configuration")),
+          del(."kubectl.kubernetes.io/last-applied-configuration") |
+          meshr_normalize_flux_source_service_annotations),
         labels: (.metadata.labels // {}),
         name: .metadata.name,
         namespace: .metadata.namespace
@@ -187,8 +189,11 @@ source_service="$(kubectl -n flux-system get service/source-controller -o json)"
 jq -e '
   (.metadata.annotations // {}) as $annotations |
   ($annotations | keys | all(
-    . == "kubectl.kubernetes.io/last-applied-configuration"
+    . == "kubectl.kubernetes.io/last-applied-configuration" or
+    . == "cloud.google.com/neg"
   )) and
+  (($annotations | has("cloud.google.com/neg") | not) or
+    $annotations["cloud.google.com/neg"] == "{\"ingress\":true}") and
   ((($annotations."kubectl.kubernetes.io/last-applied-configuration" // null)
       | if . == null then null else fromjson end) as $applied |
     $applied == null or
@@ -562,17 +567,24 @@ assert_cannot() {
   local principal="$1"
   shift
   local decision decision_status
+  local denial_reason_pattern='^no - [[:print:]]+$'
   if decision="$(kubectl auth can-i "$@" --as="$principal")"; then
     decision_status=0
   else
     decision_status=$?
   fi
-  test "$decision_status" -eq 0 || test "$decision_status" -eq 1 || return 1
-  test "$decision" = no || {
+  if test "$decision_status" -eq 1 &&
+    { test "$decision" = no || [[ "$decision" =~ $denial_reason_pattern ]]; }; then
+    return 0
+  fi
+  if test "$decision_status" -eq 0; then
     printf 'controller authorization unexpectedly allowed %s: %s\n' \
       "$principal" "$*" >&2
     return 1
-  }
+  fi
+  printf 'controller authorization review failed for %s: %s (exit %s, output %q)\n' \
+    "$principal" "$*" "$decision_status" "$decision" >&2
+  return 1
 }
 
 namespace_inventory="$(kubectl get namespaces -o json)"
