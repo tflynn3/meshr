@@ -16,6 +16,10 @@ terraform {
 provider "google" {
   project = var.project_id
   region  = var.region
+  # User ADC can retain an unrelated quota project. Charge every provider API
+  # request to the explicitly managed project instead of ambient local state.
+  billing_project       = var.project_id
+  user_project_override = true
 }
 
 provider "cloudflare" {
