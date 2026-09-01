@@ -306,14 +306,19 @@ document reads nor any control-plane mutation.
 
 Private production qualification also receives the custom
 `meshrProjectIamReadback` role in the managed project. Its permissions are
-exactly `iam.roles.get`, `iam.serviceAccounts.getIamPolicy`,
+exactly `artifactregistry.repositories.getIamPolicy`, `iam.roles.get`,
+`iam.serviceAccountKeys.list`,
+`iam.serviceAccounts.getIamPolicy`, `iam.serviceAccounts.list`,
 `iam.workloadIdentityPoolProviders.get`,
 `iam.workloadIdentityPoolProviders.list`, `resourcemanager.projects.get`, and
-`resourcemanager.projects.getIamPolicy`. This lets the workflow compare the
-three narrow custom-role definitions, inventory the shared pool to exclude an
-unexpected provider, inspect the named qualification provider, verify the
-deploy service account's workload-identity binding, and compare project
-bindings without identity impersonation, primitive Viewer, or IAM mutation.
+`resourcemanager.projects.getIamPolicy`. This lets the workflow enumerate every
+project service account, prove that none has a user-managed key or a primitive
+project role, compare the three narrow custom-role definitions, inventory every
+public and private deployment pool to exclude unexpected providers, inspect
+each named provider, verify the exact Artifact Registry grant and the deploy,
+plan, and promoter service accounts' workload-identity bindings, and compare
+project bindings without identity impersonation, primitive Viewer, or IAM
+mutation.
 
 The stack owns one retained regional `meshr-moderation` Model Armor template.
 Its policy enables prompt-injection/jailbreak, malicious-URI, basic Sensitive
@@ -664,8 +669,10 @@ namespace-scoped qualification release pointer through Kubernetes RBAC. It may
 create only admission-approved, retained commit sources and immutable input
 maps; it cannot update or delete them. It receives no Firestore document,
 Cloud Run update, or service-account impersonation grant.
-It also receives the six-permission `meshrProjectIamReadback` role for exact
-project, custom-role, WIF-provider, and service-account-policy verification.
+It also receives the nine-permission `meshrProjectIamReadback` role for exact
+project, Artifact Registry policy, custom-role, every WIF provider, all three
+release service-account policies, complete service-account inventory, and
+user-managed-key absence verification.
 The build identity can write images but cannot touch the cluster.
 The private operations environments also own their project, cluster, immutable
 release tuple, adapter tag URL, Firestore database, and cost-protection inputs.

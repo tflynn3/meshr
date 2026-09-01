@@ -137,8 +137,11 @@ test("production trust readback is exact and non-mutating", () => {
     (match) => match[1],
   );
   assert.deepEqual(permissions, [
+    "artifactregistry.repositories.getIamPolicy",
     "iam.roles.get",
+    "iam.serviceAccountKeys.list",
     "iam.serviceAccounts.getIamPolicy",
+    "iam.serviceAccounts.list",
     "iam.workloadIdentityPoolProviders.get",
     "iam.workloadIdentityPoolProviders.list",
     "resourcemanager.projects.get",
