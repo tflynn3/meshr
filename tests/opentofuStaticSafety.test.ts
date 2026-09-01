@@ -763,6 +763,18 @@ test("public build receipt is exact-SHA-bound and carries no deploy authority", 
   assert.match(runbook, /--certificate-github-workflow-trigger='push'/);
 });
 
+test("CI validates the production provider lock with the planning Terraform version", () => {
+  const ci = read(".github/workflows/ci.yml");
+  assert.match(
+    ci,
+    /hashicorp\/setup-terraform@[a-f0-9]{40}[\s\S]*?terraform_version: 1\.16\.0[\s\S]*?terraform_wrapper: false/,
+  );
+  assert.match(
+    ci,
+    /terraform -chdir=infra\/opentofu init -backend=false -input=false -lockfile=readonly/,
+  );
+});
+
 test("public build fails closed unless the exact release tag set is empty", () => {
   const ci = read(".github/workflows/ci.yml");
   const preflight = ci.match(
