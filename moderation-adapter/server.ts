@@ -69,6 +69,9 @@ function screenRequest(value: unknown): ModerationScreenRequest {
 }
 
 export function createModerationAdapterServer(options: ModerationAdapterOptions): Server {
+  if (options.environment === "production" && !/^[a-f0-9]{40}$/.test(options.releaseSha ?? "")) {
+    throw new Error("production moderation adapter requires an exact release SHA");
+  }
   const maxBodyBytes = Math.max(2_048, Math.min(64 * 1024, Math.trunc(options.maxBodyBytes ?? 16 * 1024)));
   return createServer(async (request, response) => {
     const startedAt = Date.now();
@@ -95,7 +98,11 @@ export function createModerationAdapterServer(options: ModerationAdapterOptions)
       try {
         await options.provider.health();
         logRequest(path, 200, startedAt);
-        json(response, 200, { ok: true, service: "meshr-moderation-adapter" });
+        json(response, 200, {
+          ok: true,
+          service: "meshr-moderation-adapter",
+          ...(options.releaseSha ? { releaseSha: options.releaseSha } : {}),
+        });
       } catch {
         logRequest(path, 503, startedAt);
         json(response, 503, { error: { code: "provider_unavailable" } });

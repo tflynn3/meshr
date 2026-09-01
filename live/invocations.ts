@@ -15,6 +15,51 @@ export const MESHR_MCP_TOOL_NAMES = [
 export interface ProcessInvocation {
   command: string;
   args: string[];
+  cwd: string;
+}
+
+// These are all recognized by the Codex CLI version used for launch
+// acceptance. Keep strict config enabled so a future CLI that renames or
+// removes one fails closed instead of silently restoring a host capability.
+const CODEX_GENERAL_TOOL_FEATURES = [
+  "apps",
+  "artifact",
+  "browser_use",
+  "browser_use_external",
+  "browser_use_full_cdp_access",
+  "code_mode",
+  "code_mode_host",
+  "computer_use",
+  "deferred_executor",
+  "goals",
+  "hooks",
+  "image_generation",
+  "in_app_chat",
+  "in_app_dictation",
+  "in_app_browser",
+  "in_app_local_automation",
+  "memories",
+  "multi_agent",
+  "multi_agent_v2",
+  "plugins",
+  "remote_plugin",
+  "shell_tool",
+  "shell_snapshot",
+  "shell_snapshot_v2",
+  "shell_zsh_fork",
+  "skill_mcp_dependency_install",
+  "skill_search",
+  "tool_suggest",
+  "unified_exec",
+  "view_image",
+  "workspace_dependencies",
+] as const;
+
+function isolatedCodexArgs(): string[] {
+  return CODEX_GENERAL_TOOL_FEATURES.flatMap((feature) => [
+    "--disable",
+    feature,
+  ]);
 }
 
 export function mcpServerCommand(input: {
@@ -57,10 +102,12 @@ export function mcpServerCommand(input: {
 export function buildCodexInvocation(input: {
   executable: string;
   projectRoot: string;
+  workingDirectory: string;
   stateDirectory: string;
   binding: ConnectorBinding;
   prompt: string;
   outputPath: string;
+  outputSchemaPath: string;
   model?: string;
 }): ProcessInvocation {
   const mcp = mcpServerCommand(input);
@@ -68,7 +115,9 @@ export function buildCodexInvocation(input: {
     "--ask-for-approval",
     "never",
     "exec",
+    "--strict-config",
     "--ignore-user-config",
+    "--ignore-rules",
     "--ephemeral",
     "--skip-git-repo-check",
     "--sandbox",
@@ -77,7 +126,10 @@ export function buildCodexInvocation(input: {
     "--color",
     "never",
     "--cd",
-    input.projectRoot,
+    input.workingDirectory,
+    ...isolatedCodexArgs(),
+    "--output-schema",
+    input.outputSchemaPath,
     "--output-last-message",
     input.outputPath,
     "--config",
@@ -87,21 +139,24 @@ export function buildCodexInvocation(input: {
   ];
   if (input.model) args.push("--model", input.model);
   args.push(input.prompt);
-  return { command: input.executable, args };
+  return { command: input.executable, args, cwd: input.workingDirectory };
 }
 
 export function buildManagedCodexInvocation(input: {
   executable: string;
-  projectRoot: string;
+  workingDirectory: string;
   prompt: string;
   outputPath: string;
+  outputSchemaPath: string;
   model?: string;
 }): ProcessInvocation {
   const args = [
     "--ask-for-approval",
     "never",
     "exec",
+    "--strict-config",
     "--ignore-user-config",
+    "--ignore-rules",
     "--ephemeral",
     "--skip-git-repo-check",
     "--sandbox",
@@ -110,13 +165,16 @@ export function buildManagedCodexInvocation(input: {
     "--color",
     "never",
     "--cd",
-    input.projectRoot,
+    input.workingDirectory,
+    ...isolatedCodexArgs(),
+    "--output-schema",
+    input.outputSchemaPath,
     "--output-last-message",
     input.outputPath,
   ];
   if (input.model) args.push("--model", input.model);
   args.push(input.prompt);
-  return { command: input.executable, args };
+  return { command: input.executable, args, cwd: input.workingDirectory };
 }
 
 export function managedCodexEnvironment(
@@ -154,9 +212,11 @@ export function claudeMcpConfig(input: {
 
 export function buildClaudeInvocation(input: {
   executable: string;
+  workingDirectory: string;
   prompt: string;
   mcpConfigPath: string;
   budgetUsd: number;
+  outputSchema: Record<string, unknown>;
   model?: string;
 }): ProcessInvocation {
   const tools = MESHR_MCP_TOOL_NAMES.map((name) => `mcp__meshr__${name}`).join(
@@ -167,7 +227,15 @@ export function buildClaudeInvocation(input: {
     input.prompt,
     "--output-format",
     "json",
+    "--json-schema",
+    JSON.stringify(input.outputSchema),
     "--no-session-persistence",
+    "--disable-slash-commands",
+    "--no-chrome",
+    // Only consult local settings in the fresh empty working directory. This
+    // excludes user/project hooks and plugins while retaining CLI auth.
+    "--setting-sources",
+    "local",
     "--strict-mcp-config",
     "--mcp-config",
     input.mcpConfigPath,
@@ -181,7 +249,7 @@ export function buildClaudeInvocation(input: {
     tools,
   ];
   if (input.model) args.push("--model", input.model);
-  return { command: input.executable, args };
+  return { command: input.executable, args, cwd: input.workingDirectory };
 }
 
 export function redactInvocation(
@@ -190,6 +258,7 @@ export function redactInvocation(
 ): ProcessInvocation {
   return {
     command: invocation.command,
+    cwd: invocation.cwd,
     args: invocation.args.map((value) =>
       value === prompt ? "<phase-prompt>" : value,
     ),

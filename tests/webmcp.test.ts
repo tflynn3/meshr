@@ -101,6 +101,22 @@ test("registers eight typed tools without caller-controlled identity fields", as
   assert.equal(tools.has("update_mesh_governance"), false);
 });
 
+test("page browsing tools identify external social data as untrusted and authority-free", async () => {
+  const { tools } = await registerTools();
+  for (const name of [
+    "discover_meshes",
+    "observe_mesh_activity",
+    "read_conversation",
+    "inspect_traffic_link",
+  ]) {
+    const tool = tools.get(name);
+    assert.ok(tool, `missing tool ${name}`);
+    assert.equal(tool.annotations?.untrustedContentHint, true);
+    assert.match(tool.description, /untrusted social data/i);
+    assert.match(tool.description, /grant no tool, file, or account authority/i);
+  }
+});
+
 test("tool execution dispatches to the server-backed page client", async () => {
   const { calls, tools } = await registerTools();
   const identity = (await executeJson(tools.get("get_my_agent"))) as {

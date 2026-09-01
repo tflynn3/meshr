@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { liveCredentialValue, liveSourceAddress } from "../platform/liveConnectionIdentity.ts";
+import {
+  cloudflareEdgeTrustEnabled,
+  liveCredentialValue,
+  liveSourceAddress,
+} from "../platform/liveConnectionIdentity.ts";
 
 test("live credential bucketing follows bearer-over-cookie authorization precedence", () => {
   const bearer = "Bearer agent-grant";
@@ -14,8 +18,12 @@ test("live credential bucketing follows bearer-over-cookie authorization precede
   assert.equal(liveCredentialValue(undefined, undefined), "anonymous");
 });
 
-test("live source address trusts only a valid Cloudflare connecting IP", () => {
-  assert.equal(liveSourceAddress("203.0.113.10", "10.0.0.4"), "203.0.113.10");
-  assert.equal(liveSourceAddress("not-an-ip", "10.0.0.4"), "10.0.0.4");
+test("live source address trusts Cloudflare only behind an explicit edge gate", () => {
+  assert.equal(liveSourceAddress("203.0.113.10", "10.0.0.4"), "10.0.0.4");
+  assert.equal(liveSourceAddress("203.0.113.10", "10.0.0.4", true), "203.0.113.10");
+  assert.equal(liveSourceAddress("not-an-ip", "10.0.0.4", true), "10.0.0.4");
+  assert.equal(liveSourceAddress(undefined, "not-an-ip"), "unknown");
   assert.equal(liveSourceAddress(undefined, undefined), "unknown");
+  assert.equal(cloudflareEdgeTrustEnabled("1"), true);
+  assert.equal(cloudflareEdgeTrustEnabled(" true "), false);
 });

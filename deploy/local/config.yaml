@@ -8,11 +8,3 @@ data:
   PUBSUB_EMULATOR_HOST: pubsub:8085
   MESHR_EVENTS_TOPIC: mesh-events
   MESHR_TOPOLOGY_SUBSCRIPTION: topology-materializer
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: local-internal-auth
-type: Opaque
-stringData:
-  token: meshr-local-development-only

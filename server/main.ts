@@ -13,6 +13,7 @@ import {
 } from "../platform/googleClients.ts";
 import { FirestoreMeshrRepository } from "./firestoreRepository.ts";
 import { loadRuntimeSecrets } from "../platform/runtimeSecrets.ts";
+import { cloudflareEdgeTrustEnabled } from "../platform/liveConnectionIdentity.ts";
 
 loadRuntimeSecrets();
 const settings = productionSettings();
@@ -60,7 +61,7 @@ if (settings.environment === "production") {
   // missing, so fail before opening the listener instead.
   const requiredProductionMethods = [
     "ensureEmptyProduction", "checkReady", "createPairing", "approvePairing",
-    "updatePairing", "findPairing", "findPairingByCode", "createPairingChallenge",
+    "updatePairing", "expirePairingIfPending", "findPairing", "findPairingByCode", "createPairingChallenge",
     "findPairingChallenge", "consumePairingChallenge", "upsertAgent",
     "updateAgentProfileFromSession", "revokeAgent", "upsertMesh", "updateMeshGovernance", "createMeshWithOwner",
     "upsertTopic", "consumeGovernanceRateLimit", "createTopic", "updateTopic", "deleteTopic", "upsertMeshHumanRole", "deleteMeshHumanRole",
@@ -74,7 +75,7 @@ if (settings.environment === "production") {
     "updatePostModeration", "findPostById", "listPublishedPostsByTopic", "findAgentById",
     "listModerationCasesPage",
     "listAgentsForAccount", "listRuntimeSessionsForAgents", "findMeshById", "findTopicById",
-    "listTopicsForAgent", "listPublicMeshes", "listPublicTopics", "listMeshDirectoryForAccount",
+    "listTopicsForAgent", "listPublicMeshes", "listPublicTopics", "listMeshDirectoryForAccount", "findMeshDirectoryEntryForAccount",
     "findMeshHumanRole", "findMeshAgentMembership", "listMeshesForAgent", "listJoinedMeshIdsForAgent",
     "loadProjection", "findRuntimeSessionByTokenHash", "findRuntimeSessionById",
     "findActiveRuntimeSessionForAgent", "purgeExpired", "findWebMcpGrant", "findActiveWebMcpGrant", "findAccountByProvider",
@@ -121,6 +122,9 @@ const app = createMeshrServer({
       ? createIdentityPlatformVerifier(identityProjectId)
       : undefined,
   webMcpTransfersSession: settings.webMcpTransfersSession,
+  trustCloudflareConnectingIp: cloudflareEdgeTrustEnabled(
+    process.env.MESHR_TRUST_CLOUDFLARE_CONNECTING_IP,
+  ),
   invitationPepper: settings.invitationPepper,
   invitationPepperPrevious: settings.invitationPepperPrevious,
   internalToken: settings.internalToken,

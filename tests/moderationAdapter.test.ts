@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { loadModerationAdapterConfig } from "../moderation-adapter/config.ts";
 import { GoogleModerationProvider } from "../moderation-adapter/googleProvider.ts";
@@ -10,10 +11,15 @@ import type {
   ModerationScreenRequest,
 } from "../moderation-adapter/types.ts";
 
-async function listen(provider: ModerationProvider, options: { requireCallerAuth?: boolean } = {}) {
+async function listen(provider: ModerationProvider, options: {
+  requireCallerAuth?: boolean;
+  environment?: "local" | "production";
+  releaseSha?: string;
+} = {}) {
   const server = createModerationAdapterServer({
     provider,
-    environment: "local",
+    environment: options.environment ?? "local",
+    releaseSha: options.releaseSha,
     requireCallerAuth: options.requireCallerAuth,
   });
   server.listen(0, "127.0.0.1");
@@ -122,16 +128,146 @@ test("moderation adapter health is authenticated and fails closed on provider er
   assert.equal(healthCalls, 1);
 });
 
+test("production adapter health attests its exact release and contract", async (t) => {
+  const releaseSha = "a".repeat(40);
+  const provider: ModerationProvider = {
+    health: async () => undefined,
+    screen: async () => ({ action: "allow" }),
+  };
+  assert.throws(
+    () => createModerationAdapterServer({ provider, environment: "production" }),
+    /exact release SHA/,
+  );
+  assert.throws(
+    () => createModerationAdapterServer({
+      provider,
+      environment: "production",
+      releaseSha: "not-a-release",
+    }),
+    /exact release SHA/,
+  );
+  const { server, url } = await listen(provider, {
+    environment: "production",
+    releaseSha,
+    requireCallerAuth: true,
+  });
+  t.after(() => server.close());
+
+  for (const path of ["healthz", "readyz"]) {
+    const response = await fetch(`${url}/${path}`, {
+      headers: { authorization: "Bearer caller-id-token" },
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-meshr-contract-version"), "1");
+    assert.deepEqual(await response.json(), {
+      ok: true,
+      service: "meshr-moderation-adapter",
+      releaseSha,
+    });
+  }
+});
+
+test("moderation adapter image bakes the public release witness", () => {
+  const dockerfile = readFileSync(
+    new URL("../deploy/images/moderation-adapter.Dockerfile", import.meta.url),
+    "utf8",
+  );
+  const workflow = readFileSync(
+    new URL("../.github/workflows/ci.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    dockerfile,
+    /ARG MESHR_MODERATION_RELEASE_SHA[\s\S]*\^\[a-f0-9\]\{40\}\$[\s\S]*org\.opencontainers\.image\.revision="\$MESHR_MODERATION_RELEASE_SHA"[\s\S]*MESHR_MODERATION_RELEASE_SHA="\$MESHR_MODERATION_RELEASE_SHA"/,
+  );
+  assert.match(
+    workflow,
+    /moderation-adapter\.Dockerfile[\s\S]*--build-arg "MESHR_MODERATION_RELEASE_SHA=\$GITHUB_SHA"/,
+  );
+  assert.match(
+    workflow,
+    /--provenance="mode=max,version=v1,builder-id=https:\/\/github\.com\/tflynn3\/meshr\/actions\/runs\/\$GITHUB_RUN_ID"/,
+  );
+  assert.match(workflow, /moby\/buildkit:v0\.32\.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8/);
+  assert.match(workflow, /tonistiigi\/binfmt:qemu-v9\.2\.0-51@sha256:ea2f0dd74e74f101df59f9a6b31d0960994060c7982a921cbceecee0f1841125/);
+  assert.match(
+    workflow,
+    /Scan every immutable runtime image manifest[\s\S]*trivy image[\s\S]*--platform "\$platform"[\s\S]*"\$child_ref"[\s\S]*length == 8/,
+  );
+  assert.match(workflow, /version: v0\.73\.0/);
+  assert.match(workflow, /cosign sign --yes "\$REGISTRY\/\$IMAGE_REPOSITORY\/\$image@\$digest"/);
+  assert.match(workflow, /bash scripts\/verify-moderation-adapter-image\.sh[\s\S]*Upload immutable release image receipt/);
+  assert.match(workflow, /github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'/);
+  assert.doesNotMatch(workflow, /github\.run_attempt\s*==\s*1/);
+  assert.match(
+    workflow,
+    /repositoryId:"1348689949"[\s\S]*repositoryOwnerId:"19698887"[\s\S]*workflowRef:"tflynn3\/meshr\/\.github\/workflows\/ci\.yml@refs\/heads\/main"/,
+  );
+  assert.doesNotMatch(workflow, /^  (?:canary|promote):/m);
+  assert.doesNotMatch(workflow, /GCP_(?:CANARY_)?DEPLOY_/);
+  assert.doesNotMatch(workflow, /attestations:\s*write/);
+  assert.doesNotMatch(workflow, /gcloud run|gcloud container/);
+  assert.doesNotMatch(workflow, /kubectl (?:apply|patch|create|delete|rollout|wait|auth can-i)/);
+});
+
 test("production adapter configuration requires a matching Model Armor template", () => {
+  const releaseSha = "a".repeat(40);
   const valid = loadModerationAdapterConfig({
     MESHR_ENV: "production",
     GOOGLE_CLOUD_PROJECT: "meshr-prod",
     MESHR_MODEL_ARMOR_TEMPLATE: "projects/meshr-prod/locations/us-central1/templates/agent-text",
     MESHR_DLP_LOCATION: "us-central1",
+    MESHR_MODERATION_RELEASE_SHA: releaseSha,
   });
   assert.equal(valid.error, undefined);
   assert.equal(valid.config?.modelArmorEndpoint, "https://modelarmor.us-central1.rep.googleapis.com");
   assert.equal(valid.config?.dlpParent, "projects/meshr-prod/locations/us-central1");
+  assert.equal(valid.config?.dlpEndpoint, "https://dlp.us-central1.rep.googleapis.com");
+  assert.equal(valid.config?.releaseSha, releaseSha);
+
+  const mixedCaseProduction = loadModerationAdapterConfig({
+    MESHR_ENV: "Production",
+    GOOGLE_CLOUD_PROJECT: "meshr-prod",
+    MESHR_MODEL_ARMOR_TEMPLATE: "projects/meshr-prod/locations/us-central1/templates/agent-text",
+    MESHR_DLP_LOCATION: "us-central1",
+    MESHR_MODERATION_RELEASE_SHA: releaseSha,
+  });
+  assert.equal(mixedCaseProduction.error, undefined);
+  assert.equal(mixedCaseProduction.config?.environment, "production");
+  assert.equal(
+    loadModerationAdapterConfig({
+      MESHR_ENV: "prod",
+      GOOGLE_CLOUD_PROJECT: "meshr-prod",
+      MESHR_MODEL_ARMOR_TEMPLATE: "projects/meshr-prod/locations/us-central1/templates/agent-text",
+      MESHR_DLP_LOCATION: "us-central1",
+      MESHR_MODERATION_RELEASE_SHA: releaseSha,
+    }).error,
+    "environment_invalid",
+  );
+
+  const otherwiseValid = {
+    MESHR_ENV: "production",
+    GOOGLE_CLOUD_PROJECT: "meshr-prod",
+    MESHR_MODEL_ARMOR_TEMPLATE: "projects/meshr-prod/locations/us-central1/templates/agent-text",
+    MESHR_DLP_LOCATION: "us-central1",
+  };
+  assert.equal(loadModerationAdapterConfig(otherwiseValid).error, "release_sha_missing");
+  assert.equal(
+    loadModerationAdapterConfig({
+      ...otherwiseValid,
+      MESHR_MODERATION_RELEASE_SHA: "A".repeat(40),
+    }).error,
+    "release_sha_invalid",
+  );
+
+  assert.equal(
+    loadModerationAdapterConfig({
+      MESHR_ENV: "production",
+      GOOGLE_CLOUD_PROJECT: "meshr-prod",
+      MESHR_MODEL_ARMOR_TEMPLATE: "projects/meshr-prod/locations/us-central1/templates/agent-text",
+    }).error,
+    "dlp_location_must_be_regional",
+  );
 
   assert.equal(
     loadModerationAdapterConfig({
@@ -146,6 +282,7 @@ test("production adapter configuration requires a matching Model Armor template"
       MESHR_ENV: "production",
       GOOGLE_CLOUD_PROJECT: "meshr-prod",
       MESHR_MODEL_ARMOR_TEMPLATE: "projects/meshr-prod/locations/us-central1/templates/agent-text",
+      MESHR_DLP_LOCATION: "us-central1",
       MESHR_MODEL_ARMOR_ENDPOINT: "http://modelarmor.example.invalid",
     }).error,
     "model_armor_endpoint_must_use_https",
@@ -155,6 +292,7 @@ test("production adapter configuration requires a matching Model Armor template"
       MESHR_ENV: "production",
       GOOGLE_CLOUD_PROJECT: "meshr-prod",
       MESHR_MODEL_ARMOR_TEMPLATE: "projects/meshr-prod/locations/us-central1/templates/agent-text",
+      MESHR_DLP_LOCATION: "us-central1",
       MESHR_MODEL_ARMOR_ENDPOINT: "https://evil.example.invalid",
     }).error,
     "model_armor_endpoint_host_invalid",
@@ -164,7 +302,18 @@ test("production adapter configuration requires a matching Model Armor template"
       MESHR_ENV: "production",
       GOOGLE_CLOUD_PROJECT: "meshr-prod",
       MESHR_MODEL_ARMOR_TEMPLATE: "projects/meshr-prod/locations/us-central1/templates/agent-text",
+      MESHR_DLP_LOCATION: "us-central1",
       MESHR_DLP_ENDPOINT: "https://evil.example.invalid",
+    }).error,
+    "dlp_endpoint_host_invalid",
+  );
+  assert.equal(
+    loadModerationAdapterConfig({
+      MESHR_ENV: "production",
+      GOOGLE_CLOUD_PROJECT: "meshr-prod",
+      MESHR_MODEL_ARMOR_TEMPLATE: "projects/meshr-prod/locations/us-central1/templates/agent-text",
+      MESHR_DLP_LOCATION: "us-central1",
+      MESHR_DLP_ENDPOINT: "https://dlp.us-central1.rep.googleapis.com.evil.invalid",
     }).error,
     "dlp_endpoint_host_invalid",
   );
@@ -176,7 +325,7 @@ test("Google provider calls Model Armor and DLP without exposing provider respon
     projectId: "meshr-prod",
     modelArmorEndpoint: "https://modelarmor.us-central1.rep.googleapis.com",
     modelArmorTemplate: "projects/meshr-prod/locations/us-central1/templates/agent-text",
-    dlpEndpoint: "https://dlp.googleapis.com",
+    dlpEndpoint: "https://dlp.us-central1.rep.googleapis.com",
     dlpParent: "projects/meshr-prod/locations/us-central1",
     accessToken: async () => "adapter-access-token",
     fetchImpl: (async (input, init) => {
@@ -201,9 +350,15 @@ test("Google provider calls Model Armor and DLP without exposing provider respon
   const dlpCall = calls.find((call) => call.url.endsWith(":inspect"));
   assert.ok(armorCall);
   assert.ok(dlpCall);
+  assert.equal(new URL(dlpCall.url).hostname, "dlp.us-central1.rep.googleapis.com");
   assert.match(armorCall.url, /v1\/projects\/meshr-prod\/locations\/us-central1\/templates\/agent-text:sanitizeUserPrompt$/);
   assert.match(dlpCall.url, /v2\/projects\/meshr-prod\/locations\/us-central1\/content:inspect$/);
-  assert.match(armorCall.body ?? "", /a small observation/);
+  assert.deepEqual(JSON.parse(armorCall.body ?? "{}"), {
+    userPromptData: { text: "a small observation" },
+    multiLanguageDetectionMetadata: {
+      enableMultiLanguageDetection: true,
+    },
+  });
   assert.match(dlpCall.body ?? "", /CREDIT_CARD_NUMBER/);
 });
 
@@ -212,7 +367,7 @@ test("Google provider fails closed when Model Armor does not complete", async ()
     projectId: "meshr-prod",
     modelArmorEndpoint: "https://modelarmor.us-central1.rep.googleapis.com",
     modelArmorTemplate: "projects/meshr-prod/locations/us-central1/templates/agent-text",
-    dlpEndpoint: "https://dlp.googleapis.com",
+    dlpEndpoint: "https://dlp.us-central1.rep.googleapis.com",
     dlpParent: "projects/meshr-prod/locations/us-central1",
     accessToken: async () => "adapter-access-token",
     fetchImpl: (async (input) => {
@@ -235,7 +390,7 @@ test("Google provider rejects an incomplete Model Armor result", async () => {
     projectId: "meshr-prod",
     modelArmorEndpoint: "https://modelarmor.us-central1.rep.googleapis.com",
     modelArmorTemplate: "projects/meshr-prod/locations/us-central1/templates/agent-text",
-    dlpEndpoint: "https://dlp.googleapis.com",
+    dlpEndpoint: "https://dlp.us-central1.rep.googleapis.com",
     dlpParent: "projects/meshr-prod/locations/us-central1",
     accessToken: async () => "adapter-access-token",
     fetchImpl: (async (input) => {
@@ -258,7 +413,7 @@ test("Google provider rejects a missing DLP result", async () => {
     projectId: "meshr-prod",
     modelArmorEndpoint: "https://modelarmor.us-central1.rep.googleapis.com",
     modelArmorTemplate: "projects/meshr-prod/locations/us-central1/templates/agent-text",
-    dlpEndpoint: "https://dlp.googleapis.com",
+    dlpEndpoint: "https://dlp.us-central1.rep.googleapis.com",
     dlpParent: "projects/meshr-prod/locations/us-central1",
     accessToken: async () => "adapter-access-token",
     fetchImpl: (async (input) => {
@@ -282,7 +437,7 @@ test("Google provider readiness uses screening endpoints", async () => {
     projectId: "meshr-prod",
     modelArmorEndpoint: "https://modelarmor.us-central1.rep.googleapis.com",
     modelArmorTemplate: "projects/meshr-prod/locations/us-central1/templates/agent-text",
-    dlpEndpoint: "https://dlp.googleapis.com",
+    dlpEndpoint: "https://dlp.us-central1.rep.googleapis.com",
     dlpParent: "projects/meshr-prod/locations/us-central1",
     accessToken: async () => "adapter-access-token",
     fetchImpl: (async (input, init) => {

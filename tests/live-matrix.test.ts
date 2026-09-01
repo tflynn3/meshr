@@ -17,7 +17,11 @@ import {
 } from "../live/invocations.ts";
 import { managedRootPrompt, parseManagedBody } from "../live/managed.ts";
 import { assertLoopbackOllamaUrl, parseOllamaBody } from "../live/ollama.ts";
-import { runLiveMatrix } from "../live/matrix.ts";
+import {
+  managedBodyOutputSchema,
+  phaseOutputSchema,
+  runLiveMatrix,
+} from "../live/matrix.ts";
 import { parseLiveMatrixOptions } from "../live/options.ts";
 import { nativeHostEnvironment, runProcess } from "../live/process.ts";
 import { replyPrompt, rootPrompt, traceMarker } from "../live/prompts.ts";
@@ -155,18 +159,36 @@ test("Codex plan uses invocation-local MCP overrides and never mutates global co
   const invocation = buildCodexInvocation({
     executable: "codex",
     projectRoot,
+    workingDirectory: "/tmp/meshr-codex-workspace",
     stateDirectory: "/tmp/meshr-state",
     binding: binding("codex", "theorem", 1),
     prompt,
     outputPath: "/tmp/last-message.json",
+    outputSchemaPath: "/tmp/root-output.schema.json",
   });
-  assert.deepEqual(invocation.args.slice(0, 4), [
+  assert.deepEqual(invocation.args.slice(0, 5), [
     "--ask-for-approval",
     "never",
     "exec",
+    "--strict-config",
     "--ignore-user-config",
   ]);
+  assert.equal(invocation.cwd, "/tmp/meshr-codex-workspace");
+  assert.equal(
+    invocation.args[invocation.args.indexOf("--cd") + 1],
+    invocation.cwd,
+  );
+  assert.ok(invocation.args.includes("--ignore-rules"));
   assert.ok(invocation.args.includes("--ephemeral"));
+  assert.ok(invocation.args.includes("--output-schema"));
+  const disabledFeatures = invocation.args.flatMap((value, index, args) =>
+    value === "--disable" ? [args[index + 1]!] : [],
+  );
+  assert.ok(disabledFeatures.includes("shell_tool"));
+  assert.ok(disabledFeatures.includes("code_mode_host"));
+  assert.ok(disabledFeatures.includes("apps"));
+  assert.ok(disabledFeatures.includes("multi_agent"));
+  assert.ok(disabledFeatures.includes("unified_exec"));
   assert.ok(
     invocation.args.some((value) =>
       value.startsWith("mcp_servers.meshr.command="),
@@ -222,16 +244,27 @@ test("managed Codex invocation has no binding, credential, or MCP surface", () =
 
   const invocation = buildManagedCodexInvocation({
     executable: "codex",
-    projectRoot,
+    workingDirectory: "/tmp/meshr-managed-workspace",
     prompt: managed.prompt,
     outputPath: "/tmp/managed-output.json",
+    outputSchemaPath: "/tmp/managed-output.schema.json",
   });
-  assert.deepEqual(invocation.args.slice(0, 4), [
+  assert.deepEqual(invocation.args.slice(0, 5), [
     "--ask-for-approval",
     "never",
     "exec",
+    "--strict-config",
     "--ignore-user-config",
   ]);
+  assert.equal(invocation.cwd, "/tmp/meshr-managed-workspace");
+  assert.equal(
+    invocation.args[invocation.args.indexOf("--cd") + 1],
+    invocation.cwd,
+  );
+  assert.notEqual(invocation.cwd, projectRoot);
+  assert.ok(invocation.args.includes("--ignore-rules"));
+  assert.ok(invocation.args.includes("--output-schema"));
+  assert.ok(invocation.args.includes("shell_tool"));
   assert.ok(invocation.args.includes("--ephemeral"));
   assert.ok(invocation.args.includes("read-only"));
   assert.equal(invocation.args.includes("--config"), false);
@@ -290,6 +323,7 @@ test("Claude plan uses one strict temporary Meshr MCP config", () => {
   assert.ok(config.mcpServers.meshr.args.includes(agent.pairingId));
   const invocation = buildClaudeInvocation({
     executable: "claude",
+    workingDirectory: "/tmp/meshr-claude-workspace",
     prompt: replyPrompt("trace-claude", {
       meshId: "mesh-public",
       topicId: "topic-small-discoveries",
@@ -297,9 +331,26 @@ test("Claude plan uses one strict temporary Meshr MCP config", () => {
     }),
     mcpConfigPath: "/tmp/meshr-mcp.json",
     budgetUsd: 0.25,
+    outputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: { action: { type: "string" } },
+      required: ["action"],
+    },
   });
+  assert.equal(invocation.cwd, "/tmp/meshr-claude-workspace");
   assert.ok(invocation.args.includes("--strict-mcp-config"));
   assert.ok(invocation.args.includes("--allowedTools"));
+  assert.ok(invocation.args.includes("--json-schema"));
+  assert.ok(invocation.args.includes("--disable-slash-commands"));
+  assert.ok(invocation.args.includes("--no-chrome"));
+  assert.deepEqual(
+    invocation.args.slice(
+      invocation.args.indexOf("--setting-sources"),
+      invocation.args.indexOf("--setting-sources") + 2,
+    ),
+    ["--setting-sources", "local"],
+  );
   assert.ok(invocation.args.includes("--no-session-persistence"));
   assert.ok(invocation.args.includes("--max-budget-usd"));
   const tools = invocation.args[invocation.args.indexOf("--tools") + 1]!;
@@ -324,6 +375,26 @@ test("trace prompts require a root marker followed by a distinct reply marker", 
     new RegExp(traceMarker(trace, "reply").replace(/[\[\]]/g, "\\$&")),
   );
   assert.notEqual(traceMarker(trace, "root"), traceMarker(trace, "reply"));
+});
+
+test("live model output schemas reject extra fields and pin phase results", () => {
+  assert.deepEqual(phaseOutputSchema("trace-schema", "reply"), {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      traceId: { type: "string", enum: ["trace-schema"] },
+      action: { type: "string", enum: ["reply_published"] },
+    },
+    required: ["traceId", "action"],
+  });
+  assert.deepEqual(managedBodyOutputSchema(), {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      body: { type: "string", minLength: 1, maxLength: 500 },
+    },
+    required: ["body"],
+  });
 });
 
 test("release root prompts pin the private validation conversation", () => {
@@ -372,6 +443,64 @@ test("process attempts stop at their configured timeout", async () => {
   assert.ok(execution.elapsedMs < 3_000);
   assert.notEqual(execution.exitCode, 0);
 });
+
+test(
+  "timed-out model attempts terminate their descendant process group",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "meshr-process-tree-test-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const marker = join(directory, "orphan-survived");
+    const descendant = [
+      "const fs = require('node:fs');",
+      `setTimeout(() => fs.writeFileSync(${JSON.stringify(marker)}, 'unsafe'), 300);`,
+      "setInterval(() => {}, 1000);",
+    ].join("");
+    const parent = [
+      "const { spawn } = require('node:child_process');",
+      `spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: 'ignore' });`,
+      "setInterval(() => {}, 1000);",
+    ].join("");
+
+    const execution = await runProcess({
+      command: process.execPath,
+      args: ["-e", parent],
+      cwd: projectRoot,
+      timeoutMs: 75,
+    });
+    assert.equal(execution.timedOut, true);
+    await assert.rejects(readFile(marker), /ENOENT/);
+  },
+);
+
+test(
+  "completed model attempts cannot leave detached descendants",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "meshr-process-exit-tree-test-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const marker = join(directory, "orphan-survived");
+    const descendant = [
+      "const fs = require('node:fs');",
+      `setTimeout(() => fs.writeFileSync(${JSON.stringify(marker)}, 'unsafe'), 300);`,
+      "setInterval(() => {}, 1000);",
+    ].join("");
+    const parent = [
+      "const { spawn } = require('node:child_process');",
+      `spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: 'ignore' }).unref();`,
+    ].join("");
+
+    const execution = await runProcess({
+      command: process.execPath,
+      args: ["-e", parent],
+      cwd: projectRoot,
+      timeoutMs: 2_000,
+    });
+    assert.equal(execution.exitCode, 0);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await assert.rejects(readFile(marker), /ENOENT/);
+  },
+);
 
 test("server author evidence compares both agent ID and handle", () => {
   const agent = binding("ollama", "relay", 1);
@@ -486,6 +615,15 @@ test("dry-run verifies real connector identities and plans two phases without po
       evidence.runtimes[0]?.phases.map((phase) => phase.status),
       ["planned", "planned"],
     );
+    for (const phase of evidence.runtimes[0]?.phases ?? []) {
+      const args = phase.plan.args ?? [];
+      const workspace = args[args.indexOf("--cd") + 1];
+      assert.ok(workspace);
+      assert.notEqual(workspace, projectRoot);
+      assert.match(workspace, /-workspace-/);
+      assert.ok(args.includes("--output-schema"));
+      assert.ok(args.includes("shell_tool"));
+    }
     assert.equal(mutationCount, 0);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -500,7 +638,7 @@ test("managed Codex uses two credential-free model attempts and connector-verifi
   await writeFile(
     executable,
     `#!/usr/bin/env node
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 if (args.length === 1 && args[0] === "--version") {
   process.stdout.write("codex-cli managed-test\\n");
@@ -510,6 +648,18 @@ const prompt = args.at(-1) ?? "";
 if (args.includes("--config") || /mcp_servers|token-theorem|token-tangent|must-not-cross-boundary/.test(args.join(" ") + prompt)) {
   process.exit(19);
 }
+const workspaceIndex = args.indexOf("--cd");
+const schemaIndex = args.indexOf("--output-schema");
+const disabled = args.flatMap((value, index) => value === "--disable" ? [args[index + 1]] : []);
+if (
+  workspaceIndex < 0 || realpathSync(args[workspaceIndex + 1]) !== realpathSync(process.cwd()) ||
+  readdirSync(process.cwd()).length !== 0 ||
+  schemaIndex < 0 || !args[schemaIndex + 1] ||
+  !args.includes("--strict-config") || !args.includes("--ignore-rules") ||
+  !disabled.includes("shell_tool") || !disabled.includes("code_mode_host")
+) process.exit(21);
+const schema = JSON.parse(readFileSync(args[schemaIndex + 1], "utf8"));
+if (schema.type !== "object" || schema.additionalProperties !== false || schema.required?.join(",") !== "body" || schema.properties?.body?.maxLength !== 500) process.exit(22);
 const markers = prompt.match(/\\[meshr-live:[^\\]]+\\]/g) ?? [];
 const marker = markers.find((value) => value.endsWith(":reply]")) ?? markers.find((value) => value.endsWith(":root]"));
 const outputIndex = args.indexOf("--output-last-message");

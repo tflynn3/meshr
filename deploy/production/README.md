@@ -13,7 +13,11 @@ the screening worker scales from one to three replicas on the dedicated
 provider-work queue without coupling moderation or audit failures to topology
 fan-out.
 
-Before promotion:
+## Future public-cutover checklist (not authorized)
+
+The following checklist is retained for a later public-launch review. It is not
+an instruction to execute these steps against the current qualification cluster;
+private qualification must leave launch mode off and DNS unset.
 
 1. Apply the OpenTofu foundation and verify Firestore point-in-time recovery,
    the isolated `meshr-canary`, `meshr-moderation`, and aggregate-only
@@ -65,40 +69,59 @@ Before promotion:
    public commons and
    system taxonomy. No prototype accounts, posts, credentials, or evidence are
    imported.
-4. Create the protected `canary` and `production` release branches before
-   launch (separate environment-scoped GitHub App private keys are used to mint
-   short-lived release tokens; each App is the sole bypass actor in its branch
-   ruleset), then start an explicit
-   `workflow_dispatch` on `main`, supplying the exact
-   `release_sha` that passed canary. The protected `production` environment
-   must approve the run before it promotes the signed image digests. The
-   promotion job applies immutable image and runtime ConfigMaps in
-   `flux-system`, then Flux reconciles the resulting manifest. A push to
-   `main` can build and canary-test, but can never promote production.
-5. Follow the two-phase bootstrap in `infra/opentofu/README.md`: first apply
-   the foundation with `launch_mode=false`, then dispatch `Meshr CI` with
-   `bootstrap_build_only=true` for the exact `main` SHA and copy the signed
-   moderation adapter digests from the build summary. Apply the reviewed
-   `launch_mode=true` variables with those immutable
-   `moderation_adapter_image` and `moderation_adapter_canary_image` values and
-   `moderation_model_armor_template` (and the DLP location if non-global), so
-   neither adapter has placeholder provider configuration. After that apply
-   creates both authenticated Cloud Run services, CI advances the canary
-   digest before canary E2E and the production digest only during the approved
-   production promotion. Supply
+4. On the first protected `main` push, public CI validates source, uses a
+   digest-pinned Buildx/BuildKit/binfmt toolchain to build multi-platform images
+   with SBOMs and maximum SLSA v1 provenance, HIGH/CRITICAL-scans all eight
+   immutable runtime child manifests, signs their immutable index digests,
+   re-resolves the source-SHA tags, and uploads a closed machine-readable image
+   receipt. Manual dispatch cannot publish or sign images. Public CI has no
+   hosted Cloud Run, GKE, Flux, canary, or production deployment authority.
+   Private deployment automation consumes the reviewed receipt and owns every
+   staged revision, canary, promotion, rollback, and runtime ConfigMap change.
+5. Follow the staged bootstrap in `infra/opentofu/README.md`: first apply
+   the foundation with `launch_mode=false`, then obtain the public build
+   receipt for the exact reviewed `main` SHA and independently verify every
+   immutable digest, keyless signature, runnable platform, provenance
+   predicate, and the moderation adapter's baked source-SHA witness. For
+   private qualification, apply the reviewed
+   `private_moderation_adapter_mode=true`, `launch_mode=false` variables with
+   that immutable `moderation_adapter_image`; leave DNS, Cloudflare, OAuth, and
+   `moderation_adapter_canary_image` unset. The same plan must show the exact
+   stack-owned `meshr-moderation` Model Armor filters and policy fingerprint.
+   This creates the authenticated production adapter without a public edge and
+   bounds it at three instances. Subsequent adapter revisions are created only
+   by the narrowly scoped private promoter; the qualification identity can
+   only read the exact Model Armor template and describe/invoke the adapter. Supply
    `MESHR_MODERATION_ENDPOINT`, its side-effect-free
    `MESHR_MODERATION_HEALTHCHECK_URL`, and the IAM audience
-   `MESHR_MODERATION_AUDIENCE` through the protected runtime-values ConfigMap
-   before starting the moderation worker. Production sets
+   `MESHR_MODERATION_AUDIENCE`, plus `MESHR_MODERATION_REVISION_TAG`, through
+   the immutable commit-named runtime release map before starting the
+   moderation worker. The protected promoter must deploy the release's signed
+   adapter digest as a no-traffic Cloud Run revision, bind the deterministic
+   `r-<first-20-moderation-source-SHA>` tag, and verify Cloud Run's returned tag URL
+   routes to that exact revision and digest. Production sets
    `MESHR_MODERATION_REQUIRED=1`, `MESHR_MODERATION_AUTH=adc`, and
    `MESHR_MODERATION_TOKEN_TYPE=id_token`; the worker mints a short-lived
-   audience-bound Workload Identity token for the same-origin adapter and
+   audience-bound Workload Identity token for the stable service URI and
    fails closed unless the health endpoint is reachable. The event worker has
    only Cloud Run invocation permission; the adapter's dedicated service
    account is the only identity with Model Armor/DLP permissions. Access tokens are
    reserved for direct allowlisted Google APIs. The screen and health URLs
-   must share one HTTPS origin, and the audience must be that origin (or its
-   IAM service URL).
+   must share the exact tagged revision origin; the ID-token audience remains
+   the distinct, canonical stable Cloud Run service URI. A traffic tag is
+   mutable routing state, not release provenance, so promotion and rollback
+   must re-verify its revision and digest while it is referenced. The full
+   `MESHR_MODERATION_RELEASE_SHA` is baked into both supported image configs
+   and reported by authenticated health; `MESHR_RELEASE_SHA` separately names
+   the Flux release commit that materialized the Kubernetes tuple.
+   The first foundation revision is named
+   `meshr-moderation-adapter-r-<first-20-moderation-source-SHA>`, carries that
+   tag, and has an explicit 100% stable-traffic allocation. Later staging keeps
+   the concrete active revision at 100% and the candidate tag at 0%. Promotion
+   switches the Kubernetes tuple first, then stable traffic to the new active
+   revision at 100% while retaining the previous tag at 0%; rollback reverses
+   that order. The stable origin remains the OIDC audience and follows only the
+   active revision.
    The production moderation-screening worker also requires the dedicated
    authority route: set `MESHR_MODERATION_AUTHORITY_URL` to the in-cluster API
    service and mount the dedicated `MESHR_MODERATION_AUTHORITY_TOKEN`
@@ -117,130 +140,46 @@ renewal material for every agent. Treat the harness result as necessary but
 not sufficient: attach Cloud Monitoring and billing-export evidence for the
 same window before approving promotion.
 
-Bootstrap Flux once per cluster from an operator workstation (the repository is
-public, so no Git deploy key is required). Verify the protected `production`
-branch exists before the first promotion; production Flux must never be
-pointed at `main`. The canary source follows the protected `canary` candidate
-branch, which CI advances only after verification and signing. Install the Flux controllers and
-Gateway API CRDs first, then create the protected substitution ConfigMaps
-before applying the Flux objects; otherwise the first reconciliation cannot
-render the production manifests. The cluster-scoped external-metrics adapter
-is reconciled as a separate Flux Kustomization, and both application
-Kustomizations wait for its Deployment and `APIService` to report healthy:
+## Private qualification is the active deployment path
 
-```bash
-# flux install --namespace=flux-system
-# Confirm the GKE Gateway API controller is present before applying gateway.yaml.
-kubectl get gatewayclass gke-l7-global-external-managed
-kubectl -n flux-system create configmap meshr-canary-image-digests \
-  --from-literal=API_IMAGE="$API_IMAGE" \
-  --from-literal=EVENT_PLANE_IMAGE="$EVENT_PLANE_IMAGE" \
-  --from-literal=MODERATION_ADAPTER_IMAGE="$MODERATION_ADAPTER_IMAGE" \
-  --from-literal=WEB_IMAGE="$WEB_IMAGE" \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n flux-system create configmap meshr-canary-runtime-values \
-  --from-literal=GCP_PROJECT_ID="$GCP_PROJECT_ID" \
-  --from-literal=MESHR_FIRESTORE_DATABASE=meshr-canary \
-  --from-literal=MESHR_TOPOLOGY_FIRESTORE_DATABASE=meshr-canary-projections \
-  --from-literal=MESHR_EVENT_AUDIT_FIRESTORE_DATABASE=meshr-canary-audit \
-  --from-literal=MESHR_NOTIFICATIONS_FIRESTORE_DATABASE=meshr-canary-notifications \
-  --from-literal=MESHR_MODERATION_FIRESTORE_DATABASE=meshr-canary-moderation \
-  --from-literal=MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID=pending \
-  --from-literal=MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=1 \
-  --from-literal=MESHR_MODERATION_ENDPOINT="$MESHR_MODERATION_ENDPOINT" \
-  --from-literal=MESHR_MODERATION_HEALTHCHECK_URL="$MESHR_MODERATION_HEALTHCHECK_URL" \
-  --from-literal=MESHR_MODERATION_AUDIENCE="$MESHR_MODERATION_AUDIENCE" \
-  --from-literal=MESHR_RELEASE_SHA="$RELEASE_SHA" \
-  --from-literal=MESHR_COST_PROTECTION_MODE=normal \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n flux-system create configmap meshr-metrics-adapter-values \
-  --from-literal=METRICS_ADAPTER_GSA="$(tofu -chdir=infra/opentofu output -raw metrics_adapter_service_account)" \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f deploy/production/flux/source.yaml
-kubectl apply -f deploy/production/flux/canary-source.yaml
-envsubst < deploy/production/flux/canary-promotion-rbac.yaml | kubectl apply -f -
-envsubst < deploy/production/flux/production-promotion-rbac.yaml | kubectl apply -f -
-kubectl apply -f deploy/production/flux/metrics-adapter-kustomization.yaml
-kubectl apply -f deploy/production/flux/kustomization.yaml
-kubectl apply -f deploy/production/flux/canary-kustomization.yaml
-```
+The checked-in public-edge Flux objects are dormant until a separately reviewed
+public cutover. Do not apply their canary or production input commands to the
+qualification cluster, do not point that cluster at the moving public branches,
+and do not create production or staging DNS. Never run raw `flux install`: its
+default controller RBAC is broader than the reviewed qualification boundary.
 
-The first reconciliation intentionally keeps the topology materializer
-unready until `canary-store-bootstrap` succeeds. Read its structured
-`stores.initialized` log, then patch the attested generation and request one
-more reconciliation before treating the canary Kustomization as Ready:
+The active isolated path is `deploy/production-qualification/README.md`. It
+installs only the digest-pinned source and kustomize controllers, binds them to
+namespace Roles, and verifies their exact arguments, CRDs, image digests, and
+negative authorization. Four fail-closed admission policies constrain
+create-once public-commit sources, immutable image/runtime maps, the complete
+atomic Kustomization pointer, and private ClusterIP Services.
 
-```bash
-BOOTSTRAP_ID="$(kubectl -n meshr-canary logs job/canary-store-bootstrap \
-  --all-containers=true --tail=200 \
-  | jq -Rr 'fromjson? | select(.event == "stores.initialized") | .authorityBootstrapId' \
-  | tail -n 1)"
-test -n "$BOOTSTRAP_ID" && test "$BOOTSTRAP_ID" != pending
-kubectl -n flux-system patch configmap meshr-canary-runtime-values --type=merge \
-  --patch="$(jq -n --arg id "$BOOTSTRAP_ID" '{data:{MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID:$id,MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN:"0"}}')"
-kubectl -n flux-system annotate kustomization meshr-canary \
-  "reconcile.fluxcd.io/requestedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
-```
+The private bootstrap operator creates the one-time `b` release; hosted qualification
+can finalize only its attestation-derived same-SHA `r`. A different same-SHA
+repair is operator-only. Later releases switch directly between different-SHA
+`r` tuples while preserving the attested authority bootstrap ID. Rollback
+requires both the expected active and expected previous release IDs. Capacity
+uses operator-provided canonical source (1..64) and ConfigMap (1..192) quotas,
+with the Kustomization count fixed at one; unexpected non-release objects fail
+the clean inventory preflight and hosted automation cannot delete releases.
+Retained sources reconcile every 24 hours rather than cloning the repository
+every minute; creation and source-controller restart still reconcile
+immediately. Before
+garbage collection, the operator quiesces or revokes promotion, then re-reads
+and tests the exact active/previous tuple immediately before each conditional
+delete. Staged, active, and previous tuples are never deleted. The operator
+owns capacity planning and the environment lifecycle.
 
-The bootstrap commands seed the canary inputs. Before enabling public traffic,
-also create `meshr-production-image-digests` and
-`meshr-production-runtime-values` with the exact signed release values,
-including `MESHR_MODERATION_ENDPOINT` and
-`MESHR_MODERATION_HEALTHCHECK_URL` and `MESHR_MODERATION_AUDIENCE`. For example:
+The production moderation adapter remains a separately reviewed OpenTofu
+resource. Qualification receives only read-only template/configuration checks
+and service-scoped invocation; it cannot change the adapter, Model Armor, DLP,
+Firestore data, IAM, or the five operator-anchored database IDs.
 
-```bash
-kubectl -n flux-system create configmap meshr-production-runtime-values \
-  --from-literal=GCP_PROJECT_ID="$GCP_PROJECT_ID" \
-  --from-literal=MESHR_FIRESTORE_DATABASE='(default)' \
-  --from-literal=MESHR_TOPOLOGY_FIRESTORE_DATABASE=meshr-projections \
-  --from-literal=MESHR_EVENT_AUDIT_FIRESTORE_DATABASE=meshr-audit \
-  --from-literal=MESHR_NOTIFICATIONS_FIRESTORE_DATABASE=meshr-notifications \
-  --from-literal=MESHR_MODERATION_FIRESTORE_DATABASE=meshr-moderation \
-  --from-literal=MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID=pending \
-  --from-literal=MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN=1 \
-  --from-literal=MESHR_MODERATION_ENDPOINT="$MESHR_MODERATION_ENDPOINT" \
-  --from-literal=MESHR_MODERATION_HEALTHCHECK_URL="$MESHR_MODERATION_HEALTHCHECK_URL" \
-  --from-literal=MESHR_MODERATION_AUDIENCE="$MESHR_MODERATION_AUDIENCE" \
-  --from-literal=MESHR_RELEASE_SHA="$RELEASE_SHA" \
-  --from-literal=MESHR_COST_PROTECTION_MODE=normal \
-  --dry-run=client -o yaml | kubectl apply -f -
-```
-
-The first production reconciliation follows the same generation fence. Wait
-for `production-store-bootstrap`, read the structured attestation, and patch
-the expected generation before waiting for the production Kustomization:
-
-```bash
-BOOTSTRAP_ID="$(kubectl -n meshr logs job/production-store-bootstrap \
-  --all-containers=true --tail=200 \
-  | jq -Rr 'fromjson? | select(.event == "stores.initialized") | .authorityBootstrapId' \
-  | tail -n 1)"
-test -n "$BOOTSTRAP_ID" && test "$BOOTSTRAP_ID" != pending
-kubectl -n flux-system patch configmap meshr-production-runtime-values --type=merge \
-  --patch="$(jq -n --arg id "$BOOTSTRAP_ID" '{data:{MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID:$id,MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN:"0"}}')"
-kubectl -n flux-system annotate kustomization meshr-production \
-  "reconcile.fluxcd.io/requestedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
-```
-
-The
-GitHub Actions `canary` environment owns the first pair during validation; the
-protected `production` environment owns the latter pair after the canary gate.
-The protected promotion jobs update only the image field on the matching Cloud
-Run adapter to the verified signed digest, then mint a fresh audience-bound ID
-token after rollout waits. OpenTofu still owns the service, runtime settings,
-and identities, but ignores that image field so a later foundation refresh
-cannot silently roll a release back to the bootstrap digest. The current
-deployed digests are exposed as the `moderation_adapter_*_deployed_image`
-outputs.
-
-The OpenTofu cluster resource enables the standard GKE Gateway API channel.
-Promotion is blocked until `gke-l7-global-external-managed` reports `Accepted`
-and the Gateway listeners have provisioned their addresses and certificates.
-
-Set the three `*_IMAGE` values to signed immutable digests for the initial
-bootstrap. The protected promotion job replaces both canary and production
-values on every release; never apply the example files to a cluster because
-they intentionally contain placeholders.
+A future public cutover must receive a fresh security review for Gateway API
+objects, DNS, certificates, Cloud Armor, Cloudflare, public canary isolation,
+controller RBAC, immutable release inputs, and rollback. Nothing in the private
+qualification result authorizes that public edge.
 
 Readiness checks dependency health; liveness checks only process health. A
 dependency outage must not cause a restart loop. The staging listener routes to
@@ -261,6 +200,7 @@ apply run requires an explicit checkpoint path so every page can be resumed
 and receives an immutable audit receipt before its cursor advances:
 
 ```bash
+set -euo pipefail
 MESHR_REPLAY_SOURCE=outbox \
 MESHR_REPLAY_ENVIRONMENT=production \
 MESHR_FIRESTORE_DATABASE='(default)' \
@@ -297,6 +237,7 @@ identity matches, root/reply author gates, and native-host lifecycle proofs;
 prompts, post bodies, tokens, provider output, and local paths are not copied:
 
 ```bash
+set -euo pipefail
 npm run evidence:receipt -- \
   --evidence /secure/$RUN_ID.claude.json \
   --evidence /secure/$RUN_ID.openclaw.json \

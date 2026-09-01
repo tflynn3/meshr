@@ -2,18 +2,58 @@ output "cluster_name" {
   value = google_container_cluster.autopilot.name
 }
 
+output "fleet_membership" {
+  value       = google_container_cluster.autopilot.fleet[0].membership
+  description = "Full regional fleet membership used by the production Connect Gateway path."
+}
+
+output "fleet_membership_id" {
+  value       = google_container_cluster.autopilot.fleet[0].membership_id
+  description = "Short membership name passed to gcloud container fleet memberships get-credentials."
+}
+
+output "fleet_membership_location" {
+  value       = google_container_cluster.autopilot.fleet[0].membership_location
+  description = "Regional fleet membership location passed explicitly to Connect Gateway commands."
+}
+
+output "connect_gateway_deploy_service_account" {
+  value       = var.connect_gateway_deploy_service_account_email
+  description = "Exact protected deploy identity granted Connect Gateway transport access; Kubernetes RBAC remains independently namespace-scoped."
+}
+
 output "region" {
   value = var.region
 }
 
+output "organization_policy_guardrails_enforced" {
+  value       = var.organization_policy_guardrails_enabled
+  description = "Whether this apply manages the five project-level Organization Policy guardrails. This must be true before public launch or either DNS-management path is enabled."
+}
+
+output "gke_network" {
+  value       = google_compute_network.gke.name
+  description = "Dedicated custom-mode VPC used only by the Meshr GKE cluster."
+}
+
+output "gke_subnetwork" {
+  value       = google_compute_subnetwork.gke.name
+  description = "Regional private-node subnet with explicit Pod and Service secondary ranges."
+}
+
+output "gke_nat_ip" {
+  value       = google_compute_address.gke_nat.address
+  description = "Stable Cloud NAT egress address for private Meshr GKE workloads and outbound allowlists."
+}
+
 output "gateway_ip" {
-  value       = google_compute_global_address.gateway.address
-  description = "Reserved global IPv4 address used by the production GKE Gateway and root Cloudflare record."
+  value       = try(google_compute_global_address.gateway[0].address, null)
+  description = "Reserved global IPv4 address used by the production GKE Gateway and root Cloudflare record; null while edge management is disabled."
 }
 
 output "staging_gateway_ip" {
-  value       = google_compute_global_address.staging_gateway.address
-  description = "Reserved global IPv4 address used by the independent canary Gateway and staging Cloudflare record."
+  value       = try(google_compute_global_address.staging_gateway[0].address, null)
+  description = "Reserved global IPv4 address used by the independent canary Gateway and staging Cloudflare record; null while edge management is disabled."
 }
 
 output "artifact_registry" {
@@ -40,17 +80,57 @@ output "metrics_adapter_service_account" {
 
 output "moderation_adapter_service_account" {
   value       = google_service_account.moderation_adapter.email
-  description = "Dedicated production adapter identity holding Model Armor and Sensitive Data Protection permissions."
+  description = "Exact production adapter runtime identity holding Model Armor and Sensitive Data Protection permissions; private promotion may act as only this service account."
+}
+
+output "moderation_adapter_service_name" {
+  value       = try(google_cloud_run_v2_service.moderation_adapter[0].name, null)
+  description = "Exact production Cloud Run service name on which the private promotion identity receives service-scoped revision authority."
+}
+
+output "moderation_adapter_initial_revision" {
+  value       = var.moderation_adapter_image == null ? null : local.moderation_adapter_revision_name
+  description = "Deterministic create-only production revision name derived from the first 20 characters of moderation_adapter_source_sha."
+}
+
+output "moderation_adapter_initial_revision_tag" {
+  value       = var.moderation_adapter_image == null ? null : local.moderation_adapter_revision_tag
+  description = "Deterministic create-only production traffic tag bound 100 percent to moderation_adapter_initial_revision on first apply."
+}
+
+output "production_plan_service_account" {
+  value       = var.production_plan_service_account_email
+  description = "Exact private-owned read-only plan GSA with repository-scoped access for second-stage image-witness verification."
+}
+
+output "production_moderation_promotion_service_account" {
+  value       = var.production_moderation_promotion_service_account_email
+  description = "Exact private-owned GSA granted service-scoped production moderation revision and traffic-tag authority."
+}
+
+output "production_moderation_promotion_service_role" {
+  value       = google_project_iam_custom_role.production_moderation_promotion_service.name
+  description = "Custom role with only run.services.get/update, bound on the exact production adapter service."
 }
 
 output "moderation_adapter_url" {
   value       = try(google_cloud_run_v2_service.moderation_adapter[0].uri, null)
-  description = "Authenticated production moderation adapter URL; set MESHR_MODERATION_ENDPOINT to its /screen endpoint and MESHR_MODERATION_AUDIENCE to this base URL."
+  description = "Stable authenticated production service URI used only as MESHR_MODERATION_AUDIENCE; endpoint and health URLs must use the verified immutable revision tag URI."
 }
 
 output "moderation_adapter_deployed_image" {
   value       = try(google_cloud_run_v2_service.moderation_adapter[0].template[0].containers[0].image, null)
-  description = "Currently deployed production adapter image digest. Protected CI owns revision advancement; OpenTofu reads this value without rolling it back."
+  description = "Currently deployed production adapter image digest. Private promotion owns revision advancement; OpenTofu preserves it and qualification remains read-only."
+}
+
+output "moderation_model_armor_template" {
+  value       = google_model_armor_template.moderation.name
+  description = "Stack-owned regional Model Armor template consumed by both adapters."
+}
+
+output "moderation_model_armor_policy_sha256" {
+  value       = sha256(jsonencode(local.model_armor_policy))
+  description = "SHA-256 fingerprint of Meshr's exact configured Model Armor controls; live qualification must match the underlying fields as well as this expected fingerprint."
 }
 
 output "moderation_adapter_canary_service_account" {
@@ -60,12 +140,22 @@ output "moderation_adapter_canary_service_account" {
 
 output "moderation_adapter_canary_url" {
   value       = try(google_cloud_run_v2_service.moderation_adapter_canary[0].uri, null)
-  description = "Authenticated canary moderation adapter URL; set canary MESHR_MODERATION_ENDPOINT and audience from this output."
+  description = "Stable authenticated canary service URI used only as the ID-token audience; endpoint and health URLs must use the verified immutable revision tag URI."
+}
+
+output "moderation_adapter_canary_initial_revision" {
+  value       = var.moderation_adapter_canary_image == null ? null : local.moderation_adapter_canary_revision_name
+  description = "Deterministic create-only canary revision name derived from the first 14 characters of moderation_adapter_canary_source_sha to keep its tagged hostname within the DNS label limit."
+}
+
+output "moderation_adapter_canary_initial_revision_tag" {
+  value       = var.moderation_adapter_canary_image == null ? null : local.moderation_adapter_canary_revision_tag
+  description = "Deterministic create-only canary traffic tag bound 100 percent to moderation_adapter_canary_initial_revision on first apply."
 }
 
 output "moderation_adapter_canary_deployed_image" {
   value       = try(google_cloud_run_v2_service.moderation_adapter_canary[0].template[0].containers[0].image, null)
-  description = "Currently deployed canary adapter image digest. Protected CI owns revision advancement; OpenTofu reads this value without rolling it back."
+  description = "Currently deployed canary adapter image digest. The private workflow owns the create-only service after bootstrap; OpenTofu reads this value without rolling it back."
 }
 
 output "event_subscriptions" {
@@ -123,7 +213,8 @@ output "firestore_canary_moderation_database" {
 }
 
 output "certificate_map" {
-  value = google_certificate_manager_certificate_map.meshr.name
+  value       = try(google_certificate_manager_certificate_map.meshr[0].name, null)
+  description = "Certificate map created only when launch or DNS management enables the Cloudflare edge."
 }
 
 output "cloud_armor_policy" {
@@ -149,7 +240,7 @@ output "github_actions_workload_identity_provider" {
 
 output "github_actions_deploy_workload_identity_provider" {
   value       = google_iam_workload_identity_pool_provider.github_actions_deploy.name
-  description = "Environment/ref/workflow-bound production provider; set as GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER."
+  description = "Environment/ref/workflow-bound private production-qualification provider; it is not production-promotion authority."
 }
 
 output "ci_service_account" {
@@ -159,15 +250,15 @@ output "ci_service_account" {
 
 output "ci_deploy_service_account" {
   value       = google_service_account.ci_deploy.email
-  description = "Protected production-deploy service account; set as GCP_DEPLOY_SERVICE_ACCOUNT."
+  description = "Private production-qualification service account; the legacy output name is retained for compatibility."
 }
 
 output "github_actions_canary_deploy_workload_identity_provider" {
-  value       = google_iam_workload_identity_pool_provider.github_actions_canary_deploy.name
-  description = "Environment/ref/workflow-bound canary provider; set as GCP_CANARY_DEPLOY_WORKLOAD_IDENTITY_PROVIDER."
+  value       = try(google_iam_workload_identity_pool_provider.github_actions_canary_deploy[0].name, null)
+  description = "Private-repository/environment/ref/manual-workflow-bound canary provider when canary authority is enabled; null for foundation and production-adapter-only stages."
 }
 
 output "ci_canary_deploy_service_account" {
-  value       = google_service_account.ci_canary_deploy.email
-  description = "Protected canary-deploy service account; set as GCP_CANARY_DEPLOY_SERVICE_ACCOUNT."
+  value       = try(google_service_account.ci_canary_deploy[0].email, null)
+  description = "Protected canary-deploy service account consumed only by the exact private operations workflow; null when canary authority is disabled."
 }

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { createMeshrServer, type MeshrServer } from "./app.ts";
+import type { MeshrRepository } from "./repository.ts";
 import { sha256 } from "./security.ts";
 import type { AgentProfileInput, Clock } from "./types.ts";
 
@@ -50,14 +51,96 @@ afterEach(async () => {
   }
 });
 
-async function start(options: { webMcpTransfersSession?: boolean } = {}): Promise<RunningServer> {
+async function start(options: {
+  webMcpTransfersSession?: boolean;
+  repository?: MeshrRepository;
+} = {}): Promise<RunningServer> {
   const directory = mkdtempSync(join(tmpdir(), "meshr-webmcp-test-"));
   const clock = new TestClock();
+  let appReference: MeshrServer;
+  const repository = options.repository
+    ? (new Proxy(options.repository, {
+        get(target, property, receiver) {
+          const supplied = Reflect.get(target, property, receiver);
+          if (supplied !== undefined) {
+            return typeof supplied === "function"
+              ? supplied.bind(target)
+              : supplied;
+          }
+          if (property === "findHumanSession") {
+            return async (tokenHash: string) => {
+              const row = appReference.database.sqlite
+                .prepare(
+                  `SELECT account_id, csrf_token, created_at, expires_at,
+                          absolute_expires_at, last_seen_at
+                   FROM human_sessions WHERE token_hash = ?`,
+                )
+                .get(tokenHash) as
+                | {
+                    account_id: string;
+                    csrf_token: string;
+                    created_at: string;
+                    expires_at: string;
+                    absolute_expires_at: string;
+                    last_seen_at: string;
+                  }
+                | undefined;
+              return row
+                ? {
+                    accountId: row.account_id,
+                    csrfToken: row.csrf_token,
+                    createdAt: row.created_at,
+                    expiresAt: row.expires_at,
+                    absoluteExpiresAt: row.absolute_expires_at,
+                    lastSeenAt: row.last_seen_at,
+                  }
+                : null;
+            };
+          }
+          if (property === "touchHumanSession") {
+            return async (tokenHash: string, lastSeenAt: string) => {
+              appReference.database.sqlite
+                .prepare(
+                  "UPDATE human_sessions SET last_seen_at = ? WHERE token_hash = ?",
+                )
+                .run(lastSeenAt, tokenHash);
+            };
+          }
+          if (property === "findAccountById") {
+            return async (accountId: string) => {
+              const row = appReference.database.sqlite
+                .prepare(
+                  "SELECT id, email, display_name, created_at FROM accounts WHERE id = ?",
+                )
+                .get(accountId) as
+                | {
+                    id: string;
+                    email: string;
+                    display_name: string;
+                    created_at: string;
+                  }
+                | undefined;
+              return row
+                ? {
+                    accountId: row.id,
+                    email: row.email,
+                    displayName: row.display_name,
+                    createdAt: row.created_at,
+                  }
+                : null;
+            };
+          }
+          return undefined;
+        },
+      }) as MeshrRepository)
+    : undefined;
   const app = createMeshrServer({
     dbPath: join(directory, "meshr.db"),
     clock,
     webMcpTransfersSession: options.webMcpTransfersSession,
+    repository,
   });
+  appReference = app;
   const { baseUrl } = await app.listen();
   const value = { app, baseUrl, directory, clock };
   running.push(value);
@@ -160,7 +243,9 @@ async function connectAgent(
       method: "POST",
       body: {
         acknowledgeAutonomous:
-          attention.rootPosts === "autonomous" || attention.replies === "autonomous",
+          attention.browse !== "mentions" ||
+          attention.rootPosts === "autonomous" ||
+          attention.replies === "autonomous",
       },
       cookie: owner.cookie,
       csrf: owner.csrf,
@@ -209,6 +294,129 @@ async function enableGrant(
 
 const combinedCookie = (owner: OwnerSession, webMcpCookie: string): string =>
   `${owner.cookie}; ${webMcpCookie}`;
+
+function seedLocalReadAuthority(
+  run: RunningServer,
+  label: string,
+): {
+  agentId: string;
+  nativeAuthorization: string;
+  pageCookie: string;
+} {
+  const now = run.app.database.now();
+  const expiresAt = new Date(
+    run.clock.now().getTime() + 60 * 60_000,
+  ).toISOString();
+  const accountId = `account-${label}`;
+  const agentId = `agent-${label}`;
+  const pairingId = `pairing-${label}`;
+  const sessionId = `session-${label}`;
+  const nativeToken = `native-token-${label}`;
+  const humanToken = `human-token-${label}`;
+  const pageToken = `page-token-${label}`;
+  const nativeHash = sha256(nativeToken);
+  const humanHash = sha256(humanToken);
+  const pageHash = sha256(pageToken);
+  run.app.database.transaction(() => {
+    run.app.database.sqlite
+      .prepare(
+        "INSERT INTO accounts(id, email, display_name, password_hash, created_at) VALUES(?, ?, ?, '', ?)",
+      )
+      .run(accountId, `${label}@example.test`, label, now);
+    run.app.database.sqlite
+      .prepare(
+        `INSERT INTO human_sessions(
+           token_hash, account_id, csrf_token, created_at, expires_at,
+           last_seen_at, absolute_expires_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(humanHash, accountId, `csrf-${label}`, now, expiresAt, now, expiresAt);
+    run.app.database.sqlite
+      .prepare(
+        `INSERT INTO agents(
+           id, owner_account_id, name, handle, tagline, interests_json,
+           personality, attention_json, runtime, runtime_label, runtime_subject,
+           public_key_pem, definition_digest, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, '', '[]', '', ?, 'local', ?, ?, 'fixture-key', NULL, ?, ?)`,
+      )
+      .run(
+        agentId,
+        accountId,
+        label,
+        `handle-${label}`,
+        JSON.stringify({
+          browse: "public",
+          rootPosts: "autonomous",
+          replies: "autonomous",
+        }),
+        label,
+        `fixture:${label}`,
+        now,
+        now,
+      );
+    run.app.database.sqlite
+      .prepare(
+        `INSERT INTO pairings(
+           id, code, secret_hash, runtime, runtime_label, external_subject,
+           public_key_pem, status, owner_account_id, agent_id, created_at,
+           expires_at, approved_at, claimed_at
+         ) VALUES(?, ?, 'fixture-secret', 'local', ?, ?, 'fixture-key',
+                  'claimed', ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        pairingId,
+        `CODE-${label}`,
+        label,
+        `fixture:${label}`,
+        accountId,
+        agentId,
+        now,
+        expiresAt,
+        now,
+        now,
+      );
+    run.app.database.sqlite
+      .prepare(
+        `INSERT INTO agent_sessions(
+           token_hash, agent_id, pairing_id, created_at, expires_at, last_seen_at,
+           session_id, runtime_kind, status, authority_epoch
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, 'local', 'active', 1)`,
+      )
+      .run(
+        nativeHash,
+        agentId,
+        pairingId,
+        now,
+        expiresAt,
+        now,
+        sessionId,
+      );
+    run.app.database.sqlite
+      .prepare(
+        `INSERT INTO agent_authority(agent_id, epoch, authority_kind, session_id, updated_at)
+         VALUES(?, 1, 'native', ?, ?)`,
+      )
+      .run(agentId, sessionId, now);
+    run.app.database.sqlite
+      .prepare(
+        `INSERT INTO webmcp_grants(
+           token_hash, human_session_hash, agent_id, created_at, expires_at,
+           last_used_at, revoked_at, session_id, authority_epoch
+         ) VALUES(?, ?, ?, ?, ?, ?, NULL, ?, 1)`,
+      )
+      .run(pageHash, humanHash, agentId, now, expiresAt, now, sessionId);
+    run.app.database.sqlite
+      .prepare(
+        "INSERT OR IGNORE INTO mesh_members(mesh_id, agent_id, joined_at) VALUES('mesh-public', ?, ?)",
+      )
+      .run(agentId, now);
+  });
+  return {
+    agentId,
+    nativeAuthorization: `Bearer ${nativeToken}`,
+    pageCookie: `meshr_session=${humanToken}; meshr_webmcp=${pageToken}`,
+  };
+}
 
 async function startPausedJsonPost(input: {
   baseUrl: string;
@@ -449,6 +657,63 @@ test("a human explicitly grants one owned connected identity using only HttpOnly
     cookie: combinedCookie(owner, beforeLogout.cookie),
   });
   assert.equal(afterLogout.response.status, 401);
+});
+
+test("WebMCP revocation is bounded before and after human authentication", async () => {
+  let durableSessionReads = 0;
+  const preauthRun = await start({
+    repository: {
+      findHumanSession: async () => {
+        durableSessionReads += 1;
+        return null;
+      },
+    } as unknown as MeshrRepository,
+  });
+  const invalidResponses = [];
+  for (let index = 0; index < 21; index += 1) {
+    invalidResponses.push(
+      await requestJson(preauthRun.baseUrl, "/v1/webmcp/session", {
+        method: "DELETE",
+        cookie: "meshr_session=invalid-webmcp-session",
+        csrf: "invalid-csrf",
+      }),
+    );
+  }
+  assert.equal(
+    invalidResponses.slice(0, 20).every(({ response }) => response.status === 401),
+    true,
+  );
+  assert.equal(invalidResponses.at(-1)?.response.status, 429);
+  assert.equal(
+    invalidResponses.at(-1)?.json.error.code,
+    "webmcp_session_rate_limited",
+  );
+  assert.equal(durableSessionReads, 20);
+
+  const authenticatedRun = await start();
+  const owner = await createOwner(authenticatedRun, "webmcp-revoke-budget");
+  const authenticatedResponses = [];
+  for (let index = 0; index < 6; index += 1) {
+    authenticatedResponses.push(
+      await requestJson(authenticatedRun.baseUrl, "/v1/webmcp/session", {
+        method: "DELETE",
+        cookie: owner.cookie,
+        csrf: owner.csrf,
+      }),
+    );
+  }
+  assert.equal(
+    authenticatedResponses.slice(0, 5).every(({ response }) => response.status === 200),
+    true,
+  );
+  assert.equal(authenticatedResponses.at(-1)?.response.status, 429);
+  assert.equal(
+    authenticatedResponses.at(-1)?.json.error.code,
+    "webmcp_session_rate_limited",
+  );
+  assert.ok(
+    Number(authenticatedResponses.at(-1)?.response.headers.get("retry-after")) >= 1,
+  );
 });
 
 test("page WebMCP state remains readable when transfer fencing is enabled", async () => {
@@ -860,6 +1125,251 @@ test("all eight page routes use durable state, membership, validation, and idemp
   assert.equal(unjoined.json.error.code, "mesh_membership_required");
 });
 
+test("model-visible mesh directories bound count, metadata, and serialized context", async () => {
+  const run = await start();
+  const owner = await createOwner(run, "bounded-directory");
+  const agent = await connectAgent(run, owner, "bounded-directory", autonomous);
+  const grant = await enableGrant(run, owner, agent.id);
+  const cookie = combinedCookie(owner, grant.cookie);
+  const insert = run.app.database.sqlite.prepare(
+    `INSERT INTO meshes(
+       id, owner_account_id, name, description, visibility, join_policy, created_at
+     ) VALUES(?, NULL, ?, ?, 'public', 'open', ?)`,
+  );
+  run.app.database.transaction(() => {
+    for (let index = 0; index < 20; index += 1) {
+      insert.run(
+        `mesh-context-${String(index).padStart(2, "0")}`,
+        `A context mesh ${String(index).padStart(2, "0")}`,
+        `hostile metadata ${index} `.padEnd(2_000, "x"),
+        run.app.database.now(),
+      );
+    }
+  });
+
+  for (const request of [
+    requestJson(run.baseUrl, "/v1/webmcp/meshes", { cookie }),
+    requestJson(run.baseUrl, "/v1/agent/meshes", {
+      authorization: agent.authorization,
+    }),
+  ]) {
+    const response = await request;
+    assert.equal(response.response.status, 200);
+    assert.equal(response.json.meshes.length, 12);
+    assert.deepEqual(response.json.limits, {
+      meshes: 12,
+      descriptionCharacters: 512,
+      responseBytes: 32 * 1024,
+    });
+    assert.equal(response.json.truncated.meshes, true);
+    assert.equal(response.json.truncated.metadata, true);
+    assert.equal(
+      response.json.meshes.every(
+        (mesh: { description: string }) => mesh.description.length <= 512,
+      ),
+      true,
+    );
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(response.json), "utf8") <= 32 * 1024,
+    );
+  }
+});
+
+test("durable model directories request a bounded policy-aware window and clamp a hostile adapter", async () => {
+  const calls: Array<{ limit?: number; browse?: "public" | "joined" }> = [];
+  const entries = Array.from({ length: 40 }, (_, index) => ({
+    mesh: {
+      meshId: `durable-context-${String(index).padStart(2, "0")}`,
+      ownerAccountId: null,
+      name: `Durable context ${index}`,
+      description: "x".repeat(2_000),
+      visibility: "public" as const,
+      admission: "open" as const,
+      lifecycle: "active" as const,
+      createdAt: "2026-08-27T18:00:00.000Z",
+      updatedAt: "2026-08-27T18:00:00.000Z",
+    },
+    joined: false,
+  }));
+  const repository = {
+    listMeshesForAgent: async (
+      _agentId: string,
+      options: { limit?: number; browse?: "public" | "joined" } = {},
+    ) => {
+      calls.push(options);
+      return entries;
+    },
+  } as MeshrRepository;
+  const run = await start({ repository });
+  const authority = seedLocalReadAuthority(run, "durable-bounded-directory");
+  const response = await requestJson(run.baseUrl, "/v1/webmcp/meshes", {
+    cookie: authority.pageCookie,
+    webMcpAgentId: authority.agentId,
+  });
+  assert.equal(response.response.status, 200);
+  assert.deepEqual(calls, [{ limit: 13, browse: "public" }]);
+  assert.equal(response.json.meshes.length, 12);
+  assert.equal(response.json.truncated.meshes, true);
+  assert.equal(response.json.truncated.metadata, true);
+  assert.ok(Buffer.byteLength(JSON.stringify(response.json), "utf8") <= 32 * 1024);
+});
+
+test("durable mesh metadata reads terminally recheck page, native, and attention authority", async () => {
+  const directoryEntry = {
+    mesh: {
+      meshId: "mesh-public",
+      ownerAccountId: null,
+      name: "Public mesh",
+      description: "Authority race fixture",
+      visibility: "public" as const,
+      admission: "open" as const,
+      lifecycle: "active" as const,
+      createdAt: "2026-08-27T18:00:00.000Z",
+      updatedAt: "2026-08-27T18:00:00.000Z",
+    },
+    joined: true,
+  };
+  const gated = <T>(value: T) => {
+    let armed = false;
+    let started!: () => void;
+    let release!: () => void;
+    let startedPromise = Promise.resolve();
+    let releasePromise = Promise.resolve();
+    return {
+      arm() {
+        armed = true;
+        startedPromise = new Promise<void>((resolve) => {
+          started = resolve;
+        });
+        releasePromise = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      },
+      async call(): Promise<T> {
+        if (!armed) return value;
+        started();
+        await releasePromise;
+        return value;
+      },
+      started: () => startedPromise,
+      release: () => release(),
+    };
+  };
+
+  {
+    const query = gated([directoryEntry]);
+    const run = await start({
+      repository: {
+        listMeshesForAgent: async () => query.call(),
+      } as unknown as MeshrRepository,
+    });
+    const authority = seedLocalReadAuthority(run, "page-directory-race");
+    query.arm();
+    const pending = requestJson(run.baseUrl, "/v1/webmcp/meshes", {
+      cookie: authority.pageCookie,
+      webMcpAgentId: authority.agentId,
+    });
+    await query.started();
+    run.app.database.sqlite
+      .prepare("UPDATE webmcp_grants SET revoked_at = ? WHERE agent_id = ?")
+      .run(run.app.database.now(), authority.agentId);
+    query.release();
+    const response = await pending;
+    assert.equal(response.response.status, 401);
+    assert.equal(response.json.error.code, "webmcp_grant_required");
+  }
+
+  {
+    const query = gated([directoryEntry]);
+    const run = await start({
+      repository: {
+        listMeshesForAgent: async () => query.call(),
+      } as unknown as MeshrRepository,
+    });
+    const authority = seedLocalReadAuthority(run, "attention-directory-race");
+    query.arm();
+    const pending = requestJson(run.baseUrl, "/v1/webmcp/meshes", {
+      cookie: authority.pageCookie,
+      webMcpAgentId: authority.agentId,
+    });
+    await query.started();
+    run.app.database.sqlite
+      .prepare("UPDATE agents SET attention_json = ?, updated_at = ? WHERE id = ?")
+      .run(
+        JSON.stringify({
+          browse: "joined",
+          rootPosts: "autonomous",
+          replies: "autonomous",
+        }),
+        run.app.database.now(),
+        authority.agentId,
+      );
+    query.release();
+    const response = await pending;
+    assert.equal(response.response.status, 409);
+    assert.equal(response.json.error.code, "attention_policy_changed");
+  }
+
+  {
+    const query = gated([directoryEntry]);
+    const run = await start({
+      repository: {
+        listMeshesForAgent: async () => query.call(),
+      } as unknown as MeshrRepository,
+    });
+    const authority = seedLocalReadAuthority(run, "native-directory-race");
+    query.arm();
+    const pending = requestJson(run.baseUrl, "/v1/agent/meshes", {
+      authorization: authority.nativeAuthorization,
+    });
+    await query.started();
+    run.app.database.sqlite
+      .prepare("UPDATE agent_sessions SET status = 'revoked' WHERE agent_id = ?")
+      .run(authority.agentId);
+    query.release();
+    const response = await pending;
+    assert.equal(response.response.status, 401);
+    assert.equal(response.json.error.code, "agent_authentication_failed");
+  }
+
+  {
+    const query = gated([
+      {
+        topic: {
+          topicId: "topic-small-discoveries",
+          meshId: "mesh-public",
+          name: "small-discoveries",
+          title: "Small discoveries",
+          description: "Authority race fixture",
+          tags: ["testing"],
+          createdAt: "2026-08-27T18:00:00.000Z",
+        },
+        followed: false,
+      },
+    ]);
+    const run = await start({
+      repository: {
+        listTopicsForAgent: async () => query.call(),
+      } as unknown as MeshrRepository,
+    });
+    const authority = seedLocalReadAuthority(run, "native-topic-race");
+    query.arm();
+    const pending = requestJson(
+      run.baseUrl,
+      "/v1/agent/meshes/mesh-public/topics",
+      { authorization: authority.nativeAuthorization },
+    );
+    await query.started();
+    run.app.database.sqlite
+      .prepare("UPDATE agent_sessions SET status = 'superseded' WHERE agent_id = ?")
+      .run(authority.agentId);
+    query.release();
+    const response = await pending;
+    assert.equal(response.response.status, 401);
+    assert.equal(response.json.error.code, "agent_authentication_failed");
+  }
+});
+
 test("bearer and page routes both fail closed for draft, never, and mentions policies", async () => {
   const run = await start();
   const owner = await createOwner(run, "policy");
@@ -990,4 +1500,185 @@ test("bearer and page routes both fail closed for draft, never, and mentions pol
     },
   );
   assert.equal(draftReply.json.error.code, "attention_approval_required");
+});
+
+test("rotating page-follow idempotency keys share the agent control-write budget", async () => {
+  const run = await start();
+  const owner = await createOwner(run, "page-follow-budget");
+  const agent = await connectAgent(run, owner, "page-follow-budget", autonomous);
+  const grant = await enableGrant(run, owner, agent.id);
+  const cookie = combinedCookie(owner, grant.cookie);
+  const responses = [];
+
+  for (let index = 0; index < 31; index += 1) {
+    responses.push(await requestJson(
+      run.baseUrl,
+      "/v1/webmcp/topics/topic-small-discoveries/follow",
+      {
+        method: "PUT",
+        cookie,
+        csrf: owner.csrf,
+        idempotencyKey: `page-follow-budget-${index}`,
+      },
+    ));
+  }
+
+  assert.equal(responses.slice(0, 30).every(({ response }) => response.status === 200), true);
+  assert.equal(responses.at(-1)?.response.status, 429);
+  assert.equal(responses.at(-1)?.json.error.code, "agent_mutation_rate_limited");
+  assert.equal(
+    run.app.database.sqlite.prepare(
+      "SELECT COUNT(*) AS count FROM idempotency_records WHERE agent_id = ? AND operation = 'topic.follow'",
+    ).get(agent.id)?.count,
+    30,
+  );
+});
+
+test("native and page post retries share an attempt budget without consuming accepted-write quota", async () => {
+  const run = await start();
+  const owner = await createOwner(run, "shared-post-attempt-budget");
+  const agent = await connectAgent(
+    run,
+    owner,
+    "shared-post-attempt-budget",
+    autonomous,
+  );
+  const grant = await enableGrant(run, owner, agent.id);
+  const pageCookie = combinedCookie(owner, grant.cookie);
+  const parentId = "shared-attempt-parent";
+  run.app.database.sqlite
+    .prepare(
+      `INSERT INTO posts(
+         id, mesh_id, topic_id, agent_id, session_id, parent_post_id, body,
+         created_at, moderation_state, moderation_reason, expires_at
+       ) VALUES(?, 'mesh-public', 'topic-small-discoveries', ?, 'fixture-session',
+                NULL, 'Published parent', ?, 'published', NULL, ?)`,
+    )
+    .run(
+      parentId,
+      agent.id,
+      run.app.database.now(),
+      new Date(run.clock.now().getTime() + 60 * 60_000).toISOString(),
+    );
+
+  const nativeInput = {
+    meshId: "mesh-public",
+    topicId: "topic-small-discoveries",
+    body: "One accepted native root with many exact recoveries.",
+  };
+  const pageInput = {
+    body: "One accepted page reply with many exact recoveries.",
+  };
+  const responses = [];
+  for (let index = 0; index < 15; index += 1) {
+    responses.push(
+      await requestJson(run.baseUrl, "/v1/agent/posts", {
+        method: "POST",
+        authorization: agent.authorization,
+        idempotencyKey: "shared-native-post-recovery",
+        body: nativeInput,
+      }),
+    );
+    responses.push(
+      await requestJson(
+        run.baseUrl,
+        `/v1/webmcp/posts/${parentId}/replies`,
+        {
+          method: "POST",
+          cookie: pageCookie,
+          csrf: owner.csrf,
+          idempotencyKey: "shared-page-reply-recovery",
+          body: pageInput,
+        },
+      ),
+    );
+  }
+  assert.equal(
+    responses.every(
+      ({ response }) => response.status >= 200 && response.status < 300,
+    ),
+    true,
+  );
+
+  const limited = await requestJson(run.baseUrl, "/v1/agent/posts", {
+    method: "POST",
+    authorization: agent.authorization,
+    idempotencyKey: "shared-native-post-recovery",
+    body: nativeInput,
+  });
+  assert.equal(limited.response.status, 429);
+  assert.equal(limited.json.error.code, "agent_mutation_rate_limited");
+  assert.equal(
+    run.app.database.sqlite
+      .prepare(
+        `SELECT COUNT(*) AS count FROM posts
+         WHERE body IN (?, ?)`,
+      )
+      .get(nativeInput.body, pageInput.body)?.count,
+    2,
+    "exact retries must replay only the two accepted writes",
+  );
+  assert.equal(
+    run.app.database.sqlite
+      .prepare(
+        `SELECT COUNT(*) AS count FROM idempotency_records
+         WHERE agent_id = ? AND operation IN ('post.create', 'reply.create')`,
+      )
+      .get(agent.id)?.count,
+    2,
+  );
+});
+
+test("active WebMCP transfer recovery bypasses exhausted new-control budgets", async () => {
+  const run = await start({ webMcpTransfersSession: true });
+  const owner = await createOwner(run, "webmcp-recovery-budget");
+  const agent = await connectAgent(
+    run,
+    owner,
+    "webmcp-recovery-budget",
+    autonomous,
+  );
+  const first = await enableGrant(run, owner, agent.id);
+  assert.equal(first.response.status, 201);
+
+  // The initial transfer consumed one authenticated control token. Consume
+  // the remaining nineteen through a different repeatable sink to prove the
+  // budget is shared at the owner/session boundary.
+  for (let index = 0; index < 19; index += 1) {
+    const updated = await requestJson(
+      run.baseUrl,
+      `/v1/agents/${agent.id}/profile`,
+      {
+        method: "PUT",
+        cookie: owner.cookie,
+        csrf: owner.csrf,
+        body: { tagline: `Recovery budget update ${index}` },
+      },
+    );
+    assert.equal(updated.response.status, 200);
+  }
+  const limited = await requestJson(
+    run.baseUrl,
+    `/v1/agents/${agent.id}/profile`,
+    {
+      method: "PUT",
+      cookie: owner.cookie,
+      csrf: owner.csrf,
+      body: { tagline: "This new control attempt is over budget" },
+    },
+  );
+  assert.equal(limited.response.status, 429);
+  assert.equal(limited.json.error.code, "human_control_rate_limited");
+
+  const recovered = await enableGrant(run, owner, agent.id);
+  assert.equal(recovered.response.status, 200);
+  assert.equal(recovered.cookie, first.cookie);
+  assert.equal(
+    run.app.database.sqlite
+      .prepare(
+        "SELECT COUNT(*) AS count FROM webmcp_grants WHERE human_session_hash = (SELECT token_hash FROM human_sessions WHERE account_id = ? LIMIT 1)",
+      )
+      .get(owner.id)?.count,
+    1,
+  );
 });

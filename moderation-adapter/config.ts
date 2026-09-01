@@ -10,6 +10,7 @@ export interface ModerationAdapterConfig {
   modelArmorEndpoint: string;
   dlpParent: string;
   dlpEndpoint: string;
+  releaseSha?: string;
   timeoutMs: number;
   maxBodyBytes: number;
   requireCallerAuth: boolean;
@@ -62,6 +63,13 @@ function modelArmorEndpoint(location: string, override: string | undefined): str
     : `https://modelarmor.${location}.rep.googleapis.com`;
 }
 
+function dlpEndpoint(location: string, override: string | undefined): string {
+  if (override) return override.replace(/\/+$/, "");
+  return location === "global"
+    ? "https://dlp.googleapis.com"
+    : `https://dlp.${location}.rep.googleapis.com`;
+}
+
 /**
  * Parse the adapter's launch configuration without contacting Google APIs.
  * Production requires a real Model Armor template and a regional DLP parent;
@@ -71,7 +79,11 @@ function modelArmorEndpoint(location: string, override: string | undefined): str
 export function loadModerationAdapterConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): ModerationAdapterConfigResult {
-  const environment = env.MESHR_ENV?.trim() === "production" ? "production" : "local";
+  const environmentValue = env.MESHR_ENV?.trim().toLowerCase() || "local";
+  if (environmentValue !== "local" && environmentValue !== "production") {
+    return { error: "environment_invalid" };
+  }
+  const environment = environmentValue;
   const projectId = required(env.GOOGLE_CLOUD_PROJECT || env.MESHR_MODERATION_PROJECT_ID);
   const template = required(env.MESHR_MODEL_ARMOR_TEMPLATE);
   const parsedTemplate = template ? templateParts(template) : undefined;
@@ -83,8 +95,14 @@ export function loadModerationAdapterConfig(
     required(env.MESHR_MODEL_ARMOR_ENDPOINT),
   );
   const dlpLocation = required(env.MESHR_DLP_LOCATION) || "global";
+  if (environment === "production" && dlpLocation === "global") {
+    return { error: "dlp_location_must_be_regional" };
+  }
   const parent = dlpParent(projectId, dlpLocation);
-  const dlpEndpoint = (required(env.MESHR_DLP_ENDPOINT) || "https://dlp.googleapis.com").replace(/\/+$/, "");
+  const dlpApiEndpoint = dlpEndpoint(
+    dlpLocation,
+    required(env.MESHR_DLP_ENDPOINT),
+  );
   const armorError = httpsBase("model_armor_endpoint", armorEndpoint, environment === "production");
   if (armorError) return { error: armorError };
   if (environment === "production" && required(env.MESHR_MODEL_ARMOR_ENDPOINT)) {
@@ -101,18 +119,20 @@ export function loadModerationAdapterConfig(
       return { error: "model_armor_endpoint_host_invalid" };
     }
   }
-  const dlpError = httpsBase("dlp_endpoint", dlpEndpoint, environment === "production");
+  const dlpError = httpsBase("dlp_endpoint", dlpApiEndpoint, environment === "production");
   if (dlpError) return { error: dlpError };
   if (environment === "production") {
-    let parsedDlpEndpoint: URL;
-    try {
-      parsedDlpEndpoint = new URL(dlpEndpoint);
-    } catch {
-      return { error: "dlp_endpoint_invalid" };
-    }
-    if (parsedDlpEndpoint.hostname.toLowerCase() !== "dlp.googleapis.com") {
+    const expectedDlpEndpoint = dlpEndpoint(dlpLocation, undefined);
+    if (dlpApiEndpoint.toLowerCase() !== expectedDlpEndpoint.toLowerCase()) {
       return { error: "dlp_endpoint_host_invalid" };
     }
+  }
+  const releaseSha = required(env.MESHR_MODERATION_RELEASE_SHA);
+  if (environment === "production" && !releaseSha) {
+    return { error: "release_sha_missing" };
+  }
+  if (releaseSha && !/^[a-f0-9]{40}$/.test(releaseSha)) {
+    return { error: "release_sha_invalid" };
   }
   const timeoutMs = positiveInteger(env.MESHR_MODERATION_ADAPTER_TIMEOUT_MS, 5_000);
   const maxBodyBytes = positiveInteger(env.MESHR_MODERATION_ADAPTER_MAX_BODY_BYTES, DEFAULT_MAX_BODY_BYTES);
@@ -125,7 +145,8 @@ export function loadModerationAdapterConfig(
       modelArmorTemplate: template,
       modelArmorEndpoint: armorEndpoint,
       dlpParent: parent,
-      dlpEndpoint,
+      dlpEndpoint: dlpApiEndpoint,
+      releaseSha,
       timeoutMs,
       maxBodyBytes,
       requireCallerAuth,
@@ -140,6 +161,7 @@ export function adapterOptionsFromConfig(
   return {
     provider,
     environment: config.environment,
+    releaseSha: config.releaseSha,
     requireCallerAuth: config.requireCallerAuth,
     maxBodyBytes: config.maxBodyBytes,
   };

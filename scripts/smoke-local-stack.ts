@@ -17,7 +17,8 @@ const ingestBaseUrl = componentUrl(
 );
 const liveBaseUrl = componentUrl("MESHR_LOCAL_LIVE_URL", "MESHR_SMOKE_LIVE_URL", sameOriginBaseUrl);
 const webOrigin = new URL(webBaseUrl).origin;
-const token = process.env.MESHR_LOCAL_INTERNAL_TOKEN?.trim() || "meshr-local-development-only";
+const token = process.env.MESHR_LOCAL_INTERNAL_TOKEN?.trim();
+assert.ok(token, "MESHR_LOCAL_INTERNAL_TOKEN must be supplied from the live Kubernetes Secret");
 const meshId = "mesh-public";
 
 async function json(response: Response): Promise<Record<string, unknown>> {

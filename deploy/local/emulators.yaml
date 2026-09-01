@@ -20,6 +20,12 @@ spec:
         app.kubernetes.io/component: emulator
         app.kubernetes.io/part-of: meshr
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
       containers:
         - name: firestore
           image: gcr.io/google.com/cloudsdktool/google-cloud-cli:540.0.0-emulators
@@ -32,6 +38,9 @@ spec:
             - --project=meshr-local
             - --database-mode=firestore-native
             - --quiet
+          env:
+            - {name: HOME, value: /tmp}
+            - {name: CLOUDSDK_CONFIG, value: /tmp/.config/gcloud}
           ports:
             - name: grpc
               containerPort: 8080
@@ -39,6 +48,15 @@ spec:
             tcpSocket:
               port: grpc
             initialDelaySeconds: 5
+          volumeMounts:
+            - {name: scratch, mountPath: /tmp}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
           resources:
             requests:
               cpu: 100m
@@ -46,6 +64,9 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
+      volumes:
+        - name: scratch
+          emptyDir: {sizeLimit: 512Mi}
 ---
 apiVersion: v1
 kind: Service
@@ -83,6 +104,12 @@ spec:
         app.kubernetes.io/component: emulator
         app.kubernetes.io/part-of: meshr
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
       containers:
         - name: pubsub
           image: gcr.io/google.com/cloudsdktool/google-cloud-cli:540.0.0-emulators
@@ -95,6 +122,9 @@ spec:
             - --host-port=0.0.0.0:8085
             - --project=meshr-local
             - --quiet
+          env:
+            - {name: HOME, value: /tmp}
+            - {name: CLOUDSDK_CONFIG, value: /tmp/.config/gcloud}
           ports:
             - name: grpc
               containerPort: 8085
@@ -102,6 +132,15 @@ spec:
             tcpSocket:
               port: grpc
             initialDelaySeconds: 5
+          volumeMounts:
+            - {name: scratch, mountPath: /tmp}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
           resources:
             requests:
               cpu: 100m
@@ -109,6 +148,9 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
+      volumes:
+        - name: scratch
+          emptyDir: {sizeLimit: 512Mi}
 ---
 apiVersion: v1
 kind: Service

@@ -1,0 +1,10 @@
+misconfigurations:
+  - id: AVD-KSV-0056
+    paths:
+      - deploy/production-qualification/flux-bootstrap.yaml
+    statement: >-
+      The namespace-only Flux reconciler must create and update Meshr's internal
+      ClusterIP Services and NetworkPolicies. Its Role excludes Secrets, RBAC,
+      Namespaces, ingress and Gateway resources, and every cluster-scoped kind;
+      the exact-SHA qualification overlay is also statically rejected if it
+      renders a public edge resource.

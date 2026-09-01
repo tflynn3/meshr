@@ -16,13 +16,13 @@ test("builds the real native pairing, claim, and MCP commands", () => {
     }),
     {
       init:
-        "npx --yes --package @meshr/mcp meshr-mcp init --handle 'euclid' --definition '.meshr/agents/euclid.md'",
+        "npx --yes --package @meshr/mcp@0.1.0 meshr-mcp init --handle 'euclid' --definition '.meshr/agents/euclid.md'",
       connect:
-        "npx --yes --package @meshr/mcp meshr-mcp connect --runtime codex --definition '.meshr/agents/euclid.md'",
-      claim: "npx --yes --package @meshr/mcp meshr-mcp claim --binding 'euclid'",
-      sync: "npx --yes --package @meshr/mcp meshr-mcp sync --binding 'euclid'",
+        "npx --yes --package @meshr/mcp@0.1.0 meshr-mcp connect --runtime codex --definition '.meshr/agents/euclid.md'",
+      claim: "npx --yes --package @meshr/mcp@0.1.0 meshr-mcp claim --binding 'euclid'",
+      sync: "npx --yes --package @meshr/mcp@0.1.0 meshr-mcp sync --binding 'euclid'",
       activate:
-        "codex mcp add 'meshr-euclid' -- npx --yes --package @meshr/mcp meshr-mcp mcp serve --binding 'euclid'",
+        "codex mcp add 'meshr-euclid' -- npx --yes --package @meshr/mcp@0.1.0 meshr-mcp mcp serve --binding 'euclid'",
       openClawInstall: undefined,
     },
   );
@@ -40,15 +40,15 @@ test("binds OpenClaw setup to the host-trusted agent ID", () => {
   assert.match(commands.connect, /--subject 'openclaw:garden-main'/);
   assert.equal(
     commands.openClawInstall,
-    "openclaw plugins install @meshr/openclaw",
+    "openclaw plugins install npm:@meshr/openclaw@0.1.0 --pin",
   );
   assert.equal(
     commands.activate,
-    "npx --yes --package @meshr/mcp meshr-mcp sync --binding 'bramble' && npx --yes --package @meshr/mcp meshr-mcp openclaw configure --binding 'bramble' --agent-id 'garden-main'",
+    "npx --yes --package @meshr/mcp@0.1.0 meshr-mcp sync --binding 'bramble' && npx --yes --package @meshr/mcp@0.1.0 meshr-mcp openclaw configure --binding 'bramble' --agent-id 'garden-main'",
   );
   assert.equal(
     commands.sync,
-    "npx --yes --package @meshr/mcp meshr-mcp sync --binding 'bramble'",
+    "npx --yes --package @meshr/mcp@0.1.0 meshr-mcp sync --binding 'bramble'",
   );
 });
 
@@ -61,7 +61,7 @@ test("offers a neutral MCP runtime for hosts without a first-class adapter", () 
   assert.match(commands.connect, /--runtime mcp/);
   assert.equal(
     commands.activate,
-    "npx --yes --package @meshr/mcp meshr-mcp mcp serve --binding 'orchard'",
+    "npx --yes --package @meshr/mcp@0.1.0 meshr-mcp mcp serve --binding 'orchard'",
   );
   assert.equal(commands.openClawInstall, undefined);
 });
@@ -76,7 +76,7 @@ test("quotes local definition paths and keeps filename defaults predictable", ()
   assert.match(commands.connect, /'\/tmp\/Fern'\"'\"'s profile\.md'/);
   assert.equal(
     commands.activate,
-    "claude mcp add --scope local 'meshr-fern' -- npx --yes --package @meshr/mcp meshr-mcp mcp serve --binding 'fern'",
+    "claude mcp add --scope local 'meshr-fern' -- npx --yes --package @meshr/mcp@0.1.0 meshr-mcp mcp serve --binding 'fern'",
   );
 });
 
@@ -88,6 +88,22 @@ test("includes the same-origin server in browser-generated setup commands", () =
     serverUrl: "https://meshr.social/",
   });
   assert.match(commands.connect, /--server 'https:\/\/meshr\.social\/'/);
+});
+
+test("user-facing package bootstrap commands are release-pinned", () => {
+  for (const path of ["../README.md", "../integrations/openclaw/README.md"]) {
+    const source = readFileSync(new URL(path, import.meta.url), "utf8");
+    assert.doesNotMatch(source, /--package @meshr\/mcp(?:\s|$)/);
+    assert.match(source, /--package @meshr\/mcp@0\.1\.0/);
+  }
+  const openClawReadme = readFileSync(
+    new URL("../integrations/openclaw/README.md", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    openClawReadme,
+    /openclaw plugins install npm:@meshr\/openclaw@0\.1\.0 --pin/,
+  );
 });
 
 test("offers native hosts, a generic MCP host, and a safe starter definition", () => {

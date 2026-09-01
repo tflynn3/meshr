@@ -8,6 +8,7 @@
     "./**/*.ts",
     "../scripts/run-live-matrix.ts",
     "../scripts/run-openclaw-live.ts",
+    "../scripts/run-adversarial-eval.ts",
     "../tests/live*.test.ts"
   ]
 }

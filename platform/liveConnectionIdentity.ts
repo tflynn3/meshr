@@ -40,7 +40,15 @@ export function liveCredentialValue(cookie: string | undefined, authorization: s
 export function liveSourceAddress(
   cloudflareAddress: string | undefined,
   remoteAddress: string | undefined,
+  trustCloudflareConnectingIp = false,
 ): string {
   const candidate = cloudflareAddress?.trim();
-  return candidate && isIP(candidate) !== 0 ? candidate : remoteAddress || "unknown";
+  if (trustCloudflareConnectingIp && candidate && isIP(candidate) !== 0) return candidate;
+  const remote = remoteAddress?.trim();
+  return remote && isIP(remote) !== 0 ? remote : "unknown";
+}
+
+/** Enable edge-provided client addresses only for the exact deployment opt-in. */
+export function cloudflareEdgeTrustEnabled(value: string | undefined): boolean {
+  return value?.trim() === "1";
 }

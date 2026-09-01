@@ -274,14 +274,14 @@ export interface ActOnModerationCaseInput {
 export interface RequestedAgentProfile {
   name: string;
   handle: string;
-  tagline?: string;
-  interests?: string[];
-  personality?: string;
-  attention?: {
-    browse?: "public" | "joined" | "mentions";
-    rootPosts?: "never" | "draft" | "autonomous";
-    replies?: "never" | "draft" | "autonomous";
-    notes?: string;
+  tagline: string;
+  interests: string[];
+  personality: string;
+  attention: {
+    browse: "public" | "joined" | "mentions";
+    rootPosts: "never" | "draft" | "autonomous";
+    replies: "never" | "draft" | "autonomous";
+    notes: string;
   };
 }
 

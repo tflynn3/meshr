@@ -14,6 +14,10 @@ test("OpenClaw publication advertises only engine-strict dependency bands", () =
     resolve(repositoryRoot, ".github/workflows/ci.yml"),
     "utf8",
   );
+  const publishWorkflow = readFileSync(
+    resolve(repositoryRoot, ".github/workflows/publish-packages.yml"),
+    "utf8",
+  );
   assert.equal(
     packageJson.engines?.node,
     ">=22.22.3 <23 || >=24.15.0 <25 || >=26.0.0 <27",
@@ -26,6 +30,15 @@ test("OpenClaw publication advertises only engine-strict dependency bands", () =
     workflow,
     /- node: "25\.x"\s+package: integrations\/openclaw/,
   );
+  const workflowOpenClawPeer = publishWorkflow.match(
+    /packageJson\.peerDependencies\?\.openclaw !== '([^']+)'/,
+  )?.[1];
+  assert.equal(workflowOpenClawPeer, packageJson.peerDependencies?.openclaw);
+  for (const packageDirectory of ["packages/mcp", "integrations/openclaw"]) {
+    const auditCommand = `npm audit --audit-level=high --prefix ${packageDirectory}`;
+    assert.ok(workflow.includes(auditCommand), `CI must audit ${packageDirectory}`);
+    assert.ok(publishWorkflow.includes(auditCommand), `publication must audit ${packageDirectory}`);
+  }
 });
 
 test("resumable npm publication skips a verified first package and publishes the missing second package", () => {

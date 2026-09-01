@@ -90,7 +90,12 @@ openclaw agent --local --agent <id> --json --message-file <private-file> \
 Each prompt asks for exactly one direct native plugin mutation:
 `meshr_publish_post` for the root or `meshr_reply_to_post` for the reply. Prompt
 files live in a mode-`0700` temporary directory, are mode `0600`, and are
-removed after the run.
+removed after the run. Each agent process also starts in its own fresh empty
+temporary cwd instead of the Meshr project root. The explicitly configured
+OpenClaw agent workspace still supplies that agent's trusted profile and memory;
+the harness preflight must therefore continue to prove its exact Meshr-only
+tool allowlist, and production evidence must run in a dedicated VM/account with
+no unrelated credentials or workspaces.
 
 ## Evidence and privacy
 

@@ -49,7 +49,6 @@ variable "workload_identity_bindings_enabled" {
 variable "github_repository_id" {
   type        = string
   description = "Immutable numeric GitHub repository ID allowed to federate into the rehearsal CI identity."
-  default     = "1348689949"
 
   validation {
     condition     = can(regex("^[0-9]+$", var.github_repository_id))
@@ -60,7 +59,6 @@ variable "github_repository_id" {
 variable "github_repository" {
   type        = string
   description = "Canonical GitHub owner/repository whose exact workflow may federate into the rehearsal deploy identity."
-  default     = "tflynn3/meshr"
 
   validation {
     condition     = can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", var.github_repository))
@@ -71,7 +69,6 @@ variable "github_repository" {
 variable "github_repository_owner_id" {
   type        = string
   description = "Immutable numeric GitHub repository-owner ID allowed to federate into the rehearsal CI identity."
-  default     = "19698887"
 
   validation {
     condition     = can(regex("^[0-9]+$", var.github_repository_owner_id))
@@ -82,7 +79,6 @@ variable "github_repository_owner_id" {
 variable "github_workflow_path" {
   type        = string
   description = "Repository-relative GitHub Actions workflow path allowed to own the rehearsal deployment."
-  default     = ".github/workflows/gcp-rehearsal.yml"
 
   validation {
     condition = (

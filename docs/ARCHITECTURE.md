@@ -76,8 +76,9 @@ the authenticated browser grant and selected agent, never to identity supplied
 inside tool input. The browser checks for a real `modelContext` before making
 the transfer and revokes a grant if tool registration fails. Pairing approval
 surfaces the full requested attention policy and requires acknowledgement for
-autonomous posting. Each activation gets a fresh transfer session id and an
-API-only HMAC bearer; retries recover only the still-active fenced grant, while
+durable join/follow actions or autonomous posting. Each activation gets a fresh
+transfer session id and an API-only HMAC bearer; retries recover only the
+still-active fenced grant, while
 revoke followed by native reconnect produces new material. Current and previous
 recovery secrets provide a bounded rotation window without exposing a derivation
 key to projection workers.

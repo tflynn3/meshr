@@ -9,6 +9,7 @@ variable, deployment object, or local/production boundary changes.
 The fast loop runs the existing processes directly:
 
 ```bash
+set -euo pipefail
 npm install
 npm run dev:server
 npm run dev
@@ -22,6 +23,7 @@ signed challenge, session, renewal, and heartbeat endpoints, waits for UI
 readiness, and leaves any service it did not start untouched:
 
 ```bash
+set -euo pipefail
 npm run demo
 ```
 
@@ -53,6 +55,7 @@ production always fails closed.
 The GKE-shaped loop runs Meshr in a local Kubernetes cluster:
 
 ```bash
+set -euo pipefail
 npm install
 npm run local:up
 npm run local:smoke
@@ -71,7 +74,8 @@ image-build path.
   bands (`>=22.22.3 <23`, `>=24.15.0 <25`, or `>=26.0.0 <27`). Node 25 is
   excluded because OpenClaw 2026's pinned dependency graph is not
   engine-strict compatible with that odd-numbered release line.
-- Homebrew `bazelisk`, `docker`, `colima`, `qemu`, `k3d`, and `kubectl`
+- Homebrew `bazelisk`, `docker`, `colima`, `qemu`, `k3d`, `kubectl`, and
+  `openssl`
 - At least 4 CPU, 8 GiB memory, and 40 GiB disk available to the dedicated
   `meshr-local` Colima profile
 - At least 10 GiB free on the host volume for the first Bazel dependency fetch,
@@ -84,13 +88,14 @@ It also pins the k3d 5.9 load-balancer helper because the ARM64 helper bundled
 with Homebrew k3d 5.8.3 contains an invalid `confd` executable.
 
 ```bash
-brew install bazelisk docker colima qemu k3d kubectl
+set -euo pipefail
+brew install bazelisk docker colima qemu k3d kubectl openssl
 ```
 
 ## Private managed-GCP rehearsal
 
-The `GCP deployment rehearsal` workflow is the managed-cloud acceptance loop
-before any public launch. It builds Linux AMD64 API, event-plane, and web
+The private operations deployment workflow is the managed-cloud acceptance
+loop before any public launch. It builds Linux AMD64 API, event-plane, and web
 images, pushes immutable digests to Artifact Registry, signs and verifies them
 with GitHub OIDC, creates an ephemeral GKE Autopilot cluster, and deploys the
 production Firestore/Pub/Sub runtime with GKE Workload Identity. The workflow
@@ -114,21 +119,23 @@ Terraform state, and a project-scoped budget alert. Follow
 `infra/rehearsal/README.md` to bootstrap or change it. A clean live plan is:
 
 ```bash
+set -euo pipefail
 TF_VAR_project_id=PROJECT_ID \
 TF_VAR_billing_account_id=BILLING_ACCOUNT_ID \
+TF_VAR_github_repository=OWNER/meshr-ops \
+TF_VAR_github_repository_id=IMMUTABLE_PRIVATE_REPOSITORY_ID \
+TF_VAR_github_repository_owner_id=IMMUTABLE_OWNER_ID \
+TF_VAR_github_workflow_path=.github/workflows/deploy.yml \
 GOOGLE_CLOUD_PROJECT=PROJECT_ID \
 GOOGLE_CLOUD_QUOTA_PROJECT=PROJECT_ID \
 terraform -chdir=infra/rehearsal plan
 ```
 
-The GitHub environment `gcp-rehearsal` supplies `GCP_REHEARSAL_PROJECT_ID`,
-`REGION`, `CLUSTER`, `WORKLOAD_IDENTITY_PROVIDER`, `SERVICE_ACCOUNT`, and
-`NODE_SERVICE_ACCOUNT`. It stores no Google service-account key. Once the
-workflow is present on the default branch, start a normal disposable run with:
-
-```bash
-gh workflow run gcp-rehearsal.yml --ref main -f keep_cluster=false
-```
+The private operations repository's protected `gcp-rehearsal` environment
+supplies `GCP_REHEARSAL_PROJECT_ID`, `REGION`, `CLUSTER`,
+`WORKLOAD_IDENTITY_PROVIDER`, `SERVICE_ACCOUNT`, and `NODE_SERVICE_ACCOUNT`.
+It stores no Google service-account key. The public repository contains no
+hosted rehearsal, deployment, promotion, rollback, or cleanup workflow.
 
 `keep_cluster=true` is a diagnostic exception, not the normal path. An
 always-run teardown removes the cluster after both success and failure, and a
@@ -144,20 +151,75 @@ additionally requires `API_IMAGE`, `EVENT_PLANE_IMAGE`, and `WEB_IMAGE` as full
 Artifact Registry references ending in `@sha256:<64 lowercase hex digits>`.
 Do not point this lifecycle script at a production cluster.
 
+## Private production qualification
+
+Production qualification is a separate, retained deployment in the isolated
+production project. It starts from one exact protected public `main` SHA and
+uses `deploy/production-qualification`, whose checked render excludes every
+Gateway, HTTPRoute, Ingress, external Service, public address, and trusted-edge
+forwarding header. The GKE control plane is private-only from its first apply.
+An authorized operator reaches it through Connect Gateway to install the
+privileged metrics adapter and Flux controllers, apply the canonical Git source
+admission policy, and bind the production qualification identity to namespace-
+scoped Kubernetes Roles plus read-only `get` on the two exact Flux CRDs for
+schema drift detection.
+
+Hosted automation then authenticates as that exact deploy service account and
+uses the named fleet membership through GKE Connect Gateway. Google Cloud IAM
+authorizes the Gateway transport and read-only project inventory; Kubernetes
+RBAC independently permits create/read of retained release inputs, an atomic
+CAS patch of the one app Kustomization, and the rollout, log, and named
+port-forward operations needed for qualification. Every release uses one
+create-once commit-pinned GitRepository, one immutable image map, and one
+immutable runtime map. The initial `b` runtime is finalized once to the
+attested same-SHA `r` runtime; later public SHAs switch directly between `r`
+tuples while preserving the attested store-bootstrap ID. A differing same-SHA
+repair is operator-only. Rollback names and tests both active and previous
+release IDs.
+
+Flux reconciles through the kustomize-controller identity, which is bound only
+to namespace Roles with no Secret, RBAC, Namespace, or cluster-scoped
+authority. Four fail-closed admission policies guard create-once sources,
+immutable input maps, the complete release pointer transition, and private
+ClusterIP Services. Operator-provided canonical source (1..64) and ConfigMap
+(1..192) quotas bound headroom while the Kustomization count remains one;
+unexpected non-release objects fail the clean inventory preflight and hosted
+automation cannot delete releases or reclaim capacity. Retained sources use a
+24-hour periodic interval; creation and source-controller restart still
+reconcile immediately.
+
+The operator proves the positive Gateway path and its negative authorization
+checks before workload or adversarial evaluation; there is no public-endpoint
+bootstrap or later sealing apply. The environment remains private with no
+public DNS; the operator owns capacity planning, inactive-release garbage
+collection, and the environment lifecycle. Garbage collection first quiesces
+or revokes hosted promotion, then re-reads and tests the exact active/previous
+tuple immediately before each conditional delete; staged, active, and previous
+tuples are never deleted. See
+[`deploy/production-qualification/README.md`](../deploy/production-qualification/README.md)
+for the exact lifecycle and
+[`infra/opentofu/README.md`](../infra/opentofu/README.md) for the cloud IAM,
+network, Firestore, and no-public-edge inventory contract.
+
 ## Commands
 
-| Command | Effect |
-| --- | --- |
-| `npm run build` | Build all application bundles with Bazel. |
-| `npm run images` | Build the deployable multi-architecture OCI image indexes with Bazel. |
-| `npm run local:up` | Start the isolated container VM and cluster, build native images for the host architecture, deploy, and wait. |
-| `npm run local:status` | Show local pods, services, and ingress. |
-| `npm run local:logs` | Tail the last 200 lines from all Meshr containers. |
-| `npm run local:smoke` | Prove web/API routing and the ingest to Pub/Sub to materializer to Firestore to WebSocket path, including duplicate suppression. |
-| `npm run local:down` | Delete only the `meshr-local` k3d cluster. The isolated Colima VM remains available. |
-| `npm run test:firestore` | Run the production Firestore repository conformance test against `FIRESTORE_EMULATOR_HOST` (the CI job starts the official emulator). |
-| `scripts/gcp-rehearsal.sh status` | Inspect only the label-gated ephemeral GKE rehearsal and verify its Kubernetes surface remains private. |
-| `scripts/gcp-rehearsal.sh destroy-cluster` | Delete only the identity- and label-gated ephemeral GKE rehearsal cluster. |
+| Command                                                                            | Effect                                                                                                                                |
+| ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run build`                                                                    | Build all application bundles with Bazel.                                                                                             |
+| `npm run images`                                                                   | Build the deployable multi-architecture OCI image indexes with Bazel.                                                                 |
+| `npm run local:up`                                                                 | Start the isolated container VM and cluster, build native images for the host architecture, deploy, and wait.                         |
+| `npm run local:status`                                                             | Show local pods, services, and ingress.                                                                                               |
+| `npm run local:logs`                                                               | Tail the last 200 lines from all Meshr containers.                                                                                    |
+| `npm run local:smoke`                                                              | Prove web/API routing and the ingest to Pub/Sub to materializer to Firestore to WebSocket path, including duplicate suppression.      |
+| `npm run local:down`                                                               | Delete only the `meshr-local` k3d cluster. The isolated Colima VM remains available.                                                  |
+| `npm run test:firestore`                                                           | Run the production Firestore repository conformance test against `FIRESTORE_EMULATOR_HOST` (the CI job starts the official emulator). |
+| `npm run eval:adversarial -- --help`                                               | Show the fail-closed live adversarial-evaluation capture and audit contract.                                                          |
+| `npm run verify:multi-replica -- --help`                                           | Show the two-pod durable-state, revocation, replay, and convergence verifier contract.                                                |
+| `npm run check:cloudflare-ranges`                                                  | Compare the checked-in Cloud Armor source allowlist with Cloudflare's current official ranges.                                        |
+| `npm run check:firestore-readiness -- --project PROJECT_ID --location LOCATION_ID` | Compare managed Firestore database settings, backups, indexes, and TTL policies with the checked-in production contract.              |
+| `npm run check:production-qualification`                                           | Render the private production overlay and reject edge exposure or trusted client forwarding headers.                                  |
+| `scripts/gcp-rehearsal.sh status`                                                  | Inspect only the label-gated ephemeral GKE rehearsal and verify its Kubernetes surface remains private.                               |
+| `scripts/gcp-rehearsal.sh destroy-cluster`                                         | Delete only the identity- and label-gated ephemeral GKE rehearsal cluster.                                                            |
 
 After code changes, run `npm run local:up` again. Bazel reuses unchanged actions
 and OCI layers, then k3d receives the rebuilt archives before the deployments
@@ -171,18 +233,19 @@ the pnpm dependency model; `package-lock.json` remains checked in for the fast
 non-Bazel loop. When `package.json` changes, update both lockfiles:
 
 ```bash
+set -euo pipefail
 npm install
 npx --yes pnpm@10.15.1 import
 ```
 
-| Target | Output |
-| --- | --- |
+| Target                                                                                                                   | Output                                                                                                                 |
+| ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
 | `//:api`, `//:bootstrap`, `//:ingest`, `//:materializer`, `//:live_gateway`, `//:static_server`, `//:moderation_adapter` | Node 24 ESM application bundles; external npm packages are supplied through hermetic `rules_js` runfiles in the images |
-| `//:web_dist` | Vite production directory built from declared Bazel inputs |
-| `//images:api_index` | Linux AMD64 and ARM64 control-API image index |
-| `//images:event_plane_index` | Linux AMD64 and ARM64 event-plane image index |
-| `//images:web_index` | Linux AMD64 and ARM64 web image index |
-| `//images:*_arm64_archive`, `//images:*_amd64_archive` | Single-architecture archives for k3d import |
+| `//:web_dist`                                                                                                            | Vite production directory built from declared Bazel inputs                                                             |
+| `//images:api_index`                                                                                                     | Linux AMD64 and ARM64 control-API image index                                                                          |
+| `//images:event_plane_index`                                                                                             | Linux AMD64 and ARM64 event-plane image index                                                                          |
+| `//images:web_index`                                                                                                     | Linux AMD64 and ARM64 web image index                                                                                  |
+| `//images:*_arm64_archive`, `//images:*_amd64_archive`                                                                   | Single-architecture archives for k3d import                                                                            |
 
 The images are assembled by `rules_oci` from Bazel-generated tar layers on a
 non-root distroless Node base. Docker is still the local provider used by k3d
@@ -190,21 +253,21 @@ to host its Kubernetes nodes; it is not used to construct Meshr images.
 
 ## Local architecture
 
-| Production responsibility | Local implementation | Current status |
-| --- | --- | --- |
-| GKE Autopilot | k3d Kubernetes on isolated Colima | Runnable manifests with explicit requests and limits |
-| GCP external load balancer / Gateway | k3d proxy, K3s service load balancer, and Traefik Ingress on `localhost:8080` | Same-origin path routing; not a Cloud Armor or certificate test |
-| Control API | Existing Meshr Node API with SQLite adapter | One local API replica in k3d; Firestore is exercised by the separate emulator gates, not used as the local control-plane authority |
-| Firestore | Official Firestore emulator | Event outbox, processed-event ledger, topology snapshots, and repository/API recovery tests; not a managed Firestore availability test |
-| Pub/Sub | Official Pub/Sub emulator | Ordered `mesh-events` topic and topology consumer subscription |
-| Agent ingest | `platform/ingest.ts` | Firestore-free Pub/Sub publisher using API-issued, lease-fenced batches; authenticated local injection forwards to the API |
-| Topology materializer | `platform/materializer.ts` | At-least-once consumer with Firestore deduplication and a supervised Pub/Sub subscription that reconnects after terminal stream closure |
-| Topology stream | `platform/liveGateway.ts` | Firestore watch, WebSocket heartbeat, initial snapshot and updates |
-| Identity Platform | Development verifier and local account/session implementation | Functional local substitute; deployed token exchange uses Google Cloud Identity Platform |
-| Secret Manager | Kubernetes Secret | Local-only token; never reuse in a deployed environment |
-| Artifact Registry | Bazel OCI archives imported directly into k3d | Same image graph, but no registry push or image-signing test |
-| Trace retention | Firestore `event_audit` / moderation trace collections with TTL | Production keeps `event_audit` and notification outbox state in dedicated worker databases; raw delivery/moderation traces are bounded to 30 days and an object-storage archive is intentionally outside the launch footprint |
-| Crossplane and Flux | Not installed in the runtime path yet | Local stack proves workloads/data plane, not managed-resource reconciliation |
+| Production responsibility            | Local implementation                                                          | Current status                                                                                                                                                                                                                |
+| ------------------------------------ | ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GKE Autopilot                        | k3d Kubernetes on isolated Colima                                             | Runnable manifests with explicit requests and limits                                                                                                                                                                          |
+| GCP external load balancer / Gateway | k3d proxy, K3s service load balancer, and Traefik Ingress on `localhost:8080` | Same-origin path routing; not a Cloud Armor or certificate test                                                                                                                                                               |
+| Control API                          | Existing Meshr Node API with SQLite adapter                                   | One local API replica in k3d; Firestore is exercised by the separate emulator gates, not used as the local control-plane authority                                                                                            |
+| Firestore                            | Official Firestore emulator                                                   | Event outbox, processed-event ledger, topology snapshots, and repository/API recovery tests; not a managed Firestore availability test                                                                                        |
+| Pub/Sub                              | Official Pub/Sub emulator                                                     | Ordered `mesh-events` topic and topology consumer subscription                                                                                                                                                                |
+| Agent ingest                         | `platform/ingest.ts`                                                          | Firestore-free Pub/Sub publisher using API-issued, lease-fenced batches; authenticated local injection forwards to the API                                                                                                    |
+| Topology materializer                | `platform/materializer.ts`                                                    | At-least-once consumer with Firestore deduplication and a supervised Pub/Sub subscription that reconnects after terminal stream closure                                                                                       |
+| Topology stream                      | `platform/liveGateway.ts`                                                     | Firestore watch, WebSocket heartbeat, initial snapshot and updates                                                                                                                                                            |
+| Identity Platform                    | Development verifier and local account/session implementation                 | Functional local substitute; deployed token exchange uses Google Cloud Identity Platform                                                                                                                                      |
+| Secret Manager                       | Kubernetes Secret                                                             | Local-only token; never reuse in a deployed environment                                                                                                                                                                       |
+| Artifact Registry                    | Bazel OCI archives imported directly into k3d                                 | Same image graph, but no registry push or image-signing test                                                                                                                                                                  |
+| Trace retention                      | Firestore `event_audit` / moderation trace collections with TTL               | Production keeps `event_audit` and notification outbox state in dedicated worker databases; raw delivery/moderation traces are bounded to 30 days and an object-storage archive is intentionally outside the launch footprint |
+| Crossplane and Flux                  | Not installed in the runtime path yet                                         | Local stack proves workloads/data plane, not managed-resource reconciliation                                                                                                                                                  |
 
 The honest storage boundary matters: in production, Firestore is authoritative
 for identities, sessions, bindings, meshes, memberships, posts, idempotency,
@@ -238,6 +301,7 @@ ingest and topology-materializer processes. Set `FIRESTORE_EMULATOR_HOST` and
 `PUBSUB_EMULATOR_HOST` (the CI job uses ports `8081` and `8085`) and run:
 
 ```bash
+set -euo pipefail
 npm run test:event-plane
 ```
 
@@ -269,6 +333,7 @@ Firestore and Pub/Sub emulator ports are cluster-internal. Use port-forwarding
 only for diagnosis:
 
 ```bash
+set -euo pipefail
 kubectl -n meshr-local port-forward service/firestore 8082:8080
 kubectl -n meshr-local port-forward service/pubsub 8085:8085
 ```
@@ -303,6 +368,7 @@ retry that omitted it does not become a false `event_id_conflict`.
 ## Verification before handing off a change
 
 ```bash
+set -euo pipefail
 npm test
 npm run typecheck
 npm run build
@@ -329,6 +395,7 @@ source of truth for those boundaries.
 Check workload state and logs first:
 
 ```bash
+set -euo pipefail
 npm run local:status
 npm run local:logs
 ```
@@ -336,6 +403,7 @@ npm run local:logs
 Confirm the isolated runtime rather than changing the default Docker context:
 
 ```bash
+set -euo pipefail
 colima status --profile meshr-local
 docker context use colima-meshr-local
 docker info

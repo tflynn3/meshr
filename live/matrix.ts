@@ -79,12 +79,69 @@ interface SelectedRuntime {
 const errorText = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
+export function phaseOutputSchema(
+  traceId: string,
+  phase: LivePhase,
+): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      traceId: { type: "string", enum: [traceId] },
+      action: {
+        type: "string",
+        enum: [phase === "root" ? "root_published" : "reply_published"],
+      },
+    },
+    required: ["traceId", "action"],
+  };
+}
+
+export function managedBodyOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      body: { type: "string", minLength: 1, maxLength: 500 },
+    },
+    required: ["body"],
+  };
+}
+
+async function prepareIsolatedInvocation(input: {
+  temporaryDirectory: string;
+  runtime: "codex" | "claude";
+  phase: LivePhase;
+  outputSchema: Record<string, unknown>;
+}): Promise<{ workingDirectory: string; outputSchemaPath: string }> {
+  // Keep both the subprocess cwd and Codex's declared workspace empty. The
+  // schema lives beside it so the model cannot inspect it through workspace
+  // file tools even if a future host regresses its tool filtering.
+  const workingDirectory = await mkdtemp(
+    join(
+      input.temporaryDirectory,
+      `${phaseShellName(input.runtime, input.phase)}-workspace-`,
+    ),
+  );
+  const outputSchemaPath = join(
+    input.temporaryDirectory,
+    `${phaseShellName(input.runtime, input.phase)}-output.schema.json`,
+  );
+  await writeFile(
+    outputSchemaPath,
+    `${JSON.stringify(input.outputSchema, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+  return { workingDirectory, outputSchemaPath };
+}
+
 function phaseShellName(runtime: LiveRuntime, phase: LivePhase): string {
   return `${runtime}-${phase}`;
 }
 
 async function prepareProcessInvocation(input: {
   runtime: "codex" | "claude";
+  traceId: string;
   binding: ConnectorBinding;
   prompt: string;
   options: LiveMatrixOptions;
@@ -92,11 +149,19 @@ async function prepareProcessInvocation(input: {
   temporaryDirectory: string;
   phase: LivePhase;
 }): Promise<PreparedInvocation> {
+  const outputSchema = phaseOutputSchema(input.traceId, input.phase);
+  const isolation = await prepareIsolatedInvocation({
+    temporaryDirectory: input.temporaryDirectory,
+    runtime: input.runtime,
+    phase: input.phase,
+    outputSchema,
+  });
   let invocation: ProcessInvocation;
   if (input.runtime === "codex") {
     invocation = buildCodexInvocation({
       executable: input.options.commands.codex,
       projectRoot: input.options.projectRoot,
+      workingDirectory: isolation.workingDirectory,
       stateDirectory: input.stateDirectory,
       binding: input.binding,
       prompt: input.prompt,
@@ -104,6 +169,7 @@ async function prepareProcessInvocation(input: {
         input.temporaryDirectory,
         `${phaseShellName(input.runtime, input.phase)}-last-message.json`,
       ),
+      outputSchemaPath: isolation.outputSchemaPath,
       model: input.options.models.codex,
     });
   } else {
@@ -126,9 +192,11 @@ async function prepareProcessInvocation(input: {
     );
     invocation = buildClaudeInvocation({
       executable: input.options.commands.claude,
+      workingDirectory: isolation.workingDirectory,
       prompt: input.prompt,
       mcpConfigPath: configPath,
       budgetUsd: input.options.claudeBudgetUsd,
+      outputSchema,
       model: input.options.models.claude,
     });
   }
@@ -146,21 +214,28 @@ async function prepareProcessInvocation(input: {
   };
 }
 
-function prepareManagedCodexInvocation(input: {
+async function prepareManagedCodexInvocation(input: {
   prompt: string;
   options: LiveMatrixOptions;
   temporaryDirectory: string;
   phase: LivePhase;
-}): PreparedManagedInvocation {
+}): Promise<PreparedManagedInvocation> {
+  const isolation = await prepareIsolatedInvocation({
+    temporaryDirectory: input.temporaryDirectory,
+    runtime: "codex",
+    phase: input.phase,
+    outputSchema: managedBodyOutputSchema(),
+  });
   const outputPath = join(
     input.temporaryDirectory,
     `${phaseShellName("codex", input.phase)}-managed-last-message.json`,
   );
   const invocation = buildManagedCodexInvocation({
     executable: input.options.commands.codex,
-    projectRoot: input.options.projectRoot,
+    workingDirectory: isolation.workingDirectory,
     prompt: input.prompt,
     outputPath,
+    outputSchemaPath: isolation.outputSchemaPath,
     model: input.options.models.codex,
   });
   const redacted = redactInvocation(invocation, input.prompt);
@@ -289,13 +364,13 @@ async function plannedPhases(input: {
       },
       recentPosts: [],
     });
-    const rootInvocation = prepareManagedCodexInvocation({
+    const rootInvocation = await prepareManagedCodexInvocation({
       prompt: rootPromptPlan.prompt,
       options: input.options,
       temporaryDirectory: input.temporaryDirectory,
       phase: "root",
     });
-    const replyInvocation = prepareManagedCodexInvocation({
+    const replyInvocation = await prepareManagedCodexInvocation({
       prompt: replyPromptPlan.prompt,
       options: input.options,
       temporaryDirectory: input.temporaryDirectory,
@@ -348,6 +423,7 @@ async function plannedPhases(input: {
   }
   const rootInvocation = await prepareProcessInvocation({
     runtime: input.runtime,
+    traceId: input.traceId,
     binding: input.bindings[0],
     prompt: root,
     options: input.options,
@@ -357,6 +433,7 @@ async function plannedPhases(input: {
   });
   const replyInvocation = await prepareProcessInvocation({
     runtime: input.runtime,
+    traceId: input.traceId,
     binding: input.bindings[1],
     prompt: reply,
     options: input.options,
@@ -406,7 +483,7 @@ async function runManagedCodexRuntime(input: {
       topic: context.topic,
       recentPosts: context.posts,
     });
-    const prepared = prepareManagedCodexInvocation({
+    const prepared = await prepareManagedCodexInvocation({
       prompt: managedPrompt.prompt,
       options: input.options,
       temporaryDirectory: input.temporaryDirectory,
@@ -422,7 +499,6 @@ async function runManagedCodexRuntime(input: {
     rootPhase.managedContext = managedPrompt.contextEvidence;
     rootPhase.execution = await runProcess({
       ...prepared.invocation,
-      cwd: input.options.projectRoot,
       timeoutMs: input.options.timeoutMs,
       env: managedCodexEnvironment(process.env),
     });
@@ -516,7 +592,7 @@ async function runManagedCodexRuntime(input: {
       rootPost: observedRoot,
       recentPosts: context.posts,
     });
-    const prepared = prepareManagedCodexInvocation({
+    const prepared = await prepareManagedCodexInvocation({
       prompt: managedPrompt.prompt,
       options: input.options,
       temporaryDirectory: input.temporaryDirectory,
@@ -532,7 +608,6 @@ async function runManagedCodexRuntime(input: {
     replyPhase.managedContext = managedPrompt.contextEvidence;
     replyPhase.execution = await runProcess({
       ...prepared.invocation,
-      cwd: input.options.projectRoot,
       timeoutMs: input.options.timeoutMs,
       env: managedCodexEnvironment(process.env),
     });
@@ -643,6 +718,7 @@ async function runCliRuntime(input: {
   const rootText = rootPrompt(input.traceId, rootTarget);
   const preparedRoot = await prepareProcessInvocation({
     runtime: input.runtime,
+    traceId: input.traceId,
     binding: input.bindings[0],
     prompt: rootText,
     options: input.options,
@@ -659,7 +735,6 @@ async function runCliRuntime(input: {
   });
   rootPhase.execution = await runProcess({
     ...preparedRoot.invocation,
-    cwd: input.options.projectRoot,
     timeoutMs: input.options.timeoutMs,
   });
   const rootHostExitedAt = new Date().toISOString();
@@ -755,6 +830,7 @@ async function runCliRuntime(input: {
   });
   const preparedReply = await prepareProcessInvocation({
     runtime: input.runtime,
+    traceId: input.traceId,
     binding: input.bindings[1],
     prompt: replyText,
     options: input.options,
@@ -771,7 +847,6 @@ async function runCliRuntime(input: {
   });
   replyPhase.execution = await runProcess({
     ...preparedReply.invocation,
-    cwd: input.options.projectRoot,
     timeoutMs: input.options.timeoutMs,
   });
   const replyHostExitedAt = new Date().toISOString();

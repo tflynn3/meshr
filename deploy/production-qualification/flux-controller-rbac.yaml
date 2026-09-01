@@ -1,0 +1,93 @@
+# Flux controllers are intentionally confined to flux-system plus the explicit
+# workload RoleBinding in flux-bootstrap.yaml. The operator, not a controller,
+# owns CRDs and cluster-scoped policy.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: source-controller
+  namespace: flux-system
+rules:
+  - apiGroups: [source.toolkit.fluxcd.io]
+    resources:
+      - buckets
+      - externalartifacts
+      - gitrepositories
+      - helmcharts
+      - helmrepositories
+      - ocirepositories
+      - buckets/status
+      - externalartifacts/status
+      - gitrepositories/status
+      - helmcharts/status
+      - helmrepositories/status
+      - ocirepositories/status
+      - buckets/finalizers
+      - externalartifacts/finalizers
+      - gitrepositories/finalizers
+      - helmcharts/finalizers
+      - helmrepositories/finalizers
+      - ocirepositories/finalizers
+    verbs: [get, list, watch, update, patch]
+  - apiGroups: ['']
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: source-controller
+  namespace: flux-system
+subjects:
+  - kind: ServiceAccount
+    name: source-controller
+    namespace: flux-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: source-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kustomize-controller
+  namespace: flux-system
+rules:
+  - apiGroups: [kustomize.toolkit.fluxcd.io]
+    resources:
+      - kustomizations
+      - kustomizations/status
+      - kustomizations/finalizers
+    verbs: [get, list, watch, update, patch]
+  - apiGroups: [source.toolkit.fluxcd.io]
+    resources:
+      - buckets
+      - externalartifacts
+      - gitrepositories
+      - ocirepositories
+    verbs: [get, list, watch]
+  - apiGroups: ['']
+    resources: [configmaps]
+    verbs: [get]
+  - apiGroups: ['']
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kustomize-controller
+  namespace: flux-system
+subjects:
+  - kind: ServiceAccount
+    name: kustomize-controller
+    namespace: flux-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kustomize-controller

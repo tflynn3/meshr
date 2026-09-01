@@ -20,8 +20,10 @@ data:
   MESHR_CUTOVER_VALIDATION_BINDING_ID: validation-binding-id
   MESHR_CUTOVER_VALIDATION_AGENT_ID: validation-agent-id
   MESHR_CUTOVER_VALIDATION_SESSION_ID: validation-session-id
-  MESHR_MODERATION_ENDPOINT: https://moderation.example.invalid/screen
-  MESHR_MODERATION_HEALTHCHECK_URL: https://moderation.example.invalid/healthz
-  MESHR_MODERATION_AUDIENCE: https://moderation.example.invalid
-  MESHR_RELEASE_SHA: RELEASE_SHA
+  MESHR_MODERATION_ENDPOINT: https://r-0123456789abcd---meshr-moderation-adapter-canary-000000000000.us-central1.run.app/screen
+  MESHR_MODERATION_HEALTHCHECK_URL: https://r-0123456789abcd---meshr-moderation-adapter-canary-000000000000.us-central1.run.app/healthz
+  MESHR_MODERATION_AUDIENCE: https://meshr-moderation-adapter-canary-000000000000.us-central1.run.app
+  MESHR_MODERATION_RELEASE_SHA: 0123456789abcdef0123456789abcdef01234567
+  MESHR_MODERATION_REVISION_TAG: r-0123456789abcd
+  MESHR_RELEASE_SHA: 0123456789abcdef0123456789abcdef01234567
   MESHR_COST_PROTECTION_MODE: normal

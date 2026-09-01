@@ -36,59 +36,48 @@ local/emulator evidence from the managed-project launch gates.
 
 ## Release controls
 
-Production promotion is never chained from a push to `main`. For the hosted
-service, the public repository verifies source while the private
-`tflynn3/meshr-ops` workflow accepts only an exact, green commit at the tip of
-protected public `main`. The no-public-surface rehearsal builds, signs,
-deploys, exercises, and tears down that exact commit from the private workflow.
-Hosted canary and production remain manual protected-environment actions.
+Production promotion is never chained from a push to `main`. On a protected
+`main` push, public CI verifies source and, when
+`MESHR_MANAGED_BUILD_ENABLED=true`, may build each image for exactly
+`linux/amd64` and `linux/arm64` with an SBOM and maximum SLSA v1 provenance.
+Before any publication, CI authenticates, verifies the repository's
+immutable-tag setting, and proves all four source-SHA tags are absent. A prior
+complete or partial tag set fails closed and requires a newly reviewed source
+revision; the receipt binds the exact successful run attempt.
+The gcloud and Cosign executables are downloaded at exact versions and checked
+against repository-pinned SHA-256 values before the first cloud authentication;
+Buildx, BuildKit, binfmt, and Trivy are also version/digest pinned. CI resolves each
+source-SHA tag to an immutable index, verifies and HIGH/CRITICAL-scans all eight
+runnable child manifests, signs each index, re-resolves the tag, verifies the
+exact keyless identity, and uploads a closed machine-readable receipt. The
+receipt hashes and binds every index, child manifest, config, SBOM, SLSA
+statement, exact Dockerfile, builder run, and full public source SHA. The
+moderation-adapter evidence additionally requires its image-baked source-SHA
+environment and OCI-label witnesses. A manual dispatch cannot publish or sign
+managed images.
 
-The public workflow retains build and promotion jobs as a self-hosting
-template, but they are inert unless an operator explicitly sets
-`MESHR_MANAGED_BUILD_ENABLED=true` and `MESHR_HOSTED_RELEASES_ENABLED=true` in
-that repository. The official hosted repository does not set those flags or
-store hosted deploy credentials. The `canary` and `production` release refs
-must be protected against ordinary pushes, force-pushes, and deletion. Canary and
-production use separate environment-scoped GitHub Apps; the workflow mints a
-short-lived installation token in each job from the matching App's private key.
-Store each release App's Client ID alongside its protected environment inputs as
-`MESHR_CANARY_RELEASE_APP_CLIENT_ID` or
-`MESHR_PRODUCTION_RELEASE_APP_CLIENT_ID`; the token action authenticates with
-that Client ID. Retain each numeric App ID and slug in the matching environment
-so the read-only preflight can verify the expected ruleset actor.
-Each branch ruleset must name only its own App integration as an `always`
-bypass actor, and the canary App cannot bypass production protections. The
-`production` GitHub environment must require reviewers and allow deployments
-only from protected branches. Both promotion jobs require distinct one-job
-ephemeral/JIT runner labels (`meshr-canary-jit` and `meshr-production-jit`) in
-addition to the shared fixed-egress label; do not satisfy both labels with one
-persistent runner.
+The public workflow contains no hosted Cloud Run, GKE, Flux, canary, production,
+rollback, or release-ref mutation job and stores no hosted deployment
+credential. The private `tflynn3/meshr-ops` workflow accepts only an exact green
+commit at the tip of protected public `main`, independently verifies the image
+receipt, and owns all hosted staging and promotion transactions. Its promotion
+identity is separate from the public build identity and is limited to the exact
+adapter service, image repository, and runtime service account.
 
-Before the first release, create a repository-installed read-only GitHub App
-for the automated preflight (Administration, Actions, Contents, and Deployments
-read only, plus GitHub's required Metadata read permission).
-Store its numeric ID, Client ID, and slug as repository variables
-`MESHR_PREFLIGHT_APP_ID`, `MESHR_PREFLIGHT_APP_CLIENT_ID`, and
-`MESHR_PREFLIGHT_APP_SLUG`, and its private key as the
-`MESHR_PREFLIGHT_APP_PRIVATE_KEY` repository secret. CI mints a one-job token
-from that App before any deploy or release-write credential. Run the same
-read-only GitHub control preflight locally with an administrator-authenticated
-`gh` session:
+Run the read-only GitHub control preflight locally with an
+administrator-authenticated `gh` session:
 
 ```bash
 npm run check:github-protections
 ```
 
-It verifies branch review/status protection, required environments, release-App
-rulesets, and the Workload Identity/service-account inputs without printing
-secret values or mutating repository settings. Set the two release App IDs and
-slugs in the operator environment when running the check; GitHub does not
-return Actions variable values through its API. The CI preflight App is
-intentionally read-only: GitHub may omit `bypass_actors` from ruleset details
-for that identity. When the output says `bypassActorsReadable: false`, an
-administrator must verify that each branch ruleset names only its matching
-release App as an `always` bypass actor before enabling promotion; the
-automated job does not claim to have proved that field.
+It verifies branch review/status protection, required environments, private
+release-App rulesets, and the Workload Identity/service-account inputs without
+printing secret values or mutating repository settings. Set the private canary
+and production App IDs and slugs in the operator environment when running the
+check; GitHub does not return Actions variable values through its API. If the
+API omits `bypass_actors`, an administrator must verify that each release
+ruleset names only its matching private App before enabling promotion.
 
 The `npm` environment must use custom deployment policies containing only the
 `main` branch and `v*` tags. This protects npm trusted publishing on both the

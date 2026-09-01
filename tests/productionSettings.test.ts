@@ -62,7 +62,7 @@ test("production rejects short or known-placeholder values for every sensitive s
   for (const placeholder of [
     "REPLACE_ME_WITH_A_SECURE_RANDOM_VALUE_NOW",
     "${MESHR_SECRET_FROM_SECRET_MANAGER}",
-    "meshr-local-development-only-placeholder",
+    "meshr-local-placeholder-value",
     "abcabcabcabcabcabcabcabcabcabcabcabc",
   ]) {
     assert.throws(
@@ -108,7 +108,7 @@ test("local startup preserves optional development secret semantics", () => {
     renewalRecoveryPreviousSecret: "short",
     invitationPepper: "meshr-local-invitation-pepper",
     invitationPepperPrevious: "meshr-local-invitation-pepper",
-    internalToken: "meshr-local-development-only",
+    internalToken: "local-test-token",
     moderationAuthorityToken: undefined,
     residentCohortEnabled: false,
   }));

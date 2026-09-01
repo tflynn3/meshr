@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: meshr
+resources:
+  # Reuse the production runtime verbatim, but deliberately omit every edge
+  # object and the Namespace. The private bootstrap must create `meshr`
+  # before the restricted Flux reconciler can apply this path.
+  - ../production/serviceaccounts.yaml
+  - ../production/config.yaml
+  - ../production/secrets.yaml
+  - ../production/bootstrap.yaml
+  - ../production/workloads.yaml
+  - ../production/networkpolicy.yaml
+patches:
+  # This private overlay deliberately has no authenticated Cloudflare edge.
+  # Never trust a client-supplied forwarding header on the direct origin path.
+  - target:
+      version: v1
+      kind: ConfigMap
+      name: meshr-runtime
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: meshr-runtime
+      data:
+        MESHR_TRUST_CLOUDFLARE_CONNECTING_IP: "0"

@@ -2,7 +2,11 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { createHash } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import { createFirestore, eventPlaneConfig } from "./googleClients.ts";
-import { liveCredentialValue, liveSourceAddress } from "./liveConnectionIdentity.ts";
+import {
+  cloudflareEdgeTrustEnabled,
+  liveCredentialValue,
+  liveSourceAddress,
+} from "./liveConnectionIdentity.ts";
 import {
   FIRESTORE_WATCH_RECONNECT_BASE_MS,
   FIRESTORE_WATCH_RECONNECT_MAX_MS,
@@ -27,6 +31,9 @@ const host = process.env.MESHR_HOST?.trim() || "0.0.0.0";
 const apiUrl = (process.env.MESHR_API_URL?.trim() || "http://127.0.0.1:8787").replace(/\/+$/, "");
 const allowAnonymousLocal =
   process.env.MESHR_LOCAL_MODE === "1" && process.env.MESHR_LIVE_ALLOW_ANONYMOUS === "1";
+const trustCloudflareConnectingIp = cloudflareEdgeTrustEnabled(
+  process.env.MESHR_TRUST_CLOUDFLARE_CONNECTING_IP,
+);
 const maxFrameBytes = Math.max(
   16 * 1024,
   Math.min(Number(process.env.MESHR_LIVE_MAX_FRAME_BYTES ?? 256 * 1024), 1024 * 1024),
@@ -137,7 +144,13 @@ function requestIpKey(request: IncomingMessage): string {
   // directly, so accepting it would let a single caller evade the per-IP
   // connection cap by rotating that header.
   const cloudflareAddress = headerValue(request.headers["cf-connecting-ip"])?.trim();
-  return connectionKey(liveSourceAddress(cloudflareAddress, request.socket.remoteAddress));
+  return connectionKey(
+    liveSourceAddress(
+      cloudflareAddress,
+      request.socket.remoteAddress,
+      trustCloudflareConnectingIp,
+    ),
+  );
 }
 
 interface ConnectionReservation {
