@@ -29,6 +29,28 @@ test("Google API quota is charged to the managed target project", () => {
   assert.match(provider, /user_project_override\s*=\s*true/);
 });
 
+test("Identity Platform explicitly disables local sign-in and tenancy", () => {
+  const tofu = read("infra/opentofu/main.tf");
+  const identity = tofu.match(
+    /resource "google_identity_platform_config" "default" \{([\s\S]*?)\n\}\n\nresource "google_apikeys_key"/,
+  )?.[1];
+  assert.ok(identity, "missing Identity Platform project configuration");
+  assert.match(
+    identity,
+    /multi_tenant\s*\{\s*allow_tenants\s*=\s*false\s*\}/,
+  );
+  assert.match(identity, /allow_duplicate_emails\s*=\s*true/);
+  assert.match(
+    identity,
+    /email\s*\{\s*enabled\s*=\s*false\s*password_required\s*=\s*false\s*\}/,
+  );
+  assert.match(
+    identity,
+    /phone_number\s*\{\s*enabled\s*=\s*false\s*test_phone_numbers\s*=\s*\{\}\s*\}/,
+  );
+  assert.doesNotMatch(identity, /anonymous\s*\{/);
+});
+
 test("the launch budget keeps billing-account-only ownership", () => {
   const tofu = read("infra/opentofu/main.tf");
   const budget = tofu.match(
