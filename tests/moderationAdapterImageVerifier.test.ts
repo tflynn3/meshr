@@ -53,7 +53,11 @@ type FixtureMutation =
   | "wrong-dockerfile-directory"
   | "legacy-invocation-id"
   | "missing-build-arg"
+  | "wrong-build-arg"
+  | "extra-build-arg"
   | "missing-root-build-arg"
+  | "wrong-root-build-arg"
+  | "extra-root-build-arg"
   | "unexpected-build-arg"
   | "unexpected-root-build-arg";
 
@@ -157,7 +161,13 @@ function runFixture(
                       ? {}
                       : {
                           args: {
-                            "build-arg:MESHR_MODERATION_RELEASE_SHA": sourceSha,
+                            "build-arg:MESHR_MODERATION_RELEASE_SHA":
+                              mutation === "wrong-build-arg"
+                                ? "b".repeat(40)
+                                : sourceSha,
+                            ...(mutation === "extra-build-arg"
+                              ? { "build-arg:UNREVIEWED": "value" }
+                              : {}),
                           },
                         }
                     : mutation === "unexpected-build-arg"
@@ -174,7 +184,12 @@ function runFixture(
                             ? {}
                             : {
                                 "build-arg:MESHR_MODERATION_RELEASE_SHA":
-                                  sourceSha,
+                                  mutation === "wrong-root-build-arg"
+                                    ? "b".repeat(40)
+                                    : sourceSha,
+                                ...(mutation === "extra-root-build-arg"
+                                  ? { "build-arg:UNREVIEWED": "value" }
+                                  : {}),
                               }
                           : mutation === "unexpected-root-build-arg"
                             ? { "build-arg:UNREVIEWED": "value" }
@@ -559,7 +574,11 @@ test("adapter image verifier rejects broken descriptors, configs, and attestatio
     "wrong-dockerfile-directory",
     "legacy-invocation-id",
     "missing-build-arg",
+    "wrong-build-arg",
+    "extra-build-arg",
     "missing-root-build-arg",
+    "wrong-root-build-arg",
+    "extra-root-build-arg",
   ] as const) {
     const result = runFixture(mutation);
     assert.notEqual(result.status, 0, `${mutation} unexpectedly passed`);
