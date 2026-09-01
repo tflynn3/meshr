@@ -18,7 +18,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: api
-          image: ${API_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${API_IMAGE}${MESHR_YAML_QUOTE}
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef: {name: meshr-runtime}
@@ -28,21 +28,21 @@ spec:
             # Keep the selected databases in the pod template so a protected
             # restore rolls every replica even when the image is unchanged.
             - name: MESHR_FIRESTORE_DATABASE
-              value: ${MESHR_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
-              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_DATABASE_CUTOVER_MODE
-              value: ${MESHR_DATABASE_CUTOVER_MODE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_DATABASE_CUTOVER_MODE}${MESHR_YAML_QUOTE}
             - name: MESHR_CUTOVER_VALIDATION_MESH_ID
-              value: ${MESHR_CUTOVER_VALIDATION_MESH_ID}
+              value: ${MESHR_YAML_QUOTE}${MESHR_CUTOVER_VALIDATION_MESH_ID}${MESHR_YAML_QUOTE}
             - name: MESHR_CUTOVER_VALIDATION_BINDING_ID
-              value: ${MESHR_CUTOVER_VALIDATION_BINDING_ID}
+              value: ${MESHR_YAML_QUOTE}${MESHR_CUTOVER_VALIDATION_BINDING_ID}${MESHR_YAML_QUOTE}
             - name: MESHR_CUTOVER_VALIDATION_AGENT_ID
-              value: ${MESHR_CUTOVER_VALIDATION_AGENT_ID}
+              value: ${MESHR_YAML_QUOTE}${MESHR_CUTOVER_VALIDATION_AGENT_ID}${MESHR_YAML_QUOTE}
             - name: MESHR_CUTOVER_VALIDATION_SESSION_ID
-              value: ${MESHR_CUTOVER_VALIDATION_SESSION_ID}
+              value: ${MESHR_YAML_QUOTE}${MESHR_CUTOVER_VALIDATION_SESSION_ID}${MESHR_YAML_QUOTE}
             - name: MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID
-              value: ${MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID}
+              value: ${MESHR_YAML_QUOTE}${MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID}${MESHR_YAML_QUOTE}
             - name: MESHR_IDENTITY_API_KEY_FILE
               value: /var/run/secrets/meshr/identity-api-key
             - name: MESHR_INTERNAL_TOKEN_FILE
@@ -60,11 +60,16 @@ spec:
             # Explicitly templated so Flux changes to cost protection trigger
             # a Deployment rollout; envFrom alone would leave old pods live.
             - name: MESHR_COST_PROTECTION_MODE
-              value: ${MESHR_COST_PROTECTION_MODE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_COST_PROTECTION_MODE}${MESHR_YAML_QUOTE}
             # Keep the promoted revision in the pod template so a digest-only
             # release or retry rolls API replicas that report /healthz.
             - name: MESHR_RELEASE_SHA
-              value: ${MESHR_RELEASE_SHA}
+              value: ${MESHR_YAML_QUOTE}${MESHR_RELEASE_SHA}${MESHR_YAML_QUOTE}
+            # The API hashes this Downward API UID before exposing a
+            # non-secret health fingerprint used by the multi-replica gate.
+            - name: MESHR_POD_UID
+              valueFrom:
+                fieldRef: {fieldPath: metadata.uid}
           ports: [{name: http, containerPort: 8787}]
           readinessProbe:
             httpGet: {path: /readyz, port: http}
@@ -129,7 +134,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: web
-          image: ${WEB_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${WEB_IMAGE}${MESHR_YAML_QUOTE}
           imagePullPolicy: IfNotPresent
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /web-healthz, port: http}}
@@ -161,7 +166,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: ingest
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           args: ["ingest"]
           env:
             - name: GOOGLE_CLOUD_PROJECT
@@ -221,16 +226,16 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: materializer
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           args: ["materializer", "topology"]
           envFrom: [{configMapRef: {name: meshr-runtime}}]
           env:
             - name: MESHR_FIRESTORE_DATABASE
-              value: ${MESHR_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
-              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID
-              value: ${MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID}
+              value: ${MESHR_YAML_QUOTE}${MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID}${MESHR_YAML_QUOTE}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
@@ -272,7 +277,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: moderation-worker
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           args: ["materializer", "moderation"]
           envFrom: [{configMapRef: {name: meshr-runtime}}]
           # Keep endpoint rotation in the pod template so Flux rolls existing
@@ -280,11 +285,11 @@ spec:
           # belong exclusively to the screening deployment below.
           env:
             - name: MESHR_FIRESTORE_DATABASE
-              value: ${MESHR_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
-              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_MODERATION_FIRESTORE_DATABASE
-              value: ${MESHR_MODERATION_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_MODERATION_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe:
             httpGet: {path: /readyz, port: http}
@@ -315,26 +320,30 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: moderation-screening-worker
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           args: ["materializer", "moderation-screening"]
           envFrom: [{configMapRef: {name: meshr-runtime}}]
           env:
             - name: MESHR_FIRESTORE_DATABASE
-              value: ${MESHR_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
-              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_MODERATION_FIRESTORE_DATABASE
-              value: ${MESHR_MODERATION_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_MODERATION_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_MODERATION_ENDPOINT
-              value: ${MESHR_MODERATION_ENDPOINT}
+              value: ${MESHR_YAML_QUOTE}${MESHR_MODERATION_ENDPOINT}${MESHR_YAML_QUOTE}
             - name: MESHR_MODERATION_HEALTHCHECK_URL
-              value: ${MESHR_MODERATION_HEALTHCHECK_URL}
+              value: ${MESHR_YAML_QUOTE}${MESHR_MODERATION_HEALTHCHECK_URL}${MESHR_YAML_QUOTE}
             - name: MESHR_MODERATION_AUTH
               value: adc
             - name: MESHR_MODERATION_TOKEN_TYPE
               value: id_token
             - name: MESHR_MODERATION_AUDIENCE
-              value: ${MESHR_MODERATION_AUDIENCE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_MODERATION_AUDIENCE}${MESHR_YAML_QUOTE}
+            - name: MESHR_MODERATION_REVISION_TAG
+              value: ${MESHR_YAML_QUOTE}${MESHR_MODERATION_REVISION_TAG}${MESHR_YAML_QUOTE}
+            - name: MESHR_MODERATION_RELEASE_SHA
+              value: ${MESHR_YAML_QUOTE}${MESHR_MODERATION_RELEASE_SHA}${MESHR_YAML_QUOTE}
             - name: MESHR_MODERATION_AUTHORITY_URL
               value: http://api.meshr.svc.cluster.local:8787
             - name: MESHR_MODERATION_AUTHORITY_TOKEN_FILE
@@ -409,16 +418,16 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: audit-worker
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           args: ["materializer", "audit"]
           envFrom: [{configMapRef: {name: meshr-runtime}}]
           env:
             - name: MESHR_FIRESTORE_DATABASE
-              value: ${MESHR_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
-              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_EVENT_AUDIT_FIRESTORE_DATABASE
-              value: ${MESHR_EVENT_AUDIT_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_EVENT_AUDIT_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
@@ -453,16 +462,16 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: notification-worker
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           args: ["materializer", "notifications"]
           envFrom: [{configMapRef: {name: meshr-runtime}}]
           env:
             - name: MESHR_FIRESTORE_DATABASE
-              value: ${MESHR_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
-              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_NOTIFICATIONS_FIRESTORE_DATABASE
-              value: ${MESHR_NOTIFICATIONS_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_NOTIFICATIONS_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
@@ -497,19 +506,19 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: live-gateway
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           args: ["live-gateway"]
           envFrom: [{configMapRef: {name: meshr-runtime}}]
           env:
             - {name: MESHR_PORT, value: "8080"}
             - name: MESHR_FIRESTORE_DATABASE
-              value: ${MESHR_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
-              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             # Explicitly templated so cost-protection changes roll the live
             # gateway instead of leaving an old fan-out mode running.
             - name: MESHR_COST_PROTECTION_MODE
-              value: ${MESHR_COST_PROTECTION_MODE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_COST_PROTECTION_MODE}${MESHR_YAML_QUOTE}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}

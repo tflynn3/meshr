@@ -9,6 +9,18 @@ variable "launch_mode" {
   default     = false
 }
 
+variable "organization_policy_guardrails_enabled" {
+  type        = bool
+  description = "Enforce the five project-level Organization Policy guardrails. Defaults true and may be false only for a non-public qualification apply with launch and both DNS-management flags disabled; public launch requires an organization-backed project and this value true."
+  default     = true
+}
+
+variable "private_moderation_adapter_mode" {
+  type        = bool
+  description = "Explicitly allow a separately reviewed OpenTofu apply to create or advance only the authenticated production moderation adapter while launch_mode=false. DNS, Cloudflare, OAuth, and the canary adapter must remain disabled."
+  default     = false
+}
+
 variable "accept_projection_marker_writer_risk" {
   type        = bool
   description = "Explicit security-owner acceptance that the topology materializer has database-scoped write access and could technically mutate the projection bootstrap marker. Required for launch_mode=true or production DNS management until the marker is moved to a separately restricted attestation service/database."
@@ -48,7 +60,7 @@ variable "cloudflare_origin_secret" {
   nullable    = true
 
   validation {
-    condition = var.cloudflare_origin_secret == null || (
+    condition = var.cloudflare_origin_secret == null ? true : (
       var.cloudflare_origin_secret == trimspace(var.cloudflare_origin_secret) && can(
         regex("^[A-Za-z0-9_-]{32,128}$", var.cloudflare_origin_secret),
       )
@@ -78,7 +90,7 @@ variable "production_image" {
 
 variable "moderation_adapter_image" {
   type        = string
-  description = "Immutable Cloud Run image digest for the Model Armor/Sensitive Data Protection moderation adapter. The adapter must expose authenticated /healthz and /screen endpoints. Required for launch_mode=true; null keeps validation plans resource-free."
+  description = "Immutable Cloud Run image digest for the Model Armor/Sensitive Data Protection moderation adapter. The adapter must expose authenticated /healthz and /screen endpoints. Required for launch_mode=true or private_moderation_adapter_mode=true; null keeps validation plans resource-free."
   default     = null
   nullable    = true
 
@@ -87,6 +99,21 @@ variable "moderation_adapter_image" {
       regex("^.+@sha256:[a-f0-9]{64}$", trimspace(var.moderation_adapter_image)),
     )
     error_message = "moderation_adapter_image must be null or an immutable image reference ending in @sha256:<64 lowercase hex characters>."
+  }
+}
+
+variable "moderation_adapter_source_sha" {
+  type        = string
+  description = "Exact 40-character public source commit whose signed multi-platform image witness resolves moderation_adapter_image. It must be set exactly when a production adapter image is supplied; adapter-free foundation plans leave both null."
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      var.moderation_adapter_source_sha == null ||
+      can(regex("^[a-f0-9]{40}$", var.moderation_adapter_source_sha))
+    )
+    error_message = "moderation_adapter_source_sha must be null or exactly 40 lowercase hexadecimal characters."
   }
 }
 
@@ -104,17 +131,18 @@ variable "moderation_adapter_canary_image" {
   }
 }
 
-variable "moderation_model_armor_template" {
+variable "moderation_adapter_canary_source_sha" {
   type        = string
-  description = "Fully qualified Model Armor template resource used by the moderation adapter. Required for launch_mode=true."
+  description = "Exact 40-character public source commit whose signed multi-platform image witness resolves moderation_adapter_canary_image. It must be set exactly when a canary adapter image is supplied."
   default     = null
   nullable    = true
 
   validation {
-    condition = var.moderation_model_armor_template == null || can(
-      regex("^projects/[A-Za-z0-9][A-Za-z0-9-_.:]{0,99}/locations/[A-Za-z0-9][A-Za-z0-9-_.-]{0,62}/templates/[A-Za-z0-9][A-Za-z0-9-_.-]{0,99}$", trimspace(var.moderation_model_armor_template)),
+    condition = (
+      var.moderation_adapter_canary_source_sha == null ||
+      can(regex("^[a-f0-9]{40}$", var.moderation_adapter_canary_source_sha))
     )
-    error_message = "moderation_model_armor_template must be null or a fully qualified projects/<project>/locations/<location>/templates/<template> resource."
+    error_message = "moderation_adapter_canary_source_sha must be null or exactly 40 lowercase hexadecimal characters."
   }
 }
 
@@ -134,8 +162,8 @@ variable "moderation_model_armor_endpoint" {
 
 variable "moderation_dlp_location" {
   type        = string
-  description = "Sensitive Data Protection processing location used by the moderation adapter."
-  default     = "global"
+  description = "Sensitive Data Protection processing location used by the moderation adapter. It must equal region whenever either adapter is deployed."
+  default     = "us-central1"
   validation {
     condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9-_.-]{0,62}$", trimspace(var.moderation_dlp_location)))
     error_message = "moderation_dlp_location must be a valid Google Cloud location name."
@@ -286,9 +314,9 @@ variable "github_deploy_identity" {
     repository          = string
     repository_id       = string
     repository_owner_id = string
-    workflow_path       = optional(string, ".github/workflows/ci.yml")
+    workflow_path       = string
   })
-  description = "Optional distinct GitHub repository and workflow allowed to deploy canary and production. Null reuses the artifact-build repository identity for self-hosted same-repository deployments."
+  description = "Explicit private GitHub repository identity allowed to promote canary. Required only when launch_mode or a canary adapter digest/source pair enables canary authority; foundation and production-adapter-only plans leave it null. The public build repository is never a deploy fallback."
   default     = null
   nullable    = true
 
@@ -300,7 +328,29 @@ variable "github_deploy_identity" {
       can(regex("^\\.github/workflows/[A-Za-z0-9_./-]+\\.ya?ml$", var.github_deploy_identity.workflow_path)) &&
       !strcontains(var.github_deploy_identity.workflow_path, "..")
     )
-    error_message = "github_deploy_identity must provide OWNER/REPOSITORY, decimal repository and owner IDs, and one YAML workflow below .github/workflows without parent traversal."
+    error_message = "github_deploy_identity must be null when canary authority is disabled, or explicitly provide a private OWNER/REPOSITORY, decimal repository and owner IDs, and one YAML workflow below .github/workflows without parent traversal."
+  }
+}
+
+variable "github_production_deploy_identity" {
+  type = object({
+    repository          = string
+    repository_id       = string
+    repository_owner_id = string
+    workflow_path       = string
+  })
+  description = "Explicit private GitHub repository identity allowed to qualify production. Protected production plans must supply immutable repository and owner IDs plus one exact workflow path."
+  nullable    = false
+
+  validation {
+    condition = (
+      can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", var.github_production_deploy_identity.repository)) &&
+      can(regex("^[0-9]+$", var.github_production_deploy_identity.repository_id)) &&
+      can(regex("^[0-9]+$", var.github_production_deploy_identity.repository_owner_id)) &&
+      can(regex("^\\.github/workflows/[A-Za-z0-9_./-]+\\.ya?ml$", var.github_production_deploy_identity.workflow_path)) &&
+      !strcontains(var.github_production_deploy_identity.workflow_path, "..")
+    )
+    error_message = "github_production_deploy_identity must provide OWNER/REPOSITORY, decimal repository and owner IDs, and one YAML workflow below .github/workflows without parent traversal."
   }
 }
 
@@ -312,8 +362,55 @@ variable "ci_service_account_id" {
 
 variable "ci_deploy_service_account_id" {
   type        = string
-  description = "Stable account ID for the protected GitHub Actions production-deploy identity."
+  description = "Stable account ID for the private production-qualification identity. The legacy variable name does not grant production-promotion authority."
   default     = "meshr-ci-deploy"
+}
+
+variable "connect_gateway_deploy_service_account_email" {
+  type        = string
+  description = "Exact production-qualification service-account email authorized through GKE Connect Gateway. This public stack defines its cloud-side WIF trust; the referenced private workflow and protected apply control executable authority."
+
+  validation {
+    condition = can(regex(
+      "^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$",
+      var.connect_gateway_deploy_service_account_email,
+    ))
+    error_message = "connect_gateway_deploy_service_account_email must be one exact Google service-account email, not a user, group, principal set, or wildcard."
+  }
+}
+
+variable "production_plan_service_account_email" {
+  type        = string
+  description = "Exact existing private-operations meshr-prod-plan GSA allowed to read only the Meshr Artifact Registry repository for the second-stage production image-witness plan. The private stack owns this GSA and its read-only workflow-bound WIF trust."
+  nullable    = false
+
+  validation {
+    condition = (
+      var.production_plan_service_account_email == trimspace(var.production_plan_service_account_email) &&
+      can(regex(
+        "^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$",
+        var.production_plan_service_account_email,
+      ))
+    )
+    error_message = "production_plan_service_account_email must be one exact Google service-account email without whitespace; the stack guard further pins meshr-prod-plan in project_id."
+  }
+}
+
+variable "production_moderation_promotion_service_account_email" {
+  type        = string
+  description = "Exact existing private-operations meshr-ci-promote GSA allowed to update only the production moderation-adapter service, read its exact Artifact Registry repository, and act as only the adapter runtime identity. The private stack owns this GSA and its workflow/ref/environment/manual-dispatch-bound WIF trust."
+  nullable    = false
+
+  validation {
+    condition = (
+      var.production_moderation_promotion_service_account_email == trimspace(var.production_moderation_promotion_service_account_email) &&
+      can(regex(
+        "^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$",
+        var.production_moderation_promotion_service_account_email,
+      ))
+    )
+    error_message = "production_moderation_promotion_service_account_email must be one exact Google service-account email without whitespace; the stack guard further pins meshr-ci-promote in project_id."
+  }
 }
 
 variable "ci_canary_deploy_service_account_id" {
@@ -326,23 +423,4 @@ variable "gke_node_service_account_id" {
   type        = string
   description = "Dedicated least-privilege service account used by GKE Autopilot node VMs to pull Meshr images."
   default     = "meshr-gke-nodes"
-}
-
-variable "gke_control_plane_authorized_cidrs" {
-  type = list(object({
-    cidr_block   = string
-    display_name = string
-  }))
-  description = "Fixed-egress operator or CI CIDRs allowed to reach the GKE control plane. Do not use GitHub-hosted runner ranges or 0.0.0.0/0."
-
-  validation {
-    condition = length(var.gke_control_plane_authorized_cidrs) > 0 && alltrue([
-      for entry in var.gke_control_plane_authorized_cidrs :
-      can(cidrhost(entry.cidr_block, 0)) &&
-      trimspace(entry.display_name) != "" &&
-      entry.cidr_block != "0.0.0.0/0" &&
-      entry.cidr_block != "::/0"
-    ])
-    error_message = "Provide at least one valid fixed-egress CIDR with a display name; 0.0.0.0/0 and ::/0 are not permitted."
-  }
 }

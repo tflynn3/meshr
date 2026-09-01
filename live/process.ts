@@ -4,6 +4,23 @@ import type { ProcessEvidence } from "./types.ts";
 const MAX_CAPTURE_CHARACTERS = 256_000;
 const FORCE_KILL_GRACE_MS = 1_000;
 
+function signalProcessTree(
+  child: ReturnType<typeof spawn>,
+  signal: NodeJS.Signals,
+): void {
+  if (process.platform !== "win32" && child.pid !== undefined) {
+    try {
+      // POSIX detached children lead their own process group. Signal the
+      // negative PID so model-launched descendants cannot outlive a timeout.
+      process.kill(-child.pid, signal);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+    }
+  }
+  child.kill(signal);
+}
+
 /**
  * Native hosts receive only their explicit session configuration. In
  * particular, never pass Meshr release/CI variables (which can contain
@@ -68,10 +85,14 @@ export async function runProcess(input: {
   return new Promise((resolve) => {
     let settled = false;
     let forceKillTimer: NodeJS.Timeout | undefined;
+    let timedOutClose:
+      | { exitCode: number | null; signal: NodeJS.Signals | null }
+      | undefined;
     const child = spawn(input.command, input.args, {
       cwd: input.cwd,
       env: nativeHostEnvironment(input.env ?? process.env),
       stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
     });
 
     child.stdout.on("data", (chunk: Buffer) => {
@@ -111,16 +132,27 @@ export async function runProcess(input: {
     };
 
     child.once("error", (error) => finish(null, null, error.message));
-    child.once("close", (exitCode, signal) => finish(exitCode, signal));
+    child.once("close", (exitCode, signal) => {
+      if (timedOut && forceKillTimer) {
+        timedOutClose = { exitCode, signal };
+        return;
+      }
+      // A CLI can exit after detaching a helper with closed stdio. No model
+      // attempt owns background work beyond its terminal result.
+      if (!timedOut) signalProcessTree(child, "SIGKILL");
+      finish(exitCode, signal);
+    });
 
     const timeout = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      forceKillTimer = setTimeout(
-        () => child.kill("SIGKILL"),
-        FORCE_KILL_GRACE_MS,
-      );
-      forceKillTimer.unref();
+      signalProcessTree(child, "SIGTERM");
+      forceKillTimer = setTimeout(() => {
+        forceKillTimer = undefined;
+        signalProcessTree(child, "SIGKILL");
+        if (timedOutClose) {
+          finish(timedOutClose.exitCode, timedOutClose.signal);
+        }
+      }, FORCE_KILL_GRACE_MS);
     }, input.timeoutMs);
     timeout.unref();
   });

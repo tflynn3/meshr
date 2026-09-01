@@ -15,7 +15,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: ingest
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           args: ["ingest"]
           env:
             - {name: GOOGLE_CLOUD_PROJECT, valueFrom: {configMapKeyRef: {name: meshr-runtime-canary, key: GOOGLE_CLOUD_PROJECT}}}
@@ -71,13 +71,13 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: materializer
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           args: ["materializer", "topology"]
           envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
           env:
-            - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
-            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
-            - {name: MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID, value: "${MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID}"}
+            - {name: MESHR_FIRESTORE_DATABASE, value: '${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}'}
+            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: '${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}'}
+            - {name: MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID, value: '${MESHR_YAML_QUOTE}${MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID}${MESHR_YAML_QUOTE}'}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
@@ -101,18 +101,18 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: moderation-worker
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           args: ["materializer", "moderation"]
           envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
           # Keep the queue database in the pod template. Provider calls belong
           # exclusively to the screening deployment below.
           env:
             - name: MESHR_FIRESTORE_DATABASE
-              value: ${MESHR_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
-              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_MODERATION_FIRESTORE_DATABASE
-              value: ${MESHR_MODERATION_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_MODERATION_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe:
             httpGet: {path: /readyz, port: http}
@@ -143,26 +143,30 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: moderation-screening-worker
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           args: ["materializer", "moderation-screening"]
           envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
           env:
             - name: MESHR_MODERATION_ENDPOINT
-              value: ${MESHR_MODERATION_ENDPOINT}
+              value: ${MESHR_YAML_QUOTE}${MESHR_MODERATION_ENDPOINT}${MESHR_YAML_QUOTE}
             - name: MESHR_FIRESTORE_DATABASE
-              value: ${MESHR_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
-              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_MODERATION_FIRESTORE_DATABASE
-              value: ${MESHR_MODERATION_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_MODERATION_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_MODERATION_HEALTHCHECK_URL
-              value: ${MESHR_MODERATION_HEALTHCHECK_URL}
+              value: ${MESHR_YAML_QUOTE}${MESHR_MODERATION_HEALTHCHECK_URL}${MESHR_YAML_QUOTE}
             - name: MESHR_MODERATION_AUTH
               value: adc
             - name: MESHR_MODERATION_TOKEN_TYPE
               value: id_token
             - name: MESHR_MODERATION_AUDIENCE
-              value: ${MESHR_MODERATION_AUDIENCE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_MODERATION_AUDIENCE}${MESHR_YAML_QUOTE}
+            - name: MESHR_MODERATION_REVISION_TAG
+              value: ${MESHR_YAML_QUOTE}${MESHR_MODERATION_REVISION_TAG}${MESHR_YAML_QUOTE}
+            - name: MESHR_MODERATION_RELEASE_SHA
+              value: ${MESHR_YAML_QUOTE}${MESHR_MODERATION_RELEASE_SHA}${MESHR_YAML_QUOTE}
             - {name: MESHR_MODERATION_AUTHORITY_URL, value: http://api-canary.meshr-canary.svc.cluster.local:8787}
             - {name: MESHR_MODERATION_AUTHORITY_TOKEN_FILE, value: /var/run/secrets/meshr-moderation/moderation-authority-token}
             - name: MESHR_MODERATION_CONCURRENCY
@@ -234,13 +238,13 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: audit-worker
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           args: ["materializer", "audit"]
           envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
           env:
-            - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
-            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
-            - {name: MESHR_EVENT_AUDIT_FIRESTORE_DATABASE, value: "${MESHR_EVENT_AUDIT_FIRESTORE_DATABASE}"}
+            - {name: MESHR_FIRESTORE_DATABASE, value: '${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}'}
+            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: '${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}'}
+            - {name: MESHR_EVENT_AUDIT_FIRESTORE_DATABASE, value: '${MESHR_YAML_QUOTE}${MESHR_EVENT_AUDIT_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}'}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}
@@ -264,13 +268,13 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: notification-worker
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           args: ["materializer", "notifications"]
           envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
           env:
-            - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
-            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
-            - {name: MESHR_NOTIFICATIONS_FIRESTORE_DATABASE, value: "${MESHR_NOTIFICATIONS_FIRESTORE_DATABASE}"}
+            - {name: MESHR_FIRESTORE_DATABASE, value: '${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}'}
+            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: '${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}'}
+            - {name: MESHR_NOTIFICATIONS_FIRESTORE_DATABASE, value: '${MESHR_YAML_QUOTE}${MESHR_NOTIFICATIONS_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}'}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}

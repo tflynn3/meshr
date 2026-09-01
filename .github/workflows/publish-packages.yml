@@ -86,11 +86,15 @@ jobs:
             if (packageJson.engines?.node !== expectedNode) {
               throw new Error(`${directory}/package.json must publish Node range ${expectedNode}`);
             }
-            if (directory === 'integrations/openclaw' && packageJson.peerDependencies?.openclaw !== '>=2026.7.1 <2027') {
+            if (directory === 'integrations/openclaw' && packageJson.peerDependencies?.openclaw !== '>=2026.8.1 <2027') {
               throw new Error('integrations/openclaw/package.json must accept the tested OpenClaw 2026 release line');
             }
           }
           NODE
+      - name: Audit release package dependencies
+        run: |
+          npm audit --audit-level=high --prefix packages/mcp
+          npm audit --audit-level=high --prefix integrations/openclaw
       - name: Install and build @meshr/mcp
         run: npm ci --prefix packages/mcp && npm run build --prefix packages/mcp
       - name: Install and test @meshr/openclaw

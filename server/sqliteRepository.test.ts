@@ -2,6 +2,12 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { MeshrDatabase } from "./database.ts";
+import {
+  MAX_ACTIVITY_PREFERENCES_PER_ACCOUNT,
+  MAX_MESH_DETAIL_MEMBER_ROWS,
+  MAX_MESH_DIRECTORY_ENTRIES,
+  MAX_TOPICS_PER_MESH,
+} from "./repository.ts";
 import { SqliteMeshrRepository } from "./sqliteRepository.ts";
 import type { Clock } from "./types.ts";
 
@@ -186,6 +192,170 @@ test("SQLite adapter matches Firestore transaction boundaries for corrected auth
       now,
     );
 
+    const nativePairingId = "sqlite-native-pairing";
+    const nativeSessionId = "sqlite-native-session";
+    database.sqlite.prepare(
+      `INSERT INTO pairings(
+         id, code, secret_hash, runtime, runtime_label, external_subject,
+         public_key_pem, requested_profile_json, definition_digest, status,
+         owner_account_id, agent_id, created_at, expires_at, claimed_at
+       ) VALUES(?, ?, ?, 'local', ?, ?, ?, NULL, NULL, 'claimed', ?, ?, ?, ?, ?)`,
+    ).run(
+      nativePairingId,
+      "SQLI-TEST",
+      createHash("sha256").update("sqlite-native-secret").digest("hex"),
+      "SQLite native fixture",
+      "sqlite:native",
+      "test-public-key",
+      owner.accountId,
+      agentId,
+      now,
+      "2026-08-28T19:10:00.000Z",
+      now,
+    );
+    database.sqlite.prepare(
+      `INSERT INTO agent_sessions(
+         token_hash, agent_id, pairing_id, created_at, expires_at, last_seen_at,
+         session_id, runtime_kind, status, superseded_by, authority_epoch
+       ) VALUES(?, ?, ?, ?, ?, ?, ?, 'local', 'active', NULL, 1)`,
+    ).run(
+      createHash("sha256").update("sqlite-native-token").digest("hex"),
+      agentId,
+      nativePairingId,
+      now,
+      "2026-08-28T19:10:00.000Z",
+      "2026-08-28T18:10:00.000Z",
+      nativeSessionId,
+    );
+    database.sqlite.prepare(
+      `INSERT INTO agent_authority(agent_id, epoch, authority_kind, session_id, updated_at)
+       VALUES(?, 1, 'native', ?, ?)
+       ON CONFLICT(agent_id) DO UPDATE SET
+         epoch = excluded.epoch, authority_kind = excluded.authority_kind,
+         session_id = excluded.session_id, updated_at = excluded.updated_at`,
+    ).run(agentId, nativeSessionId, "2026-08-28T18:10:00.000Z");
+
+    const invitationTokenHash = createHash("sha256").update("sqlite-cross-mesh-invite").digest("hex");
+    for (const [candidateId, name] of [
+      ["sqlite-invite-source", "SQLite invite source"],
+      ["sqlite-invite-target", "SQLite invite target"],
+    ] as const) {
+      database.sqlite.prepare(
+        `INSERT INTO meshes(
+           id, owner_account_id, name, description, visibility, join_policy,
+           lifecycle, created_at, updated_at
+         ) VALUES(?, ?, ?, '', 'private', 'invite_only', 'active', ?, ?)`,
+      ).run(candidateId, owner.accountId, name, now, now);
+    }
+    database.sqlite.prepare(
+      `INSERT INTO mesh_invitations(
+         id, mesh_id, token_hash, invited_agent_id, created_by_account_id,
+         status, created_at, expires_at, redeemed_at, redeemed_agent_id
+       ) VALUES('sqlite-cross-mesh-invite', 'sqlite-invite-source', ?, ?, ?,
+                'active', ?, '2026-08-28T19:10:00.000Z', NULL, NULL)`,
+    ).run(invitationTokenHash, agentId, owner.accountId, now);
+    await assert.rejects(
+      repository.joinMeshForAgent({
+        meshId: "sqlite-invite-target",
+        agentId,
+        ownerAccountId: owner.accountId,
+        sessionId: nativeSessionId,
+        authorityEpoch: 1,
+        runtimeKind: "local",
+        idempotencyKey: "sqlite-cross-mesh-join",
+        requestId: "sqlite-cross-mesh-request",
+        requestedAt: "2026-08-28T18:10:00.000Z",
+        invitationTokenHash,
+      }),
+      /invitation_invalid/,
+      "an invitation must be bound to the mesh that issued it",
+    );
+    assert.equal(await repository.findMeshAgentMembership("sqlite-invite-target", agentId), null);
+    assert.equal(
+      database.sqlite.prepare("SELECT status FROM mesh_invitations WHERE id = 'sqlite-cross-mesh-invite'")
+        .get()?.status,
+      "active",
+    );
+    database.sqlite.prepare("UPDATE meshes SET join_policy = 'approval' WHERE id = ?")
+      .run(meshId);
+
+    const authoritativeJoin = {
+      meshId,
+      agentId,
+      ownerAccountId: owner.accountId,
+      sessionId: nativeSessionId,
+      authorityEpoch: 1,
+      runtimeKind: "local" as const,
+      idempotencyKey: "sqlite-authoritative-join",
+      requestId: "sqlite-command-join-request",
+      requestedAt: "2026-08-28T18:10:00.000Z",
+    };
+    const pendingJoin = await repository.joinMeshForAgent(authoritativeJoin);
+    assert.equal(pendingJoin.status, "pending");
+    assert.equal(
+      (await repository.findMeshAgentMembership(meshId, agentId))?.attentionPolicy.browse,
+      "public",
+    );
+    database.sqlite.prepare("UPDATE agents SET attention_json = ? WHERE id = ?")
+      .run(JSON.stringify({ browse: "mentions", rootPosts: "draft", replies: "draft" }), agentId);
+    await assert.rejects(
+      repository.joinMeshForAgent(authoritativeJoin),
+      /attention_policy_denied/,
+      "an idempotent replay must not restore join authority after policy withdrawal",
+    );
+    clock.set("2026-08-28T18:10:00.000Z");
+    await assert.rejects(
+      repository.resolveJoinRequest({
+        requestId: authoritativeJoin.requestId,
+        meshId,
+        decision: "approved",
+        resolvedAt: "2026-08-28T18:10:00.000Z",
+        actingAccountId: owner.accountId,
+        humanSessionHash: ownerSessionHash,
+        ...artifact("withdrawn-join-approval", meshId, ownerSessionHash, "2026-08-28T18:10:00.000Z"),
+      }),
+      /attention_policy_denied/,
+      "a steward approval must not complete a join after owner policy withdrawal",
+    );
+    assert.equal((await repository.findJoinRequest(authoritativeJoin.requestId))?.status, "pending");
+    database.sqlite.prepare("UPDATE agents SET attention_json = ? WHERE id = ?")
+      .run(JSON.stringify({ browse: "public", rootPosts: "draft", replies: "draft" }), agentId);
+    database.sqlite.prepare("UPDATE meshes SET join_policy = 'invite_only' WHERE id = ?")
+      .run(meshId);
+    await assert.rejects(
+      repository.resolveJoinRequest({
+        requestId: authoritativeJoin.requestId,
+        meshId,
+        decision: "approved",
+        resolvedAt: "2026-08-28T18:10:00.000Z",
+        actingAccountId: owner.accountId,
+        humanSessionHash: ownerSessionHash,
+        ...artifact("withdrawn-admission-approval", meshId, ownerSessionHash, "2026-08-28T18:10:00.000Z"),
+      }),
+      /mesh_admission_changed/,
+      "a pending approval must not bypass a later invite-only policy",
+    );
+    assert.equal((await repository.findJoinRequest(authoritativeJoin.requestId))?.status, "pending");
+    database.sqlite.prepare(
+      "UPDATE meshes SET join_policy = 'approval', lifecycle = 'archived' WHERE id = ?",
+    ).run(meshId);
+    await assert.rejects(
+      repository.resolveJoinRequest({
+        requestId: authoritativeJoin.requestId,
+        meshId,
+        decision: "approved",
+        resolvedAt: "2026-08-28T18:10:00.000Z",
+        actingAccountId: owner.accountId,
+        humanSessionHash: ownerSessionHash,
+        ...artifact("archived-admission-approval", meshId, ownerSessionHash, "2026-08-28T18:10:00.000Z"),
+      }),
+      /mesh_unavailable/,
+      "an archived mesh must not accept a pending approval",
+    );
+    assert.equal((await repository.findJoinRequest(authoritativeJoin.requestId))?.status, "pending");
+    database.sqlite.prepare("UPDATE meshes SET lifecycle = 'active' WHERE id = ?").run(meshId);
+    clock.set(expiredNow);
+
     // Join authorization uses the repository's current clock, not the
     // request's historical createdAt. The same request succeeds once the
     // clock is moved back inside the live human session.
@@ -223,6 +393,65 @@ test("SQLite adapter matches Firestore transaction boundaries for corrected auth
       1,
     );
 
+    const defaultPreference = await repository.upsertHumanActivityPreference({
+      accountId: owner.accountId,
+      kind: "topic",
+      resourceId: topicId,
+      meshId,
+      watching: false,
+      muted: false,
+      updatedAt: "2026-08-28T18:10:00.000Z",
+      humanSessionHash: ownerSessionHash,
+    });
+    assert.deepEqual(
+      { watching: defaultPreference.watching, muted: defaultPreference.muted },
+      { watching: false, muted: false },
+    );
+    assert.equal((await repository.listHumanActivityPreferences(owner.accountId)).length, 0);
+
+    database.transaction(() => {
+      const insert = database.sqlite.prepare(
+        `INSERT INTO human_activity_preferences(
+           account_id, kind, resource_id, watching, muted, updated_at
+         ) VALUES(?, 'link', ?, 1, 0, ?)`,
+      );
+      for (let index = 0; index < MAX_ACTIVITY_PREFERENCES_PER_ACCOUNT; index += 1) {
+        insert.run(owner.accountId, `traffic:${meshId}:source-${index}:target-${index}`, now);
+      }
+    });
+    await assert.rejects(
+      repository.upsertHumanActivityPreference({
+        accountId: owner.accountId,
+        kind: "link",
+        resourceId: `traffic:${meshId}:new-source:new-target`,
+        meshId,
+        watching: true,
+        updatedAt: "2026-08-28T18:10:00.000Z",
+        humanSessionHash: ownerSessionHash,
+      }),
+      /activity_preference_limit_reached/,
+    );
+    await repository.upsertHumanActivityPreference({
+      accountId: owner.accountId,
+      kind: "link",
+      resourceId: `traffic:${meshId}:source-0:target-0`,
+      meshId,
+      watching: false,
+      muted: false,
+      updatedAt: "2026-08-28T18:10:00.000Z",
+      humanSessionHash: ownerSessionHash,
+    });
+    await repository.upsertHumanActivityPreference({
+      accountId: owner.accountId,
+      kind: "link",
+      resourceId: `traffic:${meshId}:new-source:new-target`,
+      meshId,
+      watching: true,
+      updatedAt: "2026-08-28T18:10:00.000Z",
+      humanSessionHash: ownerSessionHash,
+    });
+    assert.equal((await repository.listHumanActivityPreferences(owner.accountId)).length, 500);
+
     // Page-grant recovery must require both authority fences. A matching
     // grant row alone is not enough to reissue a browser bearer after a
     // response-loss retry.
@@ -247,6 +476,16 @@ test("SQLite adapter matches Firestore transaction boundaries for corrected auth
       .run(pageSessionId, agentId);
     await repository.revokeWebMcpGrants(ownerSessionHash, "2026-08-28T18:10:01.000Z");
     assert.equal(await repository.findActiveWebMcpGrant(ownerSessionHash, agentId), null);
+    const revokedWebMcpEpoch = database.sqlite.prepare(
+      "SELECT epoch FROM webmcp_authority WHERE human_session_hash = ?",
+    ).get(ownerSessionHash)?.epoch;
+    await repository.revokeWebMcpGrants(ownerSessionHash, "2026-08-28T18:10:02.000Z");
+    assert.equal(
+      database.sqlite.prepare(
+        "SELECT epoch FROM webmcp_authority WHERE human_session_hash = ?",
+      ).get(ownerSessionHash)?.epoch,
+      revokedWebMcpEpoch,
+    );
 
     const postId = "sqlite-conformance-post";
     database.sqlite.prepare(
@@ -483,6 +722,478 @@ test("SQLite adapter matches Firestore transaction boundaries for corrected auth
       database.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE id LIKE 'moderation-race-%-audit'")
         .get()?.count,
       1,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("SQLite durable authority commands are semantic no-ops after terminal state", async () => {
+  const now = "2026-08-31T20:00:00.000Z";
+  const later = "2026-08-31T20:01:00.000Z";
+  const clock = new MutableClock(new Date(now));
+  const database = new MeshrDatabase({ path: ":memory:", clock, seed: false });
+  const repository = new SqliteMeshrRepository(database, clock);
+  const sessionHash = createHash("sha256").update("sqlite-noop-owner").digest("hex");
+
+  try {
+    const owner = await repository.createSocialAccount({
+      provider: "google",
+      subject: "sqlite-noop-owner",
+      email: "sqlite-noop@example.test",
+      displayName: "SQLite No-op Owner",
+    });
+    await repository.createHumanSession({
+      tokenHash: sessionHash,
+      accountId: owner.accountId,
+      csrfToken: "sqlite-noop-csrf",
+      createdAt: now,
+      expiresAt: "2026-09-01T08:00:00.000Z",
+      absoluteExpiresAt: "2026-09-07T20:00:00.000Z",
+    });
+    const providerBeforeNoop = database.sqlite.prepare(
+      `SELECT created_at, last_seen_at FROM provider_identities
+       WHERE provider = 'google' AND subject = 'sqlite-noop-owner'`,
+    ).get() as { created_at: string; last_seen_at: string };
+    await repository.linkProvider({
+      accountId: owner.accountId,
+      provider: "google",
+      subject: "sqlite-noop-owner",
+      email: "sqlite-noop@example.test",
+      humanSessionHash: sessionHash,
+      linkedAt: later,
+    });
+    assert.deepEqual(
+      {
+        ...database.sqlite.prepare(
+          `SELECT created_at, last_seen_at FROM provider_identities
+           WHERE provider = 'google' AND subject = 'sqlite-noop-owner'`,
+        ).get(),
+      },
+      { ...providerBeforeNoop },
+    );
+    const meshId = "sqlite-noop-mesh";
+    await repository.createMeshWithOwner({
+      mesh: {
+        meshId,
+        ownerAccountId: owner.accountId,
+        name: "No-op mesh",
+        description: "Durable transition fixture",
+        visibility: "private",
+        admission: "approval",
+        lifecycle: "active",
+        createdAt: now,
+        updatedAt: now,
+        actingAccountId: owner.accountId,
+        humanSessionHash: sessionHash,
+      },
+      topic: {
+        topicId: "sqlite-noop-topic",
+        meshId,
+        name: "general",
+        title: "General",
+        description: "No-op fixture",
+        tags: [],
+        createdAt: now,
+      },
+      agentIds: [],
+    });
+    const agentId = "sqlite-noop-agent";
+    const attention = { browse: "joined", rootPosts: "draft", replies: "draft" };
+    database.sqlite.prepare(
+      `INSERT INTO agents(
+         id, owner_account_id, name, handle, tagline, interests_json,
+         personality, attention_json, runtime, runtime_label, runtime_subject,
+         public_key_pem, definition_digest, created_at, updated_at
+       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      agentId,
+      owner.accountId,
+      "No-op Agent",
+      "sqlite-noop-agent",
+      "Keeps retries quiet",
+      JSON.stringify(["testing"]),
+      "careful",
+      JSON.stringify(attention),
+      "local",
+      "SQLite",
+      "sqlite:no-op",
+      "fixture-public-key",
+      "fixture-digest",
+      now,
+      now,
+    );
+
+    const agentNoop = await repository.upsertAgent({
+      agentId,
+      ownerAccountId: owner.accountId,
+      name: "No-op Agent",
+      handle: "sqlite-noop-agent",
+      tagline: "Keeps retries quiet",
+      interests: ["testing"],
+      personality: "careful",
+      attention,
+      runtime: "local",
+      runtimeLabel: "SQLite",
+      runtimeSubject: "sqlite:no-op",
+      publicKeyPem: "fixture-public-key",
+      definitionDigest: "fixture-digest",
+      createdAt: now,
+      updatedAt: later,
+      expectedUpdatedAt: now,
+      actingAccountId: owner.accountId,
+      humanSessionHash: sessionHash,
+    });
+    assert.deepEqual(agentNoop, { changed: false, updatedAt: now });
+    assert.equal(
+      database.sqlite.prepare("SELECT updated_at FROM agents WHERE id = ?").get(agentId)?.updated_at,
+      now,
+    );
+
+    const governanceNoop = await repository.updateMeshGovernance({
+      meshId,
+      name: "No-op mesh",
+      description: "Durable transition fixture",
+      visibility: "private",
+      admission: "approval",
+      updatedAt: later,
+      actingAccountId: owner.accountId,
+      humanSessionHash: sessionHash,
+      ...artifact("sqlite-governance-noop", meshId, sessionHash, later),
+    });
+    assert.equal(governanceNoop.updatedAt, now);
+    assert.equal(
+      database.sqlite.prepare("SELECT COUNT(*) AS count FROM outbox_events WHERE event_id = ?")
+        .get("sqlite-governance-noop-event")?.count,
+      0,
+    );
+
+    const absentRemoval = await repository.upsertMeshAgentMembership({
+      meshId,
+      agentId,
+      status: "removed",
+      attentionPolicy: {},
+      admissionProvenance: "invite",
+      joinedAt: null,
+      updatedAt: later,
+      actingAccountId: owner.accountId,
+      humanSessionHash: sessionHash,
+      ...artifact("sqlite-absent-removal", meshId, sessionHash, later),
+    });
+    assert.equal(absentRemoval.changed, false);
+    database.sqlite.prepare(
+      `INSERT INTO mesh_agent_memberships(
+         mesh_id, agent_id, status, attention_policy_json,
+         admission_provenance, joined_at, updated_at
+       ) VALUES(?, ?, 'left', ?, 'open', ?, ?)`,
+    ).run(meshId, agentId, JSON.stringify(attention), now, now);
+    const terminalRemoval = await repository.upsertMeshAgentMembership({
+      meshId,
+      agentId,
+      status: "removed",
+      attentionPolicy: {},
+      admissionProvenance: "invite",
+      joinedAt: null,
+      updatedAt: later,
+      actingAccountId: owner.accountId,
+      humanSessionHash: sessionHash,
+      ...artifact("sqlite-terminal-removal", meshId, sessionHash, later),
+    });
+    assert.equal(terminalRemoval.changed, false);
+    const left = database.sqlite.prepare(
+      `SELECT status, attention_policy_json, admission_provenance, updated_at
+       FROM mesh_agent_memberships WHERE mesh_id = ? AND agent_id = ?`,
+    ).get(meshId, agentId) as Record<string, unknown>;
+    assert.deepEqual({ ...left }, {
+      status: "left",
+      attention_policy_json: JSON.stringify(attention),
+      admission_provenance: "open",
+      updated_at: now,
+    });
+
+    database.sqlite.prepare(
+      "UPDATE mesh_agent_memberships SET status = 'pending' WHERE mesh_id = ? AND agent_id = ?",
+    ).run(meshId, agentId);
+    const pendingRemoval = await repository.upsertMeshAgentMembership({
+      meshId,
+      agentId,
+      status: "removed",
+      attentionPolicy: {},
+      admissionProvenance: "invite",
+      joinedAt: null,
+      updatedAt: later,
+      actingAccountId: owner.accountId,
+      humanSessionHash: sessionHash,
+      ...artifact("sqlite-pending-removal", meshId, sessionHash, later),
+    });
+    assert.equal(pendingRemoval.changed, true);
+    const removed = database.sqlite.prepare(
+      `SELECT status, attention_policy_json, admission_provenance, updated_at
+       FROM mesh_agent_memberships WHERE mesh_id = ? AND agent_id = ?`,
+    ).get(meshId, agentId) as Record<string, unknown>;
+    assert.deepEqual({ ...removed }, {
+      status: "removed",
+      attention_policy_json: JSON.stringify(attention),
+      admission_provenance: "open",
+      updated_at: later,
+    });
+
+    const pairingId = "sqlite-noop-pairing";
+    database.sqlite.prepare(
+      `INSERT INTO pairings(
+         id, code, secret_hash, runtime, runtime_label, external_subject,
+         public_key_pem, status, owner_account_id, agent_id, created_at,
+         expires_at, approved_at
+       ) VALUES(?, 'NOOP-PAIR', 'fixture-secret', 'local', 'SQLite',
+                'sqlite:no-op', 'fixture-public-key', 'approved', ?, ?, ?, ?, ?)`,
+    ).run(pairingId, owner.accountId, agentId, now, "2026-09-01T20:00:00.000Z", now);
+    database.sqlite.prepare(
+      `INSERT INTO agent_sessions(
+         token_hash, agent_id, pairing_id, created_at, expires_at, last_seen_at,
+         session_id, runtime_kind, status, superseded_by, authority_epoch
+       ) VALUES('sqlite-noop-token', ?, ?, ?, ?, ?, 'sqlite-noop-session',
+                'local', 'active', NULL, 1)`,
+    ).run(agentId, pairingId, now, "2026-09-01T20:00:00.000Z", now);
+    database.sqlite.prepare(
+      `INSERT INTO webmcp_grants(
+         token_hash, human_session_hash, agent_id, created_at, expires_at,
+         last_used_at, revoked_at, session_id, authority_epoch
+       ) VALUES('sqlite-noop-grant', ?, ?, ?, ?, ?, NULL, 'sqlite-page-session', 2)`,
+    ).run(sessionHash, agentId, now, "2026-09-01T20:00:00.000Z", now);
+
+    const revokeArtifacts = artifact("sqlite-agent-revoke", meshId, sessionHash, later);
+    const revoked = await repository.revokeAgent(
+      agentId,
+      later,
+      revokeArtifacts.event,
+      revokeArtifacts.audit,
+      owner.accountId,
+      sessionHash,
+    );
+    assert.deepEqual(revoked, {
+      changed: true,
+      bindings: 1,
+      sessions: 1,
+      pageGrants: 1,
+      pairings: 1,
+    });
+    const repeated = await repository.revokeAgent(
+      agentId,
+      "2026-08-31T20:02:00.000Z",
+      artifact("sqlite-agent-revoke-repeat", meshId, sessionHash, later).event,
+      artifact("sqlite-agent-revoke-repeat", meshId, sessionHash, later).audit,
+      owner.accountId,
+      sessionHash,
+    );
+    assert.equal(repeated.changed, false);
+    assert.equal(
+      database.sqlite.prepare("SELECT expires_at FROM agent_sessions WHERE session_id = 'sqlite-noop-session'")
+        .get()?.expires_at,
+      later,
+    );
+    assert.equal(
+      database.sqlite.prepare("SELECT revoked_at FROM webmcp_grants WHERE token_hash = 'sqlite-noop-grant'")
+        .get()?.revoked_at,
+      later,
+    );
+    assert.equal(
+      database.sqlite.prepare("SELECT COUNT(*) AS count FROM outbox_events WHERE event_id = ?")
+        .get("sqlite-agent-revoke-repeat-event")?.count,
+      0,
+    );
+
+    const corruptAgentId = "sqlite-corrupt-binding-agent";
+    database.sqlite.prepare(
+      `INSERT INTO agents(
+         id, owner_account_id, name, handle, tagline, interests_json,
+         personality, attention_json, runtime, runtime_label, runtime_subject,
+         public_key_pem, definition_digest, created_at, updated_at
+       ) VALUES(?, ?, 'Corrupt Agent', 'sqlite-corrupt-agent', '', '[]', '', '{}',
+                'local', 'SQLite', 'sqlite:corrupt', 'fixture-key', NULL, ?, ?)`,
+    ).run(corruptAgentId, owner.accountId, now, now);
+    for (const suffix of ["a", "b"]) {
+      database.sqlite.prepare(
+        `INSERT INTO pairings(
+           id, code, secret_hash, runtime, runtime_label, external_subject,
+           public_key_pem, status, owner_account_id, agent_id, created_at,
+           expires_at, approved_at
+         ) VALUES(?, ?, ?, 'local', 'SQLite', 'sqlite:corrupt', 'fixture-key',
+                  'approved', ?, ?, ?, ?, ?)`,
+      ).run(
+        `sqlite-corrupt-pair-${suffix}`,
+        `CORR-${suffix.toUpperCase()}`,
+        `corrupt-secret-${suffix}`,
+        owner.accountId,
+        corruptAgentId,
+        now,
+        "2026-09-01T20:00:00.000Z",
+        now,
+      );
+    }
+    await assert.rejects(
+      repository.revokeAgent(corruptAgentId, later),
+      /agent_authority_corrupt/,
+    );
+    assert.equal(
+      database.sqlite.prepare(
+        `SELECT COUNT(*) AS count FROM pairings
+         WHERE agent_id = ? AND status = 'approved'`,
+      ).get(corruptAgentId)?.count,
+      2,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("SQLite mesh directory reads stay mesh-scoped and mark bounded rosters", async () => {
+  const now = "2026-08-31T20:00:00.000Z";
+  const clock = new MutableClock(new Date(now));
+  const database = new MeshrDatabase({ path: ":memory:", clock, seed: false });
+  const repository = new SqliteMeshrRepository(database, clock);
+  try {
+    const owner = await repository.createSocialAccount({
+      provider: "google",
+      subject: "directory-owner-google",
+      email: "directory-owner@example.test",
+      displayName: "Directory Owner",
+    });
+    const ownerSessionHash = createHash("sha256")
+      .update("directory-owner-session")
+      .digest("hex");
+    await repository.createHumanSession({
+      tokenHash: ownerSessionHash,
+      accountId: owner.accountId,
+      csrfToken: "directory-owner-csrf",
+      createdAt: now,
+      expiresAt: "2026-09-01T20:00:00.000Z",
+      absoluteExpiresAt: "2026-09-01T20:00:00.000Z",
+    });
+    const meshId = "directory-private-mesh";
+    await repository.createMeshWithOwner({
+      mesh: {
+        meshId,
+        ownerAccountId: owner.accountId,
+        name: "Bounded directory",
+        description: "A deliberately oversized local roster",
+        visibility: "private",
+        admission: "invite_only",
+        lifecycle: "active",
+        createdAt: now,
+        updatedAt: now,
+        actingAccountId: owner.accountId,
+        humanSessionHash: ownerSessionHash,
+      },
+      topic: {
+        topicId: "directory-private-topic",
+        meshId,
+        name: "general",
+        title: "General",
+        description: "Directory fixture",
+        tags: [],
+        createdAt: now,
+      },
+      agentIds: [],
+    });
+
+    const insertAgent = database.sqlite.prepare(
+      `INSERT INTO agents(
+         id, owner_account_id, name, handle, tagline, interests_json,
+         personality, attention_json, runtime, runtime_label, runtime_subject,
+         public_key_pem, definition_digest, created_at, updated_at
+       ) VALUES(?, ?, ?, ?, '', '[]', '', ?, 'local', '', ?, '', NULL, ?, ?)`,
+    );
+    const insertMember = database.sqlite.prepare(
+      "INSERT INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)",
+    );
+    database.transaction(() => {
+      for (let index = 0; index <= MAX_MESH_DETAIL_MEMBER_ROWS; index += 1) {
+        const agentId = `directory-agent-${String(index).padStart(4, "0")}`;
+        insertAgent.run(
+          agentId,
+          owner.accountId,
+          `Directory Agent ${index}`,
+          `directory-agent-${index}`,
+          JSON.stringify({
+            browse: "public",
+            rootPosts: "draft",
+            replies: "draft",
+          }),
+          `directory:${index}`,
+          now,
+          now,
+        );
+        insertMember.run(meshId, agentId, now);
+      }
+    });
+
+    const entry = await repository.findMeshDirectoryEntryForAccount(
+      meshId,
+      owner.accountId,
+    );
+    assert.ok(entry);
+    assert.equal(entry.memberAgentIds.length, MAX_MESH_DETAIL_MEMBER_ROWS);
+    assert.equal(entry.truncated, true);
+    assert.deepEqual(
+      (await repository.listMeshDirectoryForAccount(owner.accountId)).map(
+        (candidate) => candidate.mesh.meshId,
+      ),
+      [meshId],
+    );
+
+    const insertPublicMesh = database.sqlite.prepare(
+      `INSERT INTO meshes(
+         id, owner_account_id, name, description, visibility, join_policy,
+         lifecycle, created_at, updated_at
+       ) VALUES(?, ?, ?, '', 'public', 'open', 'active', ?, ?)`,
+    );
+    const insertTopic = database.sqlite.prepare(
+      `INSERT INTO topics(
+         id, mesh_id, name, title, description, tags_json, created_at
+       ) VALUES(?, ?, ?, ?, '', '[]', ?)`,
+    );
+    const publicMeshId = "directory-public-000";
+    database.transaction(() => {
+      for (let index = 0; index <= MAX_MESH_DIRECTORY_ENTRIES; index += 1) {
+        const candidateId = `directory-public-${String(index).padStart(3, "0")}`;
+        insertPublicMesh.run(
+          candidateId,
+          owner.accountId,
+          `Public ${String(index).padStart(3, "0")}`,
+          now,
+          now,
+        );
+      }
+      for (let index = 0; index <= MAX_TOPICS_PER_MESH; index += 1) {
+        const topicId = `directory-topic-${String(index).padStart(3, "0")}`;
+        insertTopic.run(
+          topicId,
+          publicMeshId,
+          `topic-${index}`,
+          `Topic ${String(index).padStart(3, "0")}`,
+          now,
+        );
+      }
+    });
+    const publicMeshes = await repository.listPublicMeshes();
+    assert.equal(publicMeshes.meshes.length, MAX_MESH_DIRECTORY_ENTRIES);
+    assert.equal(publicMeshes.truncated, true);
+    const publicTopics = await repository.listPublicTopics(publicMeshId);
+    assert.equal(publicTopics.topics.length, MAX_TOPICS_PER_MESH);
+    assert.equal(publicTopics.truncated, true);
+
+    const outsider = await repository.createSocialAccount({
+      provider: "github",
+      subject: "directory-outsider-github",
+      email: "directory-outsider@example.test",
+      displayName: "Directory Outsider",
+    });
+    assert.equal(
+      await repository.findMeshDirectoryEntryForAccount(
+        meshId,
+        outsider.accountId,
+      ),
+      null,
     );
   } finally {
     database.close();

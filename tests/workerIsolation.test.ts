@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { test } from "node:test";
 
 const root = new URL("../", import.meta.url);
@@ -147,27 +147,33 @@ test("outbox failure telemetry matches the ingest publisher contract", () => {
   assert.match(tofu, /condition_absent/);
 });
 
-test("protected cutover recovery probes the Gateway web health contract", () => {
+test("public CI has no hosted cutover recovery or deployment authority", () => {
   const workflow = read(".github/workflows/ci.yml");
+  const publicWorkflows = readdirSync(new URL(".github/workflows/", root))
+    .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))
+    .map((name) => read(`.github/workflows/${name}`))
+    .join("\n---\n");
   const productionGateway = read("deploy/production/gateway.yaml");
   const canaryGateway = read("deploy/canary/gateway.yaml");
   const staticServer = read("platform/staticServer.ts");
-  const canaryRecovery = workflow.match(
-    /- name: Confirm canary cutover recovery window([\s\S]*?)(?=\n      - name:|$)/,
-  )?.[1];
-  const productionRecovery = workflow.match(
-    /- name: Confirm production cutover recovery window([\s\S]*?)(?=\n      - name:|$)/,
-  )?.[1];
-
-  for (const [name, section, baseUrl] of [
-    ["canary", canaryRecovery, "MESHR_CANARY_URL"],
-    ["production", productionRecovery, "MESHR_PRODUCTION_URL"],
-  ] as const) {
-    assert.ok(section, `${name} cutover recovery check must remain in the release workflow`);
-    assert.match(section, new RegExp(`\\$\\{${baseUrl}%\\/\\}\\/web-healthz`));
-    assert.match(section, /jq -e '\.ok == true and \.service == "web"'/);
-    assert.doesNotMatch(section, new RegExp(`\\$\\{${baseUrl}%\\/\\}\\/healthz`));
-  }
+  assert.doesNotMatch(workflow, /cutover recovery|GCP_(?:CANARY_)?DEPLOY_/i);
+  assert.doesNotMatch(workflow, /gcloud run|gcloud container/);
+  assert.doesNotMatch(workflow, /^  (?:canary|promote):/m);
+  assert.doesNotMatch(publicWorkflows, /release-transaction\.sh/);
+  assert.doesNotMatch(
+    publicWorkflows,
+    /gcp-rehearsal\.sh\s+(?:create-cluster|deploy|destroy-cluster)\b/,
+  );
+  assert.doesNotMatch(
+    publicWorkflows,
+    /gcloud\s+(?:container\s+clusters\s+(?:create|delete)|run\s+(?:deploy|services\s+(?:update|replace)))/,
+  );
+  assert.doesNotMatch(
+    publicWorkflows,
+    /kubectl\s+(?:apply|create|delete|patch|replace|rollout|set|port-forward)\b/,
+  );
+  assert.doesNotMatch(publicWorkflows, /(?:terraform|tofu)(?:\s+-[^\s]+)*\s+apply\b/);
+  assert.doesNotMatch(publicWorkflows, /environment:\s*(?:gcp-rehearsal|canary|production)\b/);
 
   assert.match(productionGateway, /value: \/\}\}\]\n      backendRefs: \[\{name: web, port: 8080\}\]/);
   assert.match(canaryGateway, /value: \/\}\}\]\n      backendRefs: \[\{name: web-canary, port: 8080\}\]/);

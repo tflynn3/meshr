@@ -1,0 +1,555 @@
+# Apply this manifest only from the private operator path after Flux and the
+# meshr namespace exist. The Connect Gateway identity has no authority to
+# create or modify any object in this file. The restricted kustomize-controller
+# identity is bound directly so it never needs service-account token minting or
+# impersonation authority.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: meshr-production-qualification-reconciler
+  namespace: meshr
+rules:
+  - apiGroups: [""]
+    resources: [serviceaccounts, configmaps, services]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [secrets-store.csi.x-k8s.io]
+    resources: [secretproviderclasses]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: meshr-production-qualification-reconciler
+  namespace: meshr
+subjects:
+  - kind: ServiceAccount
+    name: kustomize-controller
+    namespace: flux-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: meshr-production-qualification-reconciler
+---
+# Hosted automation cannot delete immutable release inputs. The operator sets
+# bounded source (1..64) and ConfigMap (1..192) headroom for this deployment
+# profile and owns capacity review and garbage collection of releases that are
+# neither active nor previous. The quota limits (but cannot prevent) exhaustion
+# by a compromised deploy identity.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: meshr-production-qualification-releases
+  namespace: flux-system
+spec:
+  hard:
+    count/configmaps: "${MESHR_RELEASE_CONFIGMAP_QUOTA}"
+    count/gitrepositories.source.toolkit.fluxcd.io: "${MESHR_RELEASE_SOURCE_QUOTA}"
+    count/kustomizations.kustomize.toolkit.fluxcd.io: "1"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: meshr-production-qualification-source.meshr.social
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    matchPolicy: Equivalent
+    resourceRules:
+      - apiGroups: [source.toolkit.fluxcd.io]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [gitrepositories]
+        scope: Namespaced
+  matchConditions:
+    - name: exact-qualification-source
+      expression: >-
+        object.metadata.namespace == 'flux-system' &&
+        (request.userInfo.username == '${CONNECT_GATEWAY_DEPLOY_SERVICE_ACCOUNT_EMAIL}' ||
+          object.metadata.name.matches(
+            '^meshr-pq-source-[a-f0-9]{40}$'))
+  validations:
+    - expression: >-
+        object.metadata.name.matches('^meshr-pq-source-[a-f0-9]{40}$')
+      message: Qualification sources must use a full-commit release name.
+    - expression: >-
+        object.spec.url == 'https://github.com/tflynn3/meshr.git'
+      message: The qualification source URL is immutable.
+    - expression: >-
+        object.spec.interval == '24h' &&
+        has(object.spec.timeout) && object.spec.timeout == '5m'
+      message: The qualification source timing fields must remain canonical.
+    - expression: >-
+        has(object.spec.provider) && object.spec.provider == 'generic' &&
+        has(object.spec.suspend) && object.spec.suspend == false &&
+        has(object.spec.recurseSubmodules) && object.spec.recurseSubmodules == false
+      message: Provider, suspension, and submodule settings must remain canonical.
+    - expression: >-
+        has(object.spec.ref) &&
+        has(object.spec.ref.branch) && object.spec.ref.branch == 'main' &&
+        has(object.spec.ref.commit) &&
+        object.spec.ref.commit.matches('^[0-9a-f]{40}$') &&
+        object.metadata.name.endsWith(object.spec.ref.commit)
+      message: The qualification source name and protected-main commit must match.
+    - expression: >-
+        !has(object.spec.ref.tag) &&
+        !has(object.spec.ref.semver) &&
+        !has(object.spec.ref.name)
+      message: Tag, SemVer, and arbitrary named refs are forbidden.
+    - expression: >-
+        !has(object.spec.secretRef) &&
+        !has(object.spec.proxySecretRef) &&
+        !has(object.spec.verify) &&
+        !has(object.spec.include) &&
+        !has(object.spec.sparseCheckout)
+      message: Secret, proxy, verification, include, and sparse-checkout inputs are forbidden.
+    - expression: >-
+        !has(object.spec.serviceAccountName) &&
+        !has(object.spec.ignore)
+      message: Noncanonical source identity and ignore fields are forbidden.
+    - expression: >-
+        (!has(object.metadata.annotations) || object.metadata.annotations.size() == 0) &&
+        (!has(object.metadata.labels) || object.metadata.labels.size() == 0) &&
+        (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences.size() == 0) &&
+        (!has(object.metadata.finalizers) ||
+          object.metadata.finalizers.size() == 0 ||
+          object.metadata.finalizers == ['finalizers.fluxcd.io'])
+      message: Qualification source metadata must remain canonical.
+    - expression: >-
+        request.operation == 'CREATE' ||
+        (request.userInfo.username == 'system:serviceaccount:flux-system:source-controller' &&
+          object.spec == oldObject.spec)
+      message: Release sources are create-once; only controller metadata and status may change.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: meshr-production-qualification-source.meshr.social
+spec:
+  policyName: meshr-production-qualification-source.meshr.social
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: flux-system
+---
+# Release substitution maps are create-once objects named by the full public
+# commit. Matching the exact deploy identity as well as the reserved prefixes
+# prevents its namespace-wide create verb from producing arbitrary ConfigMaps.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: meshr-production-qualification-inputs.meshr.social
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    matchPolicy: Equivalent
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [configmaps]
+        scope: Namespaced
+  matchConditions:
+    - name: exact-qualification-inputs
+      expression: >-
+        object.metadata.namespace == 'flux-system' &&
+        (request.userInfo.username == '${CONNECT_GATEWAY_DEPLOY_SERVICE_ACCOUNT_EMAIL}' ||
+          object.metadata.name.matches(
+            '^(meshr-pq-images-[a-f0-9]{40}|meshr-r-[br]-[a-f0-9]{40}-[a-f0-9]{12})$'))
+  validations:
+    - expression: >-
+        object.metadata.name.matches('^meshr-pq-images-[a-f0-9]{40}$') ||
+        object.metadata.name.matches(
+          '^meshr-r-[br]-[a-f0-9]{40}-[a-f0-9]{12}$')
+      message: Qualification inputs must use a full-commit release name.
+    - expression: >-
+        (!has(object.metadata.annotations) || object.metadata.annotations.size() == 0) &&
+        (!has(object.metadata.labels) || object.metadata.labels.size() == 0) &&
+        (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences.size() == 0) &&
+        (!has(object.metadata.finalizers) || object.metadata.finalizers.size() == 0) &&
+        has(object.immutable) && object.immutable == true &&
+        !has(object.binaryData) &&
+        object.data.all(key,
+          object.data[key].size() <= 512 &&
+          !object.data[key].contains('\n') &&
+          !object.data[key].contains('\r'))
+      message: Qualification inputs must be immutable, metadata-free, and single-line.
+    - expression: >-
+        !object.metadata.name.matches('^meshr-pq-images-[a-f0-9]{40}$') ||
+        (object.data.size() == 4 &&
+          ['API_IMAGE', 'EVENT_PLANE_IMAGE', 'MODERATION_ADAPTER_IMAGE', 'WEB_IMAGE']
+            .all(key, key in object.data) &&
+          object.data.API_IMAGE.matches(
+            '^us-central1-docker[.]pkg[.]dev/${GCP_PROJECT_ID}/meshr/api@sha256:[a-f0-9]{64}$') &&
+          object.data.EVENT_PLANE_IMAGE.matches(
+            '^us-central1-docker[.]pkg[.]dev/${GCP_PROJECT_ID}/meshr/event-plane@sha256:[a-f0-9]{64}$') &&
+          object.data.MODERATION_ADAPTER_IMAGE.matches(
+            '^us-central1-docker[.]pkg[.]dev/${GCP_PROJECT_ID}/meshr/moderation-adapter@sha256:[a-f0-9]{64}$') &&
+          object.data.WEB_IMAGE.matches(
+            '^us-central1-docker[.]pkg[.]dev/${GCP_PROJECT_ID}/meshr/web@sha256:[a-f0-9]{64}$'))
+      message: Qualification images must be the four exact regional Meshr digest forms.
+    - expression: >-
+        !object.metadata.name.matches(
+          '^meshr-r-[br]-[a-f0-9]{40}-[a-f0-9]{12}$') ||
+        (object.data.size() == 20 &&
+          [
+            'GCP_PROJECT_ID',
+            'MESHR_FIRESTORE_DATABASE',
+            'MESHR_TOPOLOGY_FIRESTORE_DATABASE',
+            'MESHR_EVENT_AUDIT_FIRESTORE_DATABASE',
+            'MESHR_NOTIFICATIONS_FIRESTORE_DATABASE',
+            'MESHR_MODERATION_FIRESTORE_DATABASE',
+            'MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID',
+            'MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN',
+            'MESHR_DATABASE_CUTOVER_MODE',
+            'MESHR_CUTOVER_VALIDATION_MESH_ID',
+            'MESHR_CUTOVER_VALIDATION_BINDING_ID',
+            'MESHR_CUTOVER_VALIDATION_AGENT_ID',
+            'MESHR_CUTOVER_VALIDATION_SESSION_ID',
+            'MESHR_MODERATION_ENDPOINT',
+            'MESHR_MODERATION_HEALTHCHECK_URL',
+            'MESHR_MODERATION_AUDIENCE',
+            'MESHR_MODERATION_RELEASE_SHA',
+            'MESHR_MODERATION_REVISION_TAG',
+            'MESHR_RELEASE_SHA',
+            'MESHR_COST_PROTECTION_MODE'
+          ].all(key, key in object.data) &&
+          object.data.GCP_PROJECT_ID == '${GCP_PROJECT_ID}' &&
+          object.data.MESHR_FIRESTORE_DATABASE == '${MESHR_FIRESTORE_DATABASE}' &&
+          object.data.MESHR_TOPOLOGY_FIRESTORE_DATABASE == '${MESHR_TOPOLOGY_FIRESTORE_DATABASE}' &&
+          object.data.MESHR_EVENT_AUDIT_FIRESTORE_DATABASE == '${MESHR_EVENT_AUDIT_FIRESTORE_DATABASE}' &&
+          object.data.MESHR_NOTIFICATIONS_FIRESTORE_DATABASE == '${MESHR_NOTIFICATIONS_FIRESTORE_DATABASE}' &&
+          object.data.MESHR_MODERATION_FIRESTORE_DATABASE == '${MESHR_MODERATION_FIRESTORE_DATABASE}' &&
+          [
+            object.data.MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID,
+            object.data.MESHR_CUTOVER_VALIDATION_MESH_ID,
+            object.data.MESHR_CUTOVER_VALIDATION_BINDING_ID,
+            object.data.MESHR_CUTOVER_VALIDATION_AGENT_ID,
+            object.data.MESHR_CUTOVER_VALIDATION_SESSION_ID
+          ].all(value, value.matches('^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$')) &&
+          object.data.MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN.matches('^[01]$') &&
+          object.data.MESHR_DATABASE_CUTOVER_MODE.matches(
+            '^(off|normal|validation)$') &&
+          object.data.MESHR_MODERATION_AUDIENCE == '${MESHR_MODERATION_AUDIENCE}' &&
+          object.data.MESHR_MODERATION_AUDIENCE.matches(
+            '^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?([.][a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*[.]run[.]app$') &&
+          !object.data.MESHR_MODERATION_AUDIENCE.contains('---') &&
+          object.data.MESHR_MODERATION_RELEASE_SHA == object.data.MESHR_RELEASE_SHA &&
+          object.data.MESHR_MODERATION_REVISION_TAG.matches('^r-[a-f0-9]{20}$') &&
+          object.data.MESHR_MODERATION_RELEASE_SHA.startsWith(
+            object.data.MESHR_MODERATION_REVISION_TAG.split('r-')[1]) &&
+          object.data.MESHR_MODERATION_REVISION_TAG.size() + 3 +
+            object.data.MESHR_MODERATION_AUDIENCE.split('https://')[1].split('.')[0].size() <= 63 &&
+          object.data.MESHR_MODERATION_ENDPOINT ==
+            'https://' + object.data.MESHR_MODERATION_REVISION_TAG + '---' +
+              object.data.MESHR_MODERATION_AUDIENCE.split('https://')[1] + '/screen' &&
+          object.data.MESHR_MODERATION_HEALTHCHECK_URL ==
+            'https://' + object.data.MESHR_MODERATION_REVISION_TAG + '---' +
+              object.data.MESHR_MODERATION_AUDIENCE.split('https://')[1] + '/healthz' &&
+          object.data.MESHR_RELEASE_SHA.matches('^[a-f0-9]{40}$') &&
+          object.metadata.name.split('-')[3] == object.data.MESHR_RELEASE_SHA &&
+          ((object.metadata.name.split('-')[2] == 'b' &&
+              object.data.MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID == 'pending' &&
+              object.data.MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN == '1') ||
+            (object.metadata.name.split('-')[2] == 'r' &&
+              object.data.MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID != 'pending' &&
+              object.data.MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN == '0')) &&
+          object.data.MESHR_COST_PROTECTION_MODE.matches(
+            '^(normal|protect|throttle)$'))
+      message: Qualification runtime inputs must bind the exact release-tagged adapter and safe value contract.
+    - expression: request.operation == 'CREATE'
+      message: Qualification release inputs are immutable after creation.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: meshr-production-qualification-inputs.meshr.social
+spec:
+  policyName: meshr-production-qualification-inputs.meshr.social
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: flux-system
+---
+# The qualification Kustomization is immutable except for an atomic switch to
+# another create-once release tuple. The previous tuple remains intact as a
+# durable rollback target; controller updates may change only status/finalizers.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: meshr-production-qualification-reconciliation.meshr.social
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    matchPolicy: Equivalent
+    resourceRules:
+      - apiGroups: [kustomize.toolkit.fluxcd.io]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [kustomizations]
+        scope: Namespaced
+  matchConditions:
+    - name: exact-qualification-reconciliation
+      expression: >-
+        object.metadata.namespace == 'flux-system' &&
+        object.metadata.name == 'meshr-production-qualification'
+  validations:
+    - expression: >-
+        object.spec.interval == '1m' &&
+        object.spec.path == './deploy/production-qualification' &&
+        object.spec.targetNamespace == 'meshr' &&
+        object.spec.prune == true &&
+        has(object.spec.force) && object.spec.force == false &&
+        !has(object.spec.serviceAccountName) &&
+        has(object.spec.suspend) && object.spec.suspend == false &&
+        object.spec.wait == false &&
+        object.spec.timeout == '15m'
+      message: The qualification reconciliation core spec must remain canonical.
+    - expression: >-
+        object.spec.sourceRef.kind == 'GitRepository' &&
+        object.spec.sourceRef.name.matches(
+          '^meshr-pq-source-[a-f0-9]{40}$') &&
+        !has(object.spec.sourceRef.apiVersion) &&
+        !has(object.spec.sourceRef.namespace)
+      message: The qualification source must be one commit-named release object.
+    - expression: >-
+        object.spec.healthChecks.size() == 10 &&
+        object.spec.healthChecks[0].apiVersion == 'batch/v1' &&
+        object.spec.healthChecks[0].kind == 'Job' &&
+        object.spec.healthChecks[0].name == 'production-store-bootstrap' &&
+        object.spec.healthChecks[0].namespace == 'meshr' &&
+        object.spec.healthChecks[1].apiVersion == 'apps/v1' &&
+        object.spec.healthChecks[1].kind == 'Deployment' &&
+        object.spec.healthChecks[1].name == 'api' &&
+        object.spec.healthChecks[1].namespace == 'meshr' &&
+        object.spec.healthChecks[2].apiVersion == 'apps/v1' &&
+        object.spec.healthChecks[2].kind == 'Deployment' &&
+        object.spec.healthChecks[2].name == 'live-gateway' &&
+        object.spec.healthChecks[2].namespace == 'meshr' &&
+        object.spec.healthChecks[3].apiVersion == 'apps/v1' &&
+        object.spec.healthChecks[3].kind == 'Deployment' &&
+        object.spec.healthChecks[3].name == 'web' &&
+        object.spec.healthChecks[3].namespace == 'meshr' &&
+        object.spec.healthChecks[4].apiVersion == 'apps/v1' &&
+        object.spec.healthChecks[4].kind == 'Deployment' &&
+        object.spec.healthChecks[4].name == 'ingest' &&
+        object.spec.healthChecks[4].namespace == 'meshr' &&
+        object.spec.healthChecks[5].apiVersion == 'apps/v1' &&
+        object.spec.healthChecks[5].kind == 'Deployment' &&
+        object.spec.healthChecks[5].name == 'topology-materializer' &&
+        object.spec.healthChecks[5].namespace == 'meshr' &&
+        object.spec.healthChecks[6].apiVersion == 'apps/v1' &&
+        object.spec.healthChecks[6].kind == 'Deployment' &&
+        object.spec.healthChecks[6].name == 'moderation-worker' &&
+        object.spec.healthChecks[6].namespace == 'meshr' &&
+        object.spec.healthChecks[7].apiVersion == 'apps/v1' &&
+        object.spec.healthChecks[7].kind == 'Deployment' &&
+        object.spec.healthChecks[7].name == 'moderation-screening-worker' &&
+        object.spec.healthChecks[7].namespace == 'meshr' &&
+        object.spec.healthChecks[8].apiVersion == 'apps/v1' &&
+        object.spec.healthChecks[8].kind == 'Deployment' &&
+        object.spec.healthChecks[8].name == 'audit-worker' &&
+        object.spec.healthChecks[8].namespace == 'meshr' &&
+        object.spec.healthChecks[9].apiVersion == 'apps/v1' &&
+        object.spec.healthChecks[9].kind == 'Deployment' &&
+        object.spec.healthChecks[9].name == 'notification-worker' &&
+        object.spec.healthChecks[9].namespace == 'meshr'
+      message: The qualification health-check set and order are immutable.
+    - expression: >-
+        has(object.spec.postBuild) &&
+        has(object.spec.postBuild.substitute) &&
+        object.spec.postBuild.substitute.size() == 1 &&
+        object.spec.postBuild.substitute.MESHR_YAML_QUOTE == '"' &&
+        has(object.spec.postBuild.substituteStrategy) &&
+        object.spec.postBuild.substituteStrategy == 'WithVariables' &&
+        object.spec.postBuild.substituteFrom.size() == 2 &&
+        object.spec.postBuild.substituteFrom[0].kind == 'ConfigMap' &&
+        object.spec.postBuild.substituteFrom[0].name.matches(
+          '^meshr-pq-images-[a-f0-9]{40}$') &&
+        has(object.spec.postBuild.substituteFrom[0].optional) &&
+        object.spec.postBuild.substituteFrom[0].optional == false &&
+        object.spec.postBuild.substituteFrom[1].kind == 'ConfigMap' &&
+        object.spec.postBuild.substituteFrom[1].name.matches(
+          '^meshr-r-[br]-[a-f0-9]{40}-[a-f0-9]{12}$') &&
+        has(object.spec.postBuild.substituteFrom[1].optional) &&
+        object.spec.postBuild.substituteFrom[1].optional == false &&
+        object.spec.postBuild.substituteFrom[0].name.endsWith(
+          object.spec.sourceRef.name.split('-')[3])
+      message: Source, image, and runtime references must form one release tuple.
+    - expression: >-
+        !has(object.spec.buildMetadata) &&
+        !has(object.spec.commonMetadata) &&
+        !has(object.spec.components) &&
+        !has(object.spec.decryption) &&
+        !has(object.spec.deletionPolicy) &&
+        !has(object.spec.dependsOn) &&
+        !has(object.spec.healthCheckExprs) &&
+        !has(object.spec.ignore) &&
+        !has(object.spec.ignoreMissingComponents) &&
+        !has(object.spec.images) &&
+        !has(object.spec.kubeConfig) &&
+        !has(object.spec.namePrefix) &&
+        !has(object.spec.nameSuffix) &&
+        !has(object.spec.patches) &&
+        !has(object.spec.retryInterval)
+      message: Alternate reconciliation, mutation, decryption, and remote-cluster inputs are forbidden.
+    - expression: >-
+        has(object.metadata.annotations) &&
+        object.metadata.annotations.size() == 3 &&
+        'meshr.social/active-release-id' in object.metadata.annotations &&
+        'meshr.social/previous-release-id' in object.metadata.annotations &&
+        'meshr.social/transition-kind' in object.metadata.annotations &&
+        object.metadata.annotations['meshr.social/active-release-id'].matches(
+          '^[br]-[a-f0-9]{40}-[a-f0-9]{12}$') &&
+        object.metadata.annotations['meshr.social/previous-release-id'].matches(
+          '^[br]-[a-f0-9]{40}-[a-f0-9]{12}$') &&
+        object.metadata.annotations['meshr.social/transition-kind'] in
+          ['bootstrap', 'forward', 'rollback'] &&
+        object.spec.sourceRef.name.endsWith(
+          object.metadata.annotations['meshr.social/active-release-id'].split('-')[1]) &&
+        object.spec.postBuild.substituteFrom[0].name.endsWith(
+          object.metadata.annotations['meshr.social/active-release-id'].split('-')[1]) &&
+        object.spec.postBuild.substituteFrom[1].name ==
+          'meshr-r-' +
+            object.metadata.annotations['meshr.social/active-release-id'] &&
+        (!has(object.metadata.labels) || object.metadata.labels.size() == 0) &&
+        (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences.size() == 0) &&
+        (!has(object.metadata.finalizers) ||
+          object.metadata.finalizers.size() == 0 ||
+          object.metadata.finalizers == ['finalizers.fluxcd.io'])
+      message: Qualification reconciliation metadata must remain canonical.
+    - expression: >-
+        (request.operation == 'CREATE' &&
+          object.metadata.annotations['meshr.social/active-release-id'].startsWith('b-') &&
+          object.metadata.annotations['meshr.social/previous-release-id'] ==
+            object.metadata.annotations['meshr.social/active-release-id'] &&
+          object.metadata.annotations['meshr.social/transition-kind'] == 'bootstrap') ||
+        (request.userInfo.username == 'system:serviceaccount:flux-system:kustomize-controller' &&
+          object.spec == oldObject.spec &&
+          object.metadata.annotations == oldObject.metadata.annotations) ||
+        (request.userInfo.username == '${CONNECT_GATEWAY_DEPLOY_SERVICE_ACCOUNT_EMAIL}' &&
+          object.metadata.annotations['meshr.social/active-release-id'] !=
+            oldObject.metadata.annotations['meshr.social/active-release-id'] &&
+          (
+            (object.metadata.annotations['meshr.social/active-release-id'] ==
+                oldObject.metadata.annotations['meshr.social/previous-release-id'] &&
+              object.metadata.annotations['meshr.social/active-release-id'].startsWith('r-') &&
+              object.metadata.annotations['meshr.social/previous-release-id'] ==
+                oldObject.metadata.annotations['meshr.social/active-release-id'] &&
+              oldObject.metadata.annotations['meshr.social/transition-kind'] == 'forward' &&
+              object.metadata.annotations['meshr.social/transition-kind'] == 'rollback') ||
+            (object.metadata.annotations['meshr.social/active-release-id'].split('-')[1] !=
+                oldObject.metadata.annotations['meshr.social/active-release-id'].split('-')[1] &&
+              oldObject.metadata.annotations['meshr.social/active-release-id'].startsWith('r-') &&
+              object.metadata.annotations['meshr.social/active-release-id'].startsWith('r-') &&
+              has(oldObject.status) &&
+              has(oldObject.status.observedGeneration) &&
+              oldObject.status.observedGeneration == oldObject.metadata.generation &&
+              has(oldObject.status.conditions) &&
+              oldObject.status.conditions.exists(condition,
+                condition.type == 'Ready' &&
+                condition.status == 'True' &&
+                has(condition.observedGeneration) &&
+                condition.observedGeneration == oldObject.metadata.generation) &&
+              has(oldObject.status.lastAppliedRevision) &&
+              oldObject.status.lastAppliedRevision ==
+                'main@sha1:' +
+                  oldObject.metadata.annotations['meshr.social/active-release-id'].split('-')[1] &&
+              object.metadata.annotations['meshr.social/previous-release-id'] ==
+                oldObject.metadata.annotations['meshr.social/active-release-id'] &&
+              object.metadata.annotations['meshr.social/transition-kind'] == 'forward' &&
+              (oldObject.metadata.annotations['meshr.social/transition-kind'] != 'rollback' ||
+                object.metadata.annotations['meshr.social/active-release-id'].split('-')[1] !=
+                  oldObject.metadata.annotations['meshr.social/previous-release-id'].split('-')[1])) ||
+            (object.metadata.annotations['meshr.social/active-release-id'].split('-')[1] ==
+                oldObject.metadata.annotations['meshr.social/active-release-id'].split('-')[1] &&
+              oldObject.metadata.annotations['meshr.social/active-release-id'].startsWith('b-') &&
+              object.metadata.annotations['meshr.social/active-release-id'].startsWith('r-') &&
+              object.metadata.annotations['meshr.social/previous-release-id'] ==
+                oldObject.metadata.annotations['meshr.social/previous-release-id'] &&
+              oldObject.metadata.annotations['meshr.social/transition-kind'] == 'bootstrap' &&
+              object.metadata.annotations['meshr.social/transition-kind'] == 'bootstrap')
+          ) &&
+          ((!has(object.metadata.labels) && !has(oldObject.metadata.labels)) ||
+            (has(object.metadata.labels) && has(oldObject.metadata.labels) &&
+              object.metadata.labels == oldObject.metadata.labels)) &&
+          ((!has(object.metadata.ownerReferences) && !has(oldObject.metadata.ownerReferences)) ||
+            (has(object.metadata.ownerReferences) && has(oldObject.metadata.ownerReferences) &&
+              object.metadata.ownerReferences == oldObject.metadata.ownerReferences)) &&
+          ((!has(object.metadata.finalizers) && !has(oldObject.metadata.finalizers)) ||
+            (has(object.metadata.finalizers) && has(oldObject.metadata.finalizers) &&
+              object.metadata.finalizers == oldObject.metadata.finalizers)))
+      message: Only the controller or one atomic deploy-identity release switch is allowed.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: meshr-production-qualification-reconciliation.meshr.social
+spec:
+  policyName: meshr-production-qualification-reconciliation.meshr.social
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: flux-system
+---
+# The qualification source intentionally contains ordinary ClusterIP Services,
+# but neither the reconciler nor a compromised release may open a transient
+# public edge while the qualification environment is private. This operator-owned
+# admission boundary applies even if a future controller Role is broadened.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: meshr-production-qualification-private-services.meshr.social
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    matchPolicy: Equivalent
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [services]
+        scope: Namespaced
+  matchConditions:
+    - name: meshr-qualification-namespace
+      expression: object.metadata.namespace == 'meshr'
+  validations:
+    - expression: >-
+        (!has(object.spec.type) || object.spec.type == 'ClusterIP') &&
+        (!has(object.spec.externalIPs) || object.spec.externalIPs.size() == 0) &&
+        !has(object.spec.externalName) &&
+        !has(object.spec.loadBalancerClass) &&
+        (!has(object.spec.allocateLoadBalancerNodePorts) ||
+          object.spec.allocateLoadBalancerNodePorts == false) &&
+        object.spec.ports.all(port,
+          !has(port.nodePort) || port.nodePort == 0)
+      message: Qualification Services must remain private ClusterIP endpoints.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: meshr-production-qualification-private-services.meshr.social
+spec:
+  policyName: meshr-production-qualification-private-services.meshr.social
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: meshr

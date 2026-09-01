@@ -117,8 +117,12 @@ const activeSubscriptions = selectedSubscriptions.map(([consumer, name]) => ({
     })),
   }),
 }));
+const runtimeEnvironment = process.env.MESHR_ENV?.trim().toLowerCase() || "local";
+if (!["local", "development", "test", "production"].includes(runtimeEnvironment)) {
+  throw new Error("MESHR_ENV must be local, development, test, or production.");
+}
 const productionTopologyConsumer =
-  requestedConsumer === "topology" && process.env.MESHR_ENV?.trim().toLowerCase() === "production";
+  requestedConsumer === "topology" && runtimeEnvironment === "production";
 const expectedAuthorityBootstrapId = process.env.MESHR_EXPECTED_AUTHORITY_BOOTSTRAP_ID?.trim();
 // A bootstrap Job attests that every aggregate collection in the selected
 // topology database is empty (or belongs to the current authority generation)
@@ -134,6 +138,8 @@ const moderationTokenType = process.env.MESHR_MODERATION_TOKEN_TYPE?.trim().toLo
   ? "id_token"
   : "access_token";
 const moderationAudience = process.env.MESHR_MODERATION_AUDIENCE?.trim() || "";
+const moderationRevisionTag = process.env.MESHR_MODERATION_REVISION_TAG?.trim() || "";
+const moderationReleaseSha = process.env.MESHR_MODERATION_RELEASE_SHA?.trim() || "";
 const moderationRequired = process.env.MESHR_MODERATION_REQUIRED === "1";
 // Intake can disable its legacy Firestore sweep once the dedicated screening
 // worker is deployed. The screening worker keeps the sweep enabled as a
@@ -142,7 +148,7 @@ const moderationRequired = process.env.MESHR_MODERATION_REQUIRED === "1";
 const moderationSweepFallback = process.env.MESHR_MODERATION_SWEEP_FALLBACK?.trim() !== "0";
 const moderationHealthcheckUrl = process.env.MESHR_MODERATION_HEALTHCHECK_URL?.trim();
 const moderationAuthorityUrl = process.env.MESHR_MODERATION_AUTHORITY_URL?.trim() || "";
-const productionEnvironment = process.env.MESHR_ENV?.trim().toLowerCase() === "production";
+const productionEnvironment = runtimeEnvironment === "production";
 const moderationAuthorityToken = process.env.MESHR_MODERATION_AUTHORITY_TOKEN?.trim() ||
   (!productionEnvironment ? process.env.MESHR_INTERNAL_TOKEN?.trim() || "" : "");
 const moderationAuthorityApiEnabled = Boolean(moderationAuthorityUrl && moderationAuthorityToken);
@@ -182,7 +188,7 @@ if (requestedConsumer === "moderation-screening" && moderationRequired && modera
 let cachedModerationToken: { value: string; expiresAt: number } | undefined;
 
 async function moderationAuthorization(): Promise<string | undefined> {
-  if (moderationToken) return moderationToken;
+  if (moderationAuth === "static") return moderationToken;
   if (moderationAuth !== "adc") return undefined;
   const now = Date.now();
   if (cachedModerationToken && cachedModerationToken.expiresAt > now + 60_000) {
@@ -222,8 +228,10 @@ const moderationReadiness = createModerationReadinessProbe({
   token: moderationToken,
   tokenType: moderationTokenType,
   audience: moderationAudience,
+  revisionTag: moderationRevisionTag,
+  releaseSha: moderationReleaseSha,
   required: moderationRequired,
-  environment: process.env.MESHR_ENV?.trim() || "local",
+  environment: runtimeEnvironment,
   authorization: moderationAuthorization,
 });
 if (requestedConsumer === "moderation-screening" && moderationRequired && moderationReadiness.configError) {

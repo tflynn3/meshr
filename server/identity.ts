@@ -4,7 +4,15 @@ import type { IdentityVerifier, SocialIdentityClaims, SocialProvider } from "./t
 const GOOGLE_CERT_URL =
   "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com";
 const CLOCK_SKEW_SECONDS = 60;
-const certCache = new Map<string, { expiresAt: number; certificates: Record<string, string> }>();
+const UNKNOWN_KEY_REFRESH_COOLDOWN_MS = 60_000;
+interface CertificateSet {
+  expiresAt: number;
+  certificates: Record<string, string>;
+}
+
+const certCache = new Map<string, CertificateSet>();
+let certificateRefresh: Promise<CertificateSet> | undefined;
+let unknownKeyRefreshAllowedAt = 0;
 
 interface IdentityTokenClaims {
   aud?: unknown;
@@ -35,24 +43,66 @@ function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-async function certificates(now = Date.now()): Promise<Record<string, string>> {
+async function refreshCertificates(): Promise<CertificateSet> {
+  if (certificateRefresh) return certificateRefresh;
+  const refresh = (async () => {
+    const response = await fetch(GOOGLE_CERT_URL, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok)
+      throw new Error(`Identity certificate request failed (${response.status}).`);
+    const values = (await response.json()) as unknown;
+    const parsed = record(values);
+    const maxAge = response.headers
+      .get("cache-control")
+      ?.match(/max-age=(\d+)/i)?.[1];
+    const ttl = Math.max(60, Math.min(86_400, Number(maxAge ?? 3_600)));
+    const certificateMap = Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
+    if (Object.keys(certificateMap).length === 0)
+      throw new Error("Identity certificates were empty.");
+    const refreshed = {
+      expiresAt: Date.now() + ttl * 1_000,
+      certificates: certificateMap,
+    };
+    certCache.set(GOOGLE_CERT_URL, refreshed);
+    return refreshed;
+  })();
+  certificateRefresh = refresh;
+  try {
+    return await refresh;
+  } finally {
+    if (certificateRefresh === refresh) certificateRefresh = undefined;
+  }
+}
+
+async function certificates(
+  now = Date.now(),
+): Promise<{ cached: boolean; certificateSet: CertificateSet }> {
   const cached = certCache.get(GOOGLE_CERT_URL);
-  if (cached && cached.expiresAt > now) return cached.certificates;
-  const response = await fetch(GOOGLE_CERT_URL, {
-    headers: { Accept: "application/json" },
-    signal: AbortSignal.timeout(5_000),
-  });
-  if (!response.ok) throw new Error(`Identity certificate request failed (${response.status}).`);
-  const values = (await response.json()) as unknown;
-  const parsed = record(values);
-  const maxAge = response.headers.get("cache-control")?.match(/max-age=(\d+)/i)?.[1];
-  const ttl = Math.max(60, Math.min(86_400, Number(maxAge ?? 3_600)));
-  const certificateMap = Object.fromEntries(
-    Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
-  );
-  if (Object.keys(certificateMap).length === 0) throw new Error("Identity certificates were empty.");
-  certCache.set(GOOGLE_CERT_URL, { expiresAt: now + ttl * 1_000, certificates: certificateMap });
-  return certificateMap;
+  if (cached && cached.expiresAt > now) return { cached: true, certificateSet: cached };
+  return { cached: false, certificateSet: await refreshCertificates() };
+}
+
+async function refreshCachedCertificates(
+  observed: CertificateSet,
+  now = Date.now(),
+): Promise<CertificateSet> {
+  const current = certCache.get(GOOGLE_CERT_URL);
+  // A concurrent verifier already refreshed the snapshot we observed. Reuse it
+  // instead of immediately issuing another cache-bypass request.
+  if (current && current !== observed) return current;
+  // Unknown JWT key ids are attacker-controlled. Share an in-flight refresh,
+  // then enforce a short global cooldown so a stream of random ids cannot turn
+  // login verification into unbounded requests to Google's certificate endpoint.
+  if (certificateRefresh) return certificateRefresh;
+  if (now < unknownKeyRefreshAllowedAt) return current ?? observed;
+  unknownKeyRefreshAllowedAt = now + UNKNOWN_KEY_REFRESH_COOLDOWN_MS;
+  return refreshCertificates();
 }
 
 async function verifyToken(projectId: string, token: string): Promise<IdentityTokenClaims> {
@@ -64,7 +114,11 @@ async function verifyToken(projectId: string, token: string): Promise<IdentityTo
   }
   const payload = record(decodePart(parts[1]!)) as IdentityTokenClaims;
   const signature = Buffer.from(parts[2]!, "base64url");
-  const cert = (await certificates())[header.kid];
+  const snapshot = await certificates();
+  let cert = snapshot.certificateSet.certificates[header.kid];
+  if (!cert && snapshot.cached) {
+    cert = (await refreshCachedCertificates(snapshot.certificateSet)).certificates[header.kid];
+  }
   if (!cert) throw new Error("The identity token signing key is unknown.");
   const verifier = createVerify("RSA-SHA256");
   verifier.update(`${parts[0]}.${parts[1]}`);

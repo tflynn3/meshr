@@ -18,20 +18,20 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: api
-          image: ${API_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${API_IMAGE}${MESHR_YAML_QUOTE}
           imagePullPolicy: IfNotPresent
           envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
           env:
             - {name: MESHR_PORT, value: "8787"}
             # Keep the selected databases in the pod template so a protected
             # restore rolls every replica even when the image is unchanged.
-            - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
-            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
-            - {name: MESHR_DATABASE_CUTOVER_MODE, value: "${MESHR_DATABASE_CUTOVER_MODE}"}
-            - {name: MESHR_CUTOVER_VALIDATION_MESH_ID, value: "${MESHR_CUTOVER_VALIDATION_MESH_ID}"}
-            - {name: MESHR_CUTOVER_VALIDATION_BINDING_ID, value: "${MESHR_CUTOVER_VALIDATION_BINDING_ID}"}
-            - {name: MESHR_CUTOVER_VALIDATION_AGENT_ID, value: "${MESHR_CUTOVER_VALIDATION_AGENT_ID}"}
-            - {name: MESHR_CUTOVER_VALIDATION_SESSION_ID, value: "${MESHR_CUTOVER_VALIDATION_SESSION_ID}"}
+            - {name: MESHR_FIRESTORE_DATABASE, value: '${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}'}
+            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: '${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}'}
+            - {name: MESHR_DATABASE_CUTOVER_MODE, value: '${MESHR_YAML_QUOTE}${MESHR_DATABASE_CUTOVER_MODE}${MESHR_YAML_QUOTE}'}
+            - {name: MESHR_CUTOVER_VALIDATION_MESH_ID, value: '${MESHR_YAML_QUOTE}${MESHR_CUTOVER_VALIDATION_MESH_ID}${MESHR_YAML_QUOTE}'}
+            - {name: MESHR_CUTOVER_VALIDATION_BINDING_ID, value: '${MESHR_YAML_QUOTE}${MESHR_CUTOVER_VALIDATION_BINDING_ID}${MESHR_YAML_QUOTE}'}
+            - {name: MESHR_CUTOVER_VALIDATION_AGENT_ID, value: '${MESHR_YAML_QUOTE}${MESHR_CUTOVER_VALIDATION_AGENT_ID}${MESHR_YAML_QUOTE}'}
+            - {name: MESHR_CUTOVER_VALIDATION_SESSION_ID, value: '${MESHR_YAML_QUOTE}${MESHR_CUTOVER_VALIDATION_SESSION_ID}${MESHR_YAML_QUOTE}'}
             - {name: MESHR_IDENTITY_API_KEY_FILE, value: /var/run/secrets/meshr/identity-api-key}
             - {name: MESHR_INTERNAL_TOKEN_FILE, value: /var/run/secrets/meshr/internal-token}
             - {name: MESHR_MODERATION_AUTHORITY_TOKEN_FILE, value: /var/run/secrets/meshr-moderation/moderation-authority-token}
@@ -40,11 +40,16 @@ spec:
             - {name: MESHR_INVITATION_PEPPER_FILE, value: /var/run/secrets/meshr/invitation-pepper}
             - {name: MESHR_INVITATION_PEPPER_PREVIOUS_FILE, value: /var/run/secrets/meshr/invitation-pepper-previous}
             - name: MESHR_COST_PROTECTION_MODE
-              value: ${MESHR_COST_PROTECTION_MODE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_COST_PROTECTION_MODE}${MESHR_YAML_QUOTE}
             # Keep release evidence aligned with the canary pods after a
             # digest-only promotion or retry.
             - name: MESHR_RELEASE_SHA
-              value: ${MESHR_RELEASE_SHA}
+              value: ${MESHR_YAML_QUOTE}${MESHR_RELEASE_SHA}${MESHR_YAML_QUOTE}
+            # The API hashes this Downward API UID before exposing a
+            # non-secret health fingerprint used by the multi-replica gate.
+            - name: MESHR_POD_UID
+              valueFrom:
+                fieldRef: {fieldPath: metadata.uid}
           ports: [{name: http, containerPort: 8787}]
           readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 5, failureThreshold: 3}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15, periodSeconds: 20}
@@ -97,7 +102,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: web
-          image: ${WEB_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${WEB_IMAGE}${MESHR_YAML_QUOTE}
           imagePullPolicy: IfNotPresent
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /web-healthz, port: http}}
@@ -129,15 +134,15 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: live-gateway
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           imagePullPolicy: IfNotPresent
           args: ["live-gateway"]
           envFrom: [{configMapRef: {name: meshr-runtime-canary}}]
           env:
             - {name: MESHR_PORT, value: "8080"}
-            - {name: MESHR_FIRESTORE_DATABASE, value: "${MESHR_FIRESTORE_DATABASE}"}
-            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: "${MESHR_TOPOLOGY_FIRESTORE_DATABASE}"}
-            - {name: MESHR_COST_PROTECTION_MODE, value: "${MESHR_COST_PROTECTION_MODE}"}
+            - {name: MESHR_FIRESTORE_DATABASE, value: '${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}'}
+            - {name: MESHR_TOPOLOGY_FIRESTORE_DATABASE, value: '${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}'}
+            - {name: MESHR_COST_PROTECTION_MODE, value: '${MESHR_YAML_QUOTE}${MESHR_COST_PROTECTION_MODE}${MESHR_YAML_QUOTE}'}
           ports: [{name: http, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /readyz, port: http}}
           livenessProbe: {httpGet: {path: /healthz, port: http}, initialDelaySeconds: 15}

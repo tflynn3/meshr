@@ -1,0 +1,100 @@
+# Bootstrap these objects through the private operator path only after the
+# admission policy in flux-bootstrap.yaml is active. The main branch constraint
+# proves the exact commit is part of protected public main; commit precedence
+# keeps the source pinned instead of following the moving branch tip.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: meshr-pq-source-${MESHR_PRODUCTION_QUALIFICATION_SHA}
+  namespace: flux-system
+spec:
+  interval: 24h
+  timeout: 5m
+  url: https://github.com/tflynn3/meshr.git
+  provider: generic
+  suspend: false
+  recurseSubmodules: false
+  ref:
+    branch: main
+    commit: "${MESHR_PRODUCTION_QUALIFICATION_SHA}"
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: meshr-production-qualification
+  namespace: flux-system
+  annotations:
+    meshr.social/active-release-id: "${MESHR_PRODUCTION_QUALIFICATION_RELEASE_ID}"
+    meshr.social/previous-release-id: "${MESHR_PRODUCTION_QUALIFICATION_RELEASE_ID}"
+    meshr.social/transition-kind: bootstrap
+spec:
+  interval: 1m
+  path: ./deploy/production-qualification
+  targetNamespace: meshr
+  prune: true
+  force: false
+  # This field is permanently false. Hosted qualification stages immutable,
+  # commit-named inputs, then switches all three references atomically.
+  suspend: false
+  # The topology materializer uses a generation fence that is intentionally
+  # pending until the bootstrap Job is attested by the qualification workflow.
+  wait: false
+  timeout: 15m
+  sourceRef:
+    kind: GitRepository
+    name: meshr-pq-source-${MESHR_PRODUCTION_QUALIFICATION_SHA}
+  healthChecks:
+    - apiVersion: batch/v1
+      kind: Job
+      name: production-store-bootstrap
+      namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: api
+      namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: live-gateway
+      namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: web
+      namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: ingest
+      namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: topology-materializer
+      namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: moderation-worker
+      namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: moderation-screening-worker
+      namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: audit-worker
+      namespace: meshr
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: notification-worker
+      namespace: meshr
+  postBuild:
+    # Kustomize removes ordinary YAML quote style before Flux substitution.
+    # This exact inline value is the Flux-supported string-type wrapper used
+    # by every substitution-bearing string scalar in the workload manifests.
+    substitute:
+      MESHR_YAML_QUOTE: '"'
+    substituteStrategy: WithVariables
+    substituteFrom:
+      - kind: ConfigMap
+        name: meshr-pq-images-${MESHR_PRODUCTION_QUALIFICATION_SHA}
+        optional: false
+      - kind: ConfigMap
+        name: meshr-r-${MESHR_PRODUCTION_QUALIFICATION_RELEASE_ID}
+        optional: false

@@ -50,7 +50,7 @@ export function PairingApproval({ code }: { code: string }) {
   const [loading, setLoading] = useState(true);
   const [approving, setApproving] = useState(false);
   const [error, setError] = useState("");
-  const [acknowledgedAutonomous, setAcknowledgedAutonomous] = useState(false);
+  const [acknowledgedDurableActions, setAcknowledgedDurableActions] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -73,16 +73,21 @@ export function PairingApproval({ code }: { code: string }) {
   }, [load]);
 
   useEffect(() => {
-    setAcknowledgedAutonomous(false);
+    setAcknowledgedDurableActions(false);
   }, [pairing?.id]);
 
   async function approve() {
-    if (!pairing || !session || approving || (autonomousPosting && !acknowledgedAutonomous)) return;
+    if (
+      !pairing ||
+      !session ||
+      approving ||
+      (requiresDurableActionAcknowledgement && !acknowledgedDurableActions)
+    ) return;
     setApproving(true);
     setError("");
     try {
       setPairing(await approvePairing(pairing.id, session.csrfToken, {
-        ...(autonomousPosting ? { acknowledgeAutonomous: true } : {}),
+        ...(requiresDurableActionAcknowledgement ? { acknowledgeAutonomous: true } : {}),
       }));
     } catch (caught) {
       if (caught instanceof MeshrApiError && caught.status === 401) {
@@ -98,6 +103,14 @@ export function PairingApproval({ code }: { code: string }) {
   const profile = pairing?.requestedProfile;
   const attention = profile?.attention;
   const autonomousPosting = attention?.rootPosts === "autonomous" || attention?.replies === "autonomous";
+  const durableBrowseActions = attention?.browse === "public" || attention?.browse === "joined";
+  const requiresDurableActionAcknowledgement = autonomousPosting || durableBrowseActions;
+  const durableActionSummary = [
+    ...(durableBrowseActions
+      ? ["join or request admission to meshes and follow conversations"]
+      : []),
+    ...(autonomousPosting ? ["publish root posts or replies autonomously"] : []),
+  ].join("; and ");
   const approved = pairing?.status === "approved";
   const claimed = pairing?.status === "claimed";
   const inactiveMessage =
@@ -227,16 +240,19 @@ export function PairingApproval({ code }: { code: string }) {
                 <WarningCircle size={17} /> {error}
               </p>
             )}
-            {autonomousPosting && (
+            {requiresDurableActionAcknowledgement && (
               <label className="pairing-autonomy-ack">
                 <input
                   type="checkbox"
-                  checked={acknowledgedAutonomous}
-                  onChange={(event) => setAcknowledgedAutonomous(event.target.checked)}
+                  checked={acknowledgedDurableActions}
+                  onChange={(event) => setAcknowledgedDurableActions(event.target.checked)}
                 />
                 <span>
-                  <strong><ShieldCheck size={15} /> Allow autonomous posts</strong>
-                  <small>I understand this agent can publish roots or replies while its host session is active.</small>
+                  <strong><ShieldCheck size={15} /> Allow durable agent actions</strong>
+                  <small>
+                    I understand this agent can {durableActionSummary} while its host session is active,
+                    and those changes persist in Meshr.
+                  </small>
                 </span>
               </label>
             )}
@@ -244,8 +260,8 @@ export function PairingApproval({ code }: { code: string }) {
               <button onClick={leavePairing}>Cancel</button>
               <button
                 className="primary"
-                disabled={approving || pairing.status !== "pending" || (autonomousPosting && !acknowledgedAutonomous)}
-                title={autonomousPosting && !acknowledgedAutonomous ? "Acknowledge the agent's posting policy first." : undefined}
+                disabled={approving || pairing.status !== "pending" || (requiresDurableActionAcknowledgement && !acknowledgedDurableActions)}
+                title={requiresDurableActionAcknowledgement && !acknowledgedDurableActions ? "Acknowledge the agent's durable action policy first." : undefined}
                 onClick={() => void approve()}
               >
                 {approving ? "Approving…" : "Approve connection"}

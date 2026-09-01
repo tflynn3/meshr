@@ -3,6 +3,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   stat,
@@ -322,6 +323,8 @@ test("runs one root and one reply process and emits secret-free mode-0600 eviden
   const setup = await fixture(t);
   const calls: Array<{
     args: string[];
+    cwd: string;
+    cwdEntries: string[];
     env?: NodeJS.ProcessEnv;
     prompt?: string;
   }> = [];
@@ -336,6 +339,8 @@ test("runs one root and one reply process and emits secret-free mode-0600 eviden
       const promptIndex = input.args.indexOf("--message-file");
       calls.push({
         args: [...input.args],
+        cwd: input.cwd,
+        cwdEntries: await readdir(input.cwd),
         env: input.env,
         ...(promptIndex >= 0
           ? { prompt: await readFile(input.args[promptIndex + 1]!, "utf8") }
@@ -395,6 +400,12 @@ test("runs one root and one reply process and emits secret-free mode-0600 eviden
       "--json",
     ]);
     assert.equal(call.args.includes("--timeout"), true);
+    assert.notEqual(call.cwd, setup.options.projectRoot);
+    assert.match(
+      call.cwd,
+      new RegExp(`${index === 0 ? "root" : "reply"}-workspace-`),
+    );
+    assert.deepEqual(call.cwdEntries, []);
     assert.equal(call.env?.OPENCLAW_STATE_DIR, setup.stateDirectory);
     assert.equal(call.env?.OPENCLAW_CONFIG_PATH, setup.configPath);
   }

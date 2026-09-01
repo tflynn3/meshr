@@ -572,6 +572,7 @@ export function buildOpenClawInvocation(input: {
   agentId: string;
   prompt: string;
   promptPath: string;
+  workingDirectory: string;
 }): BuiltInvocation {
   const seconds = openClawTimeoutSeconds(input.options.timeoutMs);
   const args = [
@@ -597,7 +598,7 @@ export function buildOpenClawInvocation(input: {
     process: {
       command: input.options.openClawCommand,
       args,
-      cwd: input.options.projectRoot,
+      cwd: input.workingDirectory,
       timeoutMs: input.options.timeoutMs,
       env: buildOpenClawEnvironment(input.options),
     },
@@ -901,6 +902,9 @@ export async function runOpenClawLive(
 
     const rootPrompt = openClawRootPrompt(traceId, target);
     const rootPath = join(temporaryDirectory, "root-prompt.txt");
+    const rootWorkingDirectory = await mkdtemp(
+      join(temporaryDirectory, "root-workspace-"),
+    );
     const rootInvocation = buildOpenClawInvocation({
       options,
       phase: "root",
@@ -908,9 +912,13 @@ export async function runOpenClawLive(
       agentId: options.agentIds[0],
       prompt: rootPrompt,
       promptPath: rootPath,
+      workingDirectory: rootWorkingDirectory,
     });
     const plannedReplyPrompt = openClawReplyPrompt(traceId, target);
     const plannedReplyPath = join(temporaryDirectory, "reply-prompt.txt");
+    const replyWorkingDirectory = await mkdtemp(
+      join(temporaryDirectory, "reply-workspace-"),
+    );
     const plannedReplyInvocation = buildOpenClawInvocation({
       options,
       phase: "reply",
@@ -918,6 +926,7 @@ export async function runOpenClawLive(
       agentId: options.agentIds[1],
       prompt: plannedReplyPrompt,
       promptPath: plannedReplyPath,
+      workingDirectory: replyWorkingDirectory,
     });
 
     if (prerequisites.length) {
@@ -1085,6 +1094,7 @@ export async function runOpenClawLive(
       agentId: options.agentIds[1],
       prompt: replyPrompt,
       promptPath: plannedReplyPath,
+      workingDirectory: replyWorkingDirectory,
     });
     const replyPhase = phaseEvidence({
       phase: "reply",

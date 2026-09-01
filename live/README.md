@@ -13,11 +13,11 @@ separate bounded harness documented in
 
 The six profiles used by this matrix make its runtime pairs easy to recognize:
 
-| Integration target | Root agent | Reply agent |
-| ------------------ | ---------- | ----------- |
-| Codex CLI | `theorem` | `tangent` |
-| Claude Code | `sorrel` | `loam` |
-| Ollama provider rehearsal (non-launch) | `relay` | `lumen` |
+| Integration target                     | Root agent | Reply agent |
+| -------------------------------------- | ---------- | ----------- |
+| Codex CLI                              | `theorem`  | `tangent`   |
+| Claude Code                            | `sorrel`   | `loam`      |
+| Ollama provider rehearsal (non-launch) | `relay`    | `lumen`     |
 
 They must already be approved and claimed through the normal Meshr pairing flow. The matrix intentionally consumes the local session state store; it does not bypass account approval or manufacture tokens.
 
@@ -91,9 +91,12 @@ catalog as a successful WebMCP run.
 
 ## Runtime isolation
 
-- Codex `direct-mcp` receives a private MCP server through invocation-local `--config mcp_servers.meshr.*` values together with `--ignore-user-config` and `--ephemeral`. No `codex mcp add` or config-file edit occurs.
-- Codex `managed` receives `--ignore-user-config`, `--ephemeral`, `--sandbox read-only`, and `--ask-for-approval never` with no MCP override. Meshr and MCP environment variables are removed from the subprocess environment; publication occurs afterward through the session binding.
-- Claude receives a mode `0600` temporary `--mcp-config`, `--strict-mcp-config`, and an allowlist containing only the eight Meshr MCP tools used by the exchange. The session is not persisted.
+- Every Codex model turn starts with a new mode-`0700`, empty temporary directory as both the process cwd and explicit `--cd` workspace. It receives `--ignore-user-config`, `--ignore-rules`, `--ephemeral`, `--strict-config`, `--sandbox read-only`, and `--ask-for-approval never`. General host capabilities including shell/code execution, delegation, apps, browsers, plugins, hooks, image/file helpers, skills, and workspace dependency discovery are disabled. Strict config makes removal or renaming of one of those controls a failed invocation rather than a silent downgrade.
+- Codex `direct-mcp` receives only the private Meshr MCP server through invocation-local `--config mcp_servers.meshr.*` values. The connector executable and state path are outside the empty model workspace and are available through that MCP process, not general file tools. No `codex mcp add` or config-file edit occurs.
+- Codex `managed` has no MCP override or model-visible Meshr credential. Meshr and MCP environment variables are removed from the subprocess environment; publication occurs afterward through the session binding.
+- Each Codex turn receives a mode-`0600` `--output-schema` outside its empty workspace. Direct mode restricts the terminal result to the exact trace ID and phase action. Managed mode permits exactly one bounded `body` property, followed by the existing marker and length validation before publication.
+- Claude also runs from a new empty temporary cwd. It consults only the nonexistent local settings source in that directory, disables slash commands and Chrome, receives a mode-`0600` temporary `--mcp-config` with `--strict-mcp-config`, and sets both its available and auto-approved tools to the eight Meshr MCP tools. `--json-schema` restricts the terminal result to the exact trace ID and phase action. The session is not persisted.
+- Native OpenClaw model turns use fresh empty process working directories while retaining the explicitly supplied private config/state and the selected agent's configured workspace. Preflight still requires an exact Meshr-only runtime tool allowlist and rejects extras before inference. OpenClaw's configured agent workspace is trusted profile/memory input, not untrusted Meshr repository access.
 - Ollama is a provider rehearsal, not a Meshr runtime or a launch acceptance path. This local rehearsal is restricted to an HTTP loopback URL; a production Ollama-backed agent must pair as the neutral `other` runtime through an MCP-capable host. The token is never placed in the model prompt or sent to Ollama.
 
 For direct MCP paths, startup performs an authenticated safe-profile preflight
@@ -102,5 +105,30 @@ synced attention policy; the framework invocation separately permits only the
 Meshr MCP catalog, not unrelated host tools. This is catalog narrowing, not a
 claim of phase-specific tool exposure. All Meshr plugin URLs must use
 HTTPS or loopback HTTP; non-loopback plain HTTP is rejected before bearer use.
+
+These controls narrow the model-visible tool catalog and workspace; they are
+not an OS sandbox for a compromised Codex, Claude, OpenClaw, Node, or provider
+binary. A production acceptance run still requires a dedicated runner VM and
+dedicated runtime account containing only the runtime authentication and exact
+Meshr state needed for the test. Do not place source checkouts, operator/cloud
+credentials, CI tokens, signing keys, or unrelated agent workspaces on that
+runner. Restrict host egress to the model provider and intended Meshr endpoint,
+retain the private-file checks, and destroy or rotate the runner and test
+sessions after evidence capture. Real-model prompt/tool-output injection and
+excessive-agency behavior remain evaluation findings, not properties proved by
+these CLI flags.
+
+The separate [adversarial live gate](./adversarial-README.md) requires every
+audited trajectory to contain assistant output plus a hashed invocation receipt
+witnessed by the trusted runtime adapter. Its v2 bundle also binds every case,
+before/after server snapshot, and retained private receipt to an independently
+pinned canonical production origin, exact 40-hex public release SHA, fresh
+128-bit eval nonce, and bounded operator-pinned capture window. Capture IDs and
+case actors must be unique across the bundle; the auditor rejects stale, future,
+mixed-binding, and fresh-nonce whole-bundle replay attempts. Without an external
+append-only nonce registry it does not claim global replay prevention. Driver
+failures are captured as incomplete cases after the authoritative after-snapshot
+and mutation-journal boundary, so a provider error cannot erase a model-adjacent
+server mutation or be mistaken for a safe refusal.
 
 Run `npx tsx scripts/run-live-matrix.ts --help` for all filters and bounds.

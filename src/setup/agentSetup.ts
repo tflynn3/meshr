@@ -7,6 +7,9 @@ export const agentSetupRuntimes = [
 
 export type AgentSetupRuntime = (typeof agentSetupRuntimes)[number];
 
+const MESHR_MCP_PACKAGE = "@meshr/mcp@0.1.0";
+const MESHR_OPENCLAW_PACKAGE = "npm:@meshr/openclaw@0.1.0";
+
 export const agentSetupRuntimeDetails: Record<
   AgentSetupRuntime,
   { label: string; description: string }
@@ -56,12 +59,12 @@ export function buildAgentSetupCommands(input: {
           `openclaw:${setupValue(input.openClawAgentId ?? "", handle)}`,
         )}`
       : "";
-  const mcpCommand = `npx --yes --package @meshr/mcp meshr-mcp mcp serve --binding ${shellQuote(handle)}`;
-  const syncCommand = `npx --yes --package @meshr/mcp meshr-mcp sync --binding ${shellQuote(handle)}`;
+  const mcpCommand = `npx --yes --package ${MESHR_MCP_PACKAGE} meshr-mcp mcp serve --binding ${shellQuote(handle)}`;
+  const syncCommand = `npx --yes --package ${MESHR_MCP_PACKAGE} meshr-mcp sync --binding ${shellQuote(handle)}`;
   const serverName = `meshr-${handle.replace(/[^a-zA-Z0-9_-]+/g, "-")}`;
   const serverUrl = input.serverUrl?.trim();
   const serverFlag = serverUrl ? ` --server ${shellQuote(serverUrl)}` : "";
-  const initCommand = `npx --yes --package @meshr/mcp meshr-mcp init --handle ${shellQuote(handle)} --definition ${shellQuote(definitionPath)}`;
+  const initCommand = `npx --yes --package ${MESHR_MCP_PACKAGE} meshr-mcp init --handle ${shellQuote(handle)} --definition ${shellQuote(definitionPath)}`;
 
   const activate =
     input.runtime === "codex"
@@ -69,20 +72,20 @@ export function buildAgentSetupCommands(input: {
       : input.runtime === "claude"
         ? `claude mcp add --scope local ${shellQuote(serverName)} -- ${mcpCommand}`
         : input.runtime === "openclaw"
-          ? `${syncCommand} && npx --yes --package @meshr/mcp meshr-mcp openclaw configure --binding ${shellQuote(handle)} --agent-id ${shellQuote(setupValue(input.openClawAgentId ?? "", handle))}`
+          ? `${syncCommand} && npx --yes --package ${MESHR_MCP_PACKAGE} meshr-mcp openclaw configure --binding ${shellQuote(handle)} --agent-id ${shellQuote(setupValue(input.openClawAgentId ?? "", handle))}`
           : input.runtime === "mcp"
             ? mcpCommand
             : undefined;
 
   return {
     init: initCommand,
-    connect: `npx --yes --package @meshr/mcp meshr-mcp connect --runtime ${input.runtime}${subject}${serverFlag} --definition ${shellQuote(definitionPath)}`,
-    claim: `npx --yes --package @meshr/mcp meshr-mcp claim --binding ${shellQuote(handle)}`,
+    connect: `npx --yes --package ${MESHR_MCP_PACKAGE} meshr-mcp connect --runtime ${input.runtime}${subject}${serverFlag} --definition ${shellQuote(definitionPath)}`,
+    claim: `npx --yes --package ${MESHR_MCP_PACKAGE} meshr-mcp claim --binding ${shellQuote(handle)}`,
     sync: syncCommand,
     activate,
     openClawInstall:
       input.runtime === "openclaw"
-        ? "openclaw plugins install @meshr/openclaw"
+        ? `openclaw plugins install ${MESHR_OPENCLAW_PACKAGE} --pin`
         : undefined,
   };
 }

@@ -23,22 +23,22 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: store-bootstrap
-          image: ${EVENT_PLANE_IMAGE}
+          image: ${MESHR_YAML_QUOTE}${EVENT_PLANE_IMAGE}${MESHR_YAML_QUOTE}
           imagePullPolicy: IfNotPresent
           args: ["production-bootstrap"]
           envFrom:
             - configMapRef: {name: meshr-runtime-canary}
           env:
             - name: MESHR_RELEASE_SHA
-              value: ${MESHR_RELEASE_SHA}
+              value: ${MESHR_YAML_QUOTE}${MESHR_RELEASE_SHA}${MESHR_YAML_QUOTE}
             # Include the selected databases in the Job template so a
             # same-image restore reruns bootstrap against the new stores.
             - name: MESHR_FIRESTORE_DATABASE
-              value: ${MESHR_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_TOPOLOGY_FIRESTORE_DATABASE
-              value: ${MESHR_TOPOLOGY_FIRESTORE_DATABASE}
+              value: ${MESHR_YAML_QUOTE}${MESHR_TOPOLOGY_FIRESTORE_DATABASE}${MESHR_YAML_QUOTE}
             - name: MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN
-              value: "${MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN}"
+              value: ${MESHR_YAML_QUOTE}${MESHR_FORCE_PROJECTION_BOOTSTRAP_SCAN}${MESHR_YAML_QUOTE}
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false

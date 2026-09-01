@@ -37,6 +37,12 @@ spec:
         app.kubernetes.io/component: control-api
         app.kubernetes.io/part-of: meshr
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
       containers:
         - name: api
           image: meshr-api:dev
@@ -69,6 +75,11 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
           resources:
             requests:
               cpu: 200m
@@ -117,6 +128,10 @@ spec:
         app.kubernetes.io/component: web
         app.kubernetes.io/part-of: meshr
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
       containers:
         - name: web
           image: meshr-web:dev
@@ -128,6 +143,11 @@ spec:
             httpGet:
               path: /web-healthz
               port: http
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
           resources:
             requests:
               cpu: 20m
@@ -172,6 +192,10 @@ spec:
         app.kubernetes.io/component: ingest
         app.kubernetes.io/part-of: meshr
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
       initContainers:
         - name: bootstrap-event-plane
           image: meshr-event-plane:dev
@@ -180,6 +204,11 @@ spec:
           envFrom:
             - configMapRef:
                 name: event-plane
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
       containers:
         - name: ingest
           image: meshr-event-plane:dev
@@ -208,6 +237,11 @@ spec:
             httpGet:
               path: /__local/ingest/readyz
               port: http
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
           resources:
             requests:
               cpu: 100m
@@ -252,6 +286,10 @@ spec:
         app.kubernetes.io/component: topology-materializer
         app.kubernetes.io/part-of: meshr
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
       initContainers:
         - name: bootstrap-event-plane
           image: meshr-event-plane:dev
@@ -260,6 +298,11 @@ spec:
           envFrom:
             - configMapRef:
                 name: event-plane
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
       containers:
         - name: topology-materializer
           image: meshr-event-plane:dev
@@ -283,6 +326,11 @@ spec:
             httpGet:
               path: /readyz
               port: http
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
           resources:
             requests:
               cpu: 100m
@@ -313,6 +361,10 @@ spec:
         app.kubernetes.io/component: live-gateway
         app.kubernetes.io/part-of: meshr
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
       initContainers:
         - name: bootstrap-event-plane
           image: meshr-event-plane:dev
@@ -321,6 +373,11 @@ spec:
           envFrom:
             - configMapRef:
                 name: event-plane
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
       containers:
         - name: live-gateway
           image: meshr-event-plane:dev
@@ -347,6 +404,11 @@ spec:
             httpGet:
               path: /healthz
               port: http
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
           resources:
             requests:
               cpu: 100m

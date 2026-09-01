@@ -16,6 +16,7 @@
     "../platform/eventEnvelope.ts",
     "../platform/activityWindow.ts",
     "../platform/googleClients.ts",
+    "../platform/liveConnectionIdentity.ts",
     "../platform/runtimeSecrets.ts",
     "../platform/moderationReadiness.ts"
   ]

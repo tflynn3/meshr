@@ -235,10 +235,6 @@ test("GCP rehearsal teardown distinguishes a missing cluster from discovery fail
 test("GCP rehearsal trust pins a configurable workflow to immutable GitHub IDs", () => {
   const terraform = readFileSync(resolve(repositoryRoot, "infra/rehearsal/main.tf"), "utf8");
   const variables = readFileSync(resolve(repositoryRoot, "infra/rehearsal/variables.tf"), "utf8");
-  const workflow = readFileSync(
-    resolve(repositoryRoot, ".github/workflows/gcp-rehearsal.yml"),
-    "utf8",
-  );
   assert.match(
     terraform,
     /repo:\$\{local\.github_repository_owner\}@\$\{var\.github_repository_owner_id\}\/\$\{local\.github_repository_name\}@\$\{var\.github_repository_id\}/,
@@ -247,6 +243,8 @@ test("GCP rehearsal trust pins a configurable workflow to immutable GitHub IDs",
     terraform,
     /assertion\.sub == '\$\{local\.github_immutable_subject_prefix\}:environment:gcp-rehearsal'/,
   );
+  assert.match(terraform, /"attribute\.repository_visibility"\s*=\s*"assertion\.repository_visibility"/);
+  assert.match(terraform, /assertion\.repository_visibility == 'private'/);
   assert.doesNotMatch(
     terraform,
     /assertion\.sub == 'repo:\$\{local\.github_repository\}:environment:gcp-rehearsal'/,
@@ -257,22 +255,28 @@ test("GCP rehearsal trust pins a configurable workflow to immutable GitHub IDs",
     /serviceAccount:\$\{var\.project_id\}\.svc\.id\.goog\[\$\{local\.kubernetes_namespace\}\/\$\{each\.value\.kubernetes_service_account\}\]/,
   );
   assert.doesNotMatch(terraform, /iam\.serviceAccounts\.setIamPolicy|workload_identity_binder/);
+  assert.match(terraform, /resource "terraform_data" "private_github_authority_guard"/);
+  assert.match(terraform, /var\.github_repository_id != "1348689949"/);
+  assert.match(terraform, /lower\(var\.github_repository\) != "tflynn3\/meshr"/);
   assert.match(
     terraform,
     /\$\{var\.github_repository\}\/\$\{var\.github_workflow_path\}@refs\/heads\/main/,
   );
-  assert.match(variables, /variable "github_repository"[\s\S]*default\s*=\s*"tflynn3\/meshr"/);
-  assert.match(
-    variables,
-    /variable "github_workflow_path"[\s\S]*default\s*=\s*"\.github\/workflows\/gcp-rehearsal\.yml"/,
-  );
+  for (const variable of [
+    "github_repository",
+    "github_repository_id",
+    "github_repository_owner_id",
+    "github_workflow_path",
+  ]) {
+    const body = variables.match(
+      new RegExp(`variable "${variable}" \\{([\\s\\S]*?)\\n\\}`),
+    )?.[1];
+    assert.ok(body, `missing ${variable}`);
+    assert.doesNotMatch(body, /\bdefault\s*=/, `${variable} must be an explicit private-ops input`);
+  }
   assert.match(terraform, /assertion\.workflow_ref == '\$\{local\.github_workflow_ref\}'/);
   assert.doesNotMatch(terraform, /workflow_ref\.startsWith|feat\/copyable-agent-setup/);
   assert.doesNotMatch(terraform, /assertion\.event_name == 'push'/);
-  assert.doesNotMatch(workflow, /^\s*push:\s*$/m);
-  assert.doesNotMatch(workflow, /feat\/copyable-agent-setup/);
-  assert.match(workflow, /if: .*github\.event_name == 'workflow_dispatch'/);
-  assert.match(workflow, /if: .*github\.event_name == 'schedule'/);
 });
 
 test("GCP rehearsal topology identity can inspect its subscription for readiness", () => {

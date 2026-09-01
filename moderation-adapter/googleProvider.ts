@@ -83,7 +83,7 @@ function hasDlpHighLikelihood(result: Record<string, unknown>): boolean {
 
 async function metadataAccessToken(fetchImpl: typeof fetch): Promise<string> {
   const configured = process.env.MESHR_ADAPTER_ACCESS_TOKEN?.trim();
-  if (configured && process.env.MESHR_ENV?.trim() !== "production") return configured;
+  if (configured && process.env.MESHR_ENV?.trim().toLowerCase() !== "production") return configured;
   const host = process.env.GOOGLE_METADATA_HOST?.trim() || "metadata.google.internal";
   const response = await fetchImpl(
     `http://${host}/computeMetadata/v1/instance/service-accounts/default/token`,
@@ -152,6 +152,9 @@ export class GoogleModerationProvider implements ModerationProvider {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           userPromptData: { text: input.text },
+          multiLanguageDetectionMetadata: {
+            enableMultiLanguageDetection: true,
+          },
         }),
       }),
       this.request(dlpInspectUrl(this.options), {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
@@ -13,7 +14,7 @@ import {
 import { CURRENT_SCHEMA_VERSION } from "./database.ts";
 import { agentProfileSchema } from "./contracts.ts";
 import type { MeshrRepository, RepositoryProjection } from "./repository.ts";
-import type { Clock } from "./types.ts";
+import type { Clock, IdentityVerifier } from "./types.ts";
 
 class TestClock implements Clock {
   constructor(private value = new Date("2026-08-27T18:00:00.000Z")) {}
@@ -56,9 +57,14 @@ afterEach(async () => {
 });
 
 async function start(options: {
+  identityVerifier?: IdentityVerifier;
   moderationAuthorityToken?: string;
   internalToken?: string;
+  repository?: MeshrRepository;
   residentCohortDisclosure?: { text: string; url: string };
+  socialAuthOnly?: boolean;
+  trustCloudflareConnectingIp?: boolean;
+  webMcpTransfersSession?: boolean;
 } = {}): Promise<RunningServer> {
   const directory = mkdtempSync(join(tmpdir(), "meshr-server-test-"));
   const clock = new TestClock();
@@ -79,6 +85,8 @@ async function requestJson(
     csrf?: string;
     authorization?: string;
     idempotencyKey?: string;
+    clientIp?: string;
+    origin?: string;
   } = {},
 ): Promise<{ response: Response; json: any }> {
   const headers = new Headers();
@@ -87,6 +95,8 @@ async function requestJson(
   if (options.csrf) headers.set("X-Meshr-CSRF", options.csrf);
   if (options.authorization) headers.set("Authorization", options.authorization);
   if (options.idempotencyKey) headers.set("Idempotency-Key", options.idempotencyKey);
+  if (options.clientIp) headers.set("CF-Connecting-IP", options.clientIp);
+  if (options.origin) headers.set("Origin", options.origin);
   const response = await fetch(`${baseUrl}${path}`, {
     method: options.method ?? "GET",
     headers,
@@ -99,6 +109,77 @@ function cookieFrom(response: Response): string {
   const setCookie = response.headers.get("set-cookie");
   assert.ok(setCookie, "expected a Set-Cookie response header");
   return setCookie.split(";", 1)[0];
+}
+
+test("unexpected request logs never include query-string credentials", async (t) => {
+  const { baseUrl } = await start();
+  const logged: string[] = [];
+  const originalError = console.error;
+  console.error = (...values: unknown[]) => {
+    logged.push(values.map(String).join(" "));
+  };
+  t.after(() => {
+    console.error = originalError;
+  });
+
+  const status = await new Promise<number>((resolve, reject) => {
+    const outgoing = httpRequest(
+      new URL("/v1/pairings/lookup?code=ABCD-EFGH", baseUrl),
+      { headers: { Host: "[" } },
+      (incoming) => {
+        incoming.resume();
+        incoming.on("end", () => resolve(incoming.statusCode ?? 0));
+      },
+    );
+    outgoing.on("error", reject);
+    outgoing.end();
+  });
+
+  assert.equal(status, 500);
+  assert.ok(logged.some((line) => line.includes("meshr server request failed")));
+  assert.ok(logged.every((line) => !line.includes("ABCD-EFGH")));
+  assert.ok(logged.every((line) => !line.includes("?code=")));
+});
+
+function beginSlowJsonRequest(
+  baseUrl: string,
+  path: string,
+  options: { cookie: string; csrf: string },
+): { finish(jsonRemainder: string): Promise<{ status: number; json: any }> } {
+  const responseRequest: { outgoing?: ReturnType<typeof httpRequest> } = {};
+  const response = new Promise<{ status: number; json: any }>((resolve, reject) => {
+    const outgoing = httpRequest(new URL(path, baseUrl), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: options.cookie,
+        "X-Meshr-CSRF": options.csrf,
+      },
+    }, (incoming) => {
+      const chunks: Buffer[] = [];
+      incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
+      incoming.on("end", () => {
+        const payload = Buffer.concat(chunks).toString("utf8");
+        resolve({ status: incoming.statusCode ?? 0, json: JSON.parse(payload) });
+      });
+      incoming.on("error", reject);
+    });
+    outgoing.on("error", reject);
+    outgoing.flushHeaders();
+    outgoing.write('{"decision":');
+    Object.assign(responseRequest, { outgoing });
+  });
+  return {
+    finish(jsonRemainder: string) {
+      const outgoing = responseRequest.outgoing;
+      if (!outgoing) {
+        const error = new Error("Slow request was not initialized.");
+        return Promise.reject(error);
+      }
+      outgoing.end(jsonRemainder);
+      return response;
+    },
+  };
 }
 
 test("health and public discovery expose a durable seeded commons", async () => {
@@ -421,6 +502,28 @@ test("health reports the immutable release SHA when configured", async () => {
   }
 });
 
+test("health exposes only a fingerprint of the Kubernetes pod UID", async () => {
+  const previous = process.env.MESHR_POD_UID;
+  const podUid = "fd922327-233f-4f62-bf74-315618ee4f44";
+  process.env.MESHR_POD_UID = podUid;
+  try {
+    const { baseUrl } = await start();
+    const health = await requestJson(baseUrl, "/healthz");
+    assert.equal(health.response.status, 200);
+    assert.equal(
+      health.json.instanceFingerprint,
+      createHash("sha256")
+        .update(`meshr-pod-instance:v1:${podUid}`)
+        .digest("hex")
+        .slice(0, 32),
+    );
+    assert.equal(JSON.stringify(health.json).includes(podUid), false);
+  } finally {
+    if (previous === undefined) delete process.env.MESHR_POD_UID;
+    else process.env.MESHR_POD_UID = previous;
+  }
+});
+
 test("moderation reports are limited to mesh owners and stewards", async () => {
   const { app, baseUrl } = await start();
   const keyPair = generateKeyPairSync("ed25519");
@@ -703,6 +806,24 @@ test("moderation reports are limited to mesh owners and stewards", async () => {
   });
   assert.equal(observerReport.response.status, 403);
   assert.equal(observerReport.json.error.code, "mesh_governance_denied");
+
+  const rateReporter = await register("moderation-rate@example.test", "Moderation Rate");
+  app.database.sqlite.prepare(
+    `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
+     VALUES(?, ?, 'steward', ?, ?)`,
+  ).run(publicMeshId, rateReporter.id, app.database.now(), app.database.now());
+  const reportBurst = await Promise.all(Array.from({ length: 6 }, (_, index) =>
+    requestJson(baseUrl, `/v1/posts/${publicPostId}/report`, {
+      method: "POST",
+      cookie: rateReporter.cookie,
+      csrf: rateReporter.csrf,
+      idempotencyKey: `moderation-rate-${index}`,
+      body: { reason: `Bounded report ${index}` },
+    })));
+  assert.equal(reportBurst.filter(({ response }) => response.status === 202).length, 5);
+  const reportLimited = reportBurst.find(({ response }) => response.status === 429);
+  assert.equal(reportLimited?.json.error.code, "moderation_report_rate_limited");
+  assert.ok(Number(reportLimited?.response.headers.get("retry-after")) >= 1);
 });
 
 test("expired native renewal recovers deterministically and fences stale retries", async () => {
@@ -741,7 +862,7 @@ test("expired native renewal recovers deterministically and fences stale retries
     method: "POST",
     cookie,
     csrf,
-    body: {},
+    body: { acknowledgeAutonomous: true },
   });
   assert.equal(approval.response.status, 200);
 
@@ -1062,6 +1183,1443 @@ test("durable projection refresh updates an existing moderation state", async ()
   assert.equal(after.json.meshes[0].postCount, 1);
 });
 
+test("expensive account reads and the public directory enforce process-local budgets", async () => {
+  const { baseUrl } = await start();
+  const registration = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "read-budget@example.test",
+      password: "a sufficiently long read budget passphrase",
+      displayName: "Read Budget",
+    },
+  });
+  assert.equal(registration.response.status, 201);
+  const cookie = cookieFrom(registration.response);
+  const accountPaths = [
+    "/v1/activity/public",
+    "/v1/activity/preferences",
+    "/v1/meshes",
+    "/v1/meshes/mesh-public/governance",
+    "/v1/meshes/mesh-public/topics",
+  ];
+  const accountReads = await Promise.all(Array.from({ length: 13 }, (_, index) =>
+    requestJson(baseUrl, accountPaths[index % accountPaths.length]!, { cookie })));
+  assert.equal(accountReads.filter(({ response }) => response.status === 200).length, 12);
+  const accountLimited = accountReads.find(({ response }) => response.status === 429);
+  assert.equal(accountLimited?.json.error.code, "account_read_rate_limited");
+  assert.ok(Number(accountLimited?.response.headers.get("retry-after")) >= 1);
+
+  const untrustedProxyRun = await start();
+  const spoofedReads = await Promise.all(Array.from({ length: 6 }, (_, index) =>
+    requestJson(untrustedProxyRun.baseUrl, "/v1/public/meshes", {
+      clientIp: `198.51.100.${index + 1}`,
+    })));
+  assert.equal(spoofedReads.filter(({ response }) => response.status === 200).length, 5);
+  assert.equal(
+    spoofedReads.find(({ response }) => response.status === 429)?.json.error.code,
+    "public_mesh_directory_rate_limited",
+  );
+
+  const perIpRun = await start({ trustCloudflareConnectingIp: true });
+  const perIpReads = await Promise.all(Array.from({ length: 6 }, (_, index) =>
+    requestJson(
+      perIpRun.baseUrl,
+      index % 2 === 0 ? "/v1/public/meshes" : "/v1/public/meshes/mesh-public/topics",
+      { clientIp: "192.0.2.10" },
+    )));
+  assert.equal(perIpReads.filter(({ response }) => response.status === 200).length, 5);
+  assert.equal(
+    perIpReads.find(({ response }) => response.status === 429)?.json.error.code,
+    "public_mesh_directory_rate_limited",
+  );
+
+  const globalRun = await start({ trustCloudflareConnectingIp: true });
+  const globalReads = await Promise.all(Array.from({ length: 21 }, (_, index) =>
+    requestJson(
+      globalRun.baseUrl,
+      index % 2 === 0 ? "/v1/public/meshes" : "/v1/public/meshes/mesh-public/topics",
+      { clientIp: `198.51.100.${index + 1}` },
+    )));
+  assert.equal(globalReads.filter(({ response }) => response.status === 200).length, 20);
+  assert.equal(
+    globalReads.find(({ response }) => response.status === 429)?.json.error.code,
+    "public_mesh_directory_rate_limited",
+  );
+
+  const sourceRun = await start({ trustCloudflareConnectingIp: true });
+  const sourceAccounts = await Promise.all(Array.from({ length: 31 }, (_, index) =>
+    requestJson(sourceRun.baseUrl, "/v1/accounts", {
+      method: "POST",
+      body: {
+        email: `source-budget-${index}@example.test`,
+        password: "a sufficiently long source budget passphrase",
+        displayName: `Source Budget ${index}`,
+      },
+    })));
+  const sourceReads = await Promise.all(sourceAccounts.map(({ response }, index) =>
+    requestJson(sourceRun.baseUrl, "/v1/meshes", {
+      cookie: cookieFrom(response),
+      clientIp: "203.0.113.20",
+    })));
+  assert.equal(sourceReads.filter(({ response }) => response.status === 200).length, 30);
+  assert.equal(
+    sourceReads.find(({ response }) => response.status === 429)?.json.error.code,
+    "account_read_rate_limited",
+  );
+});
+
+test("expensive-read source rejection happens before durable human-session lookup", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "meshr-read-preauth-test-"));
+  const clock = new TestClock();
+  let sessionReads = 0;
+  const repository = {
+    findHumanSession: async () => {
+      sessionReads += 1;
+      return null;
+    },
+  } as unknown as MeshrRepository;
+  const app = createMeshrServer({
+    dbPath: join(directory, "meshr.db"),
+    clock,
+    repository,
+  });
+  const { baseUrl } = await app.listen();
+  running.push({ app, baseUrl, directory, clock });
+
+  const attempts = [];
+  for (let index = 0; index < 31; index += 1) {
+    attempts.push(await requestJson(baseUrl, "/v1/meshes", {
+      cookie: "meshr_session=invalid-session-token",
+    }));
+  }
+  assert.equal(attempts.slice(0, 30).every(({ response }) => response.status === 401), true);
+  assert.equal(attempts.at(-1)?.response.status, 429);
+  assert.equal(attempts.at(-1)?.json.error.code, "account_read_rate_limited");
+  assert.equal(sessionReads, 30, "the rejected request must not reach the durable session store");
+});
+
+test("account read rejection happens before the durable directory fan-out", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "meshr-read-fanout-test-"));
+  const clock = new TestClock();
+  const now = clock.now().toISOString();
+  const accountId = "account-read-fanout";
+  let directoryReads = 0;
+  const repository = {
+    findHumanSession: async () => ({
+      accountId,
+      csrfToken: "read-fanout-csrf",
+      createdAt: now,
+      expiresAt: new Date(clock.now().getTime() + 60 * 60_000).toISOString(),
+      absoluteExpiresAt: new Date(clock.now().getTime() + 60 * 60_000).toISOString(),
+      lastSeenAt: now,
+    }),
+    findAccountById: async () => ({
+      accountId,
+      email: "read-fanout@example.test",
+      displayName: "Read Fanout",
+      createdAt: now,
+    }),
+    listMeshDirectoryForAccount: async () => {
+      directoryReads += 1;
+      return [];
+    },
+  } as unknown as MeshrRepository;
+  const app = createMeshrServer({
+    dbPath: join(directory, "meshr.db"),
+    clock,
+    repository,
+  });
+  const { baseUrl } = await app.listen();
+  running.push({ app, baseUrl, directory, clock });
+
+  const responses = [];
+  for (let index = 0; index < 13; index += 1) {
+    responses.push(await requestJson(baseUrl, "/v1/meshes", {
+      cookie: "meshr_session=valid-read-fanout-token",
+    }));
+  }
+  assert.equal(responses.slice(0, 12).every(({ response }) => response.status === 200), true);
+  assert.equal(responses.at(-1)?.response.status, 429);
+  assert.equal(directoryReads, 12, "the limited request must not query the durable directory");
+});
+
+test("single-mesh governance and topic reads avoid the account-wide directory", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "meshr-mesh-scoped-read-test-"));
+  const clock = new TestClock();
+  const now = clock.now().toISOString();
+  const accountId = "account-mesh-scoped-read";
+  const meshId = "mesh-scoped-read";
+  let narrowReads = 0;
+  let directoryReads = 0;
+  const mesh = {
+    meshId,
+    ownerAccountId: null,
+    name: "Scoped public mesh",
+    description: "A narrow directory fixture",
+    visibility: "public" as const,
+    admission: "open" as const,
+    lifecycle: "active" as const,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const entry = {
+    mesh,
+    role: null,
+    memberAgentIds: [],
+    topics: [
+      {
+        topic: {
+          topicId: "topic-scoped-read",
+          meshId,
+          name: "general",
+          title: "General",
+          description: "Scoped topic",
+          tags: [],
+          createdAt: now,
+        },
+        activityCount: 0,
+        recentActivityCount: 0,
+        participantAgentIds: [],
+        lastActivityAt: null,
+      },
+    ],
+    roles: [],
+  };
+  const repository = {
+    findHumanSession: async () => ({
+      accountId,
+      csrfToken: "mesh-scoped-read-csrf",
+      createdAt: now,
+      expiresAt: new Date(clock.now().getTime() + 60 * 60_000).toISOString(),
+      absoluteExpiresAt: new Date(
+        clock.now().getTime() + 60 * 60_000,
+      ).toISOString(),
+      lastSeenAt: now,
+    }),
+    findAccountById: async () => ({
+      accountId,
+      email: "mesh-scoped-read@example.test",
+      displayName: "Scoped Reader",
+      createdAt: now,
+    }),
+    findMeshById: async () => mesh,
+    findMeshHumanRole: async () => null,
+    findMeshDirectoryEntryForAccount: async (
+      requestedMeshId: string,
+      requestedAccountId: string,
+    ) => {
+      narrowReads += 1;
+      assert.equal(requestedMeshId, meshId);
+      assert.equal(requestedAccountId, accountId);
+      return entry;
+    },
+    listMeshDirectoryForAccount: async () => {
+      directoryReads += 1;
+      return [entry];
+    },
+  } as unknown as MeshrRepository;
+  const app = createMeshrServer({
+    dbPath: join(directory, "meshr.db"),
+    clock,
+    repository,
+  });
+  const { baseUrl } = await app.listen();
+  running.push({ app, baseUrl, directory, clock });
+
+  const cookie = "meshr_session=mesh-scoped-read-token";
+  const governance = await requestJson(
+    baseUrl,
+    `/v1/meshes/${meshId}/governance`,
+    { cookie },
+  );
+  assert.equal(governance.response.status, 200);
+  const topics = await requestJson(baseUrl, `/v1/meshes/${meshId}/topics`, {
+    cookie,
+  });
+  assert.equal(topics.response.status, 200);
+  assert.deepEqual(
+    topics.json.topics.map((topic: { id: string }) => topic.id),
+    ["topic-scoped-read"],
+  );
+  assert.equal(narrowReads, 2);
+  assert.equal(directoryReads, 0);
+});
+
+test("mutation authentication never hydrates the account-wide projection", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "meshr-mutation-scope-test-"));
+  const clock = new TestClock();
+  const now = clock.now().toISOString();
+  const accountId = "account-mutation-scope";
+  const meshId = "mesh-mutation-scope";
+  let projectionReads = 0;
+  let meshReads = 0;
+  const mesh = {
+    meshId,
+    ownerAccountId: accountId,
+    name: "Mutation scope",
+    description: "A narrow mutation fixture",
+    visibility: "private" as const,
+    admission: "invite_only" as const,
+    lifecycle: "active" as const,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const repository = {
+    findHumanSession: async () => ({
+      accountId,
+      csrfToken: "mutation-scope-csrf",
+      createdAt: now,
+      expiresAt: new Date(clock.now().getTime() + 60 * 60_000).toISOString(),
+      absoluteExpiresAt: new Date(
+        clock.now().getTime() + 60 * 60_000,
+      ).toISOString(),
+      lastSeenAt: now,
+    }),
+    findAccountById: async () => ({
+      accountId,
+      email: "mutation-scope@example.test",
+      displayName: "Mutation Scope",
+      createdAt: now,
+    }),
+    touchHumanSession: async () => undefined,
+    loadProjection: async () => {
+      projectionReads += 1;
+      throw new Error("account projection must not be loaded by a mutation");
+    },
+    findMeshById: async () => {
+      meshReads += 1;
+      return mesh;
+    },
+    findMeshHumanRole: async () => "owner" as const,
+    consumeGovernanceRateLimit: async () => ({
+      allowed: true,
+      retryAfterSeconds: 0,
+    }),
+    updateMeshGovernance: async (patch: { name?: string; updatedAt: string }) =>
+      ({
+        ...mesh,
+        name: patch.name ?? mesh.name,
+        updatedAt: patch.updatedAt,
+      }),
+  } as unknown as MeshrRepository;
+  const app = createMeshrServer({
+    dbPath: join(directory, "meshr.db"),
+    clock,
+    repository,
+  });
+  const { baseUrl } = await app.listen();
+  running.push({ app, baseUrl, directory, clock });
+
+  const cookie = "meshr_session=mutation-scope-token";
+  const rejected = await requestJson(
+    baseUrl,
+    `/v1/meshes/${meshId}/governance`,
+    {
+      method: "PUT",
+      cookie,
+      csrf: "wrong-csrf",
+      origin: "http://127.0.0.1",
+      body: { name: "Rejected" },
+    },
+  );
+  assert.equal(rejected.response.status, 403);
+  assert.equal(meshReads, 0, "failed CSRF must precede mesh reads");
+  assert.equal(projectionReads, 0);
+
+  const accepted = await requestJson(
+    baseUrl,
+    `/v1/meshes/${meshId}/governance`,
+    {
+      method: "PUT",
+      cookie,
+      csrf: "mutation-scope-csrf",
+      origin: "http://127.0.0.1",
+      body: { name: "Narrow mutation" },
+    },
+  );
+  assert.equal(accepted.response.status, 200);
+  assert.equal(accepted.json.mesh.name, "Narrow mutation");
+  assert.equal(projectionReads, 0);
+});
+
+test("public previews propagate repository truncation", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "meshr-public-preview-test-"));
+  const clock = new TestClock();
+  const now = clock.now().toISOString();
+  const mesh = {
+    meshId: "mesh-public-preview",
+    ownerAccountId: null,
+    name: "Public preview",
+    description: "Bounded preview fixture",
+    visibility: "public" as const,
+    admission: "open" as const,
+    lifecycle: "active" as const,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const repository = {
+    listPublicMeshes: async () => ({ meshes: [mesh], truncated: true }),
+    listPublicTopics: async () => ({
+      topics: [
+        {
+          topicId: "topic-public-preview",
+          meshId: mesh.meshId,
+          name: "general",
+          title: "General",
+          description: "Bounded topic fixture",
+          tags: [],
+          createdAt: now,
+        },
+      ],
+      truncated: true,
+    }),
+  } as unknown as MeshrRepository;
+  const app = createMeshrServer({
+    dbPath: join(directory, "meshr.db"),
+    clock,
+    repository,
+  });
+  const { baseUrl } = await app.listen();
+  running.push({ app, baseUrl, directory, clock });
+
+  const meshes = await requestJson(baseUrl, "/v1/public/meshes");
+  assert.equal(meshes.response.status, 200);
+  assert.equal(meshes.json.meshes.length, 1);
+  assert.equal(meshes.json.truncated, true);
+  const topics = await requestJson(
+    baseUrl,
+    `/v1/public/meshes/${mesh.meshId}/topics`,
+  );
+  assert.equal(topics.response.status, 200);
+  assert.equal(topics.json.topics.length, 1);
+  assert.equal(topics.json.truncated, true);
+});
+
+test("activity polling requests the bounded activity-only projection", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "meshr-activity-scope-test-"));
+  const clock = new TestClock();
+  const now = clock.now().toISOString();
+  const accountId = "account-activity-scope";
+  const meshId = "mesh-activity-scope";
+  const projectionInputs: Array<Record<string, unknown>> = [];
+  const repository = {
+    findHumanSession: async () => ({
+      accountId,
+      csrfToken: "activity-scope-csrf",
+      createdAt: now,
+      expiresAt: new Date(clock.now().getTime() + 60 * 60_000).toISOString(),
+      absoluteExpiresAt: new Date(
+        clock.now().getTime() + 60 * 60_000,
+      ).toISOString(),
+      lastSeenAt: now,
+    }),
+    findAccountById: async () => ({
+      accountId,
+      email: "activity-scope@example.test",
+      displayName: "Activity Scope",
+      createdAt: now,
+    }),
+    loadProjection: async (input: Record<string, unknown>) => {
+      projectionInputs.push(input);
+      return {
+        accounts: [],
+        agents: [],
+        meshes: [
+          {
+            meshId,
+            ownerAccountId: accountId,
+            name: "Scoped activity",
+            description: "Aggregate-only fixture",
+            visibility: "private" as const,
+            admission: "invite_only" as const,
+            lifecycle: "active" as const,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+        topics: [],
+        humanRoles: [],
+        memberships: [],
+        runtimeSessions: [],
+        posts: [],
+        follows: [],
+        activity: { meshes: [], topics: [], agents: [], links: [] },
+      } satisfies RepositoryProjection;
+    },
+  } as unknown as MeshrRepository;
+  const app = createMeshrServer({
+    dbPath: join(directory, "meshr.db"),
+    clock,
+    repository,
+  });
+  const { baseUrl } = await app.listen();
+  running.push({ app, baseUrl, directory, clock });
+
+  const activity = await requestJson(
+    baseUrl,
+    `/v1/activity/public?includeAuthorized=1&meshId=${meshId}`,
+    { cookie: "meshr_session=activity-scope-token" },
+  );
+  assert.equal(activity.response.status, 200);
+  assert.equal(projectionInputs.length, 1);
+  assert.equal(projectionInputs[0]?.activityOnly, true);
+  assert.equal(projectionInputs[0]?.includePosts, false);
+  assert.deepEqual(projectionInputs[0]?.meshIds, [meshId]);
+});
+
+test("heartbeat bearer rejection happens before durable runtime-session lookup", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "meshr-heartbeat-preauth-test-"));
+  const clock = new TestClock();
+  let sessionReads = 0;
+  const repository = {
+    findRuntimeSessionByTokenHash: async () => {
+      sessionReads += 1;
+      return null;
+    },
+  } as unknown as MeshrRepository;
+  const app = createMeshrServer({
+    dbPath: join(directory, "meshr.db"),
+    clock,
+    repository,
+  });
+  const { baseUrl } = await app.listen();
+  running.push({ app, baseUrl, directory, clock });
+
+  for (let index = 0; index < 6; index += 1) {
+    const rejected = await requestJson(baseUrl, "/v1/agent-sessions/heartbeat", {
+      method: "POST",
+      authorization: "Bearer repeated-invalid-runtime-token",
+    });
+    assert.equal(rejected.response.status, 401);
+  }
+  const readsBeforeLimit = sessionReads;
+  const limited = await requestJson(baseUrl, "/v1/agent-sessions/heartbeat", {
+    method: "POST",
+    authorization: "Bearer repeated-invalid-runtime-token",
+  });
+  assert.equal(limited.response.status, 429);
+  assert.equal(limited.json.error.code, "heartbeat_rate_limited");
+  assert.equal(sessionReads, readsBeforeLimit, "the limited heartbeat must not query the durable session store");
+});
+
+test("event pre-auth limits a bearer without throttling a same-source evaluation fleet", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "meshr-event-preauth-test-"));
+  const clock = new TestClock();
+  let sessionReads = 0;
+  const repository = {
+    findRuntimeSessionByTokenHash: async () => {
+      sessionReads += 1;
+      return null;
+    },
+  } as unknown as MeshrRepository;
+  const app = createMeshrServer({
+    dbPath: join(directory, "meshr.db"),
+    clock,
+    repository,
+  });
+  const { baseUrl } = await app.listen();
+  running.push({ app, baseUrl, directory, clock });
+
+  const fleetResponses = await Promise.all(Array.from({ length: 36 }, (_, index) =>
+    requestJson(baseUrl, "/v1/agent/events", {
+      authorization: `Bearer fleet-runtime-token-${index}`,
+    })));
+  assert.equal(fleetResponses.every(({ response }) => response.status === 401), true);
+
+  // token 0 consumed one slot above; 29 more requests fill its 30-token burst.
+  for (let index = 1; index < 30; index += 1) {
+    const rejected = await requestJson(baseUrl, "/v1/agent/events", {
+      authorization: "Bearer fleet-runtime-token-0",
+    });
+    assert.equal(rejected.response.status, 401);
+  }
+  const readsBeforeLimit = sessionReads;
+  const limited = await requestJson(baseUrl, "/v1/agent/events", {
+    authorization: "Bearer fleet-runtime-token-0",
+  });
+  assert.equal(limited.response.status, 429);
+  assert.equal(limited.json.error.code, "activity_rate_limited");
+  assert.equal(sessionReads, readsBeforeLimit, "the bearer limit must run before durable authentication");
+});
+
+test("agent control-mutation source rejection happens before durable session lookup", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "meshr-agent-mutation-preauth-test-"));
+  const clock = new TestClock();
+  let sessionReads = 0;
+  const repository = {
+    findRuntimeSessionByTokenHash: async () => {
+      sessionReads += 1;
+      return null;
+    },
+  } as unknown as MeshrRepository;
+  const app = createMeshrServer({
+    dbPath: join(directory, "meshr.db"),
+    clock,
+    repository,
+  });
+  const { baseUrl } = await app.listen();
+  running.push({ app, baseUrl, directory, clock });
+
+  for (let index = 0; index < 60; index += 1) {
+    const rejected = await requestJson(baseUrl, "/v1/agent/meshes/mesh-public/join", {
+      method: "POST",
+      authorization: "Bearer repeated-invalid-control-token",
+      idempotencyKey: `invalid-control-${index}`,
+    });
+    assert.equal(rejected.response.status, 401);
+  }
+  const readsBeforeLimit = sessionReads;
+  const limited = await requestJson(baseUrl, "/v1/agent/meshes/mesh-public/join", {
+    method: "POST",
+    authorization: "Bearer repeated-invalid-control-token",
+    idempotencyKey: "invalid-control-limited",
+  });
+  assert.equal(limited.response.status, 429);
+  assert.equal(limited.json.error.code, "agent_mutation_rate_limited");
+  assert.equal(
+    sessionReads,
+    readsBeforeLimit,
+    "the source-limited mutation must not query the durable session store",
+  );
+});
+
+test("human control source rejection happens before durable session auth or provider verification", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "meshr-human-control-preauth-test-"));
+  const clock = new TestClock();
+  let sessionReads = 0;
+  let verifierCalls = 0;
+  const repository = {
+    findHumanSession: async () => {
+      sessionReads += 1;
+      return null;
+    },
+  } as unknown as MeshrRepository;
+  const identityVerifier: IdentityVerifier = async () => {
+    verifierCalls += 1;
+    throw new Error("must not verify before human authentication");
+  };
+  const app = createMeshrServer({
+    dbPath: join(directory, "meshr.db"),
+    clock,
+    repository,
+    identityVerifier,
+  });
+  const { baseUrl } = await app.listen();
+  running.push({ app, baseUrl, directory, clock });
+
+  for (let index = 0; index < 60; index += 1) {
+    const rejected = await requestJson(baseUrl, "/v1/account/providers/link", {
+      method: "POST",
+      cookie: "meshr_session=invalid-human-control-session",
+      csrf: "invalid-csrf",
+      body: { provider: "google", idToken: `invalid-${index}` },
+    });
+    assert.equal(rejected.response.status, 401);
+  }
+  const readsBeforeLimit = sessionReads;
+  const limited = await requestJson(baseUrl, "/v1/account/providers/link", {
+    method: "POST",
+    cookie: "meshr_session=invalid-human-control-session",
+    csrf: "invalid-csrf",
+    body: { provider: "google", idToken: "invalid-limited" },
+  });
+  assert.equal(limited.response.status, 429);
+  assert.equal(limited.json.error.code, "human_control_rate_limited");
+  assert.equal(sessionReads, readsBeforeLimit);
+  assert.equal(verifierCalls, 0);
+});
+
+test("verified social token replays cannot mint unbounded browser sessions", async () => {
+  let verifierCalls = 0;
+  let providerFinds = 0;
+  let providerCreates = 0;
+  let durableSessions = 0;
+  const durableRateLimits: Array<
+    NonNullable<
+      Parameters<MeshrRepository["createHumanSession"]>[0]["socialRateLimit"]
+    >
+  > = [];
+  let durableAccountExists = false;
+  const identityVerifier: IdentityVerifier = async (provider) => {
+    verifierCalls += 1;
+    return {
+      provider,
+      subject: "bounded-social-subject",
+      email: "bounded-social@example.test",
+      displayName: "Bounded Social",
+      emailVerified: true,
+    };
+  };
+  const durableAccount = {
+    accountId: "account-bounded-social",
+    email: "bounded-social@example.test",
+    displayName: "Bounded Social",
+    createdAt: "2026-08-27T18:00:00.000Z",
+  };
+  const repository = {
+    findAccountByProvider: async () => {
+      providerFinds += 1;
+      return durableAccountExists ? durableAccount : null;
+    },
+    createSocialAccount: async () => {
+      providerCreates += 1;
+      durableAccountExists = true;
+      return durableAccount;
+    },
+    createHumanSession: async (
+      input: Parameters<MeshrRepository["createHumanSession"]>[0],
+    ) => {
+      durableSessions += 1;
+      assert.ok(input.socialRateLimit);
+      durableRateLimits.push(input.socialRateLimit);
+    },
+  } as unknown as MeshrRepository;
+  const { app, baseUrl, clock } = await start({
+    identityVerifier,
+    repository,
+  });
+  const responses = [];
+  for (let index = 0; index < 5; index += 1) {
+    responses.push(
+      await requestJson(baseUrl, "/v1/sessions/social", {
+        method: "POST",
+        body: { provider: "google", idToken: `valid-replay-${index}` },
+      }),
+    );
+  }
+  const identityBeforeLimit = app.database.sqlite
+    .prepare(
+      "SELECT last_seen_at FROM provider_identities WHERE provider = ? AND subject = ?",
+    )
+    .get("google", "bounded-social-subject") as { last_seen_at: string };
+  clock.advance(1_000);
+  responses.push(
+    await requestJson(baseUrl, "/v1/sessions/social", {
+      method: "POST",
+      body: { provider: "google", idToken: "valid-replay-limited" },
+    }),
+  );
+
+  assert.equal(
+    responses.slice(0, 5).every(({ response }) => response.status === 201),
+    true,
+  );
+  assert.equal(responses.at(-1)?.response.status, 429);
+  assert.equal(
+    responses.at(-1)?.json.error.code,
+    "social_session_rate_limited",
+  );
+  assert.equal(verifierCalls, 6, "identity limiting follows successful verification");
+  assert.equal(providerFinds, 5, "the rejected replay must not resolve an account");
+  assert.equal(providerCreates, 1, "the rejected replay must not create an account");
+  assert.equal(durableSessions, 5);
+  assert.deepEqual(
+    durableRateLimits,
+    Array.from({ length: 5 }, () => ({
+      subjectHash: createHash("sha256")
+        .update("google:bounded-social-subject")
+        .digest("hex"),
+      capacity: 5,
+      refillPerSecond: 10 / 60,
+    })),
+    "every durable social session must carry the stable distributed bucket contract",
+  );
+  assert.equal(
+    (
+      app.database.sqlite
+        .prepare(
+          "SELECT last_seen_at FROM provider_identities WHERE provider = ? AND subject = ?",
+        )
+        .get("google", "bounded-social-subject") as { last_seen_at: string }
+    ).last_seen_at,
+    identityBeforeLimit.last_seen_at,
+    "the rejected replay must not advance the local identity projection",
+  );
+  assert.equal(
+    app.database.sqlite
+      .prepare("SELECT COUNT(*) AS count FROM human_sessions")
+      .get()?.count,
+    5,
+  );
+});
+
+test("local SQLite social sessions retain the process-local replay cap", async () => {
+  const { app, baseUrl } = await start({
+    identityVerifier: async (provider) => ({
+      provider,
+      subject: "local-bounded-social-subject",
+      email: "local-bounded-social@example.test",
+      displayName: "Local Bounded Social",
+      emailVerified: true,
+    }),
+  });
+  const responses = [];
+  for (let replay = 0; replay < 6; replay += 1) {
+    responses.push(
+      await requestJson(baseUrl, "/v1/sessions/social", {
+        method: "POST",
+        body: { provider: "google", idToken: `local-replay-${replay}` },
+      }),
+    );
+  }
+
+  assert.equal(
+    responses.filter(({ response }) => response.status === 201).length,
+    5,
+  );
+  assert.equal(responses.at(-1)?.response.status, 429);
+  assert.equal(
+    responses.at(-1)?.json.error.code,
+    "social_session_rate_limited",
+  );
+  assert.equal(
+    app.database.sqlite
+      .prepare("SELECT COUNT(*) AS count FROM human_sessions")
+      .get()?.count,
+    5,
+  );
+});
+
+test("durable social session rate limits return 429 and roll back the local row", async () => {
+  const subject = "durably-bounded-social-subject";
+  const account = {
+    accountId: "account-durably-bounded-social",
+    email: "durably-bounded-social@example.test",
+    displayName: "Durably Bounded Social",
+    createdAt: "2026-08-27T18:00:00.000Z",
+  };
+  let attemptedSession:
+    | Parameters<MeshrRepository["createHumanSession"]>[0]
+    | undefined;
+  const repository = {
+    findAccountByProvider: async () => account,
+    createSocialAccount: async () => account,
+    createHumanSession: async (
+      input: Parameters<MeshrRepository["createHumanSession"]>[0],
+    ) => {
+      attemptedSession = input;
+      throw new Error("social_session_rate_limited:6");
+    },
+  } as unknown as MeshrRepository;
+  const { app, baseUrl } = await start({
+    repository,
+    identityVerifier: async (provider) => ({
+      provider,
+      subject,
+      email: account.email,
+      displayName: account.displayName,
+      emailVerified: true,
+    }),
+  });
+
+  const limited = await requestJson(baseUrl, "/v1/sessions/social", {
+    method: "POST",
+    body: { provider: "google", idToken: "replayed-provider-token" },
+  });
+
+  assert.equal(limited.response.status, 429);
+  assert.equal(limited.response.headers.get("retry-after"), "6");
+  assert.equal(limited.json.error.code, "social_session_rate_limited");
+  assert.deepEqual(attemptedSession?.socialRateLimit, {
+    subjectHash: createHash("sha256")
+      .update(`google:${subject}`)
+      .digest("hex"),
+    capacity: 5,
+    refillPerSecond: 10 / 60,
+  });
+  assert.equal(
+    app.database.sqlite
+      .prepare("SELECT COUNT(*) AS count FROM human_sessions")
+      .get()?.count,
+    0,
+    "a durable rejection must remove the session inserted into the replica cache",
+  );
+});
+
+test("repeatable human control sinks share an authenticated account budget", async () => {
+  let verifierCalls = 0;
+  const identityVerifier: IdentityVerifier = async () => {
+    verifierCalls += 1;
+    throw new Error("invalid test provider token");
+  };
+  const { baseUrl } = await start({ identityVerifier });
+  const registration = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "human-control-budget@example.test",
+      password: "a sufficiently long human control passphrase",
+      displayName: "Human Control Budget",
+    },
+  });
+  const cookie = cookieFrom(registration.response);
+  const csrf = registration.json.csrfToken as string;
+  const attempts = [
+    await requestJson(baseUrl, "/v1/agents/missing-profile-agent/profile", {
+      method: "PUT",
+      cookie,
+      csrf,
+      body: { tagline: "Attempted update" },
+    }),
+    await requestJson(baseUrl, "/v1/agents/missing-binding-agent/binding", {
+      method: "DELETE",
+      cookie,
+      csrf,
+    }),
+    await requestJson(baseUrl, "/v1/meshes/mesh-public/governance", {
+      method: "PUT",
+      cookie,
+      csrf,
+      body: { description: "Attempted governance update" },
+    }),
+    await requestJson(baseUrl, "/v1/meshes/mesh-public/agents/missing-agent", {
+      method: "DELETE",
+      cookie,
+      csrf,
+    }),
+  ];
+  assert.equal(attempts.every(({ response }) => response.status !== 429), true);
+
+  for (let index = attempts.length; index < 20; index += 1) {
+    const rejected = await requestJson(baseUrl, "/v1/account/providers/link", {
+      method: "POST",
+      cookie,
+      csrf,
+      body: { provider: "google", idToken: `invalid-link-${index}` },
+    });
+    assert.equal(rejected.response.status, 401);
+  }
+  const limited = await requestJson(
+    baseUrl,
+    "/v1/agents/another-missing-agent/profile",
+    {
+      method: "PUT",
+      cookie,
+      csrf,
+      body: { tagline: "This attempt is rejected before target lookup" },
+    },
+  );
+  assert.equal(limited.response.status, 429);
+  assert.equal(limited.json.error.code, "human_control_rate_limited");
+  assert.equal(verifierCalls, 16);
+
+  // A control budget may never trap the user in a signed-in session.
+  const logout = await requestJson(baseUrl, "/v1/session", {
+    method: "DELETE",
+    cookie,
+    csrf,
+  });
+  assert.equal(logout.response.status, 200);
+});
+
+test("semantic owner-profile and mesh-governance replays do not advance local revisions", async () => {
+  const { app, baseUrl, clock } = await start();
+  const registration = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "semantic-control-noop@example.test",
+      password: "a sufficiently long semantic no-op passphrase",
+      displayName: "Semantic No-op",
+    },
+  });
+  const accountId = registration.json.user.id as string;
+  const cookie = cookieFrom(registration.response);
+  const csrf = registration.json.csrfToken as string;
+  const agentId = "agent-semantic-control-noop";
+  const createdAt = clock.now().toISOString();
+  app.database.sqlite
+    .prepare(
+      `INSERT INTO agents(
+         id, owner_account_id, name, handle, tagline, interests_json,
+         personality, attention_json, runtime, runtime_label, runtime_subject,
+         public_key_pem, definition_digest, created_at, updated_at
+       ) VALUES(?, ?, 'Semantic Agent', 'semantic-agent', 'Stable tagline',
+                '[]', 'Careful', ?, 'local', 'Fixture', 'fixture:semantic',
+                'fixture-key', NULL, ?, ?)`,
+    )
+    .run(
+      agentId,
+      accountId,
+      JSON.stringify({
+        browse: "public",
+        rootPosts: "draft",
+        replies: "draft",
+        notes: "",
+      }),
+      createdAt,
+      createdAt,
+    );
+  clock.advance(1_000);
+  const profileReplay = await requestJson(
+    baseUrl,
+    `/v1/agents/${agentId}/profile`,
+    {
+      method: "PUT",
+      cookie,
+      csrf,
+      body: { tagline: "Stable tagline" },
+    },
+  );
+  assert.equal(profileReplay.response.status, 200);
+  assert.equal(profileReplay.json.agent.updatedAt, createdAt);
+  assert.equal(
+    app.database.sqlite
+      .prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE type = 'agent.profile.updated' AND agent_id = ?",
+      )
+      .get(agentId)?.count,
+    0,
+  );
+
+  const createdMesh = await requestJson(baseUrl, "/v1/meshes", {
+    method: "POST",
+    cookie,
+    csrf,
+    idempotencyKey: "semantic-noop-mesh-create",
+    body: {
+      name: "Semantic No-op Mesh",
+      description: "Stable governance",
+      visibility: "private",
+      joinPolicy: "invite_only",
+    },
+  });
+  assert.equal(createdMesh.response.status, 201);
+  const meshId = createdMesh.json.mesh.id as string;
+  const before = app.database.sqlite
+    .prepare("SELECT updated_at FROM meshes WHERE id = ?")
+    .get(meshId) as { updated_at: string };
+  const auditsBefore = app.database.sqlite
+    .prepare(
+      "SELECT COUNT(*) AS count FROM audit_events WHERE action = 'mesh.governance.updated' AND resource_id = ?",
+    )
+    .get(meshId) as { count: number };
+  clock.advance(1_000);
+  const governanceReplay = await requestJson(
+    baseUrl,
+    `/v1/meshes/${meshId}/governance`,
+    {
+      method: "PUT",
+      cookie,
+      csrf,
+      body: {
+        name: "Semantic No-op Mesh",
+        description: "Stable governance",
+        visibility: "private",
+        joinPolicy: "invite_only",
+      },
+    },
+  );
+  assert.equal(governanceReplay.response.status, 200);
+  assert.equal(
+    (
+      app.database.sqlite
+        .prepare("SELECT updated_at FROM meshes WHERE id = ?")
+        .get(meshId) as { updated_at: string }
+    ).updated_at,
+    before.updated_at,
+  );
+  assert.equal(
+    (
+      app.database.sqlite
+        .prepare(
+          "SELECT COUNT(*) AS count FROM audit_events WHERE action = 'mesh.governance.updated' AND resource_id = ?",
+        )
+        .get(meshId) as { count: number }
+    ).count,
+    auditsBefore.count,
+  );
+});
+
+test("durable membership removal preserves observed provenance without fabricating missing history", async () => {
+  const accountId = "account-membership-removal-mirror";
+  const csrfToken = "membership-removal-csrf";
+  const sessionToken = "membership-removal-session";
+  const createdAt = "2026-08-27T18:00:00.000Z";
+  const expiresAt = "2026-08-28T18:00:00.000Z";
+  const repository = {
+    findHumanSession: async () => ({
+      accountId,
+      csrfToken,
+      createdAt,
+      expiresAt,
+      absoluteExpiresAt: expiresAt,
+      lastSeenAt: createdAt,
+    }),
+    touchHumanSession: async () => {},
+    findAccountById: async () => ({
+      accountId,
+      email: "membership-removal@example.test",
+      displayName: "Membership Removal",
+      createdAt,
+    }),
+    upsertMeshAgentMembership: async () => ({ changed: true }),
+  } as unknown as MeshrRepository;
+  const { app, baseUrl, clock } = await start({ repository });
+  const meshId = "mesh-public";
+  const observedAgentId = "agent-observed-membership";
+  const unobservedAgentId = "agent-unobserved-membership";
+  const attentionPolicy = JSON.stringify({ replies: "draft", notes: "keep" });
+
+  app.database.transaction(() => {
+    app.database.sqlite
+      .prepare(
+        `INSERT INTO accounts(id, email, display_name, password_hash, created_at)
+         VALUES(?, ?, ?, '', ?)`,
+      )
+      .run(
+        accountId,
+        "membership-removal@example.test",
+        "Membership Removal",
+        createdAt,
+      );
+    app.database.sqlite
+      .prepare(
+        `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
+         VALUES(?, ?, 'steward', ?, ?)`,
+      )
+      .run(meshId, accountId, createdAt, createdAt);
+    const insertAgent = app.database.sqlite.prepare(
+      `INSERT INTO agents(
+         id, owner_account_id, name, handle, tagline, interests_json,
+         personality, attention_json, runtime, runtime_label, runtime_subject,
+         public_key_pem, definition_digest, created_at, updated_at
+       ) VALUES(?, ?, ?, ?, '', '[]', '', '{}', 'local', 'Fixture', ?,
+                'fixture-key', NULL, ?, ?)`,
+    );
+    insertAgent.run(
+      observedAgentId,
+      accountId,
+      "Observed Membership",
+      "observed-membership",
+      `fixture:${observedAgentId}`,
+      createdAt,
+      createdAt,
+    );
+    insertAgent.run(
+      unobservedAgentId,
+      accountId,
+      "Unobserved Membership",
+      "unobserved-membership",
+      `fixture:${unobservedAgentId}`,
+      createdAt,
+      createdAt,
+    );
+    app.database.sqlite
+      .prepare(
+        "INSERT INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)",
+      )
+      .run(meshId, observedAgentId, createdAt);
+    app.database.sqlite
+      .prepare(
+        `INSERT INTO mesh_agent_memberships(
+           mesh_id, agent_id, status, attention_policy_json,
+           admission_provenance, joined_at, updated_at
+         ) VALUES(?, ?, 'joined', ?, 'approval', ?, ?)`,
+      )
+      .run(meshId, observedAgentId, attentionPolicy, createdAt, createdAt);
+  });
+  clock.advance(1_000);
+
+  const cookie = `meshr_session=${sessionToken}`;
+  const observedRemoval = await requestJson(
+    baseUrl,
+    `/v1/meshes/${meshId}/agents/${observedAgentId}`,
+    { method: "DELETE", cookie, csrf: csrfToken, origin: baseUrl },
+  );
+  assert.equal(observedRemoval.response.status, 200);
+  const preserved = app.database.sqlite
+    .prepare(
+      `SELECT status, attention_policy_json, admission_provenance, joined_at, updated_at
+       FROM mesh_agent_memberships WHERE mesh_id = ? AND agent_id = ?`,
+    )
+    .get(meshId, observedAgentId) as {
+    status: string;
+    attention_policy_json: string;
+    admission_provenance: string;
+    joined_at: string;
+    updated_at: string;
+  };
+  assert.deepEqual({ ...preserved }, {
+    status: "removed",
+    attention_policy_json: attentionPolicy,
+    admission_provenance: "approval",
+    joined_at: createdAt,
+    updated_at: clock.now().toISOString(),
+  });
+  assert.equal(
+    app.database.sqlite
+      .prepare(
+        "SELECT COUNT(*) AS count FROM mesh_members WHERE mesh_id = ? AND agent_id = ?",
+      )
+      .get(meshId, observedAgentId)?.count,
+    0,
+  );
+
+  const unobservedRemoval = await requestJson(
+    baseUrl,
+    `/v1/meshes/${meshId}/agents/${unobservedAgentId}`,
+    { method: "DELETE", cookie, csrf: csrfToken, origin: baseUrl },
+  );
+  assert.equal(unobservedRemoval.response.status, 200);
+  assert.equal(
+    app.database.sqlite
+      .prepare(
+        "SELECT COUNT(*) AS count FROM mesh_agent_memberships WHERE mesh_id = ? AND agent_id = ?",
+      )
+      .get(meshId, unobservedAgentId)?.count,
+    0,
+    "a replica missing the durable row must not invent admission provenance",
+  );
+});
+
+test("rotating idempotency keys cannot amplify native agent control writes", async () => {
+  const { app, baseUrl, clock } = await start();
+  const now = clock.now().toISOString();
+  const expiresAt = new Date(clock.now().getTime() + 60 * 60_000).toISOString();
+  const token = "bounded-agent-control-token";
+  const tokenHash = createHash("sha256").update(token).digest("hex");
+  const agentId = "agent-control-budget";
+  const accountId = "account-control-budget";
+  const pairingId = "pairing-control-budget";
+  const sessionId = "session-control-budget";
+  const postId = "post-control-budget";
+
+  app.database.transaction(() => {
+    app.database.sqlite.prepare(
+      "INSERT INTO accounts(id, email, display_name, password_hash, created_at) VALUES(?, ?, ?, ?, ?)",
+    ).run(accountId, "control-budget@example.test", "Control Budget", "fixture", now);
+    app.database.sqlite.prepare(
+      `INSERT INTO agents(
+         id, owner_account_id, name, handle, tagline, interests_json,
+         personality, attention_json, runtime, runtime_label, runtime_subject,
+         public_key_pem, definition_digest, created_at, updated_at
+       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      agentId,
+      accountId,
+      "Control Budget Agent",
+      "control-budget-agent",
+      "Exercises bounded control writes",
+      "[]",
+      "Careful",
+      JSON.stringify({ browse: "public", rootPosts: "autonomous", replies: "autonomous" }),
+      "local",
+      "Control budget fixture",
+      "fixture:control-budget",
+      "fixture-key",
+      null,
+      now,
+      now,
+    );
+    app.database.sqlite.prepare(
+      `INSERT INTO pairings(
+         id, code, secret_hash, runtime, runtime_label, external_subject,
+         public_key_pem, requested_profile_json, definition_digest, status,
+         owner_account_id, agent_id, created_at, expires_at, approved_at, claimed_at
+       ) VALUES(?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'claimed', ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      pairingId,
+      "CONTROL-BUDGET",
+      "fixture-secret",
+      "local",
+      "Control budget fixture",
+      "fixture:control-budget",
+      "fixture-key",
+      accountId,
+      agentId,
+      now,
+      expiresAt,
+      now,
+      now,
+    );
+    app.database.sqlite.prepare(
+      `INSERT INTO agent_sessions(
+         token_hash, agent_id, pairing_id, created_at, expires_at, last_seen_at,
+         session_id, runtime_kind, status, authority_epoch
+       ) VALUES(?, ?, ?, ?, ?, ?, ?, 'local', 'active', 1)`,
+    ).run(tokenHash, agentId, pairingId, now, expiresAt, now, sessionId);
+    app.database.sqlite.prepare(
+      `INSERT INTO agent_authority(agent_id, epoch, authority_kind, session_id, updated_at)
+       VALUES(?, 1, 'native', ?, ?)`,
+    ).run(agentId, sessionId, now);
+    app.database.sqlite.prepare(
+      "INSERT INTO mesh_members(mesh_id, agent_id, joined_at) VALUES('mesh-public', ?, ?)",
+    ).run(agentId, now);
+    app.database.sqlite.prepare(
+      `INSERT INTO posts(
+         id, mesh_id, topic_id, agent_id, session_id, parent_post_id, body,
+         created_at, moderation_state, moderation_reason, expires_at
+       ) VALUES(?, 'mesh-public', 'topic-small-discoveries', ?, ?, NULL, ?, ?, 'quarantined', ?, ?)`,
+    ).run(
+      postId,
+      agentId,
+      sessionId,
+      "A fixture post awaiting appeal.",
+      now,
+      "fixture_review",
+      "2026-11-25T18:00:00.000Z",
+    );
+  });
+
+  const authorization = `Bearer ${token}`;
+  const responses = [];
+  for (let index = 0; index < 31; index += 1) {
+    const idempotencyKey = `agent-control-${index}`;
+    switch (index % 4) {
+      case 0:
+        responses.push(await requestJson(baseUrl, "/v1/agent/meshes/mesh-public/join", {
+          method: "POST",
+          authorization,
+          idempotencyKey,
+        }));
+        break;
+      case 1:
+        responses.push(await requestJson(
+          baseUrl,
+          "/v1/agent/topics/topic-small-discoveries/follow",
+          { method: "PUT", authorization, idempotencyKey },
+        ));
+        break;
+      case 2:
+        responses.push(await requestJson(baseUrl, "/v1/agent/profile", {
+          method: "PUT",
+          authorization,
+          idempotencyKey,
+          body: { profile: { tagline: `Bounded control update ${index}` } },
+        }));
+        break;
+      default:
+        responses.push(await requestJson(baseUrl, `/v1/agent/posts/${postId}/appeal`, {
+          method: "POST",
+          authorization,
+          idempotencyKey,
+          body: { reason: `Bounded appeal ${index}` },
+        }));
+    }
+  }
+
+  assert.equal(
+    responses.slice(0, 30).every(({ response }) => response.status >= 200 && response.status < 300),
+    true,
+  );
+  assert.equal(responses.at(-1)?.response.status, 429);
+  assert.equal(responses.at(-1)?.json.error.code, "agent_mutation_rate_limited");
+  assert.ok(Number(responses.at(-1)?.response.headers.get("retry-after")) >= 1);
+  assert.equal(
+    app.database.sqlite.prepare(
+      "SELECT COUNT(*) AS count FROM idempotency_records WHERE agent_id = ?",
+    ).get(agentId)?.count,
+    30,
+    "the rejected rotating key must not allocate another idempotency record",
+  );
+});
+
+test("mesh creation is rate limited before its account-wide quota projection", async () => {
+  const { baseUrl } = await start();
+  const registration = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "mesh-create-budget@example.test",
+      password: "a sufficiently long mesh creation passphrase",
+      displayName: "Mesh Creation Budget",
+    },
+  });
+  assert.equal(registration.response.status, 201);
+  const cookie = cookieFrom(registration.response);
+  const csrf = registration.json.csrfToken as string;
+  const creates = await Promise.all(Array.from({ length: 6 }, (_, index) =>
+    requestJson(baseUrl, "/v1/meshes", {
+      method: "POST",
+      cookie,
+      csrf,
+      idempotencyKey: `mesh-create-budget-${index}`,
+      body: {
+        name: `Bounded mesh ${index}`,
+        visibility: "private",
+        joinPolicy: "invite_only",
+      },
+    })));
+  assert.equal(creates.filter(({ response }) => response.status === 201).length, 5);
+  assert.equal(
+    creates.find(({ response }) => response.status === 429)?.json.error.code,
+    "mesh_create_rate_limited",
+  );
+});
+
+test("activity preference writes are bounded and default state consumes no row", async () => {
+  const { app, baseUrl } = await start();
+  const register = async (email: string) => {
+    const response = await requestJson(baseUrl, "/v1/accounts", {
+      method: "POST",
+      body: {
+        email,
+        password: "a sufficiently long preference passphrase",
+        displayName: "Preference Budget",
+      },
+    });
+    assert.equal(response.response.status, 201);
+    return {
+      id: response.json.user.id as string,
+      cookie: cookieFrom(response.response),
+      csrf: response.json.csrfToken as string,
+    };
+  };
+  const owner = await register("preference-budget@example.test");
+  const defaultPreference = await requestJson(
+    baseUrl,
+    "/v1/activity/preferences/topic/topic-small-discoveries",
+    {
+      method: "PUT",
+      cookie: owner.cookie,
+      csrf: owner.csrf,
+      body: { watching: false, muted: false },
+    },
+  );
+  assert.equal(defaultPreference.response.status, 200);
+  assert.equal(
+    app.database.sqlite.prepare(
+      "SELECT COUNT(*) AS count FROM human_activity_preferences WHERE account_id = ?",
+    ).get(owner.id)?.count,
+    0,
+  );
+
+  app.database.transaction(() => {
+    const insert = app.database.sqlite.prepare(
+      `INSERT INTO human_activity_preferences(
+         account_id, kind, resource_id, watching, muted, updated_at
+       ) VALUES(?, 'link', ?, 1, 0, ?)`,
+    );
+    for (let index = 0; index < 500; index += 1) {
+      insert.run(owner.id, `traffic:mesh-public:source-${index}:target-${index}`, app.database.now());
+    }
+  });
+  const capped = await requestJson(
+    baseUrl,
+    "/v1/activity/preferences/link/traffic%3Amesh-public%3Anew-source%3Anew-target",
+    {
+      method: "PUT",
+      cookie: owner.cookie,
+      csrf: owner.csrf,
+      body: { watching: true },
+    },
+  );
+  assert.equal(capped.response.status, 429);
+  assert.equal(capped.json.error.code, "activity_preference_limit_reached");
+
+  const rateOwner = await register("preference-rate@example.test");
+  const rateResponses = await Promise.all(Array.from({ length: 21 }, (_, index) =>
+    requestJson(baseUrl, `/v1/activity/preferences/link/invalid-${index}`, {
+      method: "PUT",
+      cookie: rateOwner.cookie,
+      csrf: rateOwner.csrf,
+      body: { watching: true },
+    })));
+  assert.equal(rateResponses.filter(({ response }) => response.status === 400).length, 20);
+  assert.equal(
+    rateResponses.find(({ response }) => response.status === 429)?.json.error.code,
+    "activity_preference_rate_limited",
+  );
+});
+
 test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event polling work end to end", async () => {
   const { app, baseUrl, clock } = await start();
   const keyPair = generateKeyPairSync("ed25519");
@@ -1103,7 +2661,9 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
         tagline: "Seasonal field notes",
         interests: ["gardening", "native plants"],
         personality: "Grounded and observant.",
-        attention: { browse: "public", rootPosts: "autonomous", replies: "draft" },
+        // Omit browse/replies intentionally. The approval representation must
+        // disclose the same effective defaults the server will authorize.
+        attention: { rootPosts: "autonomous" },
       },
     },
   });
@@ -1139,6 +2699,12 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
   );
   assert.equal(lookup.response.status, 200);
   assert.equal(lookup.json.pairing.requestedProfile.handle, "bramble-live");
+  assert.deepEqual(lookup.json.pairing.requestedProfile.attention, {
+    browse: "public",
+    rootPosts: "autonomous",
+    replies: "draft",
+    notes: "",
+  });
   assert.equal(lookup.json.pairing.externalSubject, "openclaw:bramble");
   assert.equal(lookup.json.pairing.definitionDigest, definitionDigest);
 
@@ -1150,14 +2716,14 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
   assert.equal(csrfRejected.response.status, 403);
   assert.equal(csrfRejected.json.error.code, "csrf_failed");
 
-  const missingAutonomousAcknowledgement = await requestJson(
+  const missingDurableActionAcknowledgement = await requestJson(
     baseUrl,
     `/v1/pairings/${pairingId}/approve`,
     { method: "POST", cookie, csrf, body: {} },
   );
-  assert.equal(missingAutonomousAcknowledgement.response.status, 400);
+  assert.equal(missingDurableActionAcknowledgement.response.status, 400);
   assert.equal(
-    missingAutonomousAcknowledgement.json.error.code,
+    missingDurableActionAcknowledgement.json.error.code,
     "autonomous_acknowledgement_required",
   );
 
@@ -1430,6 +2996,30 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
   assert.equal(invitationList.response.status, 200);
   assert.equal(invitationList.json.invitations[0].status, "active");
   assert.equal("token" in invitationList.json.invitations[0], false);
+  const otherInviteOnlyMesh = await requestJson(baseUrl, "/v1/meshes", {
+    method: "POST",
+    cookie,
+    csrf,
+    idempotencyKey: "cross-mesh-invitation-target",
+    body: {
+      name: "Other invite-only mesh",
+      visibility: "private",
+      joinPolicy: "invite_only",
+    },
+  });
+  assert.equal(otherInviteOnlyMesh.response.status, 201);
+  const crossMeshReplay = await requestJson(
+    baseUrl,
+    `/v1/agent/meshes/${otherInviteOnlyMesh.json.mesh.id}/join`,
+    {
+      method: "POST",
+      authorization: agentAuth,
+      idempotencyKey: "mesh-join-cross-mesh-invite-001",
+      body: { invitationToken: invitation.json.token },
+    },
+  );
+  assert.equal(crossMeshReplay.response.status, 403);
+  assert.equal(crossMeshReplay.json.error.code, "invitation_invalid");
   const joinWithoutInvitation = await requestJson(
     baseUrl,
     `/v1/agent/meshes/${privateMeshId}/join`,
@@ -1730,6 +3320,20 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
     },
   );
   assert.equal(mentionPolicy.response.status, 200);
+  const mentionJoin = await requestJson(baseUrl, "/v1/agent/meshes/mesh-unjoined/join", {
+    method: "POST",
+    authorization: agentAuth,
+    idempotencyKey: "mesh-join-mentions-denied-001",
+  });
+  assert.equal(mentionJoin.response.status, 403);
+  assert.equal(mentionJoin.json.error.code, "attention_policy_denied");
+  const mentionFollow = await requestJson(baseUrl, `/v1/agent/topics/${topicId}/follow`, {
+    method: "PUT",
+    authorization: agentAuth,
+    idempotencyKey: "follow-mentions-denied-001",
+  });
+  assert.equal(mentionFollow.response.status, 403);
+  assert.equal(mentionFollow.json.error.code, "attention_policy_denied");
   const mentionPost = await requestJson(baseUrl, "/v1/agent/posts", {
     method: "POST",
     authorization: agentAuth,
@@ -1835,7 +3439,7 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
   const replacementApproval = await requestJson(
     baseUrl,
     `/v1/pairings/${replacementPairingId}/approve`,
-    { method: "POST", cookie, csrf, body: {} },
+    { method: "POST", cookie, csrf, body: { acknowledgeAutonomous: true } },
   );
   assert.equal(replacementApproval.response.status, 200);
   assert.equal(replacementApproval.json.agent.id, claim.json.agent.id);
@@ -1890,7 +3494,7 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
   const migrationApproval = await requestJson(
     baseUrl,
     `/v1/pairings/${migrationPairing.json.pairingId}/approve`,
-    { method: "POST", cookie, csrf, body: {} },
+    { method: "POST", cookie, csrf, body: { acknowledgeAutonomous: true } },
   );
   assert.equal(migrationApproval.response.status, 200);
   assert.equal(migrationApproval.json.agent.id, claim.json.agent.id);
@@ -1948,7 +3552,7 @@ test("account, pairing, Ed25519 claim, agent posting, reply, follow, and event p
       method: "POST",
       cookie: otherCookie,
       csrf: otherOwner.json.csrfToken,
-      body: {},
+      body: { acknowledgeAutonomous: true },
     },
   );
   assert.equal(foreignApproval.response.status, 409);
@@ -2139,103 +3743,256 @@ test("governance invitation and role endpoints enforce per-account budgets", asy
   assert.ok(Number(roleLimited.response.headers.get("retry-after")) >= 1);
 });
 
-test("durable event polling rechecks native session authority after a raced query", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "meshr-event-race-test-"));
-  const clock = new TestClock();
-  const token = "race-agent-token";
-  const tokenHash = createHash("sha256").update(token).digest("hex");
-  const sessionId = "session-event-race";
-  const agentId = "agent-event-race";
-  const accountId = "account-event-race";
-  const now = clock.now().toISOString();
-  const expiresAt = new Date(clock.now().getTime() + 60 * 60_000).toISOString();
-  let queryStarted!: () => void;
-  let releaseQuery!: () => void;
-  const queryStartedPromise = new Promise<void>((resolve) => { queryStarted = resolve; });
-  const queryReleasePromise = new Promise<void>((resolve) => { releaseQuery = resolve; });
-  let revoked = false;
-  const repository = {
-    listAgentEvents: async () => {
-      queryStarted();
-      await queryReleasePromise;
-      return {
-        events: [{
-          eventId: "private-raced-event",
-          type: "post.created",
-          meshId: "mesh-private",
-          topicId: "topic-private",
-          agentId,
-          sessionId,
-          runtimeKind: "openclaw",
-          payload: { observation: "should not be returned" },
-          occurredAt: now,
-        }],
-        nextAfter: null,
-      };
-    },
-    findRuntimeSessionById: async () => revoked ? null : {
-      tokenHash,
-      agentId,
-      bindingId: "binding-event-race",
-      sessionId,
-      authorityEpoch: 1,
-      createdAt: now,
-      expiresAt,
-      lastSeenAt: now,
-      status: "active",
-      supersedingSessionId: null,
-    },
-  } as unknown as MeshrRepository;
-  const app = createMeshrServer({
-    dbPath: join(directory, "meshr.db"),
-    clock,
-    repository,
-  });
-  const { baseUrl } = await app.listen();
-  running.push({ app, baseUrl, directory, clock });
-  app.database.sqlite.exec(`
-    INSERT INTO accounts(id, email, display_name, password_hash, created_at)
-    VALUES('${accountId}', 'event-race@example.test', 'Event Race', '', '${now}');
-    INSERT INTO agents(
-      id, owner_account_id, name, handle, tagline, interests_json,
-      personality, attention_json, runtime, runtime_label, runtime_subject,
-      public_key_pem, definition_digest, created_at, updated_at
-    ) VALUES(
-      '${agentId}', '${accountId}', 'Event Race Agent', 'event-race-agent',
-      'Verifies terminal event authority', '["testing"]', 'Careful',
-      '{"browse":"public","rootPosts":"autonomous","replies":"autonomous"}',
-      'openclaw', 'Race fixture', 'fixture:event-race', 'fixture-key', NULL,
-      '${now}', '${now}'
-    );
-    INSERT INTO pairings(
-      id, code, secret_hash, runtime, runtime_label, external_subject,
-      public_key_pem, requested_profile_json, definition_digest, status,
-      owner_account_id, agent_id, created_at, expires_at, approved_at, claimed_at
-    ) VALUES(
-      'binding-event-race', 'RACE-TEST', 'fixture-secret', 'openclaw',
-      'Race fixture', 'fixture:event-race', 'fixture-key', NULL, NULL, 'claimed',
-      '${accountId}', '${agentId}', '${now}', '${expiresAt}', '${now}', '${now}'
-    );
-    INSERT INTO agent_sessions(
-      token_hash, agent_id, pairing_id, created_at, expires_at, last_seen_at,
-      session_id, runtime_kind, status, authority_epoch
-    ) VALUES(
-      '${tokenHash}', '${agentId}', 'binding-event-race', '${now}', '${expiresAt}',
-      '${now}', '${sessionId}', 'openclaw', 'active', 1
-    );
-    INSERT INTO agent_authority(agent_id, epoch, authority_kind, session_id, updated_at)
-    VALUES('${agentId}', 1, 'native', '${sessionId}', '${now}');
-  `);
+test("durable event polling rechecks native session and browse authority after a raced query", async () => {
+  for (const racedAuthority of ["attention", "session"] as const) {
+    const directory = mkdtempSync(join(tmpdir(), `meshr-event-${racedAuthority}-race-test-`));
+    const clock = new TestClock();
+    const token = `race-agent-token-${racedAuthority}`;
+    const tokenHash = createHash("sha256").update(token).digest("hex");
+    const sessionId = `session-event-race-${racedAuthority}`;
+    const agentId = `agent-event-race-${racedAuthority}`;
+    const accountId = `account-event-race-${racedAuthority}`;
+    const now = clock.now().toISOString();
+    const expiresAt = new Date(clock.now().getTime() + 60 * 60_000).toISOString();
+    let queryStarted!: () => void;
+    let releaseQuery!: () => void;
+    const queryStartedPromise = new Promise<void>((resolve) => { queryStarted = resolve; });
+    const queryReleasePromise = new Promise<void>((resolve) => { releaseQuery = resolve; });
+    let revoked = false;
+    let browse: "public" | "mentions" = "public";
+    const repository = {
+      listAgentEvents: async () => {
+        queryStarted();
+        await queryReleasePromise;
+        return {
+          events: [{
+            eventId: "private-raced-event",
+            type: "post.created",
+            meshId: "mesh-private",
+            topicId: "topic-private",
+            agentId,
+            sessionId,
+            runtimeKind: "openclaw",
+            payload: { observation: "should not be returned" },
+            occurredAt: now,
+          }],
+          nextAfter: null,
+        };
+      },
+      findAgentById: async () => ({
+        agentId,
+        bindingId: "binding-event-race",
+        ownerAccountId: accountId,
+        name: "Event Race Agent",
+        handle: "event-race-agent",
+        tagline: "Verifies terminal event authority",
+        interests: ["testing"],
+        personality: "Careful",
+        attention: { browse, rootPosts: "autonomous", replies: "autonomous" },
+        runtime: "openclaw",
+        runtimeLabel: "Race fixture",
+        runtimeSubject: "fixture:event-race",
+        publicKeyPem: "fixture-key",
+        definitionDigest: null,
+        createdAt: now,
+        updatedAt: now,
+      }),
+      findRuntimeSessionById: async () => revoked ? null : {
+        tokenHash,
+        agentId,
+        bindingId: "binding-event-race",
+        sessionId,
+        authorityEpoch: 1,
+        createdAt: now,
+        expiresAt,
+        lastSeenAt: now,
+        status: "active",
+        supersedingSessionId: null,
+      },
+    } as unknown as MeshrRepository;
+    const app = createMeshrServer({
+      dbPath: join(directory, "meshr.db"),
+      clock,
+      repository,
+    });
+    const { baseUrl } = await app.listen();
+    running.push({ app, baseUrl, directory, clock });
+    app.database.sqlite.exec(`
+      INSERT INTO accounts(id, email, display_name, password_hash, created_at)
+      VALUES('${accountId}', '${racedAuthority}-event-race@example.test', 'Event Race', '', '${now}');
+      INSERT INTO agents(
+        id, owner_account_id, name, handle, tagline, interests_json,
+        personality, attention_json, runtime, runtime_label, runtime_subject,
+        public_key_pem, definition_digest, created_at, updated_at
+      ) VALUES(
+        '${agentId}', '${accountId}', 'Event Race Agent', 'event-race-agent',
+        'Verifies terminal event authority', '["testing"]', 'Careful',
+        '{"browse":"public","rootPosts":"autonomous","replies":"autonomous"}',
+        'openclaw', 'Race fixture', 'fixture:event-race', 'fixture-key', NULL,
+        '${now}', '${now}'
+      );
+      INSERT INTO pairings(
+        id, code, secret_hash, runtime, runtime_label, external_subject,
+        public_key_pem, requested_profile_json, definition_digest, status,
+        owner_account_id, agent_id, created_at, expires_at, approved_at, claimed_at
+      ) VALUES(
+        'binding-event-race', 'RACE-TEST', 'fixture-secret', 'openclaw',
+        'Race fixture', 'fixture:event-race', 'fixture-key', NULL, NULL, 'claimed',
+        '${accountId}', '${agentId}', '${now}', '${expiresAt}', '${now}', '${now}'
+      );
+      INSERT INTO agent_sessions(
+        token_hash, agent_id, pairing_id, created_at, expires_at, last_seen_at,
+        session_id, runtime_kind, status, authority_epoch
+      ) VALUES(
+        '${tokenHash}', '${agentId}', 'binding-event-race', '${now}', '${expiresAt}',
+        '${now}', '${sessionId}', 'openclaw', 'active', 1
+      );
+      INSERT INTO agent_authority(agent_id, epoch, authority_kind, session_id, updated_at)
+      VALUES('${agentId}', 1, 'native', '${sessionId}', '${now}');
+    `);
 
-  const pending = requestJson(baseUrl, "/v1/agent/events?limit=10", {
-    authorization: `Bearer ${token}`,
+    const pending = requestJson(baseUrl, "/v1/agent/events?limit=10", {
+      authorization: `Bearer ${token}`,
+    });
+    await queryStartedPromise;
+    if (racedAuthority === "attention") browse = "mentions";
+    else revoked = true;
+    releaseQuery();
+    const raced = await pending;
+    assert.equal(raced.response.status, racedAuthority === "attention" ? 409 : 401);
+    assert.equal(
+      raced.json.error.code,
+      racedAuthority === "attention" ? "attention_policy_changed" : "agent_authentication_failed",
+    );
+  }
+});
+
+test("local join-request resolution rechecks session, role, and admission after a slow body", async () => {
+  const { app, baseUrl, clock } = await start();
+  const registration = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "slow-governance@example.test",
+      password: "a sufficiently long governance passphrase",
+      displayName: "Slow Governance",
+    },
   });
-  await queryStartedPromise;
-  revoked = true;
-  releaseQuery();
-  const raced = await pending;
-  assert.equal(raced.response.status, 401);
-  assert.equal(raced.json.error.code, "agent_authentication_failed");
+  assert.equal(registration.response.status, 201);
+  const cookie = cookieFrom(registration.response);
+  const csrf = registration.json.csrfToken as string;
+  const accountId = registration.json.user.id as string;
+  const agentId = "agent-slow-governance";
+  const requestId = "join-request-slow-governance";
+  const now = app.database.now();
+  app.database.sqlite.prepare(
+    `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
+     VALUES('mesh-public', ?, 'steward', ?, ?)`,
+  ).run(accountId, now, now);
+  app.database.sqlite.prepare(
+    `INSERT INTO agents(
+       id, owner_account_id, name, handle, tagline, interests_json,
+       personality, attention_json, runtime, runtime_label, runtime_subject,
+       public_key_pem, definition_digest, created_at, updated_at
+     ) VALUES(?, ?, 'Slow Agent', 'slow-governance-agent', '', '[]', '', ?,
+       'other', 'Slow fixture', 'fixture:slow-governance', 'fixture-key', NULL, ?, ?)`,
+  ).run(
+    agentId,
+    accountId,
+    JSON.stringify({ browse: "public", rootPosts: "draft", replies: "draft", notes: "" }),
+    now,
+    now,
+  );
+  app.database.sqlite.prepare(
+    `INSERT INTO mesh_join_requests(
+       id, mesh_id, agent_id, requested_by_account_id, status, created_at, resolved_at
+     ) VALUES(?, 'mesh-public', ?, ?, 'pending', ?, NULL)`,
+  ).run(requestId, agentId, accountId, now);
+
+  clock.advance(1_000);
+  const requestStartedAt = app.database.now();
+  const slowRequest = beginSlowJsonRequest(
+    baseUrl,
+    `/v1/meshes/mesh-public/join-requests/${requestId}/resolve`,
+    { cookie, csrf },
+  );
+  let admitted = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const session = app.database.sqlite
+      .prepare("SELECT last_seen_at FROM human_sessions WHERE account_id = ?")
+      .get(accountId) as { last_seen_at: string } | undefined;
+    if (session?.last_seen_at === requestStartedAt) {
+      admitted = true;
+      break;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  }
+  assert.equal(admitted, true, "the slow request must pass initial authentication before demotion");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  app.database.sqlite
+    .prepare("UPDATE mesh_human_roles SET role = 'observer', updated_at = ? WHERE mesh_id = 'mesh-public' AND account_id = ?")
+    .run(app.database.now(), accountId);
+
+  const raced = await slowRequest.finish('"approved"}');
+  assert.equal(raced.status, 403);
+  assert.equal(raced.json.error.code, "mesh_governance_denied");
+  assert.equal(
+    (app.database.sqlite.prepare("SELECT status FROM mesh_join_requests WHERE id = ?").get(requestId) as { status: string }).status,
+    "pending",
+  );
+  assert.equal(
+    app.database.sqlite.prepare("SELECT 1 FROM mesh_members WHERE mesh_id = 'mesh-public' AND agent_id = ?").get(agentId),
+    undefined,
+  );
+
+  app.database.sqlite
+    .prepare(
+      "UPDATE mesh_human_roles SET role = 'steward', updated_at = ? WHERE mesh_id = 'mesh-public' AND account_id = ?",
+    )
+    .run(app.database.now(), accountId);
+  app.database.sqlite
+    .prepare("UPDATE meshes SET join_policy = 'approval' WHERE id = 'mesh-public'")
+    .run();
+  clock.advance(1_000);
+  const policyRequestStartedAt = app.database.now();
+  const policyRace = beginSlowJsonRequest(
+    baseUrl,
+    `/v1/meshes/mesh-public/join-requests/${requestId}/resolve`,
+    { cookie, csrf },
+  );
+  admitted = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const session = app.database.sqlite
+      .prepare("SELECT last_seen_at FROM human_sessions WHERE account_id = ?")
+      .get(accountId) as { last_seen_at: string } | undefined;
+    if (session?.last_seen_at === policyRequestStartedAt) {
+      admitted = true;
+      break;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  }
+  assert.equal(admitted, true, "the policy-race request must pass initial authentication");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  app.database.sqlite
+    .prepare("UPDATE meshes SET join_policy = 'invite_only' WHERE id = 'mesh-public'")
+    .run();
+
+  const policyRejected = await policyRace.finish('"approved"}');
+  assert.equal(policyRejected.status, 409);
+  assert.equal(policyRejected.json.error.code, "mesh_admission_changed");
+  assert.equal(
+    (app.database.sqlite.prepare("SELECT status FROM mesh_join_requests WHERE id = ?").get(requestId) as { status: string }).status,
+    "pending",
+  );
+  const denied = await requestJson(
+    baseUrl,
+    `/v1/meshes/mesh-public/join-requests/${requestId}/resolve`,
+    { method: "POST", cookie, csrf, body: { decision: "denied" } },
+  );
+  assert.equal(denied.response.status, 200);
+  assert.equal(
+    (app.database.sqlite.prepare("SELECT status FROM mesh_join_requests WHERE id = ?").get(requestId) as { status: string }).status,
+    "denied",
+  );
 });
 
 test("pending pairings expire deterministically and cannot be approved", async () => {

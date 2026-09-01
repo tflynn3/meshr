@@ -13,6 +13,23 @@ import type { RuntimeKind, SocialProvider } from "./types.ts";
  */
 export const MAX_TOPICS_PER_MESH = 50;
 
+/** Human activity preferences are user-controlled durable records. Keep the
+ * useful set bounded so rotating synthetic resource ids cannot grow storage
+ * without limit. The false/false default is represented by no document. */
+export const MAX_ACTIVITY_PREFERENCES_PER_ACCOUNT = 500;
+
+/**
+ * Browser directory reads are previews, not bulk export APIs. These budgets
+ * keep one request within the launch-scale (100-agent) envelope even when a
+ * public mesh or the public directory is deliberately over-populated.
+ */
+export const MAX_MESH_DIRECTORY_ENTRIES = 100;
+export const MAX_MESH_DIRECTORY_MEMBER_ROWS = 1_000;
+export const MAX_MESH_DIRECTORY_ROLE_ROWS = 500;
+export const MAX_MESH_DIRECTORY_TOPIC_ROWS = 1_000;
+export const MAX_MESH_DETAIL_MEMBER_ROWS = 500;
+export const MAX_MESH_DETAIL_ROLE_ROWS = 200;
+
 export interface RepositoryAgentInput {
   agentId: string;
   /** The current runtime binding. A persistent agent may receive a new binding on reconnect. */
@@ -56,7 +73,8 @@ export interface RepositoryProfileReloadResult {
   validation_failures: string[];
 }
 
-export type RepositoryProfileReviewProposalStatus = "pending" | "approved" | "denied";
+export type RepositoryProfileReviewProposalStatus =
+  "pending" | "approved" | "denied";
 
 export interface RepositoryProfileReviewProposal {
   proposalId: string;
@@ -167,6 +185,21 @@ export interface RepositoryMeshDirectoryEntry {
     createdAt: string;
     updatedAt: string;
   }>;
+  /**
+   * At least one metadata collection hit the directory read budget. Callers
+   * may render the bounded preview, but must not treat it as a complete roster.
+   */
+  truncated?: boolean;
+}
+
+export interface RepositoryPublicMeshDirectory {
+  meshes: RepositoryMeshInput[];
+  truncated: boolean;
+}
+
+export interface RepositoryPublicTopicDirectory {
+  topics: RepositoryTopicInput[];
+  truncated: boolean;
 }
 
 export interface RepositoryPairingInput {
@@ -336,6 +369,14 @@ export interface RepositoryWebMcpGrant {
   revokedAt: string | null;
 }
 
+export interface RepositoryAgentRevocationResult {
+  changed: boolean;
+  bindings: number;
+  sessions: number;
+  pageGrants: number;
+  pairings: number;
+}
+
 export interface RepositoryEventInput {
   eventId: string;
   type: string;
@@ -440,7 +481,8 @@ export interface RepositoryResidentPrincipalResult {
   sessionRotated: boolean;
 }
 
-export type RepositoryModerationCaseState = "queued" | "reviewing" | "resolved" | "appealed";
+export type RepositoryModerationCaseState =
+  "queued" | "reviewing" | "resolved" | "appealed";
 
 export interface RepositoryModerationCase {
   caseId: string;
@@ -481,7 +523,8 @@ export interface RepositoryJoinRequest {
   resolvedAt: string | null;
 }
 
-export type RepositoryMeshInvitationStatus = "active" | "redeemed" | "revoked" | "expired";
+export type RepositoryMeshInvitationStatus =
+  "active" | "redeemed" | "revoked" | "expired";
 
 /** A one-use, expiring admission token for an invite-only mesh. */
 export interface RepositoryMeshInvitation {
@@ -496,7 +539,8 @@ export interface RepositoryMeshInvitation {
   redeemedAgentId: string | null;
 }
 
-export type RepositoryMeshRoleInvitationStatus = "active" | "redeemed" | "revoked" | "expired";
+export type RepositoryMeshRoleInvitationStatus =
+  "active" | "redeemed" | "revoked" | "expired";
 
 /** A one-use, expiring human role invitation addressed by an HMAC email
  * fingerprint. The plaintext email and token are never persisted. */
@@ -569,13 +613,32 @@ export interface MeshrRepository {
     event?: RepositoryEventInput;
     audit?: RepositoryAuditInput;
   }): Promise<{ agentId: string; replaced: boolean }>;
-  updatePairing?(pairingId: string, patch: Partial<RepositoryPairingInput>): Promise<void>;
+  updatePairing?(
+    pairingId: string,
+    patch: Partial<RepositoryPairingInput>,
+  ): Promise<void>;
+  /** Atomically expires a pairing only when it is still pending and its
+   * stored deadline has passed. Returns the authoritative current row so a
+   * concurrent approval can never be overwritten by a stale status poll. */
+  expirePairingIfPending?(
+    pairingId: string,
+    expiredAt: string,
+  ): Promise<RepositoryPairingInput | null>;
   findPairing?(pairingId: string): Promise<RepositoryPairingInput | null>;
   findPairingByCode?(code: string): Promise<RepositoryPairingInput | null>;
   createPairingChallenge?(input: RepositoryPairingChallenge): Promise<void>;
-  findPairingChallenge?(challengeId: string, pairingId: string): Promise<RepositoryPairingChallenge | null>;
-  consumePairingChallenge?(challengeId: string, pairingId: string, usedAt: string): Promise<RepositoryPairingChallenge | null>;
-  upsertAgent?(input: RepositoryAgentInput): Promise<void>;
+  findPairingChallenge?(
+    challengeId: string,
+    pairingId: string,
+  ): Promise<RepositoryPairingChallenge | null>;
+  consumePairingChallenge?(
+    challengeId: string,
+    pairingId: string,
+    usedAt: string,
+  ): Promise<RepositoryPairingChallenge | null>;
+  upsertAgent?(
+    input: RepositoryAgentInput,
+  ): Promise<{ changed: boolean; updatedAt: string }>;
   /** Atomically reloads a native session's profile without changing binding authority. */
   updateAgentProfileFromSession?(input: {
     agent: RepositoryAgentInput;
@@ -602,22 +665,28 @@ export interface MeshrRepository {
     audit?: RepositoryAuditInput,
     actingAccountId?: string,
     humanSessionHash?: string,
+  ): Promise<RepositoryAgentRevocationResult>;
+  upsertMesh?(
+    input: RepositoryMeshInput & RepositoryMutationArtifacts,
   ): Promise<void>;
-  upsertMesh?(input: RepositoryMeshInput & RepositoryMutationArtifacts): Promise<void>;
   /** Atomically merges owner-governed mesh fields against the authoritative
    * document and returns the committed mesh. */
-  updateMeshGovernance?(input: RepositoryMeshGovernancePatch): Promise<RepositoryMeshInput>;
+  updateMeshGovernance?(
+    input: RepositoryMeshGovernancePatch,
+  ): Promise<RepositoryMeshInput>;
   /** Atomically creates a mesh, its first topic/owner role, and initial agent
    * memberships. Production callers must prefer this over a sequence of
    * independent upserts so a crash can never leave an ownerless mesh. */
-  createMeshWithOwner?(input: {
-    mesh: RepositoryMeshInput;
-    topic: RepositoryTopicInput;
-    agentIds: string[];
-    /** Stable client key used to make retries return the original mesh. */
-    idempotencyKey?: string;
-    requestHash?: string;
-  } & RepositoryMutationArtifacts): Promise<{ duplicate: boolean }>;
+  createMeshWithOwner?(
+    input: {
+      mesh: RepositoryMeshInput;
+      topic: RepositoryTopicInput;
+      agentIds: string[];
+      /** Stable client key used to make retries return the original mesh. */
+      idempotencyKey?: string;
+      requestHash?: string;
+    } & RepositoryMutationArtifacts,
+  ): Promise<{ duplicate: boolean }>;
   upsertTopic?(input: RepositoryTopicInput): Promise<void>;
   /** Cross-replica token bucket for bounded human governance mutations. */
   consumeGovernanceRateLimit?(input: {
@@ -628,18 +697,26 @@ export interface MeshrRepository {
     refillPerSecond: number;
   }): Promise<{ allowed: boolean; retryAfterSeconds: number }>;
   /** Durable owner/steward topic administration. */
-  createTopic?(input: RepositoryTopicCreateInput & RepositoryMutationArtifacts): Promise<void>;
-  updateTopic?(input: RepositoryTopicUpdateInput & RepositoryMutationArtifacts): Promise<void>;
-  deleteTopic?(input: RepositoryTopicDeleteInput & RepositoryMutationArtifacts): Promise<void>;
-  upsertMeshHumanRole?(input: {
-    meshId: string;
-    accountId: string;
-    role: "owner" | "steward" | "observer";
-    createdAt: string;
-    updatedAt: string;
-    actingAccountId?: string;
-    humanSessionHash?: string;
-  } & RepositoryMutationArtifacts): Promise<void>;
+  createTopic?(
+    input: RepositoryTopicCreateInput & RepositoryMutationArtifacts,
+  ): Promise<void>;
+  updateTopic?(
+    input: RepositoryTopicUpdateInput & RepositoryMutationArtifacts,
+  ): Promise<void>;
+  deleteTopic?(
+    input: RepositoryTopicDeleteInput & RepositoryMutationArtifacts,
+  ): Promise<void>;
+  upsertMeshHumanRole?(
+    input: {
+      meshId: string;
+      accountId: string;
+      role: "owner" | "steward" | "observer";
+      createdAt: string;
+      updatedAt: string;
+      actingAccountId?: string;
+      humanSessionHash?: string;
+    } & RepositoryMutationArtifacts,
+  ): Promise<void>;
   deleteMeshHumanRole?(
     meshId: string,
     accountId: string,
@@ -648,22 +725,24 @@ export interface MeshrRepository {
     event?: RepositoryEventInput,
     audit?: RepositoryAuditInput,
   ): Promise<void>;
-  upsertMeshAgentMembership?(input: {
-    meshId: string;
-    agentId: string;
-    status: "joined" | "pending" | "left" | "removed";
-    attentionPolicy: Record<string, unknown>;
-    admissionProvenance: "open" | "approval" | "invite";
-    joinedAt: string | null;
-    updatedAt: string;
-    actingAccountId?: string;
-    humanSessionHash?: string;
-  } & RepositoryMutationArtifacts): Promise<void>;
+  upsertMeshAgentMembership?(
+    input: {
+      meshId: string;
+      agentId: string;
+      status: "joined" | "pending" | "left" | "removed";
+      attentionPolicy: Record<string, unknown>;
+      admissionProvenance: "open" | "approval" | "invite";
+      joinedAt: string | null;
+      updatedAt: string;
+      actingAccountId?: string;
+      humanSessionHash?: string;
+    } & RepositoryMutationArtifacts,
+  ): Promise<{ changed: boolean }>;
   /**
    * Atomically admits an authenticated runtime session to a mesh. The
-   * command rechecks the current session authority and mesh admission policy
-   * inside the durable transaction; callers must not implement this as a
-   * read-then-upsert sequence against a projection.
+   * command rechecks the current session authority, durable agent attention,
+   * and mesh admission policy inside the durable transaction; callers must
+   * not implement this as a read-then-upsert sequence against a projection.
    */
   joinMeshForAgent?(input: {
     meshId: string;
@@ -675,91 +754,112 @@ export interface MeshrRepository {
     idempotencyKey: string;
     requestId: string;
     requestedAt: string;
-    attentionPolicy: Record<string, unknown>;
     /** SHA-256 of the one-use invitation token, when joining invite-only meshes. */
     invitationTokenHash?: string;
-  }): Promise<{ status: "joined" | "pending"; requestId?: string; duplicate: boolean }>;
-  createMeshInvitation?(input: {
-    invitationId: string;
-    meshId: string;
-    tokenHash: string;
-    invitedAgentId: string | null;
-    createdByAccountId: string;
-    createdAt: string;
-    expiresAt: string;
-    actingAccountId: string;
-    humanSessionHash: string;
-  } & RepositoryMutationArtifacts): Promise<RepositoryMeshInvitation>;
+  }): Promise<{
+    status: "joined" | "pending";
+    requestId?: string;
+    duplicate: boolean;
+  }>;
+  createMeshInvitation?(
+    input: {
+      invitationId: string;
+      meshId: string;
+      tokenHash: string;
+      invitedAgentId: string | null;
+      createdByAccountId: string;
+      createdAt: string;
+      expiresAt: string;
+      actingAccountId: string;
+      humanSessionHash: string;
+    } & RepositoryMutationArtifacts,
+  ): Promise<RepositoryMeshInvitation>;
   listMeshInvitations?(meshId: string): Promise<RepositoryMeshInvitation[]>;
-  revokeMeshInvitation?(input: {
-    invitationId: string;
-    meshId: string;
-    revokedAt: string;
-    actingAccountId: string;
-    humanSessionHash: string;
-  } & RepositoryMutationArtifacts): Promise<void>;
-  createMeshRoleInvitation?(input: {
-    invitationId: string;
-    meshId: string;
-    tokenHash: string;
-    targetEmailHash: string;
-    role: "owner" | "steward" | "observer";
-    createdByAccountId: string;
-    createdAt: string;
-    expiresAt: string;
-    actingAccountId: string;
-    humanSessionHash: string;
-  } & RepositoryMutationArtifacts): Promise<RepositoryMeshRoleInvitation>;
+  revokeMeshInvitation?(
+    input: {
+      invitationId: string;
+      meshId: string;
+      revokedAt: string;
+      actingAccountId: string;
+      humanSessionHash: string;
+    } & RepositoryMutationArtifacts,
+  ): Promise<void>;
+  createMeshRoleInvitation?(
+    input: {
+      invitationId: string;
+      meshId: string;
+      tokenHash: string;
+      targetEmailHash: string;
+      role: "owner" | "steward" | "observer";
+      createdByAccountId: string;
+      createdAt: string;
+      expiresAt: string;
+      actingAccountId: string;
+      humanSessionHash: string;
+    } & RepositoryMutationArtifacts,
+  ): Promise<RepositoryMeshRoleInvitation>;
   /** Direct, bounded lookup used by token redemption; avoids a capped inbox query. */
   findMeshRoleInvitation?(input: {
     invitationId: string;
     targetEmailHash: string;
   }): Promise<RepositoryMeshRoleInvitation | null>;
-  listMeshRoleInvitations?(meshId: string): Promise<RepositoryMeshRoleInvitation[]>;
-  listMeshRoleInvitationsForEmail?(targetEmailHash: string): Promise<RepositoryMeshRoleInvitation[]>;
-  revokeMeshRoleInvitation?(input: {
-    invitationId: string;
-    meshId: string;
-    revokedAt: string;
-    actingAccountId: string;
-    humanSessionHash: string;
-  } & RepositoryMutationArtifacts): Promise<void>;
-  acceptMeshRoleInvitation?(input: {
-    invitationId: string;
-    tokenHash: string;
-    /** HMAC of the authenticated recipient's email, selected from the active key overlap. */
-    targetEmailHash?: string;
-    accountId: string;
-    humanSessionHash: string;
-    acceptedAt: string;
-    idempotencyKey?: string;
-    requestHash?: string;
-  } & RepositoryMutationArtifacts): Promise<{
+  listMeshRoleInvitations?(
+    meshId: string,
+  ): Promise<RepositoryMeshRoleInvitation[]>;
+  listMeshRoleInvitationsForEmail?(
+    targetEmailHash: string,
+  ): Promise<RepositoryMeshRoleInvitation[]>;
+  revokeMeshRoleInvitation?(
+    input: {
+      invitationId: string;
+      meshId: string;
+      revokedAt: string;
+      actingAccountId: string;
+      humanSessionHash: string;
+    } & RepositoryMutationArtifacts,
+  ): Promise<void>;
+  acceptMeshRoleInvitation?(
+    input: {
+      invitationId: string;
+      tokenHash: string;
+      /** HMAC of the authenticated recipient's email, selected from the active key overlap. */
+      targetEmailHash?: string;
+      accountId: string;
+      humanSessionHash: string;
+      acceptedAt: string;
+      idempotencyKey?: string;
+      requestHash?: string;
+    } & RepositoryMutationArtifacts,
+  ): Promise<{
     invitation: RepositoryMeshRoleInvitation;
     role: "owner" | "steward" | "observer";
     duplicate: boolean;
   }>;
-  upsertJoinRequest?(input: {
-    requestId: string;
-    meshId: string;
-    agentId: string;
-    requestedByAccountId: string;
-    status: "pending" | "approved" | "denied" | "cancelled";
-    createdAt: string;
-    resolvedAt: string | null;
-    actingAccountId?: string;
-    humanSessionHash?: string;
-  } & RepositoryMutationArtifacts): Promise<void>;
+  upsertJoinRequest?(
+    input: {
+      requestId: string;
+      meshId: string;
+      agentId: string;
+      requestedByAccountId: string;
+      status: "pending" | "approved" | "denied" | "cancelled";
+      createdAt: string;
+      resolvedAt: string | null;
+      actingAccountId?: string;
+      humanSessionHash?: string;
+    } & RepositoryMutationArtifacts,
+  ): Promise<void>;
   findJoinRequest?(requestId: string): Promise<RepositoryJoinRequest | null>;
   listJoinRequests?(meshId: string): Promise<RepositoryJoinRequest[]>;
-  resolveJoinRequest?(input: {
-    requestId: string;
-    meshId: string;
-    decision: "approved" | "denied";
-    resolvedAt: string;
-    actingAccountId?: string;
-    humanSessionHash?: string;
-  } & RepositoryMutationArtifacts): Promise<{ agentId: string; status: "approved" | "denied" }>;
+  resolveJoinRequest?(
+    input: {
+      requestId: string;
+      meshId: string;
+      decision: "approved" | "denied";
+      resolvedAt: string;
+      actingAccountId?: string;
+      humanSessionHash?: string;
+    } & RepositoryMutationArtifacts,
+  ): Promise<{ agentId: string; status: "approved" | "denied" }>;
   upsertFollow?(input: {
     topicId: string;
     agentId: string;
@@ -794,12 +894,17 @@ export interface MeshrRepository {
     proposal: RepositoryProfileReviewProposal;
     agent: RepositoryAgentInput;
   }>;
-  listHumanActivityPreferences?(accountId: string): Promise<RepositoryHumanActivityPreference[]>;
+  listHumanActivityPreferences?(
+    accountId: string,
+  ): Promise<RepositoryHumanActivityPreference[]>;
   upsertHumanActivityPreference?(
     input: RepositoryHumanActivityPreferencePatch,
   ): Promise<RepositoryHumanActivityPreference>;
   revokeHumanSession?(tokenHash: string, revokedAt: string): Promise<void>;
-  revokeWebMcpGrants?(humanSessionHash: string, revokedAt: string): Promise<void>;
+  revokeWebMcpGrants?(
+    humanSessionHash: string,
+    revokedAt: string,
+  ): Promise<void>;
   appendEvent?(input: RepositoryEventInput): Promise<{ duplicate: boolean }>;
   /** Atomically leases a bounded, per-ordering-key prefix of the durable
    * outbox. Active leases and future retry deadlines fence later events for
@@ -825,18 +930,20 @@ export interface MeshrRepository {
     after?: string;
     limit: number;
   }): Promise<RepositoryAgentEventsPage>;
-  upsertModerationCase?(input: RepositoryModerationCase & {
-    /** Set for review actions so the durable transaction rechecks authority. */
-    actingAccountId?: string;
-    humanSessionHash?: string;
-    /** Set for agent appeals so the durable transaction rechecks session authority. */
-    actingAgentId?: string;
-    agentSessionId?: string;
-    agentAuthorityEpoch?: number;
-    idempotencyKey?: string;
-    requestHash?: string;
-    idempotencyOperation?: "moderation.report" | "moderation.action";
-  } & RepositoryMutationArtifacts): Promise<RepositoryModerationMutationResult>;
+  upsertModerationCase?(
+    input: RepositoryModerationCase & {
+      /** Set for review actions so the durable transaction rechecks authority. */
+      actingAccountId?: string;
+      humanSessionHash?: string;
+      /** Set for agent appeals so the durable transaction rechecks session authority. */
+      actingAgentId?: string;
+      agentSessionId?: string;
+      agentAuthorityEpoch?: number;
+      idempotencyKey?: string;
+      requestHash?: string;
+      idempotencyOperation?: "moderation.report" | "moderation.action";
+    } & RepositoryMutationArtifacts,
+  ): Promise<RepositoryModerationMutationResult>;
   findModerationCase?(caseId: string): Promise<RepositoryModerationCase | null>;
   listModerationCases?(meshId: string): Promise<RepositoryModerationCase[]>;
   listModerationCasesPage?(input: {
@@ -845,32 +952,34 @@ export interface MeshrRepository {
     after?: { updatedAt: string; caseId: string };
     limit: number;
   }): Promise<RepositoryModerationCasesPage>;
-  updatePostModeration?(input: {
-    caseId: string;
-    postId: string;
-    state: "published" | "quarantined" | "removed" | "redacted";
-    reason: string | null;
-    /** Optional replacement body used by a redaction action. */
-    body?: string;
-    caseState: RepositoryModerationCaseState;
-    resolution: string | null;
-    updatedAt: string;
-    /** The actor/session are revalidated in the same durable transaction. */
-    actingAccountId: string;
-    humanSessionHash: string;
-    /** Stable retry key for human governance actions. */
-    idempotencyKey?: string;
-    requestHash?: string;
-    /**
-     * Internal moderation decisions are accepted only with a compare-and-set
-     * revision. The route that supplies this field is protected by the
-     * authority service token; repositories still recheck it transactionally.
-     */
-    automated?: {
-      expectedPostState: RepositoryPostRecord["moderationState"];
-      expectedPostUpdatedAt: string;
-    };
-  } & RepositoryMutationArtifacts): Promise<RepositoryModerationMutationResult>;
+  updatePostModeration?(
+    input: {
+      caseId: string;
+      postId: string;
+      state: "published" | "quarantined" | "removed" | "redacted";
+      reason: string | null;
+      /** Optional replacement body used by a redaction action. */
+      body?: string;
+      caseState: RepositoryModerationCaseState;
+      resolution: string | null;
+      updatedAt: string;
+      /** The actor/session are revalidated in the same durable transaction. */
+      actingAccountId: string;
+      humanSessionHash: string;
+      /** Stable retry key for human governance actions. */
+      idempotencyKey?: string;
+      requestHash?: string;
+      /**
+       * Internal moderation decisions are accepted only with a compare-and-set
+       * revision. The route that supplies this field is protected by the
+       * authority service token; repositories still recheck it transactionally.
+       */
+      automated?: {
+        expectedPostState: RepositoryPostRecord["moderationState"];
+        expectedPostUpdatedAt: string;
+      };
+    } & RepositoryMutationArtifacts,
+  ): Promise<RepositoryModerationMutationResult>;
   findPostById?(postId: string): Promise<RepositoryPostRecord | null>;
   /** Read retained, published posts for one topic without the global feed cap. */
   listPublishedPostsByTopic?(input: {
@@ -890,21 +999,49 @@ export interface MeshrRepository {
   findMeshById?(meshId: string): Promise<RepositoryMeshInput | null>;
   findTopicById?(topicId: string): Promise<RepositoryTopicInput | null>;
   /** Read only topics and follows for an agent without hydrating a global projection. */
-  listTopicsForAgent?(meshId: string, agentId: string): Promise<RepositoryAgentTopic[]>;
+  listTopicsForAgent?(
+    meshId: string,
+    agentId: string,
+  ): Promise<RepositoryAgentTopic[]>;
   /** Read public directory metadata without loading post bodies. */
-  listPublicMeshes?(): Promise<RepositoryMeshInput[]>;
-  listPublicTopics?(meshId: string): Promise<RepositoryTopicInput[]>;
+  listPublicMeshes?(): Promise<RepositoryPublicMeshDirectory>;
+  listPublicTopics?(meshId: string): Promise<RepositoryPublicTopicDirectory>;
   /** Metadata/aggregate-only authenticated mesh directory read. */
-  listMeshDirectoryForAccount?(accountId: string): Promise<RepositoryMeshDirectoryEntry[]>;
-  findMeshHumanRole?(meshId: string, accountId: string): Promise<"owner" | "steward" | "observer" | null>;
-  findMeshAgentMembership?(meshId: string, agentId: string): Promise<{
+  listMeshDirectoryForAccount?(
+    accountId: string,
+  ): Promise<RepositoryMeshDirectoryEntry[]>;
+  /**
+   * Read one authorized mesh directory entry without hydrating every public
+   * mesh visible to the account.
+   */
+  findMeshDirectoryEntryForAccount?(
+    meshId: string,
+    accountId: string,
+  ): Promise<RepositoryMeshDirectoryEntry | null>;
+  findMeshHumanRole?(
+    meshId: string,
+    accountId: string,
+  ): Promise<"owner" | "steward" | "observer" | null>;
+  findMeshAgentMembership?(
+    meshId: string,
+    agentId: string,
+  ): Promise<{
     status: "joined" | "pending" | "left" | "removed";
     attentionPolicy: Record<string, unknown>;
   } | null>;
-  listMeshesForAgent?(agentId: string): Promise<Array<{
-    mesh: RepositoryMeshInput;
-    joined: boolean;
-  }>>;
+  listMeshesForAgent?(
+    agentId: string,
+    options?: {
+      limit?: number;
+      /** Exclude public-only meshes for a joined-only attention policy. */
+      browse?: "public" | "joined";
+    },
+  ): Promise<
+    Array<{
+      mesh: RepositoryMeshInput;
+      joined: boolean;
+    }>
+  >;
   /** Bounded membership lookup used by page WebMCP transfer setup. */
   listJoinedMeshIdsForAgent?(agentId: string): Promise<string[]>;
   loadProjection?(input: {
@@ -916,10 +1053,29 @@ export interface MeshrRepository {
     includePosts?: boolean;
     /** Omit aggregate activity when a metadata/presence read does not need it. */
     includeActivity?: boolean;
+    /**
+     * Return only the mesh/topic/caller-membership/activity fields consumed by
+     * WebMCP topology. This prevents model-context reads from hydrating
+     * governance, profile, presence, follow, or post collections.
+     */
+    activityOnly?: boolean;
+    /**
+     * Restrict a topology read to a small candidate set. Implementations must
+     * still revalidate current caller visibility before returning any mesh.
+     */
+    meshIds?: string[];
   }): Promise<RepositoryProjection>;
-  findRuntimeSessionByTokenHash?(tokenHash: string): Promise<RepositoryRuntimeSession | null>;
-  findRuntimeSessionById?(sessionId: string): Promise<RepositoryRuntimeSession | null>;
-  findActiveRuntimeSessionForAgent?(agentId: string, now: string, offlineAfter: string): Promise<RepositoryRuntimeSession | null>;
+  findRuntimeSessionByTokenHash?(
+    tokenHash: string,
+  ): Promise<RepositoryRuntimeSession | null>;
+  findRuntimeSessionById?(
+    sessionId: string,
+  ): Promise<RepositoryRuntimeSession | null>;
+  findActiveRuntimeSessionForAgent?(
+    agentId: string,
+    now: string,
+    offlineAfter: string,
+  ): Promise<RepositoryRuntimeSession | null>;
   purgeExpired?(now: string): Promise<number>;
   findWebMcpGrant?(
     tokenHash: string,
@@ -965,11 +1121,13 @@ export interface MeshrRepository {
     linkedAt?: string;
   }): Promise<void>;
   /** Provider identities attached to an account; subjects are never exposed. */
-  listProviderIdentities?(accountId: string): Promise<Array<{
-    provider: SocialProvider;
-    email: string;
-    linkedAt: string;
-  }>>;
+  listProviderIdentities?(accountId: string): Promise<
+    Array<{
+      provider: SocialProvider;
+      email: string;
+      linkedAt: string;
+    }>
+  >;
   createHumanSession(input: {
     tokenHash: string;
     accountId: string;
@@ -977,6 +1135,22 @@ export interface MeshrRepository {
     createdAt: string;
     expiresAt: string;
     absoluteExpiresAt: string;
+    /**
+     * Production social sign-in admission. Firestore consumes both the
+     * stable provider-subject and resolved-account buckets in the same
+     * transaction that creates the durable session. SQLite intentionally
+     * ignores this optional hint and retains the process-local limiter used
+     * by isolated/local servers.
+    */
+    socialRateLimit?: {
+      /**
+       * SHA-256 of `<provider>:<subject>`; raw provider subjects never enter
+       * quota keys.
+       */
+      subjectHash: string;
+      capacity: number;
+      refillPerSecond: number;
+    };
   }): Promise<void>;
   findHumanSession(tokenHash: string): Promise<{
     accountId: string;
@@ -1024,7 +1198,9 @@ export interface MeshrRepository {
     event?: RepositoryEventInput;
     audit?: RepositoryAuditInput;
   }): Promise<{ authorityEpoch: number; sessionId: string }>;
-  createPostWithOutbox(input: RepositoryPostInput): Promise<RepositoryPostResult>;
+  createPostWithOutbox(
+    input: RepositoryPostInput,
+  ): Promise<RepositoryPostResult>;
 }
 
 export type FirestoreRepository = FirestoreMeshrRepository;

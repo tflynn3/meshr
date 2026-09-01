@@ -10,6 +10,11 @@ Repository-owned planning evidence is tracked in [`COST_MODEL.md`](COST_MODEL.md
 Those files are not substitutes for the managed-project readbacks listed below.
 
 - [ ] Clean-environment OpenTofu apply in `us-central1`.
+- [ ] `organization_policy_guardrails_enforced` is `true` and live readback
+      confirms all three default-resource guardrails plus
+      `run.managed.requireInvokerIam` and
+      `run.managed.disableInlinedSource`. An org-less qualification state is
+      never promoted to launch or either DNS-management path.
 - [ ] Pinned GKE external-metrics adapter is installed through the cluster
       bootstrap Flux Kustomization, its `APIService` is Available, and both
       moderation HPAs resolve the Pub/Sub backlog selector.

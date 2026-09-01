@@ -4,6 +4,7 @@ set -euo pipefail
 cluster_name="meshr-local"
 colima_profile="meshr-local"
 namespace="meshr-local"
+local_internal_secret="local-internal-auth"
 repo_root="$(builtin cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
 export K3D_IMAGE_LOADBALANCER="ghcr.io/k3d-io/k3d-proxy:5.9.0"
 
@@ -30,6 +31,84 @@ select_runtime() {
   fi
   docker info >/dev/null
 }
+
+assert_loopback_bindings() {
+  local cluster_nodes
+  if ! cluster_nodes="$(docker ps --all \
+    --filter "label=k3d.cluster=${cluster_name}" \
+    --format '{{.Names}}')"; then
+    echo "cannot list the Docker nodes for $cluster_name; refusing to operate on an unverified local cluster" >&2
+    return 1
+  fi
+  if [[ -z "$cluster_nodes" ]]; then
+    echo "cannot find the Docker nodes for $cluster_name; refusing to operate on an unverified local cluster" >&2
+    return 1
+  fi
+
+  local -a nodes=()
+  local node
+  while IFS= read -r node; do
+    [[ -n "$node" ]] && nodes+=("$node")
+  done <<<"$cluster_nodes"
+
+  local unsafe_nodes
+  if ! unsafe_nodes="$(docker inspect "${nodes[@]}" --format '{{if or (eq .HostConfig.NetworkMode "host") .HostConfig.PublishAllPorts}}{{.Name}}{{end}}' 2>/dev/null)"; then
+    echo "cannot inspect the Docker nodes for $cluster_name; refusing to operate on an unverified local cluster" >&2
+    return 1
+  fi
+  if [[ -n "$unsafe_nodes" ]]; then
+    echo "existing $cluster_name cluster uses host networking or Docker PublishAllPorts; refusing to mutate it" >&2
+    return 1
+  fi
+
+  local bindings
+  if ! bindings="$(docker inspect "${nodes[@]}" --format '{{range $port, $entries := .NetworkSettings.Ports}}{{range $entries}}{{printf "%s\t%s\t%s\n" $port .HostIp .HostPort}}{{end}}{{end}}' 2>/dev/null)"; then
+    echo "cannot inspect the published ports for $cluster_name; refusing to operate on an unverified local cluster" >&2
+    return 1
+  fi
+
+  local api_found=0
+  local http_found=0
+  local container_port host_ip host_port
+  while IFS=$'\t' read -r container_port host_ip host_port; do
+    [[ -n "$container_port" ]] || continue
+    case "$host_ip" in
+      127.0.0.1|::1) ;;
+      *)
+        echo "existing $cluster_name cluster publishes $container_port on ${host_ip:-0.0.0.0}:$host_port instead of loopback" >&2
+        echo "refusing to start or mutate it; when safe, run 'npm run local:down' and then 'npm run local:up' to recreate it with loopback-only bindings" >&2
+        return 1
+        ;;
+    esac
+    [[ "$container_port" == "6443/tcp" ]] && api_found=1
+    [[ "$container_port" == "80/tcp" ]] && http_found=1
+  done <<<"$bindings"
+
+  if (( api_found == 0 || http_found == 0 )); then
+    echo "existing $cluster_name cluster is missing the expected loopback Kubernetes API or HTTP binding; refusing to mutate it" >&2
+    return 1
+  fi
+}
+
+rotate_local_internal_token() (
+  require_command openssl
+  local token token_file
+  token_file="$(mktemp "${TMPDIR:-/tmp}/meshr-local-internal-token.XXXXXX")"
+  trap 'rm -f "$token_file"' EXIT
+  chmod 600 "$token_file"
+  token="$(openssl rand -hex 32)"
+  if [[ ! "$token" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "openssl did not produce the expected 256-bit local token" >&2
+    return 1
+  fi
+  printf '%s' "$token" >"$token_file"
+  kubectl apply -f "$repo_root/deploy/local/namespace.yaml" >/dev/null
+  kubectl -n "$namespace" create secret generic "$local_internal_secret" \
+    --from-file="token=$token_file" \
+    --dry-run=client \
+    -o yaml \
+    | kubectl apply -f - >/dev/null
+)
 
 select_cluster() {
   require_command kubectl
@@ -76,17 +155,23 @@ dump_diagnostics() {
 up() {
   require_command k3d
   select_runtime
-  trap dump_diagnostics ERR
   local cluster_created=0
   if ! k3d cluster list --no-headers 2>/dev/null | awk '{print $1}' | grep -qx "$cluster_name"; then
     cluster_created=1
     k3d cluster create --config "$repo_root/deploy/local/k3d.yaml"
+    if ! assert_loopback_bindings; then
+      k3d cluster stop "$cluster_name" >/dev/null 2>&1 || true
+      return 1
+    fi
   else
+    assert_loopback_bindings
     k3d cluster start "$cluster_name"
     k3d kubeconfig merge "$cluster_name" --kubeconfig-switch-context >/dev/null
   fi
   select_cluster
+  trap dump_diagnostics ERR
   build_images
+  rotate_local_internal_token
   kubectl apply -k "$repo_root/deploy/local"
   # A fresh cluster already starts pods from the just-built images. Restarting
   # before that first rollout is ready races the Recreate API strategy and can
@@ -123,8 +208,14 @@ logs() {
 
 smoke() {
   select_runtime
+  assert_loopback_bindings
   select_cluster
-  local event_file
+  local event_file internal_token
+  internal_token="$(kubectl -n "$namespace" get secret "$local_internal_secret" -o go-template='{{index .data "token" | base64decode}}')"
+  if [[ ! "$internal_token" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "the live $local_internal_secret token is missing or invalid; run 'npm run local:up' to rotate it" >&2
+    return 1
+  fi
   event_file="$(mktemp "${TMPDIR:-/tmp}/meshr-local-smoke-event.XXXXXX")"
   trap 'rm -f "$event_file"' RETURN
   wait_http() {
@@ -170,7 +261,9 @@ smoke() {
   (
     cd "$repo_root"
     bazelisk build //:smoke
-    MESHR_LOCAL_SMOKE_EVENT_FILE="$event_file" node bazel-bin/smoke.mjs
+    MESHR_LOCAL_INTERNAL_TOKEN="$internal_token" \
+      MESHR_LOCAL_SMOKE_EVENT_FILE="$event_file" \
+      node bazel-bin/smoke.mjs
   )
   kubectl -n "$namespace" rollout restart \
     deployment/api deployment/web deployment/ingest \
@@ -200,7 +293,9 @@ smoke() {
   wait_json "${MESHR_LOCAL_URL:-http://localhost:8080}/v1/live/snapshots/mesh-public"
   (
     cd "$repo_root"
-    MESHR_LOCAL_SMOKE_REPLAY_FILE="$event_file" node bazel-bin/smoke.mjs
+    MESHR_LOCAL_INTERNAL_TOKEN="$internal_token" \
+      MESHR_LOCAL_SMOKE_REPLAY_FILE="$event_file" \
+      node bazel-bin/smoke.mjs
   )
 }
 

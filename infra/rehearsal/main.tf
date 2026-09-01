@@ -198,6 +198,27 @@ resource "terraform_data" "billing_context" {
   }
 }
 
+# Rehearsal federation is private-operations authority. Refuse the public
+# application repository even if an operator accidentally supplies its name
+# alongside the immutable numeric ID.
+resource "terraform_data" "private_github_authority_guard" {
+  input = {
+    repository    = var.github_repository
+    repository_id = var.github_repository_id
+    workflow_path = var.github_workflow_path
+  }
+
+  lifecycle {
+    precondition {
+      condition = (
+        lower(var.github_repository) != "tflynn3/meshr" &&
+        var.github_repository_id != "1348689949"
+      )
+      error_message = "The rehearsal deploy identity must belong to the private operations repository, never the public tflynn3/meshr repository."
+    }
+  }
+}
+
 data "google_project" "rehearsal" {
   project_id = var.project_id
 }
@@ -485,11 +506,12 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   display_name                       = "Meshr exact rehearsal workflow"
 
   attribute_mapping = {
-    "google.subject"                = "assertion.sub"
-    "attribute.repository_id"       = "assertion.repository_id"
-    "attribute.repository_owner_id" = "assertion.repository_owner_id"
-    "attribute.workflow_ref"        = "assertion.workflow_ref"
-    "attribute.event_name"          = "assertion.event_name"
+    "google.subject"                  = "assertion.sub"
+    "attribute.repository_id"         = "assertion.repository_id"
+    "attribute.repository_owner_id"   = "assertion.repository_owner_id"
+    "attribute.repository_visibility" = "assertion.repository_visibility"
+    "attribute.workflow_ref"          = "assertion.workflow_ref"
+    "attribute.event_name"            = "assertion.event_name"
   }
 
   # Numeric identities survive repository/owner renames. Only the exact
@@ -497,6 +519,7 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   attribute_condition = join(" ", [
     "assertion.repository_id == '${var.github_repository_id}' &&",
     "assertion.repository_owner_id == '${var.github_repository_owner_id}' &&",
+    "assertion.repository_visibility == 'private' &&",
     "assertion.sub == '${local.github_immutable_subject_prefix}:environment:gcp-rehearsal' &&",
     "assertion.workflow_ref == '${local.github_workflow_ref}' &&",
     "(assertion.event_name == 'workflow_dispatch' || assertion.event_name == 'schedule')",
@@ -505,6 +528,8 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
   }
+
+  depends_on = [terraform_data.private_github_authority_guard]
 }
 
 resource "google_service_account_iam_member" "ci_workload_identity" {

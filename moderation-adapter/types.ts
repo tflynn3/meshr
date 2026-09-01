@@ -22,5 +22,6 @@ export interface ModerationAdapterOptions {
   provider: ModerationProvider;
   requireCallerAuth?: boolean;
   environment?: "local" | "production";
+  releaseSha?: string;
   maxBodyBytes?: number;
 }

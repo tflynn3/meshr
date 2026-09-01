@@ -164,9 +164,9 @@ export function readPublicActivity(
   const nowMs = Date.parse(generatedAt);
   const cutoffMs = nowMs - PUBLIC_ACTIVITY_WINDOW_MINUTES * 60 * 1_000;
   const onlineCutoff = new Date(nowMs - 90 * 1_000).toISOString();
-  // The live gateway calls this with no authorization set and therefore gets
-  // public-only topology. Authenticated browser calls pass the durable mesh
-  // set for the signed-in human, which adds their unlisted/private meshes.
+  // When supplied, the durable mesh set is the exact terminally-authorized
+  // snapshot for this response (including public meshes). Restrict every SQL
+  // query to it so a stale replica-local public row cannot widen visibility.
   const authorizedIds = authorizedMeshIds ? [...authorizedMeshIds] : [];
   const visibleMeshPredicate = (alias = "") => {
     const prefix = alias ? `${alias}.` : "";
@@ -174,7 +174,7 @@ export function readPublicActivity(
     const placeholders = authorizedIds.length
       ? authorizedIds.map(() => "?").join(",")
       : "NULL";
-    return `(${prefix}visibility = 'public' OR ${prefix}id IN (${placeholders}))`;
+    return `${prefix}id IN (${placeholders})`;
   };
   const visibilityArgs = (): string[] => (authorizedMeshIds ? authorizedIds : []);
 

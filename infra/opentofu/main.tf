@@ -1,18 +1,41 @@
 locals {
   name = "meshr"
+  # The production cluster owns an explicit RFC1918 address plan. Keeping
+  # these ranges fixed inside the single-project launch stack prevents an
+  # operator from accidentally placing workloads on an implicit/default VPC.
+  gke_network = {
+    nodes         = "10.60.0.0/20"
+    pods          = "10.64.0.0/14"
+    services      = "10.68.0.0/20"
+    control_plane = "172.20.0.0/28"
+  }
+  # When Organization Policy guardrails are enabled, these constraints must
+  # exist before APIs that can create a default network or service account are
+  # enabled. The private project bootstrap also creates the project with
+  # auto_create_network=false. An explicit org-less qualification omits these
+  # policies and relies on exhaustive live inventory/IAM verification instead.
+  project_default_guardrails = toset([
+    "compute.skipDefaultNetworkCreation",
+    "iam.automaticIamGrantsForDefaultServiceAccounts",
+    "iam.managed.preventPrivilegedBasicRolesForDefaultServiceAccounts",
+  ])
   services = toset([
     "artifactregistry.googleapis.com",
     "apikeys.googleapis.com",
     "billingbudgets.googleapis.com",
     "cloudresourcemanager.googleapis.com",
+    "connectgateway.googleapis.com",
     "compute.googleapis.com",
     "container.googleapis.com",
     "certificatemanager.googleapis.com",
     "dlp.googleapis.com",
     "firestore.googleapis.com",
+    "gkeconnect.googleapis.com",
+    "gkehub.googleapis.com",
     "identitytoolkit.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
+    "logging.googleapis.com",
     "monitoring.googleapis.com",
     "modelarmor.googleapis.com",
     "pubsub.googleapis.com",
@@ -22,6 +45,34 @@ locals {
     "serviceusage.googleapis.com",
     "sts.googleapis.com",
   ])
+  # Keep the production AI-safety policy reviewable and fingerprintable rather
+  # than accepting the name of an externally mutable template. Google provider
+  # 6.50 does not expose a detector-model version pin, so the explicitly named
+  # Meshr policy-schema version and SHA-256 output identify only Meshr's exact
+  # configured controls. Qualification records Google's live selector and the
+  # reviewed Stable-alias baseline (v3); template GET does not reveal the
+  # provider's runtime-resolved alias target. Adversarial evaluation remains
+  # the behavioral gate.
+  model_armor_policy = {
+    meshr_policy_schema_version        = "v1"
+    enforcement_type                   = "INSPECT_AND_BLOCK"
+    ignore_partial_invocation_failures = false
+    log_template_operations            = true
+    log_sanitize_operations            = false
+    multi_language_detection           = true
+    malicious_uri_filter_enforcement   = "ENABLED"
+    pi_and_jailbreak_filter = {
+      filter_enforcement = "ENABLED"
+      confidence_level   = "MEDIUM_AND_ABOVE"
+    }
+    rai_filters = {
+      DANGEROUS         = "MEDIUM_AND_ABOVE"
+      HARASSMENT        = "MEDIUM_AND_ABOVE"
+      HATE_SPEECH       = "MEDIUM_AND_ABOVE"
+      SEXUALLY_EXPLICIT = "MEDIUM_AND_ABOVE"
+    }
+    sdp_filter_enforcement = "ENABLED"
+  }
   event_subscriptions = {
     topology      = "topology-materializer"
     moderation    = "moderation-worker"
@@ -79,7 +130,7 @@ locals {
       firestore_role  = "roles/datastore.user"
     }
     moderation_screening_worker = {
-      account_id      = "meshr-moderation-screening-canary"
+      account_id      = "meshr-mod-screening-canary"
       kubernetes_name = "meshr-moderation-screening-worker-canary"
       firestore_role  = "roles/datastore.user"
     }
@@ -382,6 +433,8 @@ locals {
         { field_path = "created_at", order = "DESCENDING" },
       ]
     }
+  }
+  canary_moderation_firestore_indexes = {
     moderation_inbox_due = {
       collection = "moderation_inbox"
       fields = [
@@ -396,8 +449,6 @@ locals {
     event_outbox_ready       = { collection = "event_outbox_ready", field = "retention_at" }
     topology_events          = { collection = "topology_events", field = "retention_at" }
     processed_events         = { collection = "processed_events", field = "retention_at" }
-    moderation_inbox         = { collection = "moderation_inbox", field = "retention_at" }
-    moderation_dlq           = { collection = "moderation_dlq", field = "retention_at" }
     audit_events             = { collection = "audit_events", field = "retention_at" }
     moderation_cases         = { collection = "moderation_cases", field = "retention_at" }
     quota_counter            = { collection = "quota_counters", field = "expires_at_ttl" }
@@ -405,6 +456,16 @@ locals {
     pairing_challenge_expiry = { collection = "pairing_challenges", field = "expires_at_ttl" }
     mesh_invitation_expiry   = { collection = "mesh_invitations", field = "expires_at_ttl" }
     role_invitation_expiry   = { collection = "mesh_role_invitations", field = "expires_at_ttl" }
+    human_session_expiry     = { collection = "human_sessions", field = "absolute_expires_at_ttl" }
+    webmcp_grant_expiry      = { collection = "webmcp_grants", field = "expires_at_ttl" }
+    webmcp_fence_expiry      = { collection = "webmcp_authority", field = "expires_at_ttl" }
+    runtime_session_expiry   = { collection = "runtime_sessions", field = "inactive_expires_at_ttl" }
+    revoked_binding_expiry   = { collection = "agent_bindings", field = "revoked_at_ttl" }
+  }
+  canary_moderation_firestore_ttl_fields = {
+    processed_events = { collection = "processed_events", field = "retention_at" }
+    moderation_inbox = { collection = "moderation_inbox", field = "retention_at" }
+    moderation_dlq   = { collection = "moderation_dlq", field = "retention_at" }
   }
   # Cloudflare is the only public edge for the proxied Gateway records. Keep
   # the origin closed to direct requests and rate-limit on the end-user IP
@@ -467,7 +528,12 @@ locals {
   # Validation plans can omit Cloudflare entirely. Any launch or explicitly
   # managed DNS apply turns this on and is guarded below so a missing token
   # cannot produce a partial public edge.
-  cloudflare_enabled = var.launch_mode || var.manage_production_dns_records || var.manage_staging_dns_records
+  cloudflare_enabled                      = var.launch_mode || var.manage_production_dns_records || var.manage_staging_dns_records
+  canary_promotion_enabled                = var.launch_mode || var.moderation_adapter_canary_image != null || var.moderation_adapter_canary_source_sha != null
+  moderation_adapter_revision_tag         = var.moderation_adapter_source_sha == null ? null : "r-${substr(var.moderation_adapter_source_sha, 0, 20)}"
+  moderation_adapter_revision_name        = var.moderation_adapter_source_sha == null ? null : "meshr-moderation-adapter-${local.moderation_adapter_revision_tag}"
+  moderation_adapter_canary_revision_tag  = var.moderation_adapter_canary_source_sha == null ? null : "r-${substr(var.moderation_adapter_canary_source_sha, 0, 14)}"
+  moderation_adapter_canary_revision_name = var.moderation_adapter_canary_source_sha == null ? null : "meshr-moderation-adapter-canary-${local.moderation_adapter_canary_revision_tag}"
   # zone_name is validated as a DNS name, then normalized once for the
   # case-insensitive Cloud Armor Host comparison. Exact equality avoids a
   # hand-built regex whose escaping could drift when a different zone is
@@ -488,9 +554,13 @@ locals {
     repository_owner_id = var.github_repository_owner_id
     workflow_path       = var.github_build_workflow_path
   }
-  github_deploy_identity     = var.github_deploy_identity == null ? local.github_build_identity : var.github_deploy_identity
-  github_build_workflow_ref  = "${local.github_build_identity.repository}/${local.github_build_identity.workflow_path}@refs/heads/main"
-  github_deploy_workflow_ref = "${local.github_deploy_identity.repository}/${local.github_deploy_identity.workflow_path}@refs/heads/main"
+  # Canary and production deployment are both private-operations authorities;
+  # neither can inherit the public artifact-build repository identity.
+  github_canary_deploy_identity         = var.github_deploy_identity
+  github_production_deploy_identity     = var.github_production_deploy_identity
+  github_build_workflow_ref             = "${local.github_build_identity.repository}/${local.github_build_identity.workflow_path}@refs/heads/main"
+  github_canary_deploy_workflow_ref     = local.github_canary_deploy_identity == null ? null : "${local.github_canary_deploy_identity.repository}/${local.github_canary_deploy_identity.workflow_path}@refs/heads/main"
+  github_production_deploy_workflow_ref = "${local.github_production_deploy_identity.repository}/${local.github_production_deploy_identity.workflow_path}@refs/heads/main"
 
   # Keep a no-credentials validation plan useful, but make the explicit launch
   # apply fail before it can create a partial public service without either
@@ -505,7 +575,6 @@ locals {
     local.edge_origin_secret,
     try(trimspace(coalesce(var.moderation_adapter_image, "")), ""),
     try(trimspace(coalesce(var.moderation_adapter_canary_image, "")), ""),
-    try(trimspace(coalesce(var.moderation_model_armor_template, "")), ""),
     try(trimspace(coalesce(var.alert_notification_email, "")), ""),
   ]
   # A restore is cut over by changing the protected Flux runtime ConfigMap to
@@ -574,6 +643,89 @@ locals {
   )
 }
 
+resource "terraform_data" "production_deploy_repository_separation_guard" {
+  input = local.github_production_deploy_identity.repository_id
+
+  lifecycle {
+    precondition {
+      condition = (
+        trimspace(local.github_production_deploy_identity.repository) != trimspace(local.github_build_identity.repository) &&
+        trimspace(local.github_production_deploy_identity.repository_id) != trimspace(local.github_build_identity.repository_id)
+      )
+      error_message = "github_production_deploy_identity must name a repository and immutable repository ID distinct from the public artifact-build repository. Verify its private visibility and protected environment through the live GitHub API before applying."
+    }
+  }
+}
+
+resource "terraform_data" "canary_deploy_repository_separation_guard" {
+  count = local.canary_promotion_enabled ? 1 : 0
+  input = var.github_deploy_identity
+
+  lifecycle {
+    precondition {
+      condition     = var.github_deploy_identity != null
+      error_message = "github_deploy_identity must name the exact private canary workflow whenever launch_mode or a canary adapter digest/source pair enables canary authority."
+    }
+    precondition {
+      condition = (
+        try(trimspace(local.github_canary_deploy_identity.repository), "") != trimspace(local.github_build_identity.repository) &&
+        try(trimspace(local.github_canary_deploy_identity.repository_id), "") != trimspace(local.github_build_identity.repository_id)
+      )
+      error_message = "github_deploy_identity must name a private repository and immutable repository ID distinct from the public artifact-build repository. Verify its private visibility and protected canary environment through the live GitHub API before applying."
+    }
+  }
+}
+
+# Private operations owns the read-only production-plan GSA and its
+# workflow-bound federation. The first foundation apply creates this stack's
+# image repository and grants that pre-existing identity repository-only read;
+# it can then verify the image witness before the second-stage adapter plan.
+resource "terraform_data" "production_plan_identity_guard" {
+  input = var.production_plan_service_account_email
+
+  lifecycle {
+    precondition {
+      condition     = var.production_plan_service_account_email == "meshr-prod-plan@${var.project_id}.iam.gserviceaccount.com"
+      error_message = "production_plan_service_account_email must be the exact private-owned meshr-prod-plan GSA in project_id."
+    }
+    precondition {
+      condition     = var.production_plan_service_account_email != google_service_account.ci_deploy.email
+      error_message = "production_plan_service_account_email must be distinct from the production qualification identity."
+    }
+    precondition {
+      condition     = var.production_plan_service_account_email != var.production_moderation_promotion_service_account_email
+      error_message = "production_plan_service_account_email must be distinct from the production promotion identity."
+    }
+    precondition {
+      condition     = var.production_plan_service_account_email != google_service_account.moderation_adapter.email
+      error_message = "production_plan_service_account_email must be distinct from the production adapter runtime identity."
+    }
+  }
+}
+
+# Private operations owns the production moderation-promotion GSA and its
+# workflow-bound federation. This stack accepts only that exact principal and
+# rejects reuse of either the read-only qualifier or the adapter's runtime
+# identity before attaching the two narrowly scoped service bindings below.
+resource "terraform_data" "production_moderation_promotion_identity_guard" {
+  input = var.production_moderation_promotion_service_account_email
+
+  lifecycle {
+    precondition {
+      condition     = var.production_moderation_promotion_service_account_email == "meshr-ci-promote@${var.project_id}.iam.gserviceaccount.com"
+      error_message = "production_moderation_promotion_service_account_email must be the exact private-owned meshr-ci-promote GSA in project_id."
+    }
+    precondition {
+      condition     = var.production_moderation_promotion_service_account_email != google_service_account.ci_deploy.email
+      error_message = "production_moderation_promotion_service_account_email must be distinct from the read-only production qualification identity."
+    }
+    precondition {
+      condition     = var.production_moderation_promotion_service_account_email != google_service_account.moderation_adapter.email
+      error_message = "production_moderation_promotion_service_account_email must be distinct from the production adapter runtime identity."
+    }
+  }
+}
+
 resource "terraform_data" "firestore_database_separation_guard" {
   input = join(",", sort(tolist(local.firestore_database_allowlist_overlap)))
 
@@ -607,7 +759,112 @@ resource "terraform_data" "launch_guard" {
         for value in local.launch_required_inputs :
         trimspace(value) != ""
       ])
-      error_message = "launch_mode=true or manage_production_dns_records=true requires project_id, billing_account_id, an operations alert email, both Google/GitHub OAuth client ID and secret values, immutable production and canary moderation adapter digests, and a Model Armor template resource. Leave both launch_mode and production DNS management disabled for validation plans."
+      error_message = "launch_mode=true or manage_production_dns_records=true requires project_id, billing_account_id, an operations alert email, both Google/GitHub OAuth client ID and secret values, and immutable production and canary moderation adapter digests. The Model Armor template is managed by this stack. Leave both launch_mode and production DNS management disabled for validation plans."
+    }
+  }
+}
+
+# Organization Policy writes require an organization-backed project. Preserve
+# the preventive controls as the default and make the sole exception an
+# explicit, non-public qualification apply. A project that cannot enforce
+# these policies is not eligible for either DNS path or public launch.
+resource "terraform_data" "organization_policy_guardrails_mode" {
+  input = var.organization_policy_guardrails_enabled
+
+  lifecycle {
+    precondition {
+      condition = (
+        var.organization_policy_guardrails_enabled ||
+        (!var.launch_mode && !var.manage_production_dns_records && !var.manage_staging_dns_records)
+      )
+      error_message = "organization_policy_guardrails_enabled=false is allowed only for non-public qualification with launch_mode=false and both DNS-management flags false. Public launch requires an organization-backed project with all Organization Policy guardrails enabled."
+    }
+  }
+}
+
+# The production adapter may be created before any public edge exists so the
+# private qualifier can exercise the real provider path. Make that a distinct,
+# explicit mode: it accepts only an immutable digest location in this project's
+# repository, requires this project's Model Armor template, and refuses every
+# public-edge or social-login input. Signature verification is a private
+# workflow gate rather than an IAM property of this input. The qualification
+# identity remains read-only; an authenticated operator advances the exact
+# digest through this reviewed OpenTofu input.
+resource "terraform_data" "private_moderation_adapter_guard" {
+  count = var.private_moderation_adapter_mode ? 1 : 0
+
+  input = "private-production-moderation-adapter"
+
+  lifecycle {
+    precondition {
+      condition     = !var.launch_mode
+      error_message = "private_moderation_adapter_mode=true requires launch_mode=false. Public launch and private adapter qualification are separate applies."
+    }
+    precondition {
+      condition     = !var.manage_production_dns_records && !var.manage_staging_dns_records && !local.cloudflare_enabled
+      error_message = "private_moderation_adapter_mode=true requires both DNS-management flags and the Cloudflare edge to remain disabled."
+    }
+    precondition {
+      condition = alltrue([
+        var.cloudflare_api_token == null,
+        var.cloudflare_origin_secret == null,
+        var.google_oauth_client_id == null,
+        var.google_oauth_client_secret == null,
+        var.github_oauth_client_id == null,
+        var.github_oauth_client_secret == null,
+      ])
+      error_message = "private_moderation_adapter_mode=true requires Cloudflare and Google/GitHub OAuth credentials to remain unset."
+    }
+    precondition {
+      condition = startswith(
+        try(trimspace(var.moderation_adapter_image), ""),
+        "${var.region}-docker.pkg.dev/${var.project_id}/${local.name}/moderation-adapter@sha256:",
+      )
+      error_message = "private_moderation_adapter_mode=true requires the exact immutable moderation-adapter digest from this project's regional Meshr Artifact Registry."
+    }
+    precondition {
+      condition     = var.moderation_adapter_canary_image == null
+      error_message = "private_moderation_adapter_mode creates only the production adapter; leave moderation_adapter_canary_image and its paired source SHA unset."
+    }
+  }
+}
+
+# Model Armor and Sensitive Data Protection inspect the same untrusted prompt.
+# Keep both processors in the selected regional boundary whenever an adapter is
+# present; a global DLP parent would silently widen data handling.
+resource "terraform_data" "moderation_data_residency_guard" {
+  count = var.moderation_adapter_image != null || var.moderation_adapter_canary_image != null ? 1 : 0
+
+  input = "regional-moderation-processing"
+
+  lifecycle {
+    precondition {
+      condition     = trimspace(var.moderation_dlp_location) == var.region
+      error_message = "moderation_dlp_location must exactly equal region whenever a moderation adapter is deployed."
+    }
+  }
+}
+
+resource "terraform_data" "moderation_adapter_release_identity_guard" {
+  input = {
+    production_source_sha = var.moderation_adapter_source_sha
+    canary_source_sha     = var.moderation_adapter_canary_source_sha
+  }
+
+  lifecycle {
+    precondition {
+      condition = (
+        (var.moderation_adapter_image == null) ==
+        (var.moderation_adapter_source_sha == null)
+      )
+      error_message = "moderation_adapter_image and moderation_adapter_source_sha must either both be null or both be set to the verified digest/source pair."
+    }
+    precondition {
+      condition = (
+        (var.moderation_adapter_canary_image == null) ==
+        (var.moderation_adapter_canary_source_sha == null)
+      )
+      error_message = "moderation_adapter_canary_image and moderation_adapter_canary_source_sha must either both be null or both be set to the verified digest/source pair."
     }
   }
 }
@@ -633,6 +890,112 @@ resource "google_project_service" "required" {
   for_each           = local.services
   service            = each.value
   disable_on_destroy = false
+
+  depends_on = [
+    google_org_policy_policy.cloud_run_disable_inlined_source,
+    google_org_policy_policy.cloud_run_require_invoker_iam,
+    google_org_policy_policy.project_default_guardrails,
+    terraform_data.organization_policy_guardrails_mode,
+  ]
+}
+
+resource "google_project_service" "organization_policy" {
+  count              = var.organization_policy_guardrails_enabled ? 1 : 0
+  service            = "orgpolicy.googleapis.com"
+  disable_on_destroy = false
+
+  depends_on = [terraform_data.organization_policy_guardrails_mode]
+}
+
+resource "google_org_policy_policy" "project_default_guardrails" {
+  for_each = var.organization_policy_guardrails_enabled ? local.project_default_guardrails : toset([])
+
+  name   = "projects/${data.google_project.current.number}/policies/${each.value}"
+  parent = "projects/${data.google_project.current.number}"
+
+  spec {
+    rules {
+      enforce = "TRUE"
+    }
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  depends_on = [google_project_service.organization_policy]
+}
+
+resource "google_compute_network" "gke" {
+  project                 = var.project_id
+  name                    = "${local.name}-gke"
+  auto_create_subnetworks = false
+  routing_mode            = "REGIONAL"
+  mtu                     = 1460
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_compute_subnetwork" "gke" {
+  project                  = var.project_id
+  name                     = "${local.name}-gke-${var.region}"
+  region                   = var.region
+  network                  = google_compute_network.gke.id
+  ip_cidr_range            = local.gke_network.nodes
+  private_ip_google_access = true
+
+  secondary_ip_range {
+    range_name    = "${local.name}-pods"
+    ip_cidr_range = local.gke_network.pods
+  }
+
+  secondary_ip_range {
+    range_name    = "${local.name}-services"
+    ip_cidr_range = local.gke_network.services
+  }
+
+  log_config {
+    aggregation_interval = "INTERVAL_5_SEC"
+    flow_sampling        = 0.1
+    metadata             = "INCLUDE_ALL_METADATA"
+  }
+}
+
+resource "google_compute_router" "gke" {
+  project = var.project_id
+  name    = "${local.name}-gke-${var.region}"
+  region  = var.region
+  network = google_compute_network.gke.id
+}
+
+resource "google_compute_address" "gke_nat" {
+  project      = var.project_id
+  name         = "${local.name}-gke-nat"
+  region       = var.region
+  address_type = "EXTERNAL"
+  network_tier = "PREMIUM"
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_compute_router_nat" "gke" {
+  project                            = var.project_id
+  name                               = "${local.name}-gke"
+  region                             = var.region
+  router                             = google_compute_router.gke.name
+  nat_ip_allocate_option             = "MANUAL_ONLY"
+  nat_ips                            = [google_compute_address.gke_nat.self_link]
+  source_subnetwork_ip_ranges_to_nat = "LIST_OF_SUBNETWORKS"
+
+  subnetwork {
+    name                    = google_compute_subnetwork.gke.id
+    source_ip_ranges_to_nat = ["ALL_IP_RANGES"]
+  }
+
+  log_config {
+    enable = true
+    filter = "ERRORS_ONLY"
+  }
 }
 
 resource "google_service_account" "gke_nodes" {
@@ -646,22 +1009,44 @@ resource "google_container_cluster" "autopilot" {
   location            = var.region
   enable_autopilot    = true
   deletion_protection = true
+  network             = google_compute_network.gke.id
+  subnetwork          = google_compute_subnetwork.gke.id
+  networking_mode     = "VPC_NATIVE"
+
+  ip_allocation_policy {
+    cluster_secondary_range_name  = "${local.name}-pods"
+    services_secondary_range_name = "${local.name}-services"
+  }
+
+  # Workloads receive private addresses only and use the explicit, logged
+  # Cloud NAT gateway above for outbound traffic. The control plane has no
+  # public endpoint from its first apply; operator bootstrap uses Connect
+  # Gateway with separately authorized Google credentials.
+  private_cluster_config {
+    enable_private_nodes    = true
+    enable_private_endpoint = true
+    master_ipv4_cidr_block  = local.gke_network.control_plane
+
+    master_global_access_config {
+      enabled = false
+    }
+  }
 
   release_channel {
     channel = "REGULAR"
   }
 
-  # Keep the Kubernetes control plane reachable only from fixed-egress
-  # operators/runners. The variable is intentionally required: GitHub-hosted
-  # runner ranges are dynamic and must not be copied into an allowlist.
+  # Register this cluster in its own project's regional fleet. Connect
+  # Gateway uses this membership instead of admitting the dynamic source
+  # ranges of GitHub-hosted runners to the Kubernetes control plane.
+  fleet {
+    project = var.project_id
+  }
+
+  # Keep the authorized-networks feature explicit but empty. The private
+  # endpoint is reachable through Connect Gateway; no public or CIDR bootstrap
+  # exception is modeled in state.
   master_authorized_networks_config {
-    dynamic "cidr_blocks" {
-      for_each = var.gke_control_plane_authorized_cidrs
-      content {
-        cidr_block   = cidr_blocks.value.cidr_block
-        display_name = cidr_blocks.value.display_name
-      }
-    }
     gcp_public_cidrs_access_enabled = false
   }
 
@@ -693,6 +1078,7 @@ resource "google_container_cluster" "autopilot" {
     google_project_service.required,
     google_project_iam_member.gke_nodes_default_node_service_account,
     google_artifact_registry_repository_iam_member.gke_nodes_images,
+    google_compute_router_nat.gke,
   ]
 }
 
@@ -1641,6 +2027,20 @@ resource "google_firestore_index" "canary" {
   }
 }
 
+resource "google_firestore_index" "canary_moderation" {
+  for_each   = local.canary_moderation_firestore_indexes
+  project    = var.project_id
+  database   = google_firestore_database.canary_moderation.name
+  collection = each.value.collection
+  dynamic "fields" {
+    for_each = each.value.fields
+    content {
+      field_path = fields.value.field_path
+      order      = fields.value.order
+    }
+  }
+}
+
 resource "google_firestore_index" "event_outbox_ready_ordering_status_created" {
   project    = var.project_id
   database   = google_firestore_database.default.name
@@ -1863,6 +2263,49 @@ resource "google_firestore_field" "pairing_challenge_expiry_ttl" {
   ttl_config {}
 }
 
+# Native credential state uses dedicated Timestamp markers. Portable ISO
+# expiry fields remain part of the repository contract, while Firestore TTL
+# removes records only after their authority can no longer be recovered.
+resource "google_firestore_field" "human_session_absolute_expiry_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "human_sessions"
+  field      = "absolute_expires_at_ttl"
+  ttl_config {}
+}
+
+resource "google_firestore_field" "webmcp_grant_expiry_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "webmcp_grants"
+  field      = "expires_at_ttl"
+  ttl_config {}
+}
+
+resource "google_firestore_field" "webmcp_authority_expiry_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "webmcp_authority"
+  field      = "expires_at_ttl"
+  ttl_config {}
+}
+
+resource "google_firestore_field" "inactive_runtime_session_expiry_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "runtime_sessions"
+  field      = "inactive_expires_at_ttl"
+  ttl_config {}
+}
+
+resource "google_firestore_field" "revoked_agent_binding_expiry_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = "agent_bindings"
+  field      = "revoked_at_ttl"
+  ttl_config {}
+}
+
 resource "google_firestore_field" "mesh_invitation_expiry_ttl" {
   project    = var.project_id
   database   = google_firestore_database.default.name
@@ -1963,6 +2406,15 @@ resource "google_firestore_field" "canary_ttl" {
   for_each   = local.canary_firestore_ttl_fields
   project    = var.project_id
   database   = google_firestore_database.canary.name
+  collection = each.value.collection
+  field      = each.value.field
+  ttl_config {}
+}
+
+resource "google_firestore_field" "canary_moderation_ttl" {
+  for_each   = local.canary_moderation_firestore_ttl_fields
+  project    = var.project_id
+  database   = google_firestore_database.canary_moderation.name
   collection = each.value.collection
   field      = each.value.field
   ttl_config {}
@@ -2083,9 +2535,14 @@ resource "google_firestore_index" "canary_topology_projection_activity_buckets_c
 resource "google_artifact_registry_repository" "images" {
   location      = var.region
   repository_id = local.name
-  description   = "Signed Meshr OCI images"
+  description   = "Immutable-tagged Meshr OCI images"
   format        = "DOCKER"
-  depends_on    = [google_project_service.required]
+
+  docker_config {
+    immutable_tags = true
+  }
+
+  depends_on = [google_project_service.required]
 }
 
 resource "google_artifact_registry_repository_iam_member" "gke_nodes_images" {
@@ -2335,11 +2792,66 @@ resource "google_service_account_iam_member" "metrics_adapter_workload_identity"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[custom-metrics/custom-metrics-stackdriver-adapter]"
 }
 
+# Model Armor is part of the application policy, not an opaque operator-owned
+# prerequisite. Retain one regional template with explicit filters and privacy
+# settings so both OpenTofu plans and the read-only qualifier can detect drift.
+resource "google_model_armor_template" "moderation" {
+  project     = var.project_id
+  location    = var.region
+  template_id = "meshr-moderation"
+  labels = {
+    meshr_policy_schema = local.model_armor_policy.meshr_policy_schema_version
+  }
+
+  filter_config {
+    malicious_uri_filter_settings {
+      filter_enforcement = local.model_armor_policy.malicious_uri_filter_enforcement
+    }
+    pi_and_jailbreak_filter_settings {
+      filter_enforcement = local.model_armor_policy.pi_and_jailbreak_filter.filter_enforcement
+      confidence_level   = local.model_armor_policy.pi_and_jailbreak_filter.confidence_level
+    }
+    rai_settings {
+      dynamic "rai_filters" {
+        for_each = local.model_armor_policy.rai_filters
+        content {
+          filter_type      = rai_filters.key
+          confidence_level = rai_filters.value
+        }
+      }
+    }
+    sdp_settings {
+      basic_config {
+        filter_enforcement = local.model_armor_policy.sdp_filter_enforcement
+      }
+    }
+  }
+
+  template_metadata {
+    enforcement_type                   = local.model_armor_policy.enforcement_type
+    ignore_partial_invocation_failures = local.model_armor_policy.ignore_partial_invocation_failures
+    log_template_operations            = local.model_armor_policy.log_template_operations
+    # Full sanitize logging includes prompts/responses and would create a new
+    # sensitive-content retention path. Audit metadata without logging bodies.
+    log_sanitize_operations = local.model_armor_policy.log_sanitize_operations
+    multi_language_detection {
+      enable_multi_language_detection = local.model_armor_policy.multi_language_detection
+    }
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  depends_on = [google_project_service.required]
+}
+
 # Screening is isolated behind a small authenticated adapter. The event-plane
 # workers receive only Cloud Run invocation permission; Model Armor and DLP
-# permissions stay on this dedicated service identity. A launch apply must
-# provide an immutable adapter image, while dry validation plans keep the
-# service absent so no placeholder workload can accidentally reach production.
+# permissions stay on this dedicated service identity. A public launch or
+# explicit private-adapter apply must provide an immutable image, while dry
+# validation plans keep the service absent so no placeholder workload can
+# accidentally reach production.
 resource "google_service_account" "moderation_adapter" {
   account_id   = "meshr-moderation-adapter"
   display_name = "Meshr production moderation adapter"
@@ -2352,15 +2864,70 @@ resource "google_service_account" "moderation_adapter_canary" {
   depends_on   = [google_project_service.required]
 }
 
+# A Cloud Run service updater can otherwise disable the IAM invocation check as
+# part of the same service PATCH. Organization-backed launch deployments enforce
+# the managed constraint project-wide before granting any private promotion
+# identity update authority. Org-less qualification relies on exhaustive
+# readback and remains ineligible for public launch.
+resource "google_org_policy_policy" "cloud_run_require_invoker_iam" {
+  count = var.organization_policy_guardrails_enabled ? 1 : 0
+
+  name   = "projects/${data.google_project.current.number}/policies/run.managed.requireInvokerIam"
+  parent = "projects/${data.google_project.current.number}"
+
+  spec {
+    rules {
+      enforce = "TRUE"
+    }
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  depends_on = [google_project_service.organization_policy]
+}
+
+# A service updater can also introduce an inline-source build rather than the
+# reviewed image artifact. Organization-backed launch deployments disable that
+# path project-wide before any Cloud Run API or promotion authority is enabled.
+# Org-less qualification relies on exhaustive readback and remains ineligible
+# for public launch. This policy does not restrict the remaining PATCH fields or
+# enforce Binary Authorization for container images.
+resource "google_org_policy_policy" "cloud_run_disable_inlined_source" {
+  count = var.organization_policy_guardrails_enabled ? 1 : 0
+
+  name   = "projects/${data.google_project.current.number}/policies/run.managed.disableInlinedSource"
+  parent = "projects/${data.google_project.current.number}"
+
+  spec {
+    rules {
+      enforce = "TRUE"
+    }
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  depends_on = [google_project_service.organization_policy]
+}
+
 resource "google_cloud_run_v2_service" "moderation_adapter" {
-  count               = var.moderation_adapter_image == null ? 0 : 1
-  name                = "meshr-moderation-adapter"
-  location            = var.region
-  ingress             = "INGRESS_TRAFFIC_ALL"
-  deletion_protection = true
+  count                = var.moderation_adapter_image == null ? 0 : 1
+  name                 = "meshr-moderation-adapter"
+  location             = var.region
+  ingress              = "INGRESS_TRAFFIC_ALL"
+  invoker_iam_disabled = false
+  deletion_protection  = true
 
   template {
+    revision        = local.moderation_adapter_revision_name
     service_account = google_service_account.moderation_adapter.email
+    scaling {
+      min_instance_count = 0
+      max_instance_count = 3
+    }
     containers {
       image = var.moderation_adapter_image
       env {
@@ -2373,7 +2940,7 @@ resource "google_cloud_run_v2_service" "moderation_adapter" {
       }
       env {
         name  = "MESHR_MODEL_ARMOR_TEMPLATE"
-        value = coalesce(var.moderation_model_armor_template, "")
+        value = google_model_armor_template.moderation.name
       }
       dynamic "env" {
         for_each = var.moderation_model_armor_endpoint == null ? [] : [var.moderation_model_armor_endpoint]
@@ -2395,27 +2962,48 @@ resource "google_cloud_run_v2_service" "moderation_adapter" {
     }
   }
 
-  # The protected promotion workflow advances this service to the exact
-  # signed digest after canary/release approval. Keep OpenTofu responsible for
-  # the service, identity, and runtime configuration, but do not let a later
-  # apply with bootstrap tfvars silently roll the adapter back to an older
-  # image. The workflow records and verifies the deployed digest explicitly.
-  lifecycle {
-    ignore_changes = [template[0].containers[0].image]
+  traffic {
+    type     = "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION"
+    revision = local.moderation_adapter_revision_name
+    percent  = 100
+    tag      = local.moderation_adapter_revision_tag
   }
 
-  depends_on = [google_project_service.required]
+  # The Google provider's Cloud Run v2 Update sends a full service template and
+  # traffic shape without a usable field mask or etag. OpenTofu therefore owns
+  # creation only; after bootstrap, the private etag-CAS workflow and exhaustive
+  # verifier own every mutable field so an infrastructure refresh cannot race
+  # or overwrite a promoted revision.
+  lifecycle {
+    ignore_changes  = all
+    prevent_destroy = true
+    precondition {
+      condition     = var.launch_mode || var.manage_production_dns_records || var.private_moderation_adapter_mode
+      error_message = "moderation_adapter_image may create the production adapter only during public launch/DNS management or with private_moderation_adapter_mode=true. Later revision images and traffic tags are owned by the private promotion workflow."
+    }
+  }
+
+  depends_on = [
+    google_project_service.required,
+    terraform_data.moderation_adapter_release_identity_guard,
+  ]
 }
 
 resource "google_cloud_run_v2_service" "moderation_adapter_canary" {
-  count               = var.moderation_adapter_canary_image == null ? 0 : 1
-  name                = "meshr-moderation-adapter-canary"
-  location            = var.region
-  ingress             = "INGRESS_TRAFFIC_ALL"
-  deletion_protection = true
+  count                = var.moderation_adapter_canary_image == null ? 0 : 1
+  name                 = "meshr-moderation-adapter-canary"
+  location             = var.region
+  ingress              = "INGRESS_TRAFFIC_ALL"
+  invoker_iam_disabled = false
+  deletion_protection  = true
 
   template {
+    revision        = local.moderation_adapter_canary_revision_name
     service_account = google_service_account.moderation_adapter_canary.email
+    scaling {
+      min_instance_count = 0
+      max_instance_count = 3
+    }
     containers {
       image = var.moderation_adapter_canary_image
       env {
@@ -2428,7 +3016,7 @@ resource "google_cloud_run_v2_service" "moderation_adapter_canary" {
       }
       env {
         name  = "MESHR_MODEL_ARMOR_TEMPLATE"
-        value = coalesce(var.moderation_model_armor_template, "")
+        value = google_model_armor_template.moderation.name
       }
       dynamic "env" {
         for_each = var.moderation_model_armor_endpoint == null ? [] : [var.moderation_model_armor_endpoint]
@@ -2450,21 +3038,32 @@ resource "google_cloud_run_v2_service" "moderation_adapter_canary" {
     }
   }
 
-  # See the production adapter lifecycle rule above. Canary image revisions
-  # are advanced only by the protected canary promotion job and must survive a
-  # routine infrastructure refresh using the original bootstrap variables.
-  lifecycle {
-    ignore_changes = [template[0].containers[0].image]
+  traffic {
+    type     = "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION"
+    revision = local.moderation_adapter_canary_revision_name
+    percent  = 100
+    tag      = local.moderation_adapter_canary_revision_tag
   }
 
-  depends_on = [google_project_service.required]
+  # See the production adapter lifecycle rule above. Canary is also create-only
+  # in OpenTofu because its private promotion workflow owns the full service
+  # through the same etag-CAS and exhaustive-readback contract.
+  lifecycle {
+    ignore_changes  = all
+    prevent_destroy = true
+  }
+
+  depends_on = [
+    google_project_service.required,
+    terraform_data.moderation_adapter_release_identity_guard,
+  ]
 }
 
 # GitHub Actions uses keyless Workload Identity Federation. Numeric owner and
 # repository IDs are immutable across renames and cannot be reclaimed after a
-# transfer or deletion. Build and deploy use distinct mapped attributes so a
-# pool-wide principal-set grant cannot cross those authority boundaries, even
-# when self-hosters keep both workflows in one repository.
+# transfer or deletion. Build and the two private deploy workflows use distinct
+# mapped attributes and repository IDs so a pool-wide principal-set grant
+# cannot cross those authority boundaries.
 resource "google_iam_workload_identity_pool" "github_actions" {
   project                   = var.project_id
   workload_identity_pool_id = "meshr-github-actions"
@@ -2490,7 +3089,9 @@ resource "google_iam_workload_identity_pool_provider" "github_actions" {
   attribute_condition = join(" ", [
     "assertion.repository_id == '${local.github_build_identity.repository_id}' &&",
     "assertion.repository_owner_id == '${local.github_build_identity.repository_owner_id}' &&",
+    "assertion.repository_visibility == 'public' &&",
     "assertion.ref == 'refs/heads/main' &&",
+    "assertion.event_name == 'push' &&",
     "assertion.workflow_ref == '${local.github_build_workflow_ref}'",
   ])
   oidc {
@@ -2499,14 +3100,16 @@ resource "google_iam_workload_identity_pool_provider" "github_actions" {
   depends_on = [google_project_service.required]
 }
 
-# Production promotion uses a separate provider whose claim condition is tied
-# to the protected environment, main ref, and this exact workflow file. The
-# artifact-build provider above intentionally has no deploy permissions.
+# Private production qualification uses a separate provider whose claim
+# condition is tied to the protected environment, main ref, and exact private
+# workflow file. The artifact-build provider above intentionally has no
+# qualification permissions. Production promotion uses the distinct external
+# GSA whose WIF provider remains private-owned rather than broadening this one.
 resource "google_iam_workload_identity_pool_provider" "github_actions_deploy" {
   project                            = var.project_id
   workload_identity_pool_id          = google_iam_workload_identity_pool.github_actions.workload_identity_pool_id
   workload_identity_pool_provider_id = "github-deploy"
-  display_name                       = "GitHub OIDC production promotion"
+  display_name                       = "GitHub OIDC production qualification"
   attribute_mapping = {
     "google.subject" = "assertion.sub"
     # Include the protected GitHub environment in the mapped attribute. IAM
@@ -2516,11 +3119,13 @@ resource "google_iam_workload_identity_pool_provider" "github_actions_deploy" {
     "attribute.release" = "assertion.repository_id + ':' + assertion.environment"
   }
   attribute_condition = join(" ", [
-    "assertion.repository_id == '${local.github_deploy_identity.repository_id}' &&",
-    "assertion.repository_owner_id == '${local.github_deploy_identity.repository_owner_id}' &&",
+    "assertion.repository_id == '${local.github_production_deploy_identity.repository_id}' &&",
+    "assertion.repository_owner_id == '${local.github_production_deploy_identity.repository_owner_id}' &&",
+    "assertion.repository_visibility == 'private' &&",
     "assertion.environment == 'production' &&",
     "assertion.ref == 'refs/heads/main' &&",
-    "assertion.workflow_ref == '${local.github_deploy_workflow_ref}'",
+    "assertion.event_name == 'workflow_dispatch' &&",
+    "assertion.workflow_ref == '${local.github_production_deploy_workflow_ref}'",
   ])
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
@@ -2536,11 +3141,12 @@ resource "google_service_account" "ci" {
 
 resource "google_service_account" "ci_deploy" {
   account_id   = var.ci_deploy_service_account_id
-  display_name = "Meshr protected GitHub Actions production-deploy identity"
+  display_name = "Meshr private production-qualification identity"
   depends_on   = [google_project_service.required]
 }
 
 resource "google_iam_workload_identity_pool_provider" "github_actions_canary_deploy" {
+  count                              = local.canary_promotion_enabled ? 1 : 0
   project                            = var.project_id
   workload_identity_pool_id          = google_iam_workload_identity_pool.github_actions.workload_identity_pool_id
   workload_identity_pool_provider_id = "github-canary-deploy"
@@ -2550,19 +3156,25 @@ resource "google_iam_workload_identity_pool_provider" "github_actions_canary_dep
     "attribute.release" = "assertion.repository_id + ':' + assertion.environment"
   }
   attribute_condition = join(" ", [
-    "assertion.repository_id == '${local.github_deploy_identity.repository_id}' &&",
-    "assertion.repository_owner_id == '${local.github_deploy_identity.repository_owner_id}' &&",
+    "assertion.repository_id == '${try(local.github_canary_deploy_identity.repository_id, "")}' &&",
+    "assertion.repository_owner_id == '${try(local.github_canary_deploy_identity.repository_owner_id, "")}' &&",
+    "assertion.repository_visibility == 'private' &&",
     "assertion.environment == 'canary' &&",
     "assertion.ref == 'refs/heads/main' &&",
-    "assertion.workflow_ref == '${local.github_deploy_workflow_ref}'",
+    "assertion.event_name == 'workflow_dispatch' &&",
+    "assertion.workflow_ref == '${local.github_canary_deploy_workflow_ref}'",
   ])
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
   }
-  depends_on = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    terraform_data.canary_deploy_repository_separation_guard,
+  ]
 }
 
 resource "google_service_account" "ci_canary_deploy" {
+  count        = local.canary_promotion_enabled ? 1 : 0
   account_id   = var.ci_canary_deploy_service_account_id
   display_name = "Meshr protected GitHub Actions canary-deploy identity"
   depends_on   = [google_project_service.required]
@@ -2577,34 +3189,24 @@ resource "google_service_account_iam_member" "ci_workload_identity" {
 resource "google_service_account_iam_member" "ci_deploy_workload_identity" {
   service_account_id = google_service_account.ci_deploy.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_actions.name}/attribute.release/${local.github_deploy_identity.repository_id}:production"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_actions.name}/attribute.release/${local.github_production_deploy_identity.repository_id}:production"
 }
 
 resource "google_service_account_iam_member" "ci_canary_deploy_workload_identity" {
-  service_account_id = google_service_account.ci_canary_deploy.name
+  count              = local.canary_promotion_enabled ? 1 : 0
+  service_account_id = google_service_account.ci_canary_deploy[0].name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_actions.name}/attribute.release/${local.github_deploy_identity.repository_id}:canary"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_actions.name}/attribute.release/${try(local.github_canary_deploy_identity.repository_id, "")}:canary"
 }
 
-# Release jobs record cost-protection transitions in a dedicated Firestore
-# database. Firestore IAM conditions are database-scoped (not collection-
-# scoped), so isolating these receipts in their own database makes the
-# database-wide datastore grant an honest least-privilege boundary.
-resource "google_project_iam_member" "ci_deploy_audit_writer" {
-  project = var.project_id
-  role    = "roles/datastore.user"
-  member  = "serviceAccount:${google_service_account.ci_deploy.email}"
-  condition {
-    title       = "production-cost-audit-database-only"
-    description = "Production release identity may write only the dedicated cost-protection audit database."
-    expression  = "resource.name == 'projects/${var.project_id}/databases/${google_firestore_database.release_audit.name}'"
-  }
-}
-
+# The canary release job records cost-protection transitions in its dedicated
+# Firestore database. The private production qualification identity is
+# deliberately metadata-only and receives no Firestore document role.
 resource "google_project_iam_member" "ci_canary_deploy_audit_writer" {
+  count   = local.canary_promotion_enabled ? 1 : 0
   project = var.project_id
   role    = "roles/datastore.user"
-  member  = "serviceAccount:${google_service_account.ci_canary_deploy.email}"
+  member  = "serviceAccount:${google_service_account.ci_canary_deploy[0].email}"
   condition {
     title       = "canary-cost-audit-database-only"
     description = "Canary release identity may write only the dedicated canary cost-protection audit database."
@@ -2612,10 +3214,12 @@ resource "google_project_iam_member" "ci_canary_deploy_audit_writer" {
   }
 }
 
-resource "google_project_iam_member" "ci_artifact_registry" {
-  project = var.project_id
-  role    = "roles/artifactregistry.writer"
-  member  = "serviceAccount:${google_service_account.ci.email}"
+resource "google_artifact_registry_repository_iam_member" "ci_artifact_registry" {
+  project    = var.project_id
+  location   = google_artifact_registry_repository.images.location
+  repository = google_artifact_registry_repository.images.name
+  role       = "roles/artifactregistry.writer"
+  member     = "serviceAccount:${google_service_account.ci.email}"
 }
 
 resource "google_project_iam_member" "ci_deploy_cluster_viewer" {
@@ -2624,22 +3228,153 @@ resource "google_project_iam_member" "ci_deploy_cluster_viewer" {
   member  = "serviceAccount:${google_service_account.ci_deploy.email}"
 }
 
-resource "google_project_iam_member" "ci_deploy_artifact_reader" {
+# Qualification proves the project still has no public edge or residual compute
+# after teardown. This predefined role is read-only and covers the heterogeneous
+# Compute inventory (addresses, forwarding rules, backends, URL maps, instances,
+# routers, and NAT configuration) without granting any mutation permission.
+resource "google_project_iam_member" "ci_deploy_compute_viewer" {
   project = var.project_id
-  role    = "roles/artifactregistry.reader"
+  role    = "roles/compute.viewer"
   member  = "serviceAccount:${google_service_account.ci_deploy.email}"
 }
 
-resource "google_project_iam_member" "ci_canary_deploy_cluster_viewer" {
-  project = var.project_id
-  role    = "roles/container.clusterViewer"
-  member  = "serviceAccount:${google_service_account.ci_canary_deploy.email}"
+# Private production qualification reads the managed project's identity, exact
+# custom-role definitions, named WIF provider, deploy-service-account policy,
+# and project IAM policy to prove the expected trust graph. Keep this separate
+# from primitive Viewer and IAM administration roles: no permission can mutate
+# identity or policy.
+resource "google_project_iam_custom_role" "ci_deploy_project_iam_readback" {
+  project     = var.project_id
+  role_id     = "meshrProjectIamReadback"
+  title       = "Meshr production trust readback"
+  description = "Read-only project, custom-role, WIF-provider, and service-account-policy metadata for production qualification."
+  stage       = "GA"
+  permissions = [
+    "iam.roles.get",
+    "iam.serviceAccounts.getIamPolicy",
+    "iam.workloadIdentityPoolProviders.get",
+    "iam.workloadIdentityPoolProviders.list",
+    "resourcemanager.projects.get",
+    "resourcemanager.projects.getIamPolicy",
+  ]
+
+  depends_on = [google_project_service.required]
 }
 
-resource "google_project_iam_member" "ci_canary_deploy_artifact_reader" {
+resource "google_project_iam_member" "ci_deploy_project_iam_readback" {
   project = var.project_id
-  role    = "roles/artifactregistry.reader"
-  member  = "serviceAccount:${google_service_account.ci_canary_deploy.email}"
+  role    = google_project_iam_custom_role.ci_deploy_project_iam_readback.name
+  member  = "serviceAccount:${google_service_account.ci_deploy.email}"
+}
+
+# The production qualifier reads configuration metadata only: it must be able
+# to prove database settings, backup schedules, indexes, and TTL policies
+# without gaining document reads or any Firestore mutation permission.
+resource "google_project_iam_custom_role" "ci_deploy_firestore_readiness" {
+  project     = var.project_id
+  role_id     = "meshrFirestoreReadiness"
+  title       = "Meshr Firestore readiness viewer"
+  description = "Read-only Firestore control-plane metadata for production qualification."
+  stage       = "GA"
+  permissions = [
+    "datastore.backupSchedules.list",
+    "datastore.databases.getMetadata",
+    "datastore.indexes.get",
+    "datastore.indexes.list",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_member" "ci_deploy_firestore_readiness" {
+  project = var.project_id
+  role    = google_project_iam_custom_role.ci_deploy_firestore_readiness.name
+  member  = "serviceAccount:${google_service_account.ci_deploy.email}"
+}
+
+# Qualification reads the one managed template to compare every security and
+# privacy field against the pinned policy fingerprint. It cannot list, create,
+# update, delete, or use a different Model Armor template.
+resource "google_project_iam_custom_role" "ci_deploy_model_armor_readiness" {
+  project     = var.project_id
+  role_id     = "meshrModelArmorReadiness"
+  title       = "Meshr Model Armor readiness viewer"
+  description = "Read-only access to the exact production Model Armor template for drift qualification."
+  stage       = "GA"
+  permissions = [
+    "modelarmor.templates.get",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_member" "ci_deploy_model_armor_readiness" {
+  project = var.project_id
+  role    = google_project_iam_custom_role.ci_deploy_model_armor_readiness.name
+  member  = "serviceAccount:${google_service_account.ci_deploy.email}"
+}
+
+# Connect Gateway is the only supported path from hosted production
+# qualification automation to the Kubernetes API. This public stack defines
+# the cloud-side WIF/GSA trust and grants the production qualification identity
+# only the two documented Gateway roles. The private repository owns the exact
+# referenced workflow and protected apply; namespace-scoped Kubernetes
+# permissions remain a separate bootstrap boundary.
+resource "google_project_iam_member" "ci_deploy_connect_gateway" {
+  for_each = toset([
+    "roles/gkehub.gatewayAdmin",
+    "roles/gkehub.viewer",
+  ])
+
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${var.connect_gateway_deploy_service_account_email}"
+
+  lifecycle {
+    precondition {
+      condition     = var.connect_gateway_deploy_service_account_email == google_service_account.ci_deploy.email
+      error_message = "connect_gateway_deploy_service_account_email must be the existing protected production qualification service account created by this stack."
+    }
+  }
+
+  depends_on = [
+    google_container_cluster.autopilot,
+    google_project_service.required,
+  ]
+}
+
+resource "google_artifact_registry_repository_iam_member" "production_plan_artifact_reader" {
+  project    = var.project_id
+  location   = google_artifact_registry_repository.images.location
+  repository = google_artifact_registry_repository.images.name
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${var.production_plan_service_account_email}"
+
+  depends_on = [terraform_data.production_plan_identity_guard]
+}
+
+resource "google_artifact_registry_repository_iam_member" "ci_deploy_artifact_reader" {
+  project    = var.project_id
+  location   = google_artifact_registry_repository.images.location
+  repository = google_artifact_registry_repository.images.name
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.ci_deploy.email}"
+}
+
+resource "google_project_iam_member" "ci_canary_deploy_cluster_viewer" {
+  count   = local.canary_promotion_enabled ? 1 : 0
+  project = var.project_id
+  role    = "roles/container.clusterViewer"
+  member  = "serviceAccount:${google_service_account.ci_canary_deploy[0].email}"
+}
+
+resource "google_artifact_registry_repository_iam_member" "ci_canary_deploy_artifact_reader" {
+  count      = local.canary_promotion_enabled ? 1 : 0
+  project    = var.project_id
+  location   = google_artifact_registry_repository.images.location
+  repository = google_artifact_registry_repository.images.name
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.ci_canary_deploy[0].email}"
 }
 
 resource "google_project_iam_member" "ci_deploy_cloud_run_viewer" {
@@ -2648,16 +3383,9 @@ resource "google_project_iam_member" "ci_deploy_cloud_run_viewer" {
   member  = "serviceAccount:${google_service_account.ci_deploy.email}"
 }
 
-resource "google_project_iam_member" "ci_canary_deploy_cloud_run_viewer" {
-  project = var.project_id
-  role    = "roles/run.viewer"
-  member  = "serviceAccount:${google_service_account.ci_canary_deploy.email}"
-}
-
-# Promotion jobs perform an authenticated adapter health preflight before
-# mutating the canary or production release refs. Keep these invoker grants
-# service-scoped and environment-specific; the deploy identities do not gain
-# permission to invoke any other Cloud Run service.
+# Qualification and promotion jobs perform an authenticated adapter health
+# preflight. Keep these invoker grants service-scoped and environment-specific;
+# the identities do not gain permission to invoke any other Cloud Run service.
 resource "google_cloud_run_v2_service_iam_member" "ci_deploy_moderation_adapter_invoker" {
   count    = var.moderation_adapter_image == null ? 0 : 1
   project  = var.project_id
@@ -2673,44 +3401,102 @@ resource "google_cloud_run_v2_service_iam_member" "ci_canary_deploy_moderation_a
   location = var.region
   name     = google_cloud_run_v2_service.moderation_adapter_canary[0].name
   role     = "roles/run.invoker"
-  member   = "serviceAccount:${google_service_account.ci_canary_deploy.email}"
+  member   = "serviceAccount:${google_service_account.ci_canary_deploy[0].email}"
 }
 
-# The protected promotion jobs move only the already signed moderation-adapter
-# digest onto their matching Cloud Run service before they mint an ID token and
-# run health checks. Keep the update permission service-scoped and pair it with
-# actAs on the dedicated runtime identity; no other Cloud Run service can be
-# changed by either release identity.
-resource "google_cloud_run_v2_service_iam_member" "ci_deploy_moderation_adapter_developer" {
+# The protected promotion workflow verifies its reviewed image evidence before
+# moving moderation-adapter digests into qualification. A predefined Cloud Run
+# developer role also
+# carries delete and unrelated resource verbs, so this exact service-bound role
+# contains only the get/update permissions Google's container-deploy contract
+# requires. The workflow re-authenticates as the existing read-only qualifier
+# to poll the returned operation and verify the new revision.
+resource "google_project_iam_custom_role" "production_moderation_promotion_service" {
+  project     = var.project_id
+  role_id     = "meshrModPromotionService"
+  title       = "Meshr moderation revision promoter"
+  description = "Get and update only the exact production moderation Cloud Run service through a service-scoped binding."
+  stage       = "GA"
+  permissions = [
+    "run.services.get",
+    "run.services.update",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_cloud_run_v2_service_iam_member" "production_moderation_promotion_service_updater" {
   count    = var.moderation_adapter_image == null ? 0 : 1
   project  = var.project_id
   location = var.region
   name     = google_cloud_run_v2_service.moderation_adapter[0].name
-  role     = "roles/run.developer"
-  member   = "serviceAccount:${google_service_account.ci_deploy.email}"
+  role     = google_project_iam_custom_role.production_moderation_promotion_service.name
+  member   = "serviceAccount:${var.production_moderation_promotion_service_account_email}"
+
+  depends_on = [
+    google_org_policy_policy.cloud_run_disable_inlined_source,
+    google_org_policy_policy.cloud_run_require_invoker_iam,
+    terraform_data.production_moderation_promotion_identity_guard,
+  ]
 }
 
-resource "google_cloud_run_v2_service_iam_member" "ci_canary_deploy_moderation_adapter_developer" {
+resource "google_service_account_iam_member" "production_moderation_promotion_act_as" {
+  count              = var.moderation_adapter_image == null ? 0 : 1
+  service_account_id = google_service_account.moderation_adapter.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${var.production_moderation_promotion_service_account_email}"
+
+  depends_on = [terraform_data.production_moderation_promotion_identity_guard]
+}
+
+resource "google_artifact_registry_repository_iam_member" "production_moderation_promotion_artifact_reader" {
+  count      = var.moderation_adapter_image == null ? 0 : 1
+  project    = var.project_id
+  location   = google_artifact_registry_repository.images.location
+  repository = google_artifact_registry_repository.images.name
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${var.production_moderation_promotion_service_account_email}"
+
+  depends_on = [terraform_data.production_moderation_promotion_identity_guard]
+}
+
+# Canary promotion also needs only the existing-service get/update methods.
+# Keep polling and exhaustive revision verification on the separately federated
+# read-only qualification identity instead of widening this custom role.
+resource "google_project_iam_custom_role" "canary_moderation_promotion_service" {
+  count       = local.canary_promotion_enabled ? 1 : 0
+  project     = var.project_id
+  role_id     = "meshrCanaryModPromotionService"
+  title       = "Meshr canary moderation revision promoter"
+  description = "Get and update only the exact canary moderation Cloud Run service through a service-scoped binding."
+  stage       = "GA"
+  permissions = [
+    "run.services.get",
+    "run.services.update",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_cloud_run_v2_service_iam_member" "ci_canary_deploy_moderation_adapter_updater" {
   count    = var.moderation_adapter_canary_image == null ? 0 : 1
   project  = var.project_id
   location = var.region
   name     = google_cloud_run_v2_service.moderation_adapter_canary[0].name
-  role     = "roles/run.developer"
-  member   = "serviceAccount:${google_service_account.ci_canary_deploy.email}"
-}
+  role     = google_project_iam_custom_role.canary_moderation_promotion_service[0].name
+  member   = "serviceAccount:${google_service_account.ci_canary_deploy[0].email}"
 
-resource "google_service_account_iam_member" "ci_deploy_moderation_adapter_act_as" {
-  count              = var.moderation_adapter_image == null ? 0 : 1
-  service_account_id = google_service_account.moderation_adapter.name
-  role               = "roles/iam.serviceAccountUser"
-  member             = "serviceAccount:${google_service_account.ci_deploy.email}"
+  depends_on = [
+    google_org_policy_policy.cloud_run_disable_inlined_source,
+    google_org_policy_policy.cloud_run_require_invoker_iam,
+  ]
 }
 
 resource "google_service_account_iam_member" "ci_canary_deploy_moderation_adapter_act_as" {
   count              = var.moderation_adapter_canary_image == null ? 0 : 1
   service_account_id = google_service_account.moderation_adapter_canary.name
   role               = "roles/iam.serviceAccountUser"
-  member             = "serviceAccount:${google_service_account.ci_canary_deploy.email}"
+  member             = "serviceAccount:${google_service_account.ci_canary_deploy[0].email}"
 }
 
 resource "google_project_iam_member" "gke_nodes_default_node_service_account" {
@@ -3219,6 +4005,7 @@ resource "google_identity_platform_default_supported_idp_config" "github" {
 }
 
 resource "google_certificate_manager_dns_authorization" "meshr" {
+  count      = local.cloudflare_enabled ? 1 : 0
   project    = var.project_id
   location   = "global"
   name       = "meshr-social-root"
@@ -3227,6 +4014,7 @@ resource "google_certificate_manager_dns_authorization" "meshr" {
 }
 
 resource "google_certificate_manager_dns_authorization" "staging" {
+  count      = local.cloudflare_enabled ? 1 : 0
   project    = var.project_id
   location   = "global"
   name       = "meshr-social-staging"
@@ -3241,9 +4029,9 @@ resource "google_certificate_manager_dns_authorization" "staging" {
 resource "cloudflare_record" "certificate_authorization" {
   count   = local.cloudflare_enabled ? 1 : 0
   zone_id = data.cloudflare_zone.meshr[0].id
-  name    = google_certificate_manager_dns_authorization.meshr.dns_resource_record[0].name
-  type    = google_certificate_manager_dns_authorization.meshr.dns_resource_record[0].type
-  value   = google_certificate_manager_dns_authorization.meshr.dns_resource_record[0].data
+  name    = google_certificate_manager_dns_authorization.meshr[0].dns_resource_record[0].name
+  type    = google_certificate_manager_dns_authorization.meshr[0].dns_resource_record[0].type
+  value   = google_certificate_manager_dns_authorization.meshr[0].dns_resource_record[0].data
   # Keep validation records DNS-only; automatic TTL avoids stale challenges.
   ttl     = 1
   proxied = false
@@ -3252,15 +4040,16 @@ resource "cloudflare_record" "certificate_authorization" {
 resource "cloudflare_record" "staging_certificate_authorization" {
   count   = local.cloudflare_enabled ? 1 : 0
   zone_id = data.cloudflare_zone.meshr[0].id
-  name    = google_certificate_manager_dns_authorization.staging.dns_resource_record[0].name
-  type    = google_certificate_manager_dns_authorization.staging.dns_resource_record[0].type
-  value   = google_certificate_manager_dns_authorization.staging.dns_resource_record[0].data
+  name    = google_certificate_manager_dns_authorization.staging[0].dns_resource_record[0].name
+  type    = google_certificate_manager_dns_authorization.staging[0].dns_resource_record[0].type
+  value   = google_certificate_manager_dns_authorization.staging[0].dns_resource_record[0].data
   # Keep validation records DNS-only; automatic TTL avoids stale challenges.
   ttl     = 1
   proxied = false
 }
 
 resource "google_certificate_manager_certificate" "meshr" {
+  count    = local.cloudflare_enabled ? 1 : 0
   project  = var.project_id
   location = "global"
   name     = "meshr-social"
@@ -3270,8 +4059,8 @@ resource "google_certificate_manager_certificate" "meshr" {
       "staging.${var.zone_name}",
     ]
     dns_authorizations = [
-      google_certificate_manager_dns_authorization.meshr.id,
-      google_certificate_manager_dns_authorization.staging.id,
+      google_certificate_manager_dns_authorization.meshr[0].id,
+      google_certificate_manager_dns_authorization.staging[0].id,
     ]
   }
   depends_on = [
@@ -3281,26 +4070,29 @@ resource "google_certificate_manager_certificate" "meshr" {
 }
 
 resource "google_certificate_manager_certificate_map" "meshr" {
+  count      = local.cloudflare_enabled ? 1 : 0
   project    = var.project_id
   name       = "meshr-social"
   depends_on = [google_project_service.required]
 }
 
 resource "google_certificate_manager_certificate_map_entry" "root" {
+  count        = local.cloudflare_enabled ? 1 : 0
   project      = var.project_id
   name         = "meshr-social-root"
-  map          = google_certificate_manager_certificate_map.meshr.name
+  map          = google_certificate_manager_certificate_map.meshr[0].name
   hostname     = var.zone_name
-  certificates = [google_certificate_manager_certificate.meshr.id]
+  certificates = [google_certificate_manager_certificate.meshr[0].id]
   depends_on   = [google_project_service.required]
 }
 
 resource "google_certificate_manager_certificate_map_entry" "staging" {
+  count        = local.cloudflare_enabled ? 1 : 0
   project      = var.project_id
   name         = "meshr-social-staging"
-  map          = google_certificate_manager_certificate_map.meshr.name
+  map          = google_certificate_manager_certificate_map.meshr[0].name
   hostname     = "staging.${var.zone_name}"
-  certificates = [google_certificate_manager_certificate.meshr.id]
+  certificates = [google_certificate_manager_certificate.meshr[0].id]
   depends_on   = [google_project_service.required]
 }
 
@@ -3308,6 +4100,7 @@ resource "google_certificate_manager_certificate_map_entry" "staging" {
 # point at a stable target while the managed GKE Gateway is reconciled and
 # during later Gateway rollouts.
 resource "google_compute_global_address" "gateway" {
+  count        = local.cloudflare_enabled ? 1 : 0
   project      = var.project_id
   name         = "meshr-gateway"
   address_type = "EXTERNAL"
@@ -3319,6 +4112,7 @@ resource "google_compute_global_address" "gateway" {
 # two independent Gateways sharing one named address, and the staging route
 # must remain reachable while the production Gateway is absent or rolling out.
 resource "google_compute_global_address" "staging_gateway" {
+  count        = local.cloudflare_enabled ? 1 : 0
   project      = var.project_id
   name         = "meshr-staging-gateway"
   address_type = "EXTERNAL"
@@ -3640,7 +4434,7 @@ resource "cloudflare_record" "root" {
   zone_id = data.cloudflare_zone.meshr[0].id
   name    = "@"
   type    = "A"
-  value   = google_compute_global_address.gateway.address
+  value   = google_compute_global_address.gateway[0].address
   # Cloudflare requires proxied records to use automatic TTL (1).
   ttl     = 1
   proxied = true
@@ -3652,7 +4446,7 @@ resource "cloudflare_record" "staging" {
   zone_id = data.cloudflare_zone.meshr[0].id
   name    = "staging"
   type    = "A"
-  value   = google_compute_global_address.staging_gateway.address
+  value   = google_compute_global_address.staging_gateway[0].address
   # Cloudflare requires proxied records to use automatic TTL (1).
   ttl     = 1
   proxied = true

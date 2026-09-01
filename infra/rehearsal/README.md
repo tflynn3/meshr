@@ -5,14 +5,10 @@ rehearsal: a short-retention Artifact Registry repository, five disposable
 named Firestore databases, one ordered Pub/Sub topology subscription, keyless
 GitHub federation, split runtime identities, and a project-scoped $25 monthly
 budget alert. It deliberately creates no GKE cluster, load balancer, public IP,
-DNS record, certificate, or public service. The `gcp-rehearsal.yml` workflow
-owns the ephemeral Autopilot cluster and deletes it in a separate always-run
-cleanup job with its own time budget.
-
-The official hosted deployment runs that lifecycle from the private operations
-repository. The public `gcp-rehearsal.yml` remains a self-hosting example and
-is inert unless `MESHR_PUBLIC_REHEARSAL_ENABLED=true` is explicitly configured
-in the repository that owns it.
+DNS record, certificate, or public service. A protected workflow in the private
+operations repository owns the ephemeral Autopilot cluster and its bounded
+cleanup lifecycle. The public application repository contains no hosted
+rehearsal or cloud-deployment workflow.
 
 ## Bootstrap and remote state
 
@@ -25,6 +21,10 @@ on the selected billing account.
 ```bash
 export TF_VAR_project_id="YOUR_REHEARSAL_PROJECT"
 export TF_VAR_billing_account_id="000000-000000-000000"
+export TF_VAR_github_repository="OWNER/meshr-ops"
+export TF_VAR_github_repository_id="IMMUTABLE_PRIVATE_REPOSITORY_ID"
+export TF_VAR_github_repository_owner_id="IMMUTABLE_OWNER_ID"
+export TF_VAR_github_workflow_path=".github/workflows/deploy.yml"
 export REHEARSAL_STATE_BUCKET="YOUR_GLOBALLY_UNIQUE_STATE_BUCKET"
 
 gcloud beta billing projects link "$TF_VAR_project_id" \
@@ -90,9 +90,10 @@ The destroy command validates the cluster's name, region, Autopilot mode,
 Workload Identity pool, and rehearsal labels before deletion. Subsequent plans
 and rehearsals require no bootstrap exception.
 
-The GitHub repository name, numeric repository/owner IDs, and workflow path
-default to this public repository's immutable identity. For the hosted service,
-override all four values so only the private operations workflow can deploy:
+The GitHub repository name, numeric repository/owner IDs, and workflow path are
+required, non-secret inputs. The exports above set all four to the private
+operations repository so only its protected workflow can deploy. If you use a
+checked local variable file instead, give it the equivalent values:
 
 ```hcl
 github_repository          = "OWNER/meshr-ops"
