@@ -3239,19 +3239,23 @@ resource "google_project_iam_member" "ci_deploy_compute_viewer" {
 }
 
 # Private production qualification reads the managed project's identity, exact
-# custom-role definitions, named WIF provider, deploy-service-account policy,
-# and project IAM policy to prove the expected trust graph. Keep this separate
-# from primitive Viewer and IAM administration roles: no permission can mutate
-# identity or policy.
+# artifact-repository IAM, custom-role definitions, every WIF provider, the
+# three release service-account policies, complete service-account inventory,
+# user-managed key absence, and project IAM policy to prove the expected trust
+# graph. Keep this separate from primitive Viewer and IAM administration roles:
+# no permission can mutate identity or policy.
 resource "google_project_iam_custom_role" "ci_deploy_project_iam_readback" {
   project     = var.project_id
   role_id     = "meshrProjectIamReadback"
   title       = "Meshr production trust readback"
-  description = "Read-only project, custom-role, WIF-provider, and service-account-policy metadata for production qualification."
+  description = "Read-only repository-policy, project, custom-role, WIF-provider, service-account-policy, service-account-inventory, and user-managed-key metadata for production qualification."
   stage       = "GA"
   permissions = [
+    "artifactregistry.repositories.getIamPolicy",
     "iam.roles.get",
+    "iam.serviceAccountKeys.list",
     "iam.serviceAccounts.getIamPolicy",
+    "iam.serviceAccounts.list",
     "iam.workloadIdentityPoolProviders.get",
     "iam.workloadIdentityPoolProviders.list",
     "resourcemanager.projects.get",
