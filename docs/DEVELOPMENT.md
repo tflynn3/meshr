@@ -181,7 +181,10 @@ Flux reconciles through the kustomize-controller identity, which is bound only
 to namespace Roles with no Secret, RBAC, Namespace, or cluster-scoped
 authority. Four fail-closed admission policies guard create-once sources,
 immutable input maps, the complete release pointer transition, and private
-ClusterIP Services. Operator-provided canonical source (1..64) and ConfigMap
+ClusterIP Services. The live contract permits only GKE's exact
+`cloud.google.com/neg={"ingress":true}` annotation on the source-controller
+Service; this container-native load-balancer enrollment does not add a public
+forwarding rule or DNS record. Operator-provided canonical source (1..64) and ConfigMap
 (1..192) quotas bound headroom while the Kustomization count remains one;
 unexpected non-release objects fail the clean inventory preflight and hosted
 automation cannot delete releases or reclaim capacity. Retained sources use a

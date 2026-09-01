@@ -584,7 +584,11 @@ test("metrics adapter RBAC cannot collide with GKE-managed external metric acces
       resource.metadata.name === roleName,
   );
 
-  assert.equal(roles.length, 1, "expected one Meshr-owned external metrics role");
+  assert.equal(
+    roles.length,
+    1,
+    "expected one Meshr-owned external metrics role",
+  );
   assert.equal(
     bindings.length,
     1,
@@ -918,6 +922,40 @@ test("GKE Autopilot Flux pod defaults normalize only the exact safe injection", 
   }
 });
 
+test("GKE source Service normalization accepts only the exact NEG injection", () => {
+  const moduleDirectory = fileURLToPath(
+    new URL("../deploy/production-qualification/", import.meta.url),
+  );
+  const normalize = (annotations: Record<string, unknown>) =>
+    JSON.parse(
+      execFileSync(
+        "jq",
+        [
+          "-L",
+          moduleDirectory,
+          "-cS",
+          'include "gke-autopilot-contract"; meshr_normalize_flux_source_service_annotations',
+        ],
+        { input: JSON.stringify(annotations), encoding: "utf8" },
+      ),
+    );
+  const canonical = {};
+  const exactNeg = { "cloud.google.com/neg": '{"ingress":true}' };
+
+  assert.deepEqual(normalize(canonical), canonical);
+  assert.deepEqual(normalize(exactNeg), canonical);
+
+  for (const annotations of [
+    { "cloud.google.com/neg": '{"ingress":false}' },
+    { "cloud.google.com/neg": '{"ingress": true}' },
+    { "cloud.google.com/neg": '{"ingress":true,"exposed_ports":{}}' },
+    { "cloud.google.com/neg-status": '{"network_endpoint_groups":{}}' },
+    { ...exactNeg, "meshr.social/bypass": "true" },
+  ]) {
+    assert.notDeepEqual(normalize(annotations), canonical);
+  }
+});
+
 test("GKE admission defaults normalize only the exact managed namespace exclusion", () => {
   const moduleDirectory = fileURLToPath(
     new URL("../deploy/production-qualification/", import.meta.url),
@@ -983,7 +1021,10 @@ test("GKE admission defaults normalize only the exact managed namespace exclusio
   const adversarialSelectors = [
     {
       matchExpressions: [
-        { ...exactSelector.matchExpressions[0], values: excludedNamespaces.slice(1) },
+        {
+          ...exactSelector.matchExpressions[0],
+          values: excludedNamespaces.slice(1),
+        },
       ],
     },
     {
@@ -1082,7 +1123,7 @@ test("Flux controller RBAC is namespaced and cannot mint or read credentials", (
   );
   assert.equal(
     fluxContract.match(/include "gke-autopilot-contract"/g)?.length,
-    2,
+    3,
   );
   for (const deploymentInvariant of [
     ".spec.replicas == 1",
@@ -1104,6 +1145,14 @@ test("Flux controller RBAC is namespaced and cannot mint or read credentials", (
     fluxContract,
     /del\([\s\S]{0,200}\.(affinity|nodeSelector|tolerations|topologySpreadConstraints)/,
   );
+  const sourceServiceHashContract = fluxContract.slice(
+    fluxContract.indexOf("source_service_contract_sha()"),
+    fluxContract.indexOf('source_deployment="$(kubectl'),
+  );
+  const sourceServiceLiveContract = fluxContract.slice(
+    fluxContract.indexOf('source_service="$(kubectl'),
+    fluxContract.indexOf("crd_contract_sha()"),
+  );
   assert.match(fluxContract, /source_service_contract_sha\(\)/);
   assert.match(
     fluxContract,
@@ -1112,6 +1161,16 @@ test("Flux controller RBAC is namespaced and cannot mint or read credentials", (
   assert.match(
     fluxContract,
     /kubectl\.kubernetes\.io\/last-applied-configuration[\s\S]*fromjson/,
+  );
+  assert.match(
+    sourceServiceHashContract,
+    /del\(\."kubectl\.kubernetes\.io\/last-applied-configuration"\)[\s\S]*meshr_normalize_flux_source_service_annotations/,
+  );
+  assert.ok(sourceServiceLiveContract.includes('. == "cloud.google.com/neg"'));
+  assert.ok(
+    sourceServiceLiveContract.includes(
+      '$annotations["cloud.google.com/neg"] == "{\\"ingress\\":true}"',
+    ),
   );
   for (const signedContractDigest of [
     "719f952c1353c1f1f491b67f069ffb737ae2353a560e997d2f04db97437acdc0",
@@ -1268,7 +1327,11 @@ test("documented authorization checks distinguish denial from transport failure"
       /(assert_documented_can_i\(\) \{[\s\S]*?\n\})/g,
     ),
   ].map((match) => match[1]);
-  assert.equal(helpers.length, 2, "each independent shell block needs a helper");
+  assert.equal(
+    helpers.length,
+    2,
+    "each independent shell block needs a helper",
+  );
   assert.doesNotMatch(
     qualificationReadme,
     /auth can-i[\s\S]{0,160}\| grep -Fx (?:yes|no)/,
@@ -1282,21 +1345,29 @@ test("documented authorization checks distinguish denial from transport failure"
 ${helper}
 kubectl() {
   printf '%s\\n' "$KUBECTL_DECISION"
+  if [[ -n "\${KUBECTL_STDERR:-}" ]]; then
+    printf '%s\\n' "$KUBECTL_STDERR" >&2
+  fi
   return "$KUBECTL_STATUS"
 }
 KUBECTL_DECISION=yes KUBECTL_STATUS=0 assert_documented_can_i yes get pods
 KUBECTL_DECISION=no KUBECTL_STATUS=1 assert_documented_can_i no get secrets
+KUBECTL_DECISION='no - GKE Warden authz denied' KUBECTL_STATUS=1 assert_documented_can_i no get secrets
+KUBECTL_DECISION=no KUBECTL_STDERR='Warning: resource is not namespace scoped' KUBECTL_STATUS=1 assert_documented_can_i no get secrets
 if KUBECTL_DECISION=no KUBECTL_STATUS=0 assert_documented_can_i no get secrets; then exit 91; fi
 if KUBECTL_DECISION=yes KUBECTL_STATUS=1 assert_documented_can_i yes get pods; then exit 92; fi
-if KUBECTL_DECISION= KUBECTL_STATUS=2 assert_documented_can_i no get secrets; then exit 93; fi
-if KUBECTL_DECISION=no KUBECTL_STATUS=1 assert_documented_can_i yes get pods; then exit 94; fi`,
+if KUBECTL_DECISION= KUBECTL_STATUS=1 assert_documented_can_i no get secrets; then exit 93; fi
+if KUBECTL_DECISION='transport failed' KUBECTL_STATUS=1 assert_documented_can_i no get secrets; then exit 94; fi
+if KUBECTL_DECISION=no KUBECTL_STATUS=2 assert_documented_can_i no get secrets; then exit 95; fi
+if KUBECTL_DECISION= KUBECTL_STDERR='no - transport failed' KUBECTL_STATUS=1 assert_documented_can_i no get secrets; then exit 96; fi
+if KUBECTL_DECISION=no KUBECTL_STATUS=1 assert_documented_can_i yes get pods; then exit 97; fi`,
       ],
       { stdio: ["ignore", "ignore", "pipe"] },
     );
   }
 });
 
-test("controller authorization denials accept kubectl's negative exit status", () => {
+test("controller authorization denials require canonical output and status", () => {
   const assertCannot = fluxContract.match(
     /(assert_cannot\(\) \{[\s\S]*?\n\})\n\nnamespace_inventory=/,
   )?.[1];
@@ -1309,14 +1380,28 @@ test("controller authorization denials accept kubectl's negative exit status", (
 ${assertCannot}
 kubectl() {
   printf '%s\\n' "$KUBECTL_DECISION"
+  if [[ -n "\${KUBECTL_STDERR:-}" ]]; then
+    printf '%s\\n' "$KUBECTL_STDERR" >&2
+  fi
   return "$KUBECTL_STATUS"
 }
 KUBECTL_DECISION=no KUBECTL_STATUS=1 assert_cannot principal get secrets
+KUBECTL_DECISION='no - GKE Warden authz denied' KUBECTL_STATUS=1 assert_cannot principal get secrets
+KUBECTL_DECISION=no KUBECTL_STDERR='Warning: resource is not namespace scoped' KUBECTL_STATUS=1 assert_cannot principal get secrets
 if KUBECTL_DECISION=yes KUBECTL_STATUS=0 assert_cannot principal get secrets; then
   exit 91
 fi
-if KUBECTL_DECISION= KUBECTL_STATUS=2 assert_cannot principal get secrets; then
+if KUBECTL_DECISION= KUBECTL_STATUS=1 assert_cannot principal get secrets; then
   exit 92
+fi
+if KUBECTL_DECISION='transport failed' KUBECTL_STATUS=1 assert_cannot principal get secrets; then
+  exit 93
+fi
+if KUBECTL_DECISION=no KUBECTL_STATUS=2 assert_cannot principal get secrets; then
+  exit 94
+fi
+if KUBECTL_DECISION= KUBECTL_STDERR='no - transport failed' KUBECTL_STATUS=1 assert_cannot principal get secrets; then
+  exit 95
 fi`,
     ],
     { stdio: ["ignore", "ignore", "pipe"] },

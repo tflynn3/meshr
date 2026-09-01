@@ -227,6 +227,7 @@ set -euo pipefail
 assert_documented_can_i() {
   local expected="$1"
   local decision decision_status
+  local denial_reason_pattern='^no - [[:print:]]+$'
   shift
   if decision="$(kubectl auth can-i "$@")"; then
     decision_status=0
@@ -238,7 +239,8 @@ assert_documented_can_i() {
     return 0
   fi
   if test "$expected" = no &&
-    test "$decision_status" -eq 1 && test "$decision" = no; then
+    test "$decision_status" -eq 1 &&
+    { test "$decision" = no || [[ "$decision" =~ $denial_reason_pattern ]]; }; then
     return 0
   fi
   printf 'unexpected kubectl auth result: expected=%s exit=%s decision=%s\n' \
@@ -262,9 +264,14 @@ CRD contracts, validates exact controller arguments, images, and RBAC, and must
 run both immediately after bootstrap and again through Connect Gateway.
 GKE Autopilot adds an exact `RuntimeDefault` seccomp profile and amd64
 `NoSchedule` toleration to these controller Pods, plus an exact managed-system
-namespace exclusion to admission-policy match constraints. The verifier
-normalizes only those reviewed values, confirms that `flux-system` and `meshr`
-remain selected, and rejects every other scheduling, security-context, or
+namespace exclusion to admission-policy match constraints. GKE also adds the
+exact `cloud.google.com/neg={"ingress":true}` annotation when it enrolls the
+source-controller Service for container-native load balancing. The verifier
+normalizes only those reviewed values; every other annotation or NEG value
+remains in the signed comparison and is rejected. NEG enrollment alone creates
+no public edge, and the verified overlay still excludes public forwarding and
+DNS resources. The verifier confirms that `flux-system` and `meshr` remain
+selected and rejects every other scheduling, security-context, or
 admission-selector change.
 `operator` mode additionally compares all three live controller Roles and
 RoleBindings with the reviewed contract, lists RoleBindings in every namespace,
@@ -592,6 +599,7 @@ set -euo pipefail
 assert_documented_can_i() {
   local expected="$1"
   local decision decision_status
+  local denial_reason_pattern='^no - [[:print:]]+$'
   shift
   if decision="$(kubectl auth can-i "$@")"; then
     decision_status=0
@@ -603,7 +611,8 @@ assert_documented_can_i() {
     return 0
   fi
   if test "$expected" = no &&
-    test "$decision_status" -eq 1 && test "$decision" = no; then
+    test "$decision_status" -eq 1 &&
+    { test "$decision" = no || [[ "$decision" =~ $denial_reason_pattern ]]; }; then
     return 0
   fi
   printf 'unexpected kubectl auth result: expected=%s exit=%s decision=%s\n' \
