@@ -145,6 +145,27 @@ test("production GKE uses a dedicated custom VPC and private-node subnet", () =>
   assert.doesNotMatch(tofu, /role\s*=\s*"roles\/(?:owner|editor)"/);
 });
 
+test("GKE workload identity bindings wait for the managed workload pool", () => {
+  const bindings = [
+    ...tofu.matchAll(
+      /resource "google_service_account_iam_member" "([^"]+)" \{([\s\S]*?)\n\}/g,
+    ),
+  ].filter(
+    ([, , body]) =>
+      body!.includes('role               = "roles/iam.workloadIdentityUser"') &&
+      body!.includes(".svc.id.goog["),
+  );
+
+  assert.equal(bindings.length, 10);
+  for (const [, name, body] of bindings) {
+    assert.match(
+      body!,
+      /depends_on\s*=\s*\[google_container_cluster\.autopilot\]/,
+      `${name} must wait for the cluster Workload Identity pool`,
+    );
+  }
+});
+
 test("private GKE egress uses one explicit logged Cloud NAT", () => {
   const address = resource("google_compute_address", "gke_nat");
   const router = resource("google_compute_router", "gke");

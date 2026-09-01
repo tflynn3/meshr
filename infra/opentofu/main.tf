@@ -356,20 +356,6 @@ locals {
         { field_path = "created_at", order = "ASCENDING" },
       ]
     }
-    event_outbox_published_event = {
-      collection = "event_outbox"
-      fields = [
-        { field_path = "published_at", order = "ASCENDING" },
-        { field_path = "__name__", order = "ASCENDING" },
-      ]
-    }
-    event_outbox_created_cursor = {
-      collection = "event_outbox"
-      fields = [
-        { field_path = "created_at", order = "ASCENDING" },
-        { field_path = "__name__", order = "ASCENDING" },
-      ]
-    }
     event_outbox_observation_scope_created_cursor = {
       collection = "event_outbox"
       fields = [
@@ -1868,34 +1854,6 @@ resource "google_firestore_index" "event_outbox_mesh_status_created" {
   }
 }
 
-resource "google_firestore_index" "event_outbox_published_event" {
-  project    = var.project_id
-  database   = google_firestore_database.default.name
-  collection = "event_outbox"
-  fields {
-    field_path = "published_at"
-    order      = "ASCENDING"
-  }
-  fields {
-    field_path = "__name__"
-    order      = "ASCENDING"
-  }
-}
-
-resource "google_firestore_index" "event_outbox_created_cursor" {
-  project    = var.project_id
-  database   = google_firestore_database.default.name
-  collection = "event_outbox"
-  fields {
-    field_path = "created_at"
-    order      = "ASCENDING"
-  }
-  fields {
-    field_path = "__name__"
-    order      = "ASCENDING"
-  }
-}
-
 resource "google_firestore_index" "event_outbox_observation_scope_created_cursor" {
   project    = var.project_id
   database   = google_firestore_database.default.name
@@ -2785,6 +2743,7 @@ resource "google_service_account_iam_member" "metrics_adapter_workload_identity"
   service_account_id = google_service_account.metrics_adapter.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[custom-metrics/custom-metrics-stackdriver-adapter]"
+  depends_on         = [google_container_cluster.autopilot]
 }
 
 # Model Armor is part of the application policy, not an opaque operator-owned
@@ -3104,7 +3063,7 @@ resource "google_iam_workload_identity_pool_provider" "github_actions_deploy" {
   project                            = var.project_id
   workload_identity_pool_id          = google_iam_workload_identity_pool.github_actions.workload_identity_pool_id
   workload_identity_pool_provider_id = "github-deploy"
-  display_name                       = "GitHub OIDC production qualification"
+  display_name                       = "GitHub OIDC prod qualification"
   attribute_mapping = {
     "google.subject" = "assertion.sub"
     # Include the protected GitHub environment in the mapped attribute. IAM
@@ -3895,30 +3854,35 @@ resource "google_service_account_iam_member" "api_workload_identity" {
   service_account_id = google_service_account.api.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[meshr/meshr-api]"
+  depends_on         = [google_container_cluster.autopilot]
 }
 
 resource "google_service_account_iam_member" "api_canary_workload_identity" {
   service_account_id = google_service_account.api_canary.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[meshr-canary/meshr-api-canary]"
+  depends_on         = [google_container_cluster.autopilot]
 }
 
 resource "google_service_account_iam_member" "bootstrap_workload_identity" {
   service_account_id = google_service_account.bootstrap.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[meshr/meshr-bootstrap]"
+  depends_on         = [google_container_cluster.autopilot]
 }
 
 resource "google_service_account_iam_member" "bootstrap_canary_workload_identity" {
   service_account_id = google_service_account.bootstrap_canary.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[meshr-canary/meshr-bootstrap-canary]"
+  depends_on         = [google_container_cluster.autopilot]
 }
 
 resource "google_service_account_iam_member" "resident_seeder_workload_identity" {
   service_account_id = google_service_account.resident_seeder.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[meshr/meshr-resident-seeder]"
+  depends_on         = [google_container_cluster.autopilot]
 }
 
 resource "google_service_account_iam_member" "canary_worker_workload_identity" {
@@ -3926,12 +3890,14 @@ resource "google_service_account_iam_member" "canary_worker_workload_identity" {
   service_account_id = google_service_account.canary_worker[each.key].name
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[meshr-canary/${each.value.kubernetes_name}]"
+  depends_on         = [google_container_cluster.autopilot]
 }
 
 resource "google_service_account_iam_member" "ingest_canary_workload_identity" {
   service_account_id = google_service_account.ingest_canary.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[meshr-canary/meshr-ingest-canary]"
+  depends_on         = [google_container_cluster.autopilot]
 }
 
 resource "google_service_account_iam_member" "worker_workload_identity" {
@@ -3939,12 +3905,14 @@ resource "google_service_account_iam_member" "worker_workload_identity" {
   service_account_id = google_service_account.worker[each.key].name
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[meshr/${each.value.kubernetes_name}]"
+  depends_on         = [google_container_cluster.autopilot]
 }
 
 resource "google_service_account_iam_member" "ingest_workload_identity" {
   service_account_id = google_service_account.ingest.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[meshr/meshr-ingest]"
+  depends_on         = [google_container_cluster.autopilot]
 }
 
 resource "google_identity_platform_config" "default" {
@@ -5156,6 +5124,7 @@ resource "google_billing_budget" "launch" {
   depends_on      = [google_project_service.required]
   billing_account = var.billing_account_id
   display_name    = "Meshr launch budget"
+  ownership_scope = "BILLING_ACCOUNT"
   budget_filter {
     # A billing account can host unrelated projects. Scope the 50/75/90/95%
     # alerts to Meshr so application protection is not triggered by another
@@ -5168,8 +5137,11 @@ resource "google_billing_budget" "launch" {
       units         = tostring(var.monthly_budget_usd)
     }
   }
-  all_updates_rule {
-    monitoring_notification_channels = local.monitoring_notification_channels
+  dynamic "all_updates_rule" {
+    for_each = length(local.monitoring_notification_channels) == 0 ? [] : [local.monitoring_notification_channels]
+    content {
+      monitoring_notification_channels = all_updates_rule.value
+    }
   }
   threshold_rules {
     threshold_percent = 0.5

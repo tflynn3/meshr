@@ -21,6 +21,27 @@ test("literal GCP service-account IDs satisfy provider constraints", () => {
   }
 });
 
+test("Google API quota is charged to the managed target project", () => {
+  const versions = read("infra/opentofu/versions.tf");
+  const provider = versions.match(/provider "google" \{([\s\S]*?)\n\}/)?.[1];
+  assert.ok(provider, "missing Google provider configuration");
+  assert.match(provider, /billing_project\s*=\s*var\.project_id/);
+  assert.match(provider, /user_project_override\s*=\s*true/);
+});
+
+test("the launch budget keeps billing-account-only ownership", () => {
+  const tofu = read("infra/opentofu/main.tf");
+  const budget = tofu.match(
+    /resource "google_billing_budget" "launch" \{([\s\S]*?)\n\}/,
+  )?.[1];
+  assert.ok(budget, "missing launch budget");
+  assert.match(budget, /ownership_scope\s*=\s*"BILLING_ACCOUNT"/);
+  assert.match(
+    budget,
+    /dynamic "all_updates_rule"[\s\S]*length\(local\.monitoring_notification_channels\) == 0 \? \[\] : \[local\.monitoring_notification_channels\]/,
+  );
+});
+
 test("Pub/Sub dead-letter grants use import-stable subscription keys", () => {
   const tofu = read("infra/opentofu/main.tf");
 
@@ -845,6 +866,8 @@ test("public build fails closed unless the exact release tag set is empty", () =
     preflight,
     /for image in api event-plane moderation-adapter web/,
   );
+  assert.match(preflight, /--head/);
+  assert.doesNotMatch(preflight, /--request HEAD/);
   assert.match(
     preflight,
     /case "\$manifest_status" in[\s\S]*404\) ;;[\s\S]*200\)[\s\S]*exit 1[\s\S]*\*\)[\s\S]*exit 1/,

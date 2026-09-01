@@ -75,7 +75,7 @@ test("readiness manifest covers every OpenTofu Firestore database, index, and TT
   const manifest = extractFirestoreReadinessManifest(source, locationId);
   assert.equal(manifest.databases.length, 12);
   assert.equal(manifest.backupSchedules.length, 6);
-  assert.equal(manifest.indexes.length, 78);
+  assert.equal(manifest.indexes.length, 74);
   assert.equal(manifest.ttls.length, 62);
   assert.ok(
     manifest.databases.every((database) => database.locationId === locationId),
@@ -123,6 +123,16 @@ test("readiness manifest covers every OpenTofu Firestore database, index, and TT
     ),
     "the managed API materializes __name__ as the final composite-index field",
   );
+  assert.equal(
+    manifest.indexes.filter(
+      (index) =>
+        index.fields.length === 2 &&
+        index.fields[0]?.fieldPath !== "__name__" &&
+        index.fields[0]?.order === index.fields[1]?.order,
+    ).length,
+    0,
+    "same-direction single-field indexes are built in and must not be declared as composites",
+  );
 });
 
 test("production qualifier has only Firestore control-plane read permissions", () => {
@@ -158,7 +168,7 @@ test("exact managed Firestore inventory passes only when every resource is ready
     protectedDatabaseCount: 12,
     pitrEnabledDatabaseCount: 8,
     readyBackupScheduleCount: 6,
-    readyIndexCount: 78,
+    readyIndexCount: 74,
     activeTtlCount: 62,
     issues: [],
   });

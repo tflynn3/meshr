@@ -70,6 +70,21 @@ test("production Workload Identity separates build, canary, and private qualific
     /github_production_deploy_identity\s*=\s*var\.github_production_deploy_identity/,
   );
 
+  const providers = [
+    ...terraform.matchAll(
+      /resource "google_iam_workload_identity_pool_provider" "([^"]+)" \{([\s\S]*?)\n\}/g,
+    ),
+  ];
+  assert.equal(providers.length, 3);
+  for (const [, name, body] of providers) {
+    const displayName = body!.match(/display_name\s*=\s*"([^"]+)"/)?.[1];
+    assert.ok(displayName, `missing display name for ${name}`);
+    assert.ok(
+      displayName.length <= 32,
+      `${name} display name exceeds GCP's 32-character limit`,
+    );
+  }
+
   assert.match(
     terraform,
     /"attribute\.build_repository_id"\s*=\s*"assertion\.repository_id"/,
