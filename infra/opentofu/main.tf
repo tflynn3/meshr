@@ -1379,14 +1379,9 @@ resource "google_pubsub_subscription" "workers" {
 }
 
 resource "google_pubsub_subscription" "canary_workers" {
-  for_each = {
-    topology      = "topology-materializer-canary"
-    moderation    = "moderation-worker-canary"
-    audit         = "audit-worker-canary"
-    notifications = "notification-worker-canary"
-  }
-  name  = each.value
-  topic = google_pubsub_topic.events_canary.id
+  for_each = local.event_subscriptions
+  name     = "${each.value}-canary"
+  topic    = google_pubsub_topic.events_canary.id
 
   enable_message_ordering    = true
   ack_deadline_seconds       = 30
@@ -1458,9 +1453,9 @@ resource "google_pubsub_topic_iam_member" "dead_letter_service_agent" {
 }
 
 resource "google_pubsub_subscription_iam_member" "dead_letter_service_agent" {
-  for_each     = google_pubsub_subscription.workers
+  for_each     = local.event_subscriptions
   project      = var.project_id
-  subscription = each.value.name
+  subscription = google_pubsub_subscription.workers[each.key].name
   role         = "roles/pubsub.subscriber"
   member       = "serviceAccount:service-${data.google_project.current.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
 }
@@ -1473,9 +1468,9 @@ resource "google_pubsub_topic_iam_member" "dead_letter_canary_service_agent" {
 }
 
 resource "google_pubsub_subscription_iam_member" "dead_letter_canary_service_agent" {
-  for_each     = google_pubsub_subscription.canary_workers
+  for_each     = local.event_subscriptions
   project      = var.project_id
-  subscription = each.value.name
+  subscription = google_pubsub_subscription.canary_workers[each.key].name
   role         = "roles/pubsub.subscriber"
   member       = "serviceAccount:service-${data.google_project.current.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
 }

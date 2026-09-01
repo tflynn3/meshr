@@ -21,6 +21,59 @@ test("literal GCP service-account IDs satisfy provider constraints", () => {
   }
 });
 
+test("Pub/Sub dead-letter grants use import-stable subscription keys", () => {
+  const tofu = read("infra/opentofu/main.tf");
+
+  assert.doesNotMatch(
+    tofu,
+    /for_each\s*=\s*google_pubsub_subscription\./,
+    "resource-derived collections cannot be enumerated during state-free import",
+  );
+
+  const subscriptions = new Map([
+    ["workers", "name     = each.value"],
+    ["canary_workers", 'name     = "${each.value}-canary"'],
+  ]);
+  for (const [name, expectedName] of subscriptions) {
+    const subscription = tofu.match(
+      new RegExp(
+        `resource "google_pubsub_subscription" "${name}" \\{([\\s\\S]*?)\\n\\}`,
+      ),
+    )?.[1];
+    assert.ok(subscription, `missing Pub/Sub subscription set ${name}`);
+    assert.ok(subscription.includes("for_each = local.event_subscriptions"));
+    assert.ok(subscription.includes(expectedName));
+  }
+
+  const expectedBindings = new Map([
+    [
+      "dead_letter_service_agent",
+      [
+        "local.event_subscriptions",
+        "google_pubsub_subscription.workers[each.key].name",
+      ],
+    ],
+    [
+      "dead_letter_canary_service_agent",
+      [
+        "local.event_subscriptions",
+        "google_pubsub_subscription.canary_workers[each.key].name",
+      ],
+    ],
+  ]);
+
+  for (const [name, [forEach, subscription]] of expectedBindings) {
+    const binding = tofu.match(
+      new RegExp(
+        `resource "google_pubsub_subscription_iam_member" "${name}" \\{([\\s\\S]*?)\\n\\}`,
+      ),
+    )?.[1];
+    assert.ok(binding, `missing Pub/Sub dead-letter binding ${name}`);
+    assert.ok(binding.includes(`for_each     = ${forEach}`));
+    assert.ok(binding.includes(`subscription = ${subscription}`));
+  }
+});
+
 test("Artifact Registry tags and CI access are repository-scoped and immutable", () => {
   const tofu = read("infra/opentofu/main.tf");
   const repository = tofu.match(
