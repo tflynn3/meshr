@@ -18,13 +18,14 @@ case "$verification_mode" in
 esac
 
 # Hash the execution and security contract from the signed Pod template after
-# removing Kubernetes API default spellings and two GKE Autopilot-owned
-# annotations. This deliberately retains scheduling constraints,
-# initContainers, command, env/envFrom, volumes/mounts, probes, resources, host
-# settings, service-account identity, and every security context, so injected
-# execution fields fail.
+# removing Kubernetes API default spellings and the exact reviewed GKE
+# Autopilot mutations. This deliberately retains every other scheduling
+# constraint and security context plus initContainers, command, env/envFrom,
+# volumes/mounts, probes, resources, host settings, and service-account
+# identity, so broader injected execution fields fail.
 pod_template_contract_sha() {
-  jq -cS '
+  jq -L "$script_directory" -cS '
+    include "gke-autopilot-contract";
     def strip_default($key; $value):
       if (has($key) | not) or .[$key] == $value then
         del(.[$key])
@@ -32,6 +33,7 @@ pod_template_contract_sha() {
         .
       end;
     .spec.template
+    | meshr_normalize_flux_pod_template
     | del(.metadata.creationTimestamp)
     | .metadata.annotations = (.metadata.annotations // {})
     | .metadata.annotations |= with_entries(
@@ -350,21 +352,12 @@ verify_admission_contract() {
         expected_kind=ValidatingAdmissionPolicyBinding
       fi
       live_object="$(kubectl get "$resource_type" "$policy_name" -o json)"
-      jq -e --arg kind "$expected_kind" --arg name "$policy_name" \
+      jq -L "$script_directory" -e \
+        --arg kind "$expected_kind" --arg name "$policy_name" \
         --slurpfile expected "$expected_contract" '
+          include "gke-autopilot-contract";
           def normalized_spec:
-            .spec |
-            if has("matchConstraints") then
-              .matchConstraints.matchPolicy //= "Equivalent" |
-              .matchConstraints.namespaceSelector //= {} |
-              .matchConstraints.objectSelector //= {}
-            elif has("matchResources") then
-              .matchResources.matchPolicy //= "Equivalent" |
-              .matchResources.namespaceSelector //= {} |
-              .matchResources.objectSelector //= {}
-            else
-              .
-            end;
+            .spec | meshr_normalize_admission_spec;
           . as $actual |
           ($expected[0][] |
             select(.kind == $kind and .metadata.name == $name)) as $contract |

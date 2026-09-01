@@ -101,11 +101,12 @@ npm ci
 
 When a hosted job materializes a receipt-approved source bundle instead of a
 full checkout, include
-`deploy/production-qualification/admission-contract.json` beside
-`verify-flux-contract.sh` and cover both files with the receipt's approved
-digests. The verifier and release transaction helper use only `bash`,
-`kubectl`, `jq`, `shasum`, and standard shell tools after authentication; do
-not add a post-OIDC package install or public dependency fetch.
+`deploy/production-qualification/admission-contract.json` and
+`gke-autopilot-contract.jq` beside `verify-flux-contract.sh`, and cover all
+three files with the receipt's approved digests. The verifier and release
+transaction helper use only `bash`, `kubectl`, `jq`, `shasum`, and standard
+shell tools after authentication; do not add a post-OIDC package install or
+public dependency fetch.
 
 The operator workstation and hosted runner must use a `kubectl` client no more
 than one minor version above or below the cluster server. Check the numeric
@@ -197,21 +198,48 @@ mint service-account tokens.
 
 ```bash
 set -euo pipefail
+assert_documented_can_i() {
+  local expected="$1"
+  local decision decision_status
+  shift
+  if decision="$(kubectl auth can-i "$@")"; then
+    decision_status=0
+  else
+    decision_status=$?
+  fi
+  if test "$expected" = yes &&
+    test "$decision_status" -eq 0 && test "$decision" = yes; then
+    return 0
+  fi
+  if test "$expected" = no &&
+    test "$decision_status" -eq 1 && test "$decision" = no; then
+    return 0
+  fi
+  printf 'unexpected kubectl auth result: expected=%s exit=%s decision=%s\n' \
+    "$expected" "$decision_status" "$decision" >&2
+  return 1
+}
 for controller in source-controller kustomize-controller; do
-  kubectl auth can-i create serviceaccounts --subresource=token \
+  assert_documented_can_i no create serviceaccounts --subresource=token \
     -n flux-system \
-    --as="system:serviceaccount:flux-system:${controller}" | grep -Fx no
+    --as="system:serviceaccount:flux-system:${controller}"
 done
-kubectl auth can-i get secrets -n flux-system \
-  --as=system:serviceaccount:flux-system:source-controller | grep -Fx no
-kubectl auth can-i get secrets -n meshr \
-  --as=system:serviceaccount:flux-system:kustomize-controller | grep -Fx no
+assert_documented_can_i no get secrets -n flux-system \
+  --as=system:serviceaccount:flux-system:source-controller
+assert_documented_can_i no get secrets -n meshr \
+  --as=system:serviceaccount:flux-system:kustomize-controller
 ```
 
 Type-checking alone does not detect a new or changed nested CRD field. The
 verification script hashes the complete served GitRepository and Kustomization
 CRD contracts, validates exact controller arguments, images, and RBAC, and must
 run both immediately after bootstrap and again through Connect Gateway.
+GKE Autopilot adds an exact `RuntimeDefault` seccomp profile and amd64
+`NoSchedule` toleration to these controller Pods, plus an exact managed-system
+namespace exclusion to admission-policy match constraints. The verifier
+normalizes only those reviewed values, confirms that `flux-system` and `meshr`
+remain selected, and rejects every other scheduling, security-context, or
+admission-selector change.
 `operator` mode additionally compares all three live controller Roles and
 RoleBindings with the reviewed contract, lists RoleBindings in every namespace,
 and rejects any extra RoleBinding or ClusterRoleBinding that directly subjects
@@ -535,25 +563,44 @@ that broad name creation cannot bypass the reserved prefixes.
 
 ```bash
 set -euo pipefail
-kubectl auth can-i get deployments -n meshr | grep -Fx yes
-kubectl auth can-i create gitrepositories.source.toolkit.fluxcd.io \
-  -n flux-system | grep -Fx yes
-kubectl auth can-i patch \
+assert_documented_can_i() {
+  local expected="$1"
+  local decision decision_status
+  shift
+  if decision="$(kubectl auth can-i "$@")"; then
+    decision_status=0
+  else
+    decision_status=$?
+  fi
+  if test "$expected" = yes &&
+    test "$decision_status" -eq 0 && test "$decision" = yes; then
+    return 0
+  fi
+  if test "$expected" = no &&
+    test "$decision_status" -eq 1 && test "$decision" = no; then
+    return 0
+  fi
+  printf 'unexpected kubectl auth result: expected=%s exit=%s decision=%s\n' \
+    "$expected" "$decision_status" "$decision" >&2
+  return 1
+}
+assert_documented_can_i yes get deployments -n meshr
+assert_documented_can_i yes create \
+  gitrepositories.source.toolkit.fluxcd.io -n flux-system
+assert_documented_can_i yes patch \
   kustomizations.kustomize.toolkit.fluxcd.io/meshr-production-qualification \
-  -n flux-system | grep -Fx yes
-kubectl auth can-i get \
-  customresourcedefinitions.apiextensions.k8s.io/gitrepositories.source.toolkit.fluxcd.io \
-  | grep -Fx yes
-kubectl auth can-i get \
-  customresourcedefinitions.apiextensions.k8s.io/kustomizations.kustomize.toolkit.fluxcd.io \
-  | grep -Fx yes
-kubectl auth can-i get secrets -n meshr | grep -Fx no
-kubectl auth can-i create pods/exec -n meshr | grep -Fx no
-kubectl auth can-i update kustomizations.kustomize.toolkit.fluxcd.io \
-  -n flux-system | grep -Fx no
-kubectl auth can-i delete configmaps -n flux-system | grep -Fx no
-kubectl auth can-i create serviceaccounts --subresource=token \
-  -n flux-system | grep -Fx no
+  -n flux-system
+assert_documented_can_i yes get \
+  customresourcedefinitions.apiextensions.k8s.io/gitrepositories.source.toolkit.fluxcd.io
+assert_documented_can_i yes get \
+  customresourcedefinitions.apiextensions.k8s.io/kustomizations.kustomize.toolkit.fluxcd.io
+assert_documented_can_i no get secrets -n meshr
+assert_documented_can_i no create pods/exec -n meshr
+assert_documented_can_i no update \
+  kustomizations.kustomize.toolkit.fluxcd.io -n flux-system
+assert_documented_can_i no delete configmaps -n flux-system
+assert_documented_can_i no create serviceaccounts --subresource=token \
+  -n flux-system
 hosted_denial_log="$(mktemp)"
 if kubectl -n flux-system create configmap qualification-arbitrary-denial \
   2>"$hosted_denial_log"; then
