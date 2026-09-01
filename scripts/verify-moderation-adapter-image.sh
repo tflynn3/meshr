@@ -236,12 +236,17 @@ while IFS=$'\t' read -r attestation_digest subject_digest; do
       ["context", "dockerfile"] and
     .predicate.buildDefinition.externalParameters.request.root.configSource ==
       {path:$dockerfileBasename} and
-    .predicate.buildDefinition.externalParameters.request.root.request.args == {
-      "vcs:localdir:context":".",
-      "vcs:localdir:dockerfile":$dockerfileDirectory,
-      "vcs:revision":$sha,
-      "vcs:source":"https://github.com/tflynn3/meshr"
-    } and
+    .predicate.buildDefinition.externalParameters.request.root.request.args ==
+      ({
+        "vcs:localdir:context":".",
+        "vcs:localdir:dockerfile":$dockerfileDirectory,
+        "vcs:revision":$sha,
+        "vcs:source":"https://github.com/tflynn3/meshr"
+      } + (if $requireWitness then
+        {"build-arg:MESHR_MODERATION_RELEASE_SHA":$sha}
+      else
+        {}
+      end)) and
     .predicate.buildDefinition.externalParameters.request.compatibilityVersion == 30 and
     ((.predicate.buildDefinition.externalParameters.request | has("secrets") | not) or
       .predicate.buildDefinition.externalParameters.request.secrets == []) and
