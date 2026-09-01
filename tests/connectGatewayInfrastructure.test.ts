@@ -32,6 +32,9 @@ const admissionContract = read(
 const fluxContract = read(
   "deploy/production-qualification/verify-flux-contract.sh",
 );
+const gkeAutopilotContract = read(
+  "deploy/production-qualification/gke-autopilot-contract.jq",
+);
 const releaseTransaction = read(
   "deploy/production-qualification/release-transaction.sh",
 );
@@ -566,6 +569,69 @@ test("metrics adapter is direct operator bootstrap and not CI-mutable Flux input
   assert.doesNotMatch(rbac, /meshr-metrics-adapter-values/);
 });
 
+test("metrics adapter RBAC cannot collide with GKE-managed external metric access", () => {
+  const resources = parseAllDocuments(metricsAdapter).map((document) =>
+    document.toJS(),
+  );
+  const roleName = "meshr-external-metrics-reader";
+  const roles = resources.filter(
+    (resource) =>
+      resource.kind === "ClusterRole" && resource.metadata.name === roleName,
+  );
+  const bindings = resources.filter(
+    (resource) =>
+      resource.kind === "ClusterRoleBinding" &&
+      resource.metadata.name === roleName,
+  );
+
+  assert.equal(roles.length, 1, "expected one Meshr-owned external metrics role");
+  assert.equal(
+    bindings.length,
+    1,
+    "expected one Meshr-owned external metrics binding",
+  );
+  const [role] = roles;
+  const [binding] = bindings;
+  assert.equal(role.aggregationRule, undefined);
+  assert.deepEqual(role.rules, [
+    {
+      apiGroups: ["external.metrics.k8s.io"],
+      resources: [
+        "pubsub.googleapis.com|subscription|num_undelivered_messages",
+      ],
+      verbs: ["list", "get", "watch"],
+    },
+  ]);
+  assert.deepEqual(binding.roleRef, {
+    apiGroup: "rbac.authorization.k8s.io",
+    kind: "ClusterRole",
+    name: roleName,
+  });
+  assert.deepEqual(binding.subjects, [
+    {
+      kind: "ServiceAccount",
+      name: "horizontal-pod-autoscaler",
+      namespace: "kube-system",
+    },
+  ]);
+  assert.equal(
+    resources.some(
+      (resource) => resource.metadata?.name === "external-metrics-reader",
+    ),
+    false,
+    "Meshr manifests must not own GKE's external-metrics-reader objects",
+  );
+  assert.equal(
+    resources.some(
+      (resource) =>
+        resource.kind === "ClusterRoleBinding" &&
+        resource.roleRef?.name === "external-metrics-reader",
+    ),
+    false,
+    "Meshr manifests must not bind GKE's wildcard external metrics role",
+  );
+});
+
 test("restricted Flux controller can reconcile only overlay resource kinds", () => {
   const resources = parseAllDocuments(fluxBootstrap).map((document) =>
     document.toJS(),
@@ -760,6 +826,205 @@ test("minimal Flux renderer strips broad controllers and pins the exact two imag
   }
 });
 
+test("GKE Autopilot Flux pod defaults normalize only the exact safe injection", () => {
+  const moduleDirectory = fileURLToPath(
+    new URL("../deploy/production-qualification/", import.meta.url),
+  );
+  const normalize = (template: Record<string, unknown>) =>
+    JSON.parse(
+      execFileSync(
+        "jq",
+        [
+          "-L",
+          moduleDirectory,
+          "-cS",
+          'include "gke-autopilot-contract"; meshr_normalize_flux_pod_template',
+        ],
+        { input: JSON.stringify(template), encoding: "utf8" },
+      ),
+    );
+  const canonical = {
+    metadata: { labels: { app: "source-controller" } },
+    spec: {
+      serviceAccountName: "source-controller",
+      securityContext: { fsGroup: 1337 },
+      containers: [{ name: "manager", image: "example.invalid/controller" }],
+    },
+  };
+  const exactSeccomp = {
+    seccompProfile: { type: "RuntimeDefault" },
+  };
+  const exactToleration = {
+    effect: "NoSchedule",
+    key: "kubernetes.io/arch",
+    operator: "Equal",
+    value: "amd64",
+  };
+  const injected = structuredClone(canonical);
+  Object.assign(injected.spec, {
+    securityContext: { ...canonical.spec.securityContext, ...exactSeccomp },
+    tolerations: [exactToleration],
+  });
+
+  assert.deepEqual(normalize(injected), normalize(canonical));
+
+  const adversarial = [
+    {
+      securityContext: {
+        ...canonical.spec.securityContext,
+        seccompProfile: { type: "Unconfined" },
+      },
+      tolerations: [exactToleration],
+    },
+    {
+      securityContext: {
+        ...canonical.spec.securityContext,
+        seccompProfile: {
+          type: "RuntimeDefault",
+          localhostProfile: "attacker/profile.json",
+        },
+      },
+      tolerations: [exactToleration],
+    },
+    {
+      securityContext: {
+        ...canonical.spec.securityContext,
+        ...exactSeccomp,
+        runAsUser: 0,
+      },
+      tolerations: [exactToleration],
+    },
+    {
+      securityContext: { ...canonical.spec.securityContext, ...exactSeccomp },
+      tolerations: [exactToleration, { operator: "Exists" }],
+    },
+    {
+      securityContext: { ...canonical.spec.securityContext, ...exactSeccomp },
+      tolerations: [
+        { ...exactToleration, operator: "Exists", value: undefined },
+      ],
+    },
+    {
+      securityContext: { ...canonical.spec.securityContext, ...exactSeccomp },
+      tolerations: [{ ...exactToleration, effect: "NoExecute" }],
+    },
+  ].map((mutation) => {
+    const template = structuredClone(canonical);
+    Object.assign(template.spec, mutation);
+    return template;
+  });
+  for (const template of adversarial) {
+    assert.notDeepEqual(normalize(template), normalize(canonical));
+  }
+});
+
+test("GKE admission defaults normalize only the exact managed namespace exclusion", () => {
+  const moduleDirectory = fileURLToPath(
+    new URL("../deploy/production-qualification/", import.meta.url),
+  );
+  const normalize = (spec: Record<string, unknown>) =>
+    JSON.parse(
+      execFileSync(
+        "jq",
+        [
+          "-L",
+          moduleDirectory,
+          "-cS",
+          'include "gke-autopilot-contract"; meshr_normalize_admission_spec',
+        ],
+        { input: JSON.stringify(spec), encoding: "utf8" },
+      ),
+    );
+  const excludedNamespaces = [
+    "kube-system",
+    "gke-gmp-system",
+    "gke-managed-cim",
+    "gke-managed-volumepopulator",
+    "gke-managed-checkpointing",
+    "gke-managed-parallelstorecsi",
+    "gke-managed-lustrecsi",
+    "gke-managed-otel",
+    "gke-managed-mldiagnostics",
+    "gke-managed-networking-dra-driver",
+    "gke-managed-pod-snapshots",
+  ];
+  const exactSelector = {
+    matchExpressions: [
+      {
+        key: "kubernetes.io/metadata.name",
+        operator: "NotIn",
+        values: excludedNamespaces,
+      },
+    ],
+  };
+  const canonical = {
+    failurePolicy: "Fail",
+    matchConstraints: {
+      resourceRules: [
+        {
+          apiGroups: [""],
+          apiVersions: ["v1"],
+          operations: ["CREATE"],
+          resources: ["configmaps"],
+          scope: "Namespaced",
+        },
+      ],
+    },
+  };
+  const injected = structuredClone(canonical);
+  Object.assign(injected.matchConstraints, {
+    namespaceSelector: exactSelector,
+  });
+
+  assert.equal(excludedNamespaces.includes("flux-system"), false);
+  assert.equal(excludedNamespaces.includes("meshr"), false);
+  assert.deepEqual(normalize(injected), normalize(canonical));
+
+  const adversarialSelectors = [
+    {
+      matchExpressions: [
+        { ...exactSelector.matchExpressions[0], values: excludedNamespaces.slice(1) },
+      ],
+    },
+    {
+      matchExpressions: [
+        {
+          ...exactSelector.matchExpressions[0],
+          values: [...excludedNamespaces, "flux-system"],
+        },
+      ],
+    },
+    {
+      matchExpressions: [
+        {
+          ...exactSelector.matchExpressions[0],
+          values: [...excludedNamespaces, "meshr"],
+        },
+      ],
+    },
+    {
+      matchExpressions: [
+        { ...exactSelector.matchExpressions[0], operator: "Exists" },
+      ],
+    },
+    {
+      matchExpressions: [
+        ...exactSelector.matchExpressions,
+        { key: "meshr.social/bypass", operator: "DoesNotExist" },
+      ],
+    },
+    {
+      ...exactSelector,
+      matchLabels: { "meshr.social/bypass": "true" },
+    },
+  ];
+  for (const namespaceSelector of adversarialSelectors) {
+    const policy = structuredClone(canonical);
+    Object.assign(policy.matchConstraints, { namespaceSelector });
+    assert.notDeepEqual(normalize(policy), normalize(canonical));
+  }
+});
+
 test("Flux controller RBAC is namespaced and cannot mint or read credentials", () => {
   const resources = parseAllDocuments(fluxControllerRbac).map((document) =>
     document.toJS(),
@@ -814,6 +1079,10 @@ test("Flux controller RBAC is namespaced and cannot mint or read credentials", (
   assert.match(
     fluxContract,
     /pod_template_contract_sha\(\)[\s\S]*\.spec\.template[\s\S]*\.containers \|= map/,
+  );
+  assert.equal(
+    fluxContract.match(/include "gke-autopilot-contract"/g)?.length,
+    2,
   );
   for (const deploymentInvariant of [
     ".spec.replicas == 1",
@@ -919,7 +1188,7 @@ test("Flux controller RBAC is namespaced and cannot mint or read credentials", (
     ".matchResources.objectSelector //= {}",
   ]) {
     assert.ok(
-      fluxContract.includes(admissionDefault),
+      `${fluxContract}\n${gkeAutopilotContract}`.includes(admissionDefault),
       `missing admission API default normalization ${admissionDefault}`,
     );
   }
@@ -940,6 +1209,10 @@ test("Flux controller RBAC is namespaced and cannot mint or read credentials", (
   assert.match(
     qualificationReadme,
     /verify-flux-contract\.sh operator[\s\S]*verify-flux-contract\.sh gateway/,
+  );
+  assert.match(
+    qualificationReadme,
+    /admission-contract\.json[\s\S]*gke-autopilot-contract\.jq[\s\S]*verify-flux-contract\.sh[\s\S]*all\s+three files[\s\S]*approved digests/,
   );
   assert.match(
     qualificationReadme,
@@ -987,6 +1260,40 @@ test("checked-in admission contract exactly matches bootstrap policies", () => {
     }));
   assert.equal(expected.length, policyNames.size * 2);
   assert.deepEqual(JSON.parse(admissionContract), expected);
+});
+
+test("documented authorization checks distinguish denial from transport failure", () => {
+  const helpers = [
+    ...qualificationReadme.matchAll(
+      /(assert_documented_can_i\(\) \{[\s\S]*?\n\})/g,
+    ),
+  ].map((match) => match[1]);
+  assert.equal(helpers.length, 2, "each independent shell block needs a helper");
+  assert.doesNotMatch(
+    qualificationReadme,
+    /auth can-i[\s\S]{0,160}\| grep -Fx (?:yes|no)/,
+  );
+  for (const helper of helpers) {
+    execFileSync(
+      "bash",
+      [
+        "-c",
+        `set -euo pipefail
+${helper}
+kubectl() {
+  printf '%s\\n' "$KUBECTL_DECISION"
+  return "$KUBECTL_STATUS"
+}
+KUBECTL_DECISION=yes KUBECTL_STATUS=0 assert_documented_can_i yes get pods
+KUBECTL_DECISION=no KUBECTL_STATUS=1 assert_documented_can_i no get secrets
+if KUBECTL_DECISION=no KUBECTL_STATUS=0 assert_documented_can_i no get secrets; then exit 91; fi
+if KUBECTL_DECISION=yes KUBECTL_STATUS=1 assert_documented_can_i yes get pods; then exit 92; fi
+if KUBECTL_DECISION= KUBECTL_STATUS=2 assert_documented_can_i no get secrets; then exit 93; fi
+if KUBECTL_DECISION=no KUBECTL_STATUS=1 assert_documented_can_i yes get pods; then exit 94; fi`,
+      ],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
+  }
 });
 
 test("controller authorization denials accept kubectl's negative exit status", () => {
