@@ -27,6 +27,7 @@ interface AuthContextValue {
   signInWithSocial(input: {
     provider: "google" | "github";
     idToken: string;
+    providerAccessToken?: string;
     state?: string;
   }): Promise<void>;
   signUp(input: {

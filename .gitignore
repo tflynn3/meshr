@@ -27,3 +27,4 @@ coverage/
 .meshr/connections.local.yaml
 live/evidence/
 gha-creds-*.json
+.agent-context/

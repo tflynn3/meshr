@@ -14,7 +14,11 @@ import {
 import { CURRENT_SCHEMA_VERSION } from "./database.ts";
 import { agentProfileSchema } from "./contracts.ts";
 import type { MeshrRepository, RepositoryProjection } from "./repository.ts";
-import type { Clock, IdentityVerifier } from "./types.ts";
+import type {
+  Clock,
+  GithubIdentityVerifier,
+  IdentityVerifier,
+} from "./types.ts";
 
 class TestClock implements Clock {
   constructor(private value = new Date("2026-08-27T18:00:00.000Z")) {}
@@ -58,6 +62,7 @@ afterEach(async () => {
 
 async function start(options: {
   identityVerifier?: IdentityVerifier;
+  githubIdentityVerifier?: GithubIdentityVerifier;
   moderationAuthorityToken?: string;
   internalToken?: string;
   repository?: MeshrRepository;
@@ -1834,6 +1839,366 @@ test("human control source rejection happens before durable session auth or prov
   assert.equal(limited.json.error.code, "human_control_rate_limited");
   assert.equal(sessionReads, readsBeforeLimit);
   assert.equal(verifierCalls, 0);
+});
+
+test("GitHub social sign-in uses an access token bound to a verified GitHub email", async () => {
+  const identityVerifier: IdentityVerifier = async (provider) => ({
+    provider,
+    subject: "firebase-owner",
+    providerSubject: "424242",
+    email: "untrusted@example.test",
+    displayName: "Firebase Owner",
+    emailVerified: false,
+  });
+  const githubIdentityVerifier: GithubIdentityVerifier = async () => ({
+    subject: "424242",
+    email: "verified@example.test",
+    displayName: "Verified Owner",
+  });
+  const { baseUrl } = await start({ identityVerifier, githubIdentityVerifier });
+
+  const signedIn = await requestJson(baseUrl, "/v1/sessions/social", {
+    method: "POST",
+    body: {
+      provider: "github",
+      idToken: "firebase-id-token",
+      providerAccessToken: "github-access-token",
+    },
+  });
+
+  assert.equal(signedIn.response.status, 201);
+  assert.equal(signedIn.json.user.email, "verified@example.test");
+  assert.equal(signedIn.json.user.displayName, "Verified Owner");
+});
+
+test("GitHub social sign-in rejects an access token for a different provider subject", async () => {
+  const { baseUrl } = await start({
+    identityVerifier: async (provider) => ({
+      provider,
+      subject: "firebase-owner",
+      providerSubject: "424242",
+      email: "untrusted@example.test",
+      displayName: "Firebase Owner",
+      emailVerified: false,
+    }),
+    githubIdentityVerifier: async () => ({
+      subject: "999999",
+      email: "attacker@example.test",
+      displayName: "Different GitHub User",
+    }),
+  });
+
+  const rejected = await requestJson(baseUrl, "/v1/sessions/social", {
+    method: "POST",
+    body: {
+      provider: "github",
+      idToken: "firebase-id-token",
+      providerAccessToken: "different-github-access-token",
+    },
+  });
+
+  assert.equal(rejected.response.status, 401);
+  assert.equal(rejected.json.error.code, "invalid_identity_token");
+});
+
+test("provider linking verifies the current GitHub proof when targeting Google", async () => {
+  const githubTokens: string[] = [];
+  const { app, baseUrl } = await start({
+    identityVerifier: async (provider, idToken) => {
+      if (provider === "github" && idToken === "current-github-id-token") {
+        return {
+          provider,
+          subject: "firebase-current-github",
+          providerSubject: "424242",
+          email: "untrusted@example.test",
+          displayName: "Firebase GitHub User",
+          emailVerified: false,
+        };
+      }
+      if (provider === "google" && idToken === "target-google-id-token") {
+        return {
+          provider,
+          subject: "firebase-target-google",
+          providerSubject: "google-owner",
+          email: "owner@example.test",
+          displayName: "Google Owner",
+          emailVerified: true,
+        };
+      }
+      throw new Error("unexpected identity proof");
+    },
+    githubIdentityVerifier: async (accessToken) => {
+      githubTokens.push(accessToken);
+      if (accessToken !== "current-github-access-token") {
+        throw new Error("unexpected GitHub access token");
+      }
+      return {
+        subject: "424242",
+        email: "owner@example.test",
+        displayName: "GitHub Owner",
+      };
+    },
+  });
+  const registration = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "owner@example.test",
+      password: "a sufficiently long provider-link passphrase",
+      displayName: "Provider Link Owner",
+    },
+  });
+  assert.equal(registration.response.status, 201);
+  const accountId = registration.json.user.id as string;
+  app.database.sqlite
+    .prepare(
+      `INSERT INTO provider_identities(provider, subject, account_id, email, created_at, last_seen_at)
+       VALUES('github', ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      "firebase-current-github",
+      accountId,
+      "owner@example.test",
+      app.database.now(),
+      app.database.now(),
+    );
+
+  const linked = await requestJson(baseUrl, "/v1/account/providers/link", {
+    method: "POST",
+    cookie: cookieFrom(registration.response),
+    csrf: registration.json.csrfToken as string,
+    body: {
+      provider: "google",
+      idToken: "target-google-id-token",
+      currentProvider: "github",
+      currentIdToken: "current-github-id-token",
+      currentProviderAccessToken: "current-github-access-token",
+    },
+  });
+
+  assert.equal(linked.response.status, 201);
+  assert.equal(linked.json.identity.provider, "google");
+  assert.deepEqual(githubTokens, ["current-github-access-token"]);
+});
+
+test("provider linking verifies the target GitHub proof when reauthenticated with Google", async () => {
+  const githubTokens: string[] = [];
+  const { app, baseUrl } = await start({
+    identityVerifier: async (provider, idToken) => {
+      if (provider === "google" && idToken === "current-google-id-token") {
+        return {
+          provider,
+          subject: "firebase-current-google",
+          providerSubject: "google-owner",
+          email: "owner@example.test",
+          displayName: "Google Owner",
+          emailVerified: true,
+        };
+      }
+      if (provider === "github" && idToken === "target-github-id-token") {
+        return {
+          provider,
+          subject: "firebase-target-github",
+          providerSubject: "424242",
+          email: "untrusted@example.test",
+          displayName: "Firebase GitHub User",
+          emailVerified: false,
+        };
+      }
+      throw new Error("unexpected identity proof");
+    },
+    githubIdentityVerifier: async (accessToken) => {
+      githubTokens.push(accessToken);
+      if (accessToken !== "target-github-access-token") {
+        throw new Error("unexpected GitHub access token");
+      }
+      return {
+        subject: "424242",
+        email: "owner@example.test",
+        displayName: "GitHub Owner",
+      };
+    },
+  });
+  const registration = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "owner@example.test",
+      password: "a sufficiently long provider-link passphrase",
+      displayName: "Provider Link Owner",
+    },
+  });
+  assert.equal(registration.response.status, 201);
+  const accountId = registration.json.user.id as string;
+  app.database.sqlite
+    .prepare(
+      `INSERT INTO provider_identities(provider, subject, account_id, email, created_at, last_seen_at)
+       VALUES('google', ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      "firebase-current-google",
+      accountId,
+      "owner@example.test",
+      app.database.now(),
+      app.database.now(),
+    );
+
+  const linked = await requestJson(baseUrl, "/v1/account/providers/link", {
+    method: "POST",
+    cookie: cookieFrom(registration.response),
+    csrf: registration.json.csrfToken as string,
+    body: {
+      provider: "github",
+      idToken: "target-github-id-token",
+      providerAccessToken: "target-github-access-token",
+      currentProvider: "google",
+      currentIdToken: "current-google-id-token",
+    },
+  });
+
+  assert.equal(linked.response.status, 201);
+  assert.equal(linked.json.identity.provider, "github");
+  assert.equal(linked.json.identity.email, "owner@example.test");
+  assert.deepEqual(githubTokens, ["target-github-access-token"]);
+});
+
+test("provider linking fails closed for missing or invalid GitHub proof", async () => {
+  const { app, baseUrl } = await start({
+    identityVerifier: async (provider, idToken) => {
+      if (provider === "github" && idToken === "github-id-token") {
+        return {
+          provider,
+          subject: "firebase-github-owner",
+          providerSubject: "424242",
+          email: "untrusted@example.test",
+          displayName: "Firebase GitHub User",
+          emailVerified: false,
+        };
+      }
+      if (provider === "google" && idToken === "google-id-token") {
+        return {
+          provider,
+          subject: "firebase-google-owner",
+          providerSubject: "google-owner",
+          email: "owner@example.test",
+          displayName: "Google Owner",
+          emailVerified: true,
+        };
+      }
+      throw new Error("unexpected identity proof");
+    },
+    githubIdentityVerifier: async (accessToken) => {
+      if (accessToken !== "valid-github-access-token") {
+        throw new Error("invalid GitHub access token");
+      }
+      return {
+        subject: "424242",
+        email: "owner@example.test",
+        displayName: "GitHub Owner",
+      };
+    },
+  });
+  const registration = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "owner@example.test",
+      password: "a sufficiently long provider-link passphrase",
+      displayName: "Provider Link Owner",
+    },
+  });
+  assert.equal(registration.response.status, 201);
+  const accountId = registration.json.user.id as string;
+  app.database.sqlite
+    .prepare(
+      `INSERT INTO provider_identities(provider, subject, account_id, email, created_at, last_seen_at)
+       VALUES('github', ?, ?, ?, ?, ?), ('google', ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      "firebase-github-owner",
+      accountId,
+      "owner@example.test",
+      app.database.now(),
+      app.database.now(),
+      "firebase-google-owner",
+      accountId,
+      "owner@example.test",
+      app.database.now(),
+      app.database.now(),
+    );
+  const cookie = cookieFrom(registration.response);
+  const csrf = registration.json.csrfToken as string;
+
+  const missingTargetToken = await requestJson(
+    baseUrl,
+    "/v1/account/providers/link",
+    {
+      method: "POST",
+      cookie,
+      csrf,
+      body: {
+        provider: "github",
+        idToken: "github-id-token",
+        currentProvider: "google",
+        currentIdToken: "google-id-token",
+      },
+    },
+  );
+  assert.equal(missingTargetToken.response.status, 400);
+  assert.equal(missingTargetToken.json.error.code, "invalid_request");
+
+  const invalidTargetToken = await requestJson(
+    baseUrl,
+    "/v1/account/providers/link",
+    {
+      method: "POST",
+      cookie,
+      csrf,
+      body: {
+        provider: "github",
+        idToken: "github-id-token",
+        providerAccessToken: "invalid-github-access-token",
+        currentProvider: "google",
+        currentIdToken: "google-id-token",
+      },
+    },
+  );
+  assert.equal(invalidTargetToken.response.status, 401);
+  assert.equal(invalidTargetToken.json.error.code, "invalid_identity_token");
+
+  const missingCurrentToken = await requestJson(
+    baseUrl,
+    "/v1/account/providers/link",
+    {
+      method: "POST",
+      cookie,
+      csrf,
+      body: {
+        provider: "google",
+        idToken: "google-id-token",
+        currentProvider: "github",
+        currentIdToken: "github-id-token",
+      },
+    },
+  );
+  assert.equal(missingCurrentToken.response.status, 400);
+  assert.equal(missingCurrentToken.json.error.code, "invalid_request");
+
+  const invalidCurrentToken = await requestJson(
+    baseUrl,
+    "/v1/account/providers/link",
+    {
+      method: "POST",
+      cookie,
+      csrf,
+      body: {
+        provider: "google",
+        idToken: "google-id-token",
+        currentProvider: "github",
+        currentIdToken: "github-id-token",
+        currentProviderAccessToken: "invalid-github-access-token",
+      },
+    },
+  );
+  assert.equal(invalidCurrentToken.response.status, 401);
+  assert.equal(invalidCurrentToken.json.error.code, "invalid_identity_token");
 });
 
 test("verified social token replays cannot mint unbounded browser sessions", async () => {
