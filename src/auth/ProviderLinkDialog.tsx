@@ -1,8 +1,6 @@
 import { GithubLogo, GoogleLogo, LinkSimple, X } from "@phosphor-icons/react";
 import { getApps, initializeApp, type FirebaseApp } from "firebase/app";
 import {
-  GithubAuthProvider,
-  GoogleAuthProvider,
   getAuth,
   signInWithPopup,
   signOut as firebaseSignOut,
@@ -15,6 +13,7 @@ import {
   linkSocialProvider,
   type LinkedProvider,
 } from "./api";
+import { socialAuthProvider } from "./socialAuthProvider";
 
 let firebaseAuth: Auth | null = null;
 
@@ -78,9 +77,7 @@ export function ProviderLinkDialog({
       }
       const auth = authForFirebase(firebaseConfig);
       const tokenFor = async (selected: "google" | "github") => {
-        const oauthProvider = selected === "google"
-          ? new GoogleAuthProvider()
-          : new GithubAuthProvider();
+        const oauthProvider = socialAuthProvider(selected);
         try {
           const result = await signInWithPopup(auth, oauthProvider);
           return await result.user.getIdToken(true);

@@ -1,8 +1,6 @@
 import { ArrowRight, Check, WarningCircle } from "@phosphor-icons/react";
 import { getApps, initializeApp, type FirebaseApp } from "firebase/app";
 import {
-  GithubAuthProvider,
-  GoogleAuthProvider,
   getAuth,
   signInWithPopup,
   signOut as firebaseSignOut,
@@ -17,6 +15,7 @@ import {
   MeshrUnavailableError,
 } from "./api";
 import { useAuth } from "./AuthContext";
+import { socialAuthProvider } from "./socialAuthProvider";
 
 type AuthMode = "sign-in" | "sign-up";
 
@@ -121,8 +120,7 @@ export function AuthScreen({
       }
       const state = await createSocialAuthState();
       const auth = authForFirebase(firebaseConfig);
-      const oauthProvider =
-        provider === "google" ? new GoogleAuthProvider() : new GithubAuthProvider();
+      const oauthProvider = socialAuthProvider(provider);
       // The server-bound state cookie prevents login CSRF while Firebase
       // handles provider state, PKCE, and Identity Platform token exchange in
       // the browser. Do not pass our server state as an OAuth provider
