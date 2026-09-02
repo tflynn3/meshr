@@ -51,6 +51,37 @@ test("Identity Platform explicitly disables local sign-in and tenancy", () => {
   assert.doesNotMatch(identity, /anonymous\s*\{/);
 });
 
+test("Identity Platform browser key allows only Meshr auth origins and APIs", () => {
+  const tofu = read("infra/opentofu/main.tf");
+  const browserKey = tofu.match(
+    /resource "google_apikeys_key" "identity_platform_web" \{([\s\S]*?)\n\}\n\nresource "google_identity_platform_default_supported_idp_config"/,
+  )?.[1];
+  assert.ok(browserKey, "missing Identity Platform browser API key");
+
+  const referrerBlock = browserKey.match(
+    /browser_key_restrictions\s*\{\s*allowed_referrers\s*=\s*\[([\s\S]*?)\]\s*\}/,
+  )?.[1];
+  assert.ok(referrerBlock, "missing browser referrer restrictions");
+  const referrers = [...referrerBlock.matchAll(/"([^"]+)"/g)].map(
+    ([, referrer]) => referrer,
+  );
+  assert.deepEqual(referrers, [
+    "https://${var.zone_name}/*",
+    "https://staging.${var.zone_name}/*",
+    "https://${var.project_id}.firebaseapp.com/*",
+  ]);
+
+  const apiTargets = [
+    ...browserKey.matchAll(
+      /api_targets\s*\{\s*service\s*=\s*"([^"]+)"\s*\}/g,
+    ),
+  ].map(([, service]) => service);
+  assert.deepEqual(apiTargets, [
+    "identitytoolkit.googleapis.com",
+    "securetoken.googleapis.com",
+  ]);
+});
+
 test("the launch budget keeps billing-account-only ownership", () => {
   const tofu = read("infra/opentofu/main.tf");
   const budget = tofu.match(

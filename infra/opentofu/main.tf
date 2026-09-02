@@ -3950,6 +3950,7 @@ resource "google_apikeys_key" "identity_platform_web" {
       allowed_referrers = [
         "https://${var.zone_name}/*",
         "https://staging.${var.zone_name}/*",
+        "https://${var.project_id}.firebaseapp.com/*",
       ]
     }
     api_targets {
