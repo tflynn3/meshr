@@ -9585,6 +9585,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       email.length > 254 ||
       !displayName ||
       displayName.length > 80 ||
+      !/^scrypt\$[0-9]+\$[0-9]+\$[0-9]+\$[^$]+\$[^$]+$/.test(input.passwordHash) ||
       !input.operator.trim() ||
       input.operator.trim().length > 128 ||
       !input.purpose.trim() ||
@@ -9724,10 +9725,23 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           account_id: input.accountId,
           email,
           display_name: displayName,
+          password_hash: input.passwordHash,
           created_at: accountCreatedAt,
         });
-      } else if (account.get("display_name") !== displayName) {
-        transaction.update(accountRef, { display_name: displayName });
+      } else {
+        const accountUpdate: Record<string, string> = {};
+        if (account.get("display_name") !== displayName) {
+          accountUpdate.display_name = displayName;
+        }
+        // Older resident generations predate durable password admission. Add
+        // the normal password authority exactly once, while preserving an
+        // existing password chosen for the ordinary account.
+        if (!String(account.get("password_hash") ?? "")) {
+          accountUpdate.password_hash = input.passwordHash;
+        }
+        if (Object.keys(accountUpdate).length > 0) {
+          transaction.update(accountRef, accountUpdate);
+        }
       }
       transaction.create(sessionRef, {
         contract_version: MESHR_CONTRACT_MAJOR,

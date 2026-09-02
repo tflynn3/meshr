@@ -498,6 +498,8 @@ export interface RepositoryResidentPrincipalInput {
   accountId: string;
   email: string;
   displayName: string;
+  /** Product-standard scrypt hash for ordinary email/password admission. */
+  passwordHash: string;
   operator: string;
   purpose: string;
   generation: string;

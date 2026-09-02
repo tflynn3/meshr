@@ -3,6 +3,7 @@ import { createHash, generateKeyPairSync } from "node:crypto";
 import { test } from "node:test";
 import { Firestore } from "@google-cloud/firestore";
 import { FirestoreMeshrRepository } from "../server/firestoreRepository.ts";
+import { verifyPassword } from "../server/security.ts";
 import {
   deriveResidentCredentialBundle,
   parseResidentPrincipalManifest,
@@ -62,7 +63,11 @@ test("Firestore provisions ordinary resident accounts and preserves normal pairi
     const accountDocument = await collection("accounts").doc(account!.accountId).get();
     assert.deepEqual(
       Object.keys(accountDocument.data() ?? {}).sort(),
-      ["account_id", "contract_version", "created_at", "display_name", "email"],
+      ["account_id", "contract_version", "created_at", "display_name", "email", "password_hash"],
+    );
+    assert.equal(
+      await verifyPassword(bundle.principals[0]!.password, String(accountDocument.get("password_hash"))),
+      true,
     );
     const residentDocuments = await collection("resident_principals").get();
     const auditDocuments = await collection("audit_events").get();
