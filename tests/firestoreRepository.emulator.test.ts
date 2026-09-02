@@ -1778,13 +1778,13 @@ test(
         expiresAt: "2026-08-28T19:00:00.000Z",
         sessionId: `${prefix}_page_session`,
       });
-      assert.equal(pageTransfer.authorityEpoch, 1);
+      assert.equal(pageTransfer.authorityEpoch, 2);
       assert.equal(pageTransfer.sessionId, `${prefix}_page_session`);
       const pageGrant = await collection("webmcp_grants")
         .doc(pageGrantId)
         .get();
       assert.equal(pageGrant.exists, true);
-      assert.equal(pageGrant.get("authority_epoch"), 1);
+      assert.equal(pageGrant.get("authority_epoch"), 2);
       const activePageGrant = await repository.findActiveWebMcpGrant(
         accountSessionHash,
         agentId,
@@ -1851,7 +1851,7 @@ test(
         expiresAt: "2026-08-28T18:15:00.000Z",
         claimPairing: false,
       });
-      assert.equal(nativeRecovery.authorityEpoch, 2);
+      assert.equal(nativeRecovery.authorityEpoch, 3);
       const superseding = await repository.startRuntimeSession({
         agentId,
         bindingId: pairingId,
@@ -1863,7 +1863,7 @@ test(
         expiresAt: "2026-08-28T18:15:00.000Z",
         claimPairing: false,
       });
-      assert.equal(superseding.authorityEpoch, 3);
+      assert.equal(superseding.authorityEpoch, 4);
       const nativeRecoveryPredecessor = await collection("runtime_sessions")
         .doc(`${prefix}_native_recovery`)
         .get();
@@ -1919,7 +1919,7 @@ test(
         challengeId: recoveryChallengeId,
         challengeUsedAt: recoveryNow,
         expectedSessionId: `${prefix}_native_superseding`,
-        expectedAuthorityEpoch: 3,
+        expectedAuthorityEpoch: 4,
         allowExpiredPredecessorRecovery: true,
         event: {
           eventId: `${prefix}_expired_recovery_event`,
@@ -1947,7 +1947,7 @@ test(
           createdAt: recoveryNow,
         },
       });
-      assert.equal(recovery.authorityEpoch, 4);
+      assert.equal(recovery.authorityEpoch, 5);
       assert.equal(
         (
           await recoveryRepository.findRuntimeSessionById(
@@ -1983,7 +1983,7 @@ test(
             .digest("hex"),
           expiresAt: "2026-08-28T18:35:00.000Z",
           expectedSessionId: `${prefix}_native_superseding`,
-          expectedAuthorityEpoch: 3,
+          expectedAuthorityEpoch: 4,
           allowExpiredPredecessorRecovery: true,
         }),
         /session_superseded/,
@@ -2496,7 +2496,7 @@ test(
         expiresAt: grantExpiresAt,
         sessionId: `${prefix}_page_session`,
       });
-      assert.equal(transfer.authorityEpoch, 1);
+      assert.equal(transfer.authorityEpoch, 2);
       const supersededSession = await collection("runtime_sessions")
         .doc(runtimeSessionId)
         .get();
@@ -3499,6 +3499,280 @@ test(
       }
       await authority.terminate();
       await topology.terminate();
+    }
+  },
+);
+
+test(
+  "Firestore browser-first creation atomically preserves replay, grant, and portfolio invariants",
+  {
+    skip: !process.env.FIRESTORE_EMULATOR_HOST,
+  },
+  async () => {
+    const projectId =
+      process.env.GOOGLE_CLOUD_PROJECT?.trim() || "meshr-emulator";
+    const firestore = new Firestore({ projectId, databaseId: "(default)" });
+    const prefix = `browser_first_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const collection = (name: string) =>
+      firestore.collection(`${prefix}_${name}`);
+    const now = "2026-08-28T18:00:00.000Z";
+    let clockNow = now;
+    const repository = new FirestoreMeshrRepository({
+      firestore,
+      collectionPrefix: prefix,
+      clock: { now: () => new Date(clockNow) },
+      invitationPepper: `${prefix}:pepper`,
+    });
+    const humanSessionHash = createHash("sha256")
+      .update(`${prefix}:human-session`)
+      .digest("hex");
+
+    try {
+      await repository.ensureEmptyProduction();
+      const owner = await repository.createSocialAccount({
+        provider: "google",
+        subject: `${prefix}:owner`,
+        email: `${prefix}@example.test`,
+        displayName: "Browser-first owner",
+      });
+      await repository.createHumanSession({
+        tokenHash: humanSessionHash,
+        accountId: owner.accountId,
+        csrfToken: `${prefix}:csrf`,
+        createdAt: now,
+        expiresAt: "2026-08-28T20:00:00.000Z",
+        absoluteExpiresAt: "2026-09-04T18:00:00.000Z",
+      });
+
+      const command = (ordinal: number) => {
+        const agentId = `${prefix}_agent_${ordinal}`;
+        const grantId = createHash("sha256")
+          .update(`${prefix}:grant:${ordinal}`)
+          .digest("hex");
+        const sessionId = `${prefix}_page_${ordinal}`;
+        const idempotencyKey = `${prefix}:create:${ordinal}`;
+        const requestHash = createHash("sha256")
+          .update(`${prefix}:request:${ordinal}`)
+          .digest("hex");
+        return {
+          agent: {
+            agentId,
+            ownerAccountId: owner.accountId,
+            name: `Browser Agent ${ordinal}`,
+            handle: `${prefix.slice(-16)}-browser-${ordinal}`,
+            tagline: "Created directly by the browser.",
+            interests: ["WebMCP"],
+            personality: "Careful and curious.",
+            attention: {
+              browse: "public",
+              rootPosts: "never",
+              replies: "never",
+              notes: "Observe without publishing.",
+            },
+            runtime: "other" as const,
+            runtimeLabel: "Page WebMCP",
+            runtimeSubject: `webmcp:${agentId}`,
+            publicKeyPem: "",
+            definitionDigest: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+          grantId,
+          humanSessionHash,
+          expiresAt: "2026-08-28T19:00:00.000Z",
+          sessionId,
+          idempotencyKey,
+          requestHash,
+          event: {
+            eventId: `${prefix}_event_${ordinal}`,
+            type: "agent.created",
+            meshId: "mesh-public",
+            topicId: null,
+            agentId,
+            sessionId,
+            runtimeKind: null,
+            payload: { agentId, authority: "page_webmcp" },
+            occurredAt: now,
+          },
+          audit: {
+            auditId: `${prefix}_audit_${ordinal}`,
+            actorType: "human" as const,
+            actorId: owner.accountId,
+            sessionId: humanSessionHash,
+            action: "webmcp.agent.created",
+            resourceType: "agent",
+            resourceId: agentId,
+            data: { authority: "page_webmcp" },
+            createdAt: now,
+          },
+        };
+      };
+
+      const firstInput = command(1);
+      const first = await repository.createBrowserAgentWithPageAuthority(
+        firstInput,
+      );
+      assert.equal(first.duplicate, false);
+      assert.equal(first.agent.agentId, firstInput.agent.agentId);
+      assert.equal(first.grant.grantId, firstInput.grantId);
+      assert.equal(
+        (
+          await repository.createBrowserAgentWithPageAuthority(firstInput)
+        ).duplicate,
+        true,
+      );
+      assert.deepEqual(
+        await repository.listNativeBoundAgentIds([firstInput.agent.agentId]),
+        [],
+      );
+      assert.equal((await collection("pairings").get()).empty, true);
+      assert.equal((await collection("agent_bindings").get()).empty, true);
+      assert.equal((await collection("runtime_sessions").get()).empty, true);
+
+      const secondInput = command(2);
+      const second = await repository.createBrowserAgentWithPageAuthority(
+        secondInput,
+      );
+      assert.equal(second.duplicate, false);
+      assert.equal(
+        (
+          await collection("webmcp_grants")
+            .doc(firstInput.grantId)
+            .get()
+        ).get("revoked_at"),
+        now,
+      );
+      assert.equal(
+        await repository.findActiveWebMcpGrant(
+          humanSessionHash,
+          firstInput.agent.agentId,
+        ),
+        null,
+      );
+      assert.equal(
+        (
+          await repository.findActiveWebMcpGrant(
+            humanSessionHash,
+            secondInput.agent.agentId,
+          )
+        )?.tokenHash,
+        secondInput.grantId,
+      );
+      assert.equal(
+        (await collection("event_outbox").doc(firstInput.event.eventId).get())
+          .exists,
+        true,
+      );
+      assert.equal(
+        (await collection("event_outbox").doc(secondInput.event.eventId).get())
+          .exists,
+        true,
+      );
+      assert.equal((await collection("audit_events").get()).size, 2);
+
+      // Attaching the first native runtime reuses the durable identity but
+      // must not make it look like the agent only just joined the commons.
+      clockNow = "2026-08-28T18:10:00.000Z";
+      const nativePairingId = `${prefix}_native_pairing`;
+      const { publicKey } = generateKeyPairSync("ed25519");
+      await repository.createPairing({
+        pairingId: nativePairingId,
+        code: "BRWS-0001",
+        secretHash: createHash("sha256")
+          .update(`${prefix}:native-secret`)
+          .digest("hex"),
+        runtime: "local",
+        runtimeLabel: "Browser-first native host",
+        externalSubject: `${prefix}:native-host`,
+        publicKeyPem: publicKey
+          .export({ type: "spki", format: "pem" })
+          .toString(),
+        requestedProfile: null,
+        definitionDigest: null,
+        status: "pending",
+        ownerAccountId: null,
+        agentId: null,
+        createdAt: clockNow,
+        expiresAt: "2026-08-28T19:10:00.000Z",
+        approvedAt: null,
+        claimedAt: null,
+      });
+      const nativeApproval = await repository.approvePairing({
+        pairingId: nativePairingId,
+        ownerAccountId: owner.accountId,
+        humanSessionHash,
+        agentId: `${prefix}_should_not_replace_identity`,
+        profile: {
+          name: firstInput.agent.name,
+          handle: firstInput.agent.handle,
+          tagline: firstInput.agent.tagline,
+          interests: firstInput.agent.interests,
+          personality: firstInput.agent.personality,
+          attention: firstInput.agent.attention,
+        },
+        approvedAt: clockNow,
+      });
+      assert.equal(nativeApproval.agentId, firstInput.agent.agentId);
+      assert.equal(nativeApproval.replaced, false);
+      const retainedMembership = await collection("mesh_agent_memberships")
+        .doc(`mesh-public:${firstInput.agent.agentId}`)
+        .get();
+      assert.equal(retainedMembership.get("joined_at"), now);
+      assert.equal(retainedMembership.get("updated_at"), clockNow);
+      assert.deepEqual(
+        await repository.listNativeBoundAgentIds([
+          firstInput.agent.agentId,
+          secondInput.agent.agentId,
+        ]),
+        [firstInput.agent.agentId],
+      );
+
+      await repository.revokeWebMcpGrants(
+        humanSessionHash,
+        "2026-08-28T18:10:01.000Z",
+      );
+      assert.equal(
+        await repository.findActiveWebMcpGrant(
+          humanSessionHash,
+          secondInput.agent.agentId,
+        ),
+        null,
+      );
+      await assert.rejects(
+        repository.createBrowserAgentWithPageAuthority(secondInput),
+        /idempotency_expired/,
+      );
+
+      const portfolioBatch = firestore.batch();
+      for (let ordinal = 3; ordinal <= 25; ordinal += 1) {
+        portfolioBatch.set(collection("agents").doc(`${prefix}_agent_${ordinal}`), {
+          contract_version: 1,
+          agent_id: `${prefix}_agent_${ordinal}`,
+          owner_account_id: owner.accountId,
+          created_at: now,
+          updated_at: now,
+        });
+      }
+      await portfolioBatch.commit();
+      await assert.rejects(
+        repository.createBrowserAgentWithPageAuthority(command(26)),
+        /agent_limit_reached/,
+      );
+      assert.equal(
+        (
+          await collection("agents")
+            .where("owner_account_id", "==", owner.accountId)
+            .get()
+        ).size,
+        25,
+      );
+    } finally {
+      for (const candidate of await firestore.listCollections()) {
+        if (candidate.id.startsWith(`${prefix}_`)) {
+          await firestore.recursiveDelete(candidate);
+        }
+      }
+      await firestore.terminate();
     }
   },
 );

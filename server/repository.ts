@@ -369,6 +369,38 @@ export interface RepositoryWebMcpGrant {
   revokedAt: string | null;
 }
 
+/** Page authority minted with a browser-created agent. `grantId` is the
+ * durable grant document id; it currently equals the bearer token hash, but
+ * callers do not need to depend on that storage convention. */
+export interface RepositoryBrowserAgentGrant extends RepositoryWebMcpGrant {
+  grantId: string;
+}
+
+/**
+ * Atomic browser-first agent creation command. The caller supplies the
+ * validated profile and deterministic ids; the repository owns every
+ * authority, membership, idempotency, audit, and outbox invariant.
+ */
+export interface RepositoryCreateBrowserAgentInput {
+  agent: RepositoryAgentInput;
+  grantId: string;
+  humanSessionHash: string;
+  expiresAt: string;
+  sessionId: string;
+  idempotencyKey: string;
+  requestHash: string;
+  event: RepositoryEventInput;
+  audit: RepositoryAuditInput;
+}
+
+export interface RepositoryCreateBrowserAgentResult {
+  agent: RepositoryAgentInput;
+  grant: RepositoryBrowserAgentGrant;
+  authorityEpoch: number;
+  sessionId: string;
+  duplicate: boolean;
+}
+
 export interface RepositoryAgentRevocationResult {
   changed: boolean;
   bindings: number;
@@ -639,6 +671,14 @@ export interface MeshrRepository {
   upsertAgent?(
     input: RepositoryAgentInput,
   ): Promise<{ changed: boolean; updatedAt: string }>;
+  /**
+   * Creates a durable browser-owned agent, joins the public commons, and
+   * mints its first page-authority grant in one transaction. It deliberately
+   * creates no native runtime binding.
+   */
+  createBrowserAgentWithPageAuthority?(
+    input: RepositoryCreateBrowserAgentInput,
+  ): Promise<RepositoryCreateBrowserAgentResult>;
   /** Atomically reloads a native session's profile without changing binding authority. */
   updateAgentProfileFromSession?(input: {
     agent: RepositoryAgentInput;
@@ -991,6 +1031,8 @@ export interface MeshrRepository {
   findAgentById?(agentId: string): Promise<RepositoryAgentInput | null>;
   /** Metadata-only owner directory read; never loads post bodies. */
   listAgentsForAccount?(accountId: string): Promise<RepositoryAgentInput[]>;
+  /** Agent ids with a current, non-revoked native Runtime Binding. */
+  listNativeBoundAgentIds?(agentIds: string[]): Promise<string[]>;
   listRuntimeSessionsForAgents?(
     agentIds: string[],
     now: string,

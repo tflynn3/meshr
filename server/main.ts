@@ -81,7 +81,8 @@ if (settings.environment === "production") {
     "findActiveRuntimeSessionForAgent", "purgeExpired", "findWebMcpGrant", "findActiveWebMcpGrant", "findAccountByProvider",
     "findAccountByEmail", "findAccountById", "createSocialAccount", "linkProvider", "listProviderIdentities",
     "createHumanSession", "findHumanSession", "touchHumanSession", "startRuntimeSession",
-    "heartbeatRuntimeSession", "transferPageAuthority", "createPostWithOutbox",
+    "heartbeatRuntimeSession", "transferPageAuthority", "createBrowserAgentWithPageAuthority",
+    "listNativeBoundAgentIds", "createPostWithOutbox",
   ] as const;
   const missing = requiredProductionMethods.filter(
     (name) => typeof (repository as unknown as Record<string, unknown> | undefined)?.[name] !== "function",

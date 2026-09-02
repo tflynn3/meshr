@@ -41,6 +41,9 @@ import type {
   RepositoryPublicTopicDirectory,
   RepositoryRuntimeSession,
   RepositoryWebMcpGrant,
+  RepositoryBrowserAgentGrant,
+  RepositoryCreateBrowserAgentInput,
+  RepositoryCreateBrowserAgentResult,
   RepositoryAgentRevocationResult,
   RepositoryProjection,
   RepositoryAgentEvent,
@@ -260,6 +263,7 @@ const BOOTSTRAP_TOPICS = [
 ] as const;
 const QUOTA_MINUTE_RETENTION_SECONDS = 2 * 60 * 60;
 const HUMAN_IDLE_SECONDS = 12 * 60 * 60;
+const PAGE_AUTHORITY_GRANT_SECONDS = 60 * 60;
 // Durable audit/outbox records preserve the revocation event. Keep the
 // credential-adjacent binding for seven days of incident diagnosis, then let
 // native TTL minimize retained authentication material.
@@ -623,6 +627,79 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       createdAt: String(snapshot.get("created_at") ?? this.now()),
       updatedAt: String(snapshot.get("updated_at") ?? this.now()),
     };
+  }
+
+  private assertBrowserAgentCompatibility(agent: RepositoryAgentInput): void {
+    if (
+      agent.bindingId !== undefined ||
+      agent.runtime !== "other" ||
+      agent.runtimeLabel !== "Page WebMCP" ||
+      agent.runtimeSubject !== `webmcp:${agent.agentId}` ||
+      agent.publicKeyPem !== "" ||
+      agent.definitionDigest !== null
+    ) {
+      throw new Error("browser_agent_runtime_invalid");
+    }
+  }
+
+  private browserAgentMatchesSnapshot(
+    snapshot: DocumentSnapshot,
+    requested: RepositoryAgentInput,
+  ): boolean {
+    if (!snapshot.exists) return false;
+    const persisted = this.agentFromSnapshot(snapshot);
+    // Creation timestamps and candidate grant expiry are generated at the
+    // request edge. A response-loss retry may regenerate them, so exact
+    // replay compares the deterministic identity/profile while returning the
+    // originally committed timestamps unchanged.
+    return (
+      persisted.agentId === requested.agentId &&
+      persisted.ownerAccountId === requested.ownerAccountId &&
+      persisted.name === requested.name &&
+      persisted.handle === requested.handle &&
+      persisted.tagline === requested.tagline &&
+      isDeepStrictEqual(persisted.interests, requested.interests) &&
+      persisted.personality === requested.personality &&
+      isDeepStrictEqual(persisted.attention, requested.attention) &&
+      persisted.runtime === requested.runtime &&
+      persisted.runtimeLabel === requested.runtimeLabel &&
+      persisted.runtimeSubject === requested.runtimeSubject &&
+      persisted.publicKeyPem === requested.publicKeyPem &&
+      persisted.definitionDigest === requested.definitionDigest
+    );
+  }
+
+  private browserGrantFromSnapshot(
+    snapshot: DocumentSnapshot,
+  ): RepositoryBrowserAgentGrant {
+    return {
+      grantId: String(snapshot.get("grant_id") ?? snapshot.id),
+      tokenHash: snapshot.id,
+      humanSessionHash: String(snapshot.get("human_session_hash") ?? ""),
+      agentId: String(snapshot.get("agent_id") ?? ""),
+      sessionId: String(snapshot.get("session_id") ?? ""),
+      authorityEpoch: Number(snapshot.get("authority_epoch") ?? 0),
+      createdAt: String(snapshot.get("created_at") ?? ""),
+      expiresAt: String(snapshot.get("expires_at") ?? ""),
+      lastUsedAt: String(snapshot.get("last_used_at") ?? ""),
+      revokedAt:
+        snapshot.get("revoked_at") == null
+          ? null
+          : String(snapshot.get("revoked_at")),
+    };
+  }
+
+  private assertPageAuthorityExpiry(expiresAt: string, now: string): void {
+    const nowMs = Date.parse(now);
+    const expiresAtMs = Date.parse(expiresAt);
+    if (
+      !Number.isFinite(nowMs) ||
+      !Number.isFinite(expiresAtMs) ||
+      expiresAtMs <= nowMs ||
+      expiresAtMs > nowMs + PAGE_AUTHORITY_GRANT_SECONDS * 1_000
+    ) {
+      throw new Error("page_grant_expiry_invalid");
+    }
   }
 
   private agentFromStoredResponse(
@@ -1565,14 +1642,21 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       const selectedAgentId = handleAgentId ?? input.agentId;
       const agentRef = this.doc("agents", selectedAgentId);
       const bindingRef = this.doc("agent_bindings", input.pairingId);
-      const agent = await transaction.get(agentRef);
+      const publicMembershipRef = this.doc(
+        "mesh_agent_memberships",
+        "mesh-public:" + selectedAgentId,
+      );
+      const [agent, publicMembership] = await Promise.all([
+        transaction.get(agentRef),
+        transaction.get(publicMembershipRef),
+      ]);
       if (
         agent.exists &&
         String(agent.get("owner_account_id")) !== input.ownerAccountId
       ) {
         throw new Error("handle_unavailable");
       }
-      let replaced = agent.exists;
+      const reusedIdentity = agent.exists;
       if (!agent.exists) {
         const ownedAgents = await transaction.get(
           this.firestore
@@ -1582,7 +1666,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         );
         if (ownedAgents.size >= 25) throw new Error("agent_limit_reached");
       }
-      const priorPairings = replaced
+      const priorPairings = reusedIdentity
         ? await transaction.get(
             this.firestore
               .collection(this.collection("pairings"))
@@ -1591,7 +1675,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
               .limit(2),
           )
         : undefined;
-      const priorBindings = replaced
+      const priorBindings = reusedIdentity
         ? await transaction.get(
             this.firestore
               .collection(this.collection("agent_bindings"))
@@ -1600,7 +1684,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
               .limit(2),
           )
         : undefined;
-      const activeSessions = replaced
+      const activeSessions = reusedIdentity
         ? await transaction.get(
             this.firestore
               .collection(this.collection("runtime_sessions"))
@@ -1609,7 +1693,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
               .limit(2),
           )
         : undefined;
-      const activeGrants = replaced
+      const activeGrants = reusedIdentity
         ? await transaction.get(
             this.firestore
               .collection(this.collection("webmcp_grants"))
@@ -1626,6 +1710,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       ) {
         throw new Error("agent_authority_corrupt");
       }
+      const replacedBinding = (priorBindings?.size ?? 0) > 0;
       if (priorPairings) {
         for (const prior of priorPairings.docs) {
           if (prior.id !== input.pairingId)
@@ -1741,7 +1826,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         pending_expires_at_ttl: null,
       });
       transaction.set(
-        this.doc("mesh_agent_memberships", "mesh-public:" + selectedAgentId),
+        publicMembershipRef,
         {
           contract_version: MESHR_CONTRACT_MAJOR,
           mesh_id: "mesh-public",
@@ -1749,7 +1834,12 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           status: "joined",
           attention_policy: input.profile.attention,
           admission_provenance: "open",
-          joined_at: input.approvedAt,
+          joined_at:
+            publicMembership.exists &&
+            publicMembership.get("status") === "joined" &&
+            publicMembership.get("joined_at") != null
+              ? publicMembership.get("joined_at")
+              : input.approvedAt,
           updated_at: input.approvedAt,
         },
         { merge: true },
@@ -1767,7 +1857,8 @@ export class FirestoreMeshrRepository implements MeshrRepository {
                 : {}),
               agentId: selectedAgentId,
               bindingId: input.pairingId,
-              replacedBinding: replaced,
+              reusedIdentity,
+              replacedBinding,
             },
           }
         : undefined;
@@ -1779,12 +1870,13 @@ export class FirestoreMeshrRepository implements MeshrRepository {
                 ? (input.audit.data as Record<string, unknown>)
                 : {}),
               agentId: selectedAgentId,
-              replacedBinding: replaced,
+              reusedIdentity,
+              replacedBinding,
             },
           }
         : undefined;
       this.writeMutationArtifacts(transaction, { event, audit });
-      return { agentId: selectedAgentId, replaced };
+      return { agentId: selectedAgentId, replaced: replacedBinding };
     });
   }
 
@@ -2178,6 +2270,432 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         );
       }
       return { changed: true, updatedAt: effectiveUpdatedAt };
+    });
+  }
+
+  async createBrowserAgentWithPageAuthority(
+    input: RepositoryCreateBrowserAgentInput,
+  ): Promise<RepositoryCreateBrowserAgentResult> {
+    const agent = input.agent;
+    this.assertBrowserAgentCompatibility(agent);
+    const handleKey = agent.handle.trim().normalize("NFKC").toLowerCase();
+    if (
+      !agent.agentId ||
+      !agent.ownerAccountId ||
+      !handleKey ||
+      !input.grantId ||
+      !input.humanSessionHash ||
+      !input.sessionId ||
+      !input.idempotencyKey ||
+      !input.requestHash
+    ) {
+      throw new Error("browser_agent_input_invalid");
+    }
+    const committedAgent: RepositoryAgentInput = {
+      agentId: agent.agentId,
+      ownerAccountId: agent.ownerAccountId,
+      name: agent.name,
+      handle: agent.handle,
+      tagline: agent.tagline,
+      interests: [...agent.interests],
+      personality: agent.personality,
+      attention: { ...agent.attention },
+      runtime: "other",
+      runtimeLabel: "Page WebMCP",
+      runtimeSubject: `webmcp:${agent.agentId}`,
+      publicKeyPem: "",
+      definitionDigest: null,
+      createdAt: agent.createdAt,
+      updatedAt: agent.updatedAt,
+    };
+
+    const now = this.now();
+    const agentRef = this.doc("agents", agent.agentId);
+    const handleRef = this.doc("agent_handles", handleKey);
+    const membershipRef = this.doc(
+      "mesh_agent_memberships",
+      `mesh-public:${agent.agentId}`,
+    );
+    const meshRef = this.doc("meshes", "mesh-public");
+    const authorityRef = this.authorityRef(agent.agentId);
+    const fenceRef = this.webMcpAuthorityRef(input.humanSessionHash);
+    const grantRef = this.doc("webmcp_grants", input.grantId);
+    const idempotencyRef = this.doc(
+      "idempotency",
+      `${agent.ownerAccountId}:webmcp.agent.create:${input.idempotencyKey}`,
+    );
+
+    return this.firestore.runTransaction(async (transaction) => {
+      const [
+        humanSession,
+        account,
+        currentAgent,
+        handle,
+        membership,
+        mesh,
+        authority,
+        fence,
+        grant,
+        idempotency,
+        activeSessions,
+        humanGrants,
+        agentGrants,
+        ownedAgents,
+      ] = await Promise.all([
+        transaction.get(
+          this.doc("human_sessions", input.humanSessionHash),
+        ),
+        transaction.get(this.doc("accounts", agent.ownerAccountId)),
+        transaction.get(agentRef),
+        transaction.get(handleRef),
+        transaction.get(membershipRef),
+        transaction.get(meshRef),
+        transaction.get(authorityRef),
+        transaction.get(fenceRef),
+        transaction.get(grantRef),
+        transaction.get(idempotencyRef),
+        transaction.get(
+          this.firestore
+            .collection(this.collection("runtime_sessions"))
+            .where("agent_id", "==", agent.agentId)
+            .where("status", "==", "active")
+            .limit(2),
+        ),
+        transaction.get(
+          this.firestore
+            .collection(this.collection("webmcp_grants"))
+            .where("human_session_hash", "==", input.humanSessionHash)
+            .where("revoked_at", "==", null)
+            .limit(2),
+        ),
+        transaction.get(
+          this.firestore
+            .collection(this.collection("webmcp_grants"))
+            .where("agent_id", "==", agent.agentId)
+            .where("revoked_at", "==", null)
+            .limit(2),
+        ),
+        transaction.get(
+          this.firestore
+            .collection(this.collection("agents"))
+            .where("owner_account_id", "==", agent.ownerAccountId)
+            .limit(26),
+        ),
+      ]);
+
+      const nowMs = Date.parse(now);
+      const humanExpiresAt = humanSession.exists
+        ? Date.parse(String(humanSession.get("expires_at") ?? ""))
+        : NaN;
+      const humanAbsoluteExpiresAt = humanSession.exists
+        ? Date.parse(String(humanSession.get("absolute_expires_at") ?? ""))
+        : NaN;
+      const humanLastSeenAt = humanSession.exists
+        ? Date.parse(String(humanSession.get("last_seen_at") ?? ""))
+        : NaN;
+      if (
+        !humanSession.exists ||
+        humanSession.get("account_id") !== agent.ownerAccountId ||
+        !account.exists ||
+        !Number.isFinite(humanExpiresAt) ||
+        !Number.isFinite(humanAbsoluteExpiresAt) ||
+        !Number.isFinite(humanLastSeenAt) ||
+        humanExpiresAt <= nowMs ||
+        humanAbsoluteExpiresAt <= nowMs ||
+        humanLastSeenAt <= nowMs - HUMAN_IDLE_SECONDS * 1_000
+      ) {
+        throw new Error("session_invalid");
+      }
+      if (
+        activeSessions.size > 1 ||
+        humanGrants.size > 1 ||
+        agentGrants.size > 1
+      ) {
+        throw new Error("agent_authority_corrupt");
+      }
+
+      if (idempotency.exists) {
+        if (
+          !constantTimeStringEqual(
+            String(idempotency.get("request_hash") ?? ""),
+            input.requestHash,
+          )
+        ) {
+          throw new Error("idempotency_conflict");
+        }
+        const idempotencyExpiresAt = Date.parse(
+          String(idempotency.get("expires_at") ?? ""),
+        );
+        if (
+          !Number.isFinite(idempotencyExpiresAt) ||
+          idempotencyExpiresAt <= nowMs
+        ) {
+          throw new Error("idempotency_expired");
+        }
+        const response = idempotency.get("response_body");
+        const responseRecord =
+          response && typeof response === "object" && !Array.isArray(response)
+            ? (response as Record<string, unknown>)
+            : {};
+        const persistedGrant = grant.exists
+          ? this.browserGrantFromSnapshot(grant)
+          : null;
+        const persistedAgent = currentAgent.exists
+          ? this.agentFromSnapshot(currentAgent)
+          : null;
+        const entityMatches =
+          this.browserAgentMatchesSnapshot(currentAgent, agent) &&
+          handle.exists &&
+          String(handle.get("agent_id") ?? "") === agent.agentId &&
+          membership.exists &&
+          membership.get("mesh_id") === "mesh-public" &&
+          membership.get("agent_id") === agent.agentId &&
+          membership.get("status") === "joined" &&
+          isDeepStrictEqual(
+            membership.get("attention_policy") ?? {},
+            agent.attention,
+          ) &&
+          responseRecord.agent_id === agent.agentId &&
+          responseRecord.grant_id === input.grantId &&
+          responseRecord.session_id === input.sessionId;
+        if (!entityMatches || !persistedAgent || !persistedGrant) {
+          throw new Error("idempotency_conflict");
+        }
+        const epoch = Number(responseRecord.authority_epoch ?? -1);
+        const activeGrantMatches =
+          humanGrants.size === 1 &&
+          humanGrants.docs[0]!.id === input.grantId &&
+          agentGrants.size === 1 &&
+          agentGrants.docs[0]!.id === input.grantId &&
+          activeSessions.empty &&
+          persistedGrant.grantId === input.grantId &&
+          persistedGrant.tokenHash === input.grantId &&
+          persistedGrant.humanSessionHash === input.humanSessionHash &&
+          persistedGrant.agentId === agent.agentId &&
+          persistedGrant.sessionId === input.sessionId &&
+          persistedGrant.authorityEpoch === epoch &&
+          persistedGrant.revokedAt === null &&
+          Number.isFinite(Date.parse(persistedGrant.expiresAt)) &&
+          Date.parse(persistedGrant.expiresAt) > nowMs &&
+          authority.exists &&
+          authority.get("authority_kind") === "page" &&
+          authority.get("session_id") === input.sessionId &&
+          Number(authority.get("epoch") ?? -1) === epoch &&
+          fence.exists &&
+          fence.get("grant_id") === input.grantId &&
+          fence.get("agent_id") === agent.agentId &&
+          fence.get("session_id") === input.sessionId &&
+          fence.get("revoked_at") == null &&
+          Number(fence.get("epoch") ?? -1) === epoch;
+        if (!activeGrantMatches) throw new Error("idempotency_expired");
+        return {
+          agent: persistedAgent,
+          grant: persistedGrant,
+          authorityEpoch: epoch,
+          sessionId: persistedGrant.sessionId,
+          duplicate: true,
+        };
+      }
+
+      // A deterministic id can be replayed only through the matching durable
+      // idempotency record above. Never adopt or overwrite an independently
+      // created identity that happens to use the same id or normalized handle.
+      if (currentAgent.exists || membership.exists || grant.exists) {
+        throw new Error("idempotency_conflict");
+      }
+      if (handle.exists) {
+        throw new Error(
+          String(handle.get("agent_id") ?? "") === agent.agentId
+            ? "idempotency_conflict"
+            : "handle_unavailable",
+        );
+      }
+      if (!mesh.exists) throw new Error("mesh_not_found");
+      if (
+        mesh.get("lifecycle") !== "active" ||
+        mesh.get("visibility") !== "public" ||
+        mesh.get("admission") !== "open"
+      ) {
+        throw new Error("mesh_unavailable");
+      }
+      if (ownedAgents.size >= 25) throw new Error("agent_limit_reached");
+      this.assertPageAuthorityExpiry(input.expiresAt, now);
+      if (
+        Date.parse(input.expiresAt) > humanExpiresAt ||
+        Date.parse(input.expiresAt) > humanAbsoluteExpiresAt
+      ) {
+        throw new Error("page_grant_expiry_invalid");
+      }
+
+      const currentRuntime = activeSessions.docs[0];
+      if (currentRuntime) {
+        if (
+          !authority.exists ||
+          authority.get("authority_kind") !== "native" ||
+          authority.get("session_id") !== currentRuntime.get("session_id") ||
+          Number(authority.get("epoch") ?? -1) !==
+            Number(currentRuntime.get("authority_epoch") ?? -2)
+        ) {
+          throw new Error("agent_authority_corrupt");
+        }
+      } else if (authority.exists) {
+        throw new Error("agent_authority_corrupt");
+      }
+      if (!agentGrants.empty) throw new Error("agent_authority_corrupt");
+      const previousHumanGrant = humanGrants.docs[0];
+      if (
+        previousHumanGrant &&
+        (!fence.exists ||
+          fence.get("grant_id") !== previousHumanGrant.id ||
+          fence.get("agent_id") !== previousHumanGrant.get("agent_id") ||
+          fence.get("session_id") !== previousHumanGrant.get("session_id") ||
+          fence.get("revoked_at") != null ||
+          Number(fence.get("epoch") ?? -1) !==
+            Number(previousHumanGrant.get("authority_epoch") ?? -2))
+      ) {
+        throw new Error("webmcp_authority_corrupt");
+      }
+
+      const epoch =
+        Math.max(
+          Number(fence.exists ? (fence.get("epoch") ?? 0) : 0),
+          Number(authority.exists ? (authority.get("epoch") ?? 0) : 0),
+        ) + 1;
+      for (const session of activeSessions.docs) {
+        transaction.update(session.ref, {
+          status: "superseded",
+          superseding_session_id: input.sessionId,
+          expires_at: now,
+          inactive_expires_at_ttl: ttlTimestamp(now),
+        });
+      }
+      for (const previous of humanGrants.docs) {
+        const previousExpiresAt = String(previous.get("expires_at") ?? now);
+        transaction.update(previous.ref, {
+          revoked_at: now,
+          expires_at_ttl: ttlTimestamp(previousExpiresAt),
+        });
+      }
+      transaction.create(agentRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        agent_id: agent.agentId,
+        owner_account_id: agent.ownerAccountId,
+        name: agent.name,
+        handle: agent.handle,
+        tagline: agent.tagline,
+        interests: agent.interests,
+        personality: agent.personality,
+        attention_policy: agent.attention,
+        runtime: "other",
+        runtime_label: "Page WebMCP",
+        runtime_subject: `webmcp:${agent.agentId}`,
+        public_key_pem: "",
+        definition_digest: null,
+        created_at: agent.createdAt,
+        updated_at: agent.updatedAt,
+      });
+      transaction.create(handleRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        handle: agent.handle,
+        agent_id: agent.agentId,
+        updated_at: agent.updatedAt,
+      });
+      transaction.create(membershipRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        mesh_id: "mesh-public",
+        agent_id: agent.agentId,
+        status: "joined",
+        attention_policy: agent.attention,
+        admission_provenance: "open",
+        joined_at: agent.createdAt,
+        updated_at: agent.updatedAt,
+      });
+      transaction.set(authorityRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        agent_id: agent.agentId,
+        epoch,
+        authority_kind: "page",
+        session_id: input.sessionId,
+        runtime_kind: "other",
+        updated_at: now,
+      });
+      transaction.set(
+        fenceRef,
+        {
+          contract_version: MESHR_CONTRACT_MAJOR,
+          human_session_hash: input.humanSessionHash,
+          epoch,
+          grant_id: input.grantId,
+          agent_id: agent.agentId,
+          session_id: input.sessionId,
+          updated_at: now,
+          revoked_at: null,
+          expires_at_ttl: ttlTimestamp(input.expiresAt),
+        },
+        { merge: true },
+      );
+      transaction.create(grantRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        grant_id: input.grantId,
+        agent_id: agent.agentId,
+        human_session_hash: input.humanSessionHash,
+        session_id: input.sessionId,
+        authority_epoch: epoch,
+        runtime_kind: "other",
+        created_at: now,
+        expires_at: input.expiresAt,
+        expires_at_ttl: ttlTimestamp(input.expiresAt),
+        last_used_at: now,
+        revoked_at: null,
+      });
+      const idempotencyExpiresAt = new Date(
+        nowMs + IDEMPOTENCY_RETENTION_SECONDS * 1_000,
+      ).toISOString();
+      transaction.create(idempotencyRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        operation: "webmcp.agent.create",
+        request_hash: input.requestHash,
+        response_status: 201,
+        response_body: {
+          agent_id: agent.agentId,
+          grant_id: input.grantId,
+          session_id: input.sessionId,
+          authority_epoch: epoch,
+        },
+        created_at: now,
+        expires_at: idempotencyExpiresAt,
+        expires_at_ttl: ttlTimestamp(idempotencyExpiresAt),
+      });
+      this.touchLiveAccessEpoch(
+        transaction,
+        now,
+        "browser_agent_page_authority_created",
+        agent.agentId,
+      );
+      this.writeMutationArtifacts(transaction, {
+        event: input.event,
+        audit: input.audit,
+      });
+
+      const committedGrant: RepositoryBrowserAgentGrant = {
+        grantId: input.grantId,
+        tokenHash: input.grantId,
+        humanSessionHash: input.humanSessionHash,
+        agentId: agent.agentId,
+        sessionId: input.sessionId,
+        authorityEpoch: epoch,
+        createdAt: now,
+        expiresAt: input.expiresAt,
+        lastUsedAt: now,
+        revokedAt: null,
+      };
+      return {
+        agent: committedAgent,
+        grant: committedGrant,
+        authorityEpoch: epoch,
+        sessionId: input.sessionId,
+        duplicate: false,
+      };
     });
   }
 
@@ -6790,6 +7308,29 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       );
   }
 
+  async listNativeBoundAgentIds(agentIds: string[]): Promise<string[]> {
+    const unique = [...new Set(agentIds)].filter(Boolean);
+    const counts = new Map<string, number>();
+    for (let index = 0; index < unique.length; index += 30) {
+      const group = unique.slice(index, index + 30);
+      if (!group.length) continue;
+      const snapshot = await this.firestore
+        .collection(this.collection("agent_bindings"))
+        .where("agent_id", "in", group)
+        .where("revoked_at", "==", null)
+        .limit(group.length * 2)
+        .get();
+      for (const document of snapshot.docs) {
+        const agentId = String(document.get("agent_id") ?? "");
+        counts.set(agentId, (counts.get(agentId) ?? 0) + 1);
+      }
+    }
+    if ([...counts.values()].some((count) => count > 1)) {
+      throw new Error("agent_authority_corrupt");
+    }
+    return [...counts.keys()].sort();
+  }
+
   async listRuntimeSessionsForAgents(
     agentIds: string[],
     now: string,
@@ -9726,6 +10267,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     audit?: RepositoryAuditInput;
   }): Promise<{ authorityEpoch: number; sessionId: string }> {
     const now = this.now();
+    this.assertPageAuthorityExpiry(input.expiresAt, now);
     const sessionId = input.sessionId;
     return this.firestore.runTransaction(async (transaction) => {
       const humanSessionRef = this.doc(
@@ -9735,18 +10277,22 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       const agentRef = this.doc("agents", input.agentId);
       const authorityRef = this.authorityRef(input.agentId);
       const fenceRef = this.webMcpAuthorityRef(input.humanSessionHash);
+      const grantRef = this.doc("webmcp_grants", input.grantId);
       const [
         humanSession,
         agent,
         authority,
         fence,
+        requestedGrant,
         nativeSessions,
         humanGrants,
+        agentGrants,
       ] = await Promise.all([
         transaction.get(humanSessionRef),
         transaction.get(agentRef),
         transaction.get(authorityRef),
         transaction.get(fenceRef),
+        transaction.get(grantRef),
         transaction.get(
           this.firestore
             .collection(this.collection("runtime_sessions"))
@@ -9765,17 +10311,38 @@ export class FirestoreMeshrRepository implements MeshrRepository {
             .where("revoked_at", "==", null)
             .limit(2),
         ),
+        transaction.get(
+          this.firestore
+            .collection(this.collection("webmcp_grants"))
+            .where("agent_id", "==", input.agentId)
+            .where("revoked_at", "==", null)
+            .limit(2),
+        ),
       ]);
-      if (nativeSessions.size > 1 || humanGrants.size > 1) {
+      if (
+        nativeSessions.size > 1 ||
+        humanGrants.size > 1 ||
+        agentGrants.size > 1
+      ) {
         throw new Error("agent_authority_corrupt");
       }
+      const nowMs = Date.parse(now);
+      const humanExpiresAt = Date.parse(
+        String(humanSession.get("expires_at") ?? ""),
+      );
+      const humanAbsoluteExpiresAt = Date.parse(
+        String(humanSession.get("absolute_expires_at") ?? ""),
+      );
       if (
         !humanSession.exists ||
-        Date.parse(String(humanSession.get("expires_at"))) <= Date.parse(now) ||
-        Date.parse(String(humanSession.get("absolute_expires_at"))) <=
-          Date.parse(now) ||
+        !Number.isFinite(humanExpiresAt) ||
+        !Number.isFinite(humanAbsoluteExpiresAt) ||
+        humanExpiresAt <= nowMs ||
+        humanAbsoluteExpiresAt <= nowMs ||
         Date.parse(String(humanSession.get("last_seen_at"))) <
-          Date.parse(now) - 12 * 60 * 60 * 1_000
+          nowMs - HUMAN_IDLE_SECONDS * 1_000 ||
+        Date.parse(input.expiresAt) > humanExpiresAt ||
+        Date.parse(input.expiresAt) > humanAbsoluteExpiresAt
       ) {
         throw new Error("session_invalid");
       }
@@ -9785,21 +10352,77 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       ) {
         throw new Error("session_invalid");
       }
-      const nowMs = Date.parse(now);
-      const currentNative = nativeSessions.docs.find(
-        (session) =>
-          authority.exists &&
-          authority.get("authority_kind") === "native" &&
-          authority.get("session_id") === session.get("session_id") &&
-          Number(authority.get("epoch") ?? 0) ===
-            Number(session.get("authority_epoch") ?? 0) &&
-          Date.parse(String(session.get("expires_at"))) > nowMs &&
-          Date.parse(String(session.get("last_seen_at"))) >= nowMs - 90_000,
-      );
-      if (!currentNative) throw new Error("session_invalid");
+      if (requestedGrant.exists) throw new Error("grant_already_exists");
+
+      const currentNative = nativeSessions.docs[0];
+      const currentAgentGrant = agentGrants.docs[0];
+      const authorityKind = authority.exists
+        ? String(authority.get("authority_kind") ?? "")
+        : null;
+      if (authorityKind === "native") {
+        // Connectivity is intentionally not required. An offline or expired
+        // but still authoritative native session may be explicitly handed to
+        // the owner-controlled page; the transaction supersedes it below.
+        if (
+          !currentNative ||
+          currentAgentGrant ||
+          authority.get("session_id") !== currentNative.get("session_id") ||
+          Number(authority.get("epoch") ?? -1) !==
+            Number(currentNative.get("authority_epoch") ?? -2)
+        ) {
+          throw new Error("agent_authority_corrupt");
+        }
+      } else if (authorityKind === "page") {
+        if (currentNative) throw new Error("agent_authority_corrupt");
+        // A revoked or TTL-deleted page grant leaves a harmless stale agent
+        // fence. If an unrevoked grant remains, it must exactly match the
+        // target agent's authority before this transfer may replace it.
+        if (
+          currentAgentGrant &&
+          (currentAgentGrant.get("session_id") !==
+            authority.get("session_id") ||
+            Number(currentAgentGrant.get("authority_epoch") ?? -1) !==
+              Number(authority.get("epoch") ?? -2))
+        ) {
+          throw new Error("agent_authority_corrupt");
+        }
+      } else if (authorityKind === null) {
+        if (currentNative || currentAgentGrant) {
+          throw new Error("agent_authority_corrupt");
+        }
+      } else if (authorityKind === "revoked") {
+        // Binding revocation is terminal for native credentials, not for the
+        // Human-owned durable agent identity. With no surviving native/page
+        // authority, its owner may explicitly reactivate it through WebMCP.
+        if (currentNative || currentAgentGrant) {
+          throw new Error("agent_authority_corrupt");
+        }
+      } else {
+        throw new Error("agent_authority_corrupt");
+      }
+
+      const currentHumanGrant = humanGrants.docs[0];
+      if (
+        currentHumanGrant &&
+        (!fence.exists ||
+          fence.get("grant_id") !== currentHumanGrant.id ||
+          fence.get("agent_id") !== currentHumanGrant.get("agent_id") ||
+          fence.get("session_id") !== currentHumanGrant.get("session_id") ||
+          fence.get("revoked_at") != null ||
+          Number(fence.get("epoch") ?? -1) !==
+            Number(currentHumanGrant.get("authority_epoch") ?? -2))
+      ) {
+        throw new Error("webmcp_authority_corrupt");
+      }
       // The human-scoped fence, rather than the selected agent's epoch, is the
-      // serialization point for tab races across different agents.
-      const epoch = Number(fence.exists ? (fence.get("epoch") ?? 0) : 0) + 1;
+      // serialization point for tab races across different agents. The agent
+      // epoch may be ahead after a native session or another Human's page
+      // grant, so advance from both fences and never reuse an old epoch.
+      const epoch =
+        Math.max(
+          Number(fence.exists ? (fence.get("epoch") ?? 0) : 0),
+          Number(authority.exists ? (authority.get("epoch") ?? 0) : 0),
+        ) + 1;
       for (const previous of nativeSessions.docs) {
         transaction.update(previous.ref, {
           status: "superseded",
@@ -9808,7 +10431,13 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           inactive_expires_at_ttl: ttlTimestamp(now),
         });
       }
-      for (const grant of humanGrants.docs) {
+      const grantsToRevoke = new Map(
+        [...humanGrants.docs, ...agentGrants.docs].map((grant) => [
+          grant.id,
+          grant,
+        ]),
+      );
+      for (const grant of grantsToRevoke.values()) {
         const expiresAt = String(grant.get("expires_at") ?? now);
         transaction.update(grant.ref, {
           revoked_at: now,
@@ -9821,11 +10450,13 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         epoch,
         authority_kind: "page",
         session_id: sessionId,
-        // Preserve the originating runtime for every page-originated event;
-        // page control changes who may write, not what host the agent came
-        // from.
+        // Preserve native provenance when one exists. Browser-created agents
+        // deliberately retain their neutral `other` compatibility runtime;
+        // page control does not fabricate a native binding.
         runtime_kind:
-          currentNative.get("runtime_kind") ?? agent.get("runtime") ?? "other",
+          currentNative?.get("runtime_kind") ??
+          agent.get("runtime") ??
+          "other",
         updated_at: now,
       });
       transaction.set(
@@ -9849,12 +10480,11 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         "page_authority_transferred",
         input.agentId,
       );
-      // Grant material is stable for a human/agent pair, so a retry after a
-      // committed handoff can recover the same bearer without storing its
-      // plaintext. Revocation and the epoch fence still make old grants
-      // unusable while this write refreshes the one-hour expiry.
-      transaction.set(
-        this.doc("webmcp_grants", input.grantId),
+      // Every activation has fresh grant material. Response-loss recovery
+      // reads the already-committed grant before calling this command; never
+      // overwrite an old hash or make revoked material valid again.
+      transaction.create(
+        grantRef,
         {
           contract_version: MESHR_CONTRACT_MAJOR,
           grant_id: input.grantId,
@@ -9863,7 +10493,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           session_id: sessionId,
           authority_epoch: epoch,
           runtime_kind:
-            currentNative.get("runtime_kind") ??
+            currentNative?.get("runtime_kind") ??
             agent.get("runtime") ??
             "other",
           created_at: now,
@@ -9872,29 +10502,14 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           last_used_at: now,
           revoked_at: null,
         },
-        { merge: false },
       );
       // The handoff, its immutable audit record, and the outbox envelope must
       // commit together. A crash between authority transfer and a later
       // fire-and-forget append would otherwise make the transfer untraceable.
-      if (input.event) {
-        transaction.create(
-          this.doc("event_outbox", input.event.eventId),
-          this.eventOutboxDocument(input.event),
-        );
-        this.queueOutboxReady(
-          transaction,
-          input.event.eventId,
-          input.event.meshId,
-          input.event.occurredAt,
-        );
-      }
-      if (input.audit) {
-        transaction.create(
-          this.doc("audit_events", input.audit.auditId),
-          this.auditDocument(input.audit),
-        );
-      }
+      this.writeMutationArtifacts(transaction, {
+        event: input.event,
+        audit: input.audit,
+      });
       return { authorityEpoch: epoch, sessionId };
     });
   }
