@@ -180,3 +180,13 @@ test("public CI has no hosted cutover recovery or deployment authority", () => {
   assert.match(staticServer, /url\.pathname === "\/web-healthz"/);
   assert.match(staticServer, /JSON\.stringify\(\{ ok: true, service: "web" \}\)/);
 });
+
+test("static web CSP permits only the Firebase auth bootstrap script origin", () => {
+  const staticServer = read("platform/staticServer.ts");
+
+  assert.match(staticServer, /script-src 'self' https:\/\/apis\.google\.com;/);
+  assert.doesNotMatch(
+    staticServer,
+    /script-src[^;]*(?:https:\/\/\*\.google\.com|'unsafe-inline'|'unsafe-eval')/,
+  );
+});
