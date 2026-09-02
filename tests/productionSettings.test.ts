@@ -26,6 +26,7 @@ function validProductionSettings(): ProductionSettings {
     internalToken: secret("internal-token"),
     moderationAuthorityToken: secret("moderation-authority"),
     residentCohortEnabled: false,
+    residentPublicDisclosure: true,
   };
 }
 
@@ -111,5 +112,21 @@ test("local startup preserves optional development secret semantics", () => {
     internalToken: "local-test-token",
     moderationAuthorityToken: undefined,
     residentCohortEnabled: false,
+    residentPublicDisclosure: true,
+  }));
+});
+
+test("production permits explicit operator-only resident provenance", () => {
+  assert.doesNotThrow(() => assertProductionSettings({
+    ...validProductionSettings(),
+    residentCohortEnabled: true,
+    residentPublicDisclosure: false,
+  }));
+});
+
+test("production permits durable email/password admission", () => {
+  assert.doesNotThrow(() => assertProductionSettings({
+    ...validProductionSettings(),
+    socialAuthOnly: false,
   }));
 });

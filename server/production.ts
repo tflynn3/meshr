@@ -14,6 +14,8 @@ export interface ProductionSettings {
   moderationAuthorityToken?: string;
   /** Public, cohort-level notice for project-operated resident agents. */
   residentCohortEnabled: boolean;
+  /** Whether the cohort notice is exposed through the public auth config. */
+  residentPublicDisclosure: boolean;
   residentDisclosureText?: string;
   residentDisclosureUrl?: string;
 }
@@ -122,6 +124,8 @@ export function productionSettings(
   const invitationPepper = process.env.MESHR_INVITATION_PEPPER?.trim();
   const invitationPepperPrevious = process.env.MESHR_INVITATION_PEPPER_PREVIOUS?.trim();
   const residentCohortEnabled = process.env.MESHR_RESIDENT_COHORT_ENABLED?.trim() === "1";
+  const residentPublicDisclosure =
+    process.env.MESHR_RESIDENT_PUBLIC_DISCLOSURE?.trim() !== "0";
   return {
     environment: normalizedEnvironment,
     storage,
@@ -137,6 +141,7 @@ export function productionSettings(
     internalToken: process.env.MESHR_INTERNAL_TOKEN?.trim(),
     moderationAuthorityToken: process.env.MESHR_MODERATION_AUTHORITY_TOKEN?.trim(),
     residentCohortEnabled,
+    residentPublicDisclosure,
     residentDisclosureText: process.env.MESHR_RESIDENT_DISCLOSURE_TEXT?.trim(),
     residentDisclosureUrl: process.env.MESHR_RESIDENT_DISCLOSURE_URL?.trim(),
   };
@@ -148,11 +153,13 @@ export function assertProductionSettings(settings: ProductionSettings): void {
     throw new Error("MESHR_COST_PROTECTION_MODE must be normal, protect, or throttle.");
   }
   if (settings.environment !== "production") return;
-  residentCohortDisclosure(
-    settings.residentCohortEnabled,
-    settings.residentDisclosureText,
-    settings.residentDisclosureUrl,
-  );
+  if (settings.residentCohortEnabled && settings.residentPublicDisclosure) {
+    residentCohortDisclosure(
+      true,
+      settings.residentDisclosureText,
+      settings.residentDisclosureUrl,
+    );
+  }
   const invalid: string[] = [];
   const usable = (value: string | undefined): value is string => Boolean(
     value &&
@@ -160,7 +167,9 @@ export function assertProductionSettings(settings: ProductionSettings): void {
       !/^(?:REPLACE(?:_|$)|PROJECT_ID$|\$\{[^}]+\})/i.test(value.trim()),
   );
   if (settings.storage !== "firestore") invalid.push("MESHR_STORAGE=firestore");
-  if (!settings.socialAuthOnly) invalid.push("MESHR_SOCIAL_AUTH_ONLY=1");
+  // Email/password admission is backed by the Firestore account authority in
+  // production. Social-only mode remains available for deployments that
+  // choose it, but it is not a production safety invariant.
   if (!settings.secureCookies) invalid.push("MESHR_SECURE_COOKIES=1");
   if (!settings.webMcpTransfersSession) invalid.push("MESHR_WEBMCP_SESSION_TRANSFER=1");
   if (!usable(settings.identityProjectId)) invalid.push("MESHR_IDENTITY_PROJECT_ID or GOOGLE_CLOUD_PROJECT");

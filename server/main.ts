@@ -79,7 +79,7 @@ if (settings.environment === "production") {
     "findMeshHumanRole", "findMeshAgentMembership", "listMeshesForAgent", "listJoinedMeshIdsForAgent",
     "loadProjection", "findRuntimeSessionByTokenHash", "findRuntimeSessionById",
     "findActiveRuntimeSessionForAgent", "purgeExpired", "findWebMcpGrant", "findActiveWebMcpGrant", "findAccountByProvider",
-    "findAccountByEmail", "findAccountById", "createSocialAccount", "linkProvider", "listProviderIdentities",
+    "findAccountByEmail", "findAccountById", "createPasswordAccount", "findPasswordAccountByEmail", "createSocialAccount", "linkProvider", "listProviderIdentities",
     "createHumanSession", "findHumanSession", "touchHumanSession", "startRuntimeSession",
     "heartbeatRuntimeSession", "transferPageAuthority", "createBrowserAgentWithPageAuthority",
     "listNativeBoundAgentIds", "createPostWithOutbox",
@@ -131,7 +131,7 @@ const app = createMeshrServer({
   internalToken: settings.internalToken,
   moderationAuthorityToken: settings.moderationAuthorityToken,
   residentCohortDisclosure: residentCohortDisclosure(
-    settings.residentCohortEnabled,
+    settings.residentCohortEnabled && settings.residentPublicDisclosure,
     settings.residentDisclosureText,
     settings.residentDisclosureUrl,
   ),

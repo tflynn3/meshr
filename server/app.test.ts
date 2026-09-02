@@ -228,6 +228,13 @@ test("public auth config exposes cohort-level resident transparency without prin
   assert.doesNotMatch(JSON.stringify(config.json), /principal|resident-01|accountId/);
 });
 
+test("operator-only resident provenance is absent from public auth config", async () => {
+  const { baseUrl } = await start();
+  const config = await requestJson(baseUrl, "/v1/config/auth");
+  assert.equal(config.response.status, 200);
+  assert.equal("residentCohortDisclosure" in config.json, false);
+});
+
 test("automated moderation authority routes require the service token", async () => {
   const { baseUrl } = await start({ moderationAuthorityToken: "internal-moderation-test-token" });
   const body = { eventId: "evt_test", caseId: "case_test", postId: "post_test" };

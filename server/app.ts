@@ -2370,10 +2370,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     return scopedProjectionCache.get(projectionCacheKey(scope));
   };
   // The local compatibility adapter keeps the original long-lived fixture
-  // sessions so existing offline stories remain reproducible. Public mode
-  // (social auth or an explicit strict flag) uses the launch contract.
+  // sessions so existing offline stories remain reproducible. Production
+  // always uses the bounded runtime-session policy, regardless of which
+  // Human admission method is enabled.
   const strictRuntimeSessions =
-    socialAuthOnly || process.env.MESHR_STRICT_SESSIONS === "1";
+    socialAuthOnly ||
+    process.env.MESHR_STRICT_SESSIONS === "1" ||
+    process.env.MESHR_ENV?.trim().toLowerCase() === "production";
   const runtimeAgentSessionSeconds = strictRuntimeSessions
     ? AGENT_SESSION_SECONDS
     : 12 * 60 * 60;
@@ -7627,13 +7630,48 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       const password = requiredString(input, "password", { min: 12, max: 256 });
       const displayName = requiredString(input, "displayName", { max: 80 });
       const passwordHash = await hashPassword(password);
+      const accountId = database.id("usr");
+      const createdAt = database.now();
       const account: AccountRow = {
-        id: database.id("usr"),
+        id: accountId,
         email,
         display_name: displayName,
         password_hash: passwordHash,
-        created_at: database.now(),
+        created_at: createdAt,
       };
+      if (repository) {
+        if (!repository.createPasswordAccount) {
+          throw new ApiError(
+            503,
+            "account_store_unavailable",
+            "The durable account store does not support email/password admission.",
+          );
+        }
+        try {
+          await repository.createPasswordAccount({
+            accountId,
+            email,
+            displayName,
+            passwordHash,
+            createdAt,
+          });
+        } catch (error) {
+          if (error instanceof Error && error.message === "account_exists") {
+            throw new ApiError(
+              409,
+              "account_exists",
+              "An account already uses that email.",
+            );
+          }
+          throw new ApiError(
+            503,
+            "account_store_unavailable",
+            error instanceof Error
+              ? error.message
+              : "The durable account store is unavailable.",
+          );
+        }
+      }
       try {
         db.prepare(
           `INSERT INTO accounts(id, email, display_name, password_hash, created_at)
@@ -7680,13 +7718,63 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         requiredString(input, "email", { max: 254 }),
       );
       const password = requiredString(input, "password", { min: 1, max: 256 });
-      const account = db
+      let account = db
         .prepare("SELECT * FROM accounts WHERE email = ?")
         .get(email) as AccountRow | undefined;
-      const valid =
-        account && account.password_hash
-          ? await verifyPassword(password, account.password_hash)
-          : (await hashPassword(password), false);
+      let valid = false;
+      if (repository) {
+        if (!repository.findPasswordAccountByEmail) {
+          throw new ApiError(
+            503,
+            "account_store_unavailable",
+            "The durable account store does not support email/password admission.",
+          );
+        }
+        let durable;
+        try {
+          durable = await repository.findPasswordAccountByEmail(email);
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "account_store_unavailable",
+            error instanceof Error
+              ? error.message
+              : "The durable account store is unavailable.",
+          );
+        }
+        if (durable) {
+          valid = await verifyPassword(password, durable.passwordHash);
+          if (valid) {
+            account = {
+              id: durable.account.accountId,
+              email: durable.account.email,
+              display_name: durable.account.displayName,
+              password_hash: durable.passwordHash,
+              created_at: durable.account.createdAt,
+            };
+            db.prepare(
+              `INSERT OR IGNORE INTO accounts(id, email, display_name, password_hash, created_at)
+               VALUES(?, ?, ?, ?, ?)`,
+            ).run(
+              account.id,
+              account.email,
+              account.display_name,
+              account.password_hash,
+              account.created_at,
+            );
+          }
+        } else {
+          // Preserve the invalid-credential timing envelope even when no
+          // durable account matches the supplied address.
+          await hashPassword(password);
+        }
+      } else {
+        valid = Boolean(
+          account?.password_hash &&
+            (await verifyPassword(password, account.password_hash)),
+        );
+        if (!account || !account.password_hash) await hashPassword(password);
+      }
       if (!account || !valid) {
         throw new ApiError(
           401,

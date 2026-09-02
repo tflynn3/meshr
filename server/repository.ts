@@ -64,6 +64,13 @@ export interface RepositoryAgentInput {
   };
 }
 
+/** Account record used only by the ordinary email/password admission path.
+ * The password hash is never returned by an HTTP route or projection. */
+export interface RepositoryPasswordAccount {
+  account: RepositoryAccount;
+  passwordHash: string;
+}
+
 export interface RepositoryProfileReloadResult {
   contract_version: 1;
   applied: boolean;
@@ -1139,6 +1146,18 @@ export interface MeshrRepository {
   /** Resolve an existing account for an explicit owner-invited collaborator. */
   findAccountByEmail(email: string): Promise<RepositoryAccount | null>;
   findAccountById(accountId: string): Promise<RepositoryAccount | null>;
+  /** Durable email/password account operations. Production implementations
+   * must keep the hash in the authority store, never in the API projection. */
+  createPasswordAccount?(input: {
+    accountId: string;
+    email: string;
+    displayName: string;
+    passwordHash: string;
+    createdAt: string;
+  }): Promise<RepositoryAccount>;
+  findPasswordAccountByEmail?(
+    email: string,
+  ): Promise<RepositoryPasswordAccount | null>;
   createSocialAccount(input: {
     provider: SocialProvider;
     subject: string;

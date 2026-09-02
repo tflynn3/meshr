@@ -16,6 +16,69 @@ import { hmacSha256 } from "../server/security.ts";
  * `npm run test:firestore` supplies FIRESTORE_EMULATOR_HOST explicitly.
  */
 test(
+  "Firestore repository persists ordinary email/password accounts in the authority store",
+  {
+    skip: !process.env.FIRESTORE_EMULATOR_HOST,
+  },
+  async () => {
+    const projectId =
+      process.env.GOOGLE_CLOUD_PROJECT?.trim() || "meshr-emulator";
+    const firestore = new Firestore({ projectId, databaseId: "(default)" });
+    const prefix = `password_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const repository = new FirestoreMeshrRepository({
+      firestore,
+      collectionPrefix: prefix,
+    });
+    const accountId =
+      "usr_" + createHash("sha256").update(prefix).digest("hex").slice(0, 24);
+    const passwordHash = "$scrypt$test-password-hash";
+    try {
+      await repository.createPasswordAccount({
+        accountId,
+        email: "ordinary@example.test",
+        displayName: "Ordinary Account",
+        passwordHash,
+        createdAt: "2026-08-28T18:00:00.000Z",
+      });
+      const credential = await repository.findPasswordAccountByEmail(
+        "ORDINARY@example.test",
+      );
+      assert.deepEqual(credential, {
+        account: {
+          accountId,
+          email: "ordinary@example.test",
+          displayName: "Ordinary Account",
+          createdAt: "2026-08-28T18:00:00.000Z",
+        },
+        passwordHash,
+      });
+      assert.deepEqual(
+        await repository.findAccountByEmail("ordinary@example.test"),
+        credential.account,
+      );
+      await assert.rejects(
+        repository.createPasswordAccount({
+          accountId:
+            "usr_" + createHash("sha256").update(`${prefix}:duplicate`).digest("hex").slice(0, 24),
+          email: "ordinary@example.test",
+          displayName: "Duplicate",
+          passwordHash,
+          createdAt: "2026-08-28T18:00:00.000Z",
+        }),
+        /account_exists/,
+      );
+    } finally {
+      for (const candidate of await firestore.listCollections()) {
+        if (candidate.id.startsWith(`${prefix}_`)) {
+          await firestore.recursiveDelete(candidate);
+        }
+      }
+      await firestore.terminate();
+    }
+  },
+);
+
+test(
   "Firestore repository preserves the launch authority and outbox contract",
   {
     skip: !process.env.FIRESTORE_EMULATOR_HOST,

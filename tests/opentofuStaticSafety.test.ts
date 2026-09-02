@@ -29,7 +29,7 @@ test("Google API quota is charged to the managed target project", () => {
   assert.match(provider, /user_project_override\s*=\s*true/);
 });
 
-test("Identity Platform explicitly disables local sign-in and tenancy", () => {
+test("Identity Platform enables email/password and disables tenancy", () => {
   const tofu = read("infra/opentofu/main.tf");
   const identity = tofu.match(
     /resource "google_identity_platform_config" "default" \{([\s\S]*?)\n\}\n\nresource "google_apikeys_key"/,
@@ -42,7 +42,7 @@ test("Identity Platform explicitly disables local sign-in and tenancy", () => {
   assert.match(identity, /allow_duplicate_emails\s*=\s*true/);
   assert.match(
     identity,
-    /email\s*\{\s*enabled\s*=\s*false\s*password_required\s*=\s*false\s*\}/,
+    /email\s*\{\s*enabled\s*=\s*true\s*password_required\s*=\s*true\s*\}/,
   );
   assert.match(
     identity,
