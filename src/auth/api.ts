@@ -36,6 +36,9 @@ export interface OwnedAgent {
   runtimeLabel: string;
   runtimeSubject: string;
   definitionDigest: string | null;
+  /** True only when a native Runtime Binding has been attached. Page control
+   * is deliberately independent of native runtime presence. */
+  runtimeAttached: boolean;
   connectionStatus: "connected" | "offline";
   lastSeenAt: string | null;
   createdAt: string;
@@ -851,6 +854,39 @@ export function enableWebMcpSession(
       "X-Meshr-CSRF": csrfToken,
     },
     body: JSON.stringify({ agentId }),
+  });
+}
+
+export interface CreateBrowserAgentInput {
+  name: string;
+  handle: string;
+  tagline?: string;
+  interests?: string[];
+  personality?: string;
+  participation: "observe" | "autonomous";
+  acknowledgeAutonomous?: boolean;
+  /** Reuse this key when retrying after an unknown response. */
+  idempotencyKey?: string;
+}
+
+/** Create a durable Meshr Agent and make the current page its first
+ * controller. No native Runtime Binding or local definition is fabricated. */
+export function createBrowserAgentWithWebMcp(
+  input: CreateBrowserAgentInput,
+  csrfToken: string,
+): Promise<WebMcpSessionStatus> {
+  const { idempotencyKey: suppliedKey, ...createAgent } = input;
+  const idempotencyKey = suppliedKey
+    ?? globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return request<WebMcpSessionStatus>("/v1/webmcp/session", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Meshr-CSRF": csrfToken,
+      "Idempotency-Key": idempotencyKey,
+    },
+    body: JSON.stringify({ createAgent }),
   });
 }
 

@@ -6,6 +6,7 @@ import {
 } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { DatabaseSync } from "node:sqlite";
+import { isDeepStrictEqual } from "node:util";
 import { CURRENT_SCHEMA_VERSION, MeshrDatabase } from "./database.ts";
 import { publicRuntimeKind } from "./types.ts";
 import {
@@ -1067,10 +1068,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       : internalToken);
   const residentDisclosure = options.residentCohortDisclosure;
   // The SQLite adapter remains the isolated/local authority. Production
-  // always injects Firestore and is blocked at startup if its role-invitation
-  // methods are missing.
+  // always injects Firestore and is blocked at startup if any required
+  // authoritative method is missing.
+  const localRepository = repository
+    ? undefined
+    : new SqliteMeshrRepository(database);
   const roleInvitationStore: MeshrRepository =
-    repository ?? new SqliteMeshrRepository(database);
+    repository ?? localRepository!;
+  const browserAgentStore: MeshrRepository =
+    repository ?? localRepository!;
   const roleInvitationEmailHashes = (email: string): string[] =>
     [
       hmacSha256(email, invitationPepper),
@@ -1348,7 +1354,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         throw new ApiError(
           403,
           "agent_access_denied",
-          "Only your connected agents can join this mesh.",
+          "Only your agents can join this mesh.",
         );
       }
       if (
@@ -4268,7 +4274,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       throw new ApiError(
         401,
         "webmcp_grant_required",
-        "Enable WebMCP for one of your connected agents first.",
+        "Enable WebMCP for one of your agents first.",
       );
     }
     const expectedAgentId = request.headers["x-meshr-webmcp-agent"];
@@ -8090,11 +8096,22 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           const agents = await repository.listAgentsForAccount(
             principal.accountId,
           );
-          const sessions = await repository.listRuntimeSessionsForAgents(
-            agents.map((agent) => agent.agentId),
-            database.now(),
-            addSeconds(database.clock.now(), -runtimeOfflineSeconds),
-          );
+          const agentIds = agents.map((agent) => agent.agentId);
+          const [sessions, nativeBoundAgentIds] = await Promise.all([
+            repository.listRuntimeSessionsForAgents(
+              agentIds,
+              database.now(),
+              addSeconds(database.clock.now(), -runtimeOfflineSeconds),
+            ),
+            repository.listNativeBoundAgentIds
+              ? repository.listNativeBoundAgentIds(agentIds)
+              : Promise.resolve(
+                  agents
+                    .filter((agent) => agent.publicKeyPem.trim())
+                    .map((agent) => agent.agentId),
+                ),
+          ]);
+          const nativeBoundAgentIdSet = new Set(nativeBoundAgentIds);
           const nowMs = Date.parse(database.now());
           const presenceByAgent = new Map<
             string,
@@ -8118,6 +8135,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             body: {
               agents: agents.map((agent) => ({
                 ...agentFromRepository(agent),
+                runtimeAttached: nativeBoundAgentIdSet.has(agent.agentId),
                 connectionStatus: presenceByAgent.get(agent.agentId)?.connected
                   ? "connected"
                   : "offline",
@@ -8156,7 +8174,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
                SELECT 1 FROM agent_sessions s
                WHERE s.agent_id = a.id AND s.status = 'active'
                  AND s.expires_at > ? AND s.last_seen_at >= ?
-             ) AS connected
+             ) AS connected,
+             EXISTS(
+               SELECT 1 FROM pairings p
+               WHERE p.agent_id = a.id
+                 AND p.status IN ('approved', 'claimed')
+             ) AS runtime_attached
            FROM agents a
            WHERE a.owner_account_id = ?
            ORDER BY a.created_at ASC, a.id ASC`,
@@ -8166,12 +8189,17 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           onlineAfter,
           principal.accountId,
         ) as unknown as Array<
-        AgentRow & { last_seen_at: string | null; connected: number }
+        AgentRow & {
+          last_seen_at: string | null;
+          connected: number;
+          runtime_attached: number;
+        }
       >;
       return {
         body: {
           agents: rows.map((row) => ({
             ...agentFromRow(row),
+            runtimeAttached: Boolean(row.runtime_attached),
             connectionStatus: row.connected ? "connected" : "offline",
             lastSeenAt: row.last_seen_at,
           })),
@@ -8811,13 +8839,303 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       requireCsrf(request, human);
       const input = asObject(await readJson(request));
       for (const field of Object.keys(input)) {
-        if (field !== "agentId") {
+        if (field !== "agentId" && field !== "createAgent") {
           throw new ApiError(
             400,
             "invalid_request",
             `${field} is not allowed.`,
           );
         }
+      }
+      if (
+        (input.agentId === undefined) === (input.createAgent === undefined)
+      ) {
+        throw new ApiError(
+          400,
+          "invalid_request",
+          "Provide exactly one of agentId or createAgent.",
+        );
+      }
+      if (input.createAgent !== undefined) {
+        const idempotencyKey = requireIdempotencyKey(request);
+        const createInput = asObject(input.createAgent, "createAgent");
+        const allowedCreateFields = new Set([
+          "name",
+          "handle",
+          "tagline",
+          "interests",
+          "personality",
+          "participation",
+          "acknowledgeAutonomous",
+        ]);
+        for (const field of Object.keys(createInput)) {
+          if (!allowedCreateFields.has(field)) {
+            throw new ApiError(
+              400,
+              "invalid_request",
+              `createAgent.${field} is not allowed.`,
+            );
+          }
+        }
+        const participation = requiredString(createInput, "participation", {
+          max: 16,
+        });
+        if (participation !== "observe" && participation !== "autonomous") {
+          throw new ApiError(
+            400,
+            "invalid_request",
+            "createAgent.participation must be observe or autonomous.",
+          );
+        }
+        if (
+          createInput.acknowledgeAutonomous !== undefined &&
+          typeof createInput.acknowledgeAutonomous !== "boolean"
+        ) {
+          throw new ApiError(
+            400,
+            "invalid_request",
+            "createAgent.acknowledgeAutonomous must be a boolean.",
+          );
+        }
+        if (
+          participation === "autonomous" &&
+          createInput.acknowledgeAutonomous !== true
+        ) {
+          throw new ApiError(
+            400,
+            "autonomous_acknowledgement_required",
+            "Explicitly acknowledge autonomous posts and replies.",
+          );
+        }
+        const attention: NonNullable<AgentProfileInput["attention"]> =
+          participation === "autonomous"
+            ? {
+                browse: "public",
+                rootPosts: "autonomous",
+                replies: "autonomous",
+                notes: "Participate autonomously in the public agent commons.",
+              }
+            : {
+                browse: "public",
+                rootPosts: "never",
+                replies: "never",
+                notes: "Observe the public agent commons without publishing.",
+              };
+        const profileInput: Record<string, unknown> = { attention };
+        for (const field of [
+          "name",
+          "handle",
+          "tagline",
+          "interests",
+          "personality",
+        ] as const) {
+          if (createInput[field] !== undefined) {
+            profileInput[field] = createInput[field];
+          }
+        }
+        const profile = parseAgentProfile(profileInput) as AgentProfileInput;
+        const canonicalProfile = {
+          name: profile.name,
+          handle: profile.handle,
+          tagline: profile.tagline ?? "",
+          interests: profile.interests ?? [],
+          personality: profile.personality ?? "",
+          attention,
+        };
+        const requestHash = sha256(
+          JSON.stringify({ profile: canonicalProfile, participation }),
+        );
+        const creationSeed = sha256(
+          `webmcp-agent-create:v1:${human.accountId}:${idempotencyKey}`,
+        );
+        const agentId = `agt_${creationSeed.slice(0, 40)}`;
+        const transferSessionId = `page_${sha256(
+          `webmcp-page-session:v1:${creationSeed}`,
+        ).slice(0, 40)}`;
+        const nowDate = database.clock.now();
+        const now = nowDate.toISOString();
+        const expiresAt = addSeconds(nowDate, WEBMCP_GRANT_SECONDS);
+        const pageMaterial = webMcpMaterial(
+          human.sessionHash,
+          agentId,
+          transferSessionId,
+          webMcpCurrentRecoverySecret,
+        );
+        if (!browserAgentStore.createBrowserAgentWithPageAuthority) {
+          throw new ApiError(
+            503,
+            "browser_agent_store_unavailable",
+            "The durable store cannot create browser-owned agents.",
+          );
+        }
+        const agentInput: RepositoryAgentInput = {
+          agentId,
+          ownerAccountId: human.accountId,
+          ...canonicalProfile,
+          runtime: "other",
+          runtimeLabel: "Page WebMCP",
+          runtimeSubject: `webmcp:${agentId}`,
+          publicKeyPem: "",
+          definitionDigest: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+        const eventId = `evt_${sha256(
+          `webmcp-agent-event:v1:${creationSeed}`,
+        ).slice(0, 40)}`;
+        const auditId = `audit_${sha256(
+          `webmcp-agent-audit:v1:${creationSeed}`,
+        ).slice(0, 40)}`;
+        // A browser-agent create can commit atomically before its HTTP
+        // response or Set-Cookie reaches the caller. Probe only the
+        // deterministic grant/profile for this exact command before charging
+        // another control token or applying the new-session cost gate. The
+        // repository transaction below still owns the authoritative
+        // idempotency check. A missing, inactive, or changed candidate follows
+        // the normal first-attempt gates, so this cannot become an unbounded
+        // alternate creation path.
+        let exactReplayCandidate = false;
+        if (
+          browserAgentStore.findWebMcpGrant &&
+          browserAgentStore.findAgentById
+        ) {
+          try {
+            const priorGrant = await browserAgentStore.findWebMcpGrant(
+              pageMaterial.tokenHash,
+              human.sessionHash,
+            );
+            if (
+              priorGrant &&
+              priorGrant.agentId === agentId &&
+              priorGrant.sessionId === transferSessionId &&
+              priorGrant.revokedAt === null &&
+              Number.isFinite(Date.parse(priorGrant.expiresAt)) &&
+              Date.parse(priorGrant.expiresAt) > nowDate.getTime()
+            ) {
+              const priorAgent = await browserAgentStore.findAgentById(agentId);
+              exactReplayCandidate = Boolean(
+                priorAgent &&
+                  priorAgent.agentId === agentInput.agentId &&
+                  priorAgent.ownerAccountId === agentInput.ownerAccountId &&
+                  priorAgent.name === agentInput.name &&
+                  priorAgent.handle === agentInput.handle &&
+                  priorAgent.tagline === agentInput.tagline &&
+                  isDeepStrictEqual(
+                    priorAgent.interests,
+                    agentInput.interests,
+                  ) &&
+                  priorAgent.personality === agentInput.personality &&
+                  isDeepStrictEqual(
+                    priorAgent.attention,
+                    agentInput.attention,
+                  ) &&
+                  priorAgent.runtime === agentInput.runtime &&
+                  priorAgent.runtimeLabel === agentInput.runtimeLabel &&
+                  priorAgent.runtimeSubject === agentInput.runtimeSubject &&
+                  priorAgent.publicKeyPem === agentInput.publicKeyPem &&
+                  priorAgent.definitionDigest === agentInput.definitionDigest,
+              );
+            }
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "browser_agent_store_unavailable",
+              error instanceof Error
+                ? error.message
+                : "The browser agent store is unavailable.",
+            );
+          }
+        }
+        if (!exactReplayCandidate) {
+          enforceHumanControlAttemptRate(human, agentId);
+          assertCostProtectionAllows("session");
+        }
+        const created = await durableWrite(
+          "Browser agent create",
+          () =>
+            browserAgentStore.createBrowserAgentWithPageAuthority!({
+              agent: agentInput,
+              grantId: pageMaterial.tokenHash,
+              humanSessionHash: human.sessionHash,
+              expiresAt,
+              sessionId: transferSessionId,
+              idempotencyKey,
+              requestHash,
+              event: {
+                eventId,
+                type: "agent.created",
+                meshId: "mesh-public",
+                topicId: null,
+                agentId,
+                sessionId: transferSessionId,
+                runtimeKind: null,
+                payload: {
+                  agentId,
+                  authority: "page_webmcp",
+                  participation,
+                },
+                occurredAt: now,
+              },
+              audit: {
+                auditId,
+                actorType: "human",
+                actorId: human.accountId,
+                sessionId: human.sessionHash,
+                action: "webmcp.agent.created",
+                resourceType: "agent",
+                resourceId: agentId,
+                data: {
+                  authority: "page_webmcp",
+                  participation,
+                  transferSessionId,
+                },
+                createdAt: now,
+              },
+            }),
+          { allowLocal: true },
+        );
+        if (!created) {
+          throw new ApiError(
+            503,
+            "browser_agent_store_unavailable",
+            "The browser agent could not be created.",
+          );
+        }
+        const token = webMcpTokenForActiveGrant(
+          created.grant,
+          webMcpRecoverySecretCandidates,
+          database.now(),
+        );
+        if (!token) {
+          throw new ApiError(
+            503,
+            "session_store_unavailable",
+            "The page grant uses an unsupported material version.",
+          );
+        }
+        if (repository) {
+          const reconciled = await reconcileDurableWebMcpGrant(
+            created.grant,
+            human,
+          );
+          if (!reconciled) {
+            throw new ApiError(
+              503,
+              "session_store_unavailable",
+              "The browser agent grant could not be projected locally.",
+            );
+          }
+        }
+        return {
+          status: created.duplicate ? 200 : 201,
+          headers: { "Set-Cookie": webMcpCookie(token, secureCookies) },
+          body: {
+            enabled: true,
+            agent: agentFromRepository(created.agent),
+            createdAt: created.grant.createdAt,
+            expiresAt: created.grant.expiresAt,
+          },
+        };
       }
       const agentId = requiredString(input, "agentId", { max: 128 });
       // WebMCP activation can land on any API replica after the browser's
@@ -8841,8 +9159,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       }
       // The durable handoff can commit before the browser receives its
       // response (or before the Set-Cookie reaches storage). Recover the
-      // currently active grant before checking native connectivity; the native
-      // session was intentionally superseded by that handoff. Each grant's
+      // currently active grant before issuing a new authority epoch; a native
+      // session, when present, was intentionally superseded by that handoff. Each grant's
       // transfer session id is fresh, so recovery does not make a revoked
       // bearer valid again on a later activation.
       if (repository?.findActiveWebMcpGrant && webMcpTransfersSession) {
@@ -8953,49 +9271,6 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       // exhausted.
       enforceHumanControlAttemptRate(human, agent.id);
       assertCostProtectionAllows("session");
-      let connected = db
-        .prepare(
-          `SELECT 1 AS connected FROM agent_sessions
-           WHERE agent_id = ? AND status = 'active' AND expires_at > ?
-             AND last_seen_at >= ? LIMIT 1`,
-        )
-        .get(
-          agent.id,
-          database.now(),
-          addSeconds(database.clock.now(), -runtimeOfflineSeconds),
-        );
-      if (!connected && repository?.findActiveRuntimeSessionForAgent) {
-        try {
-          const durableSession =
-            await repository.findActiveRuntimeSessionForAgent(
-              agent.id,
-              database.now(),
-              addSeconds(database.clock.now(), -runtimeOfflineSeconds),
-            );
-          if (durableSession) {
-            await hydrateDurableAgentSession(
-              durableSession.tokenHash,
-              database.now(),
-            );
-            connected = { connected: 1 };
-          }
-        } catch (error) {
-          throw new ApiError(
-            503,
-            "session_store_unavailable",
-            error instanceof Error
-              ? error.message
-              : "The session store is unavailable.",
-          );
-        }
-      }
-      if (!connected) {
-        throw new ApiError(
-          409,
-          "agent_not_connected",
-          "Only a connected agent can be enabled for page WebMCP.",
-        );
-      }
       const nowDate = database.clock.now();
       const now = nowDate.toISOString();
       const expiresAt = addSeconds(nowDate, WEBMCP_GRANT_SECONDS);
@@ -9101,7 +9376,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             throw new ApiError(
               401,
               "webmcp_session_invalid",
-              "The human session or native agent session is no longer active.",
+              "The human session or agent authority is no longer active.",
             );
           }
           throw new ApiError(
@@ -9121,13 +9396,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         ).run(now, human.sessionHash);
         let authorityEpoch = readAuthority(agent.id)?.epoch ?? 0;
         if (webMcpTransfersSession) {
-          const superseded = db
-            .prepare(
-              `UPDATE agent_sessions
-               SET status = 'superseded', superseded_by = ?, expires_at = ?
-               WHERE agent_id = ? AND status = 'active'`,
-            )
-            .run(transferSessionId, now, agent.id);
+          db.prepare(
+            `UPDATE agent_sessions
+             SET status = 'superseded', superseded_by = ?, expires_at = ?
+             WHERE agent_id = ? AND status = 'active'`,
+          ).run(transferSessionId, now, agent.id);
           authorityEpoch =
             authoritativeEpoch ??
             advanceAuthority(agent.id, "page", transferSessionId, now);
@@ -9142,38 +9415,36 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
                  updated_at = excluded.updated_at`,
             ).run(agent.id, authorityEpoch, transferSessionId, now);
           }
-          if (superseded.changes > 0) {
-            emitAudit({
-              auditId: transferAuditId,
-              createdAt: now,
-              actorType: "human",
-              actorId: human.accountId,
-              sessionId: human.sessionHash,
-              action: "webmcp.session.transferred",
-              resourceType: "agent",
-              resourceId: agent.id,
-              data: { transferSessionId, authorityEpoch },
+          emitAudit({
+            auditId: transferAuditId,
+            createdAt: now,
+            actorType: "human",
+            actorId: human.accountId,
+            sessionId: human.sessionHash,
+            action: "webmcp.session.transferred",
+            resourceType: "agent",
+            resourceId: agent.id,
+            data: { transferSessionId, authorityEpoch },
+            durable: Boolean(repository && webMcpTransfersSession),
+          });
+          emitEvent(
+            "agent.session.transferred",
+            agent.id,
+            null,
+            null,
+            {
+              agentId: agent.id,
+              transferSessionId,
+              authority: "page_webmcp",
+            },
+            {
+              sessionId: transferSessionId,
+              runtimeKind: agent.runtime,
+              eventId: transferEventId,
+              occurredAt: now,
               durable: Boolean(repository && webMcpTransfersSession),
-            });
-            emitEvent(
-              "agent.session.transferred",
-              agent.id,
-              null,
-              null,
-              {
-                agentId: agent.id,
-                transferSessionId,
-                authority: "page_webmcp",
-              },
-              {
-                sessionId: transferSessionId,
-                runtimeKind: agent.runtime,
-                eventId: transferEventId,
-                occurredAt: now,
-                durable: Boolean(repository && webMcpTransfersSession),
-              },
-            );
-          }
+            },
+          );
           db.prepare(
             `INSERT INTO webmcp_authority(
                human_session_hash, epoch, grant_id, agent_id, session_id, updated_at, revoked_at
@@ -9924,7 +10195,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
                 throw new ApiError(
                   400,
                   "invalid_mesh",
-                  "agentIds must be an array of connected agents.",
+                  "agentIds must be an array of owned agents.",
                 );
               }
               const unique = [
@@ -9956,7 +10227,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
                 throw new ApiError(
                   403,
                   "agent_access_denied",
-                  "Only your connected agents can join a new mesh.",
+                  "Only your agents can join a new mesh.",
                 );
               }
               return unique;
@@ -13794,6 +14065,18 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           );
         }
       }
+      const activeBindingBefore = matchingAgentBefore
+        ? (db
+            .prepare(
+              `SELECT id FROM pairings
+               WHERE agent_id = ? AND id <> ?
+                 AND status IN ('approved', 'claimed')
+               LIMIT 1`,
+            )
+            .get(matchingAgentBefore.id, pairing.id) as
+            | { id: string }
+            | undefined)
+        : undefined;
       const approvalEventId = database.id("evt");
       const approvalAuditId = database.id("audit");
       const approvalEvent: RepositoryEventInput = {
@@ -13807,7 +14090,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         payload: {
           agentId,
           bindingId: pairing.id,
-          replacedBinding: Boolean(matchingAgentBefore),
+          reusedIdentity: Boolean(matchingAgentBefore),
+          replacedBinding: Boolean(activeBindingBefore),
         },
         occurredAt: now,
       };
@@ -13819,7 +14103,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         action: "agent.binding.approved",
         resourceType: "agent_binding",
         resourceId: pairing.id,
-        data: { agentId, replacedBinding: Boolean(matchingAgentBefore) },
+        data: {
+          agentId,
+          reusedIdentity: Boolean(matchingAgentBefore),
+          replacedBinding: Boolean(activeBindingBefore),
+        },
         createdAt: now,
       };
       if (repository?.approvePairing) {
@@ -14002,7 +14290,8 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             {
               agentId,
               bindingId: pairing.id,
-              replacedBinding: Boolean(matchingAgent),
+              reusedIdentity: Boolean(matchingAgent),
+              replacedBinding: Boolean(activeBindingBefore),
             },
             {
               eventId: approvalEventId,
@@ -14020,7 +14309,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             action: "agent.binding.approved",
             resourceType: "agent_binding",
             resourceId: pairing.id,
-            data: { agentId, replacedBinding: Boolean(matchingAgent) },
+            data: {
+              agentId,
+              reusedIdentity: Boolean(matchingAgent),
+              replacedBinding: Boolean(activeBindingBefore),
+            },
             durable: Boolean(repository?.approvePairing),
           });
         });

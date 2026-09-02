@@ -463,7 +463,7 @@ test("SQLite adapter matches Firestore transaction boundaries for corrected auth
       agentId,
       grantId: pageGrantHash,
       humanSessionHash: ownerSessionHash,
-      expiresAt: "2026-08-28T19:10:00.000Z",
+      expiresAt: "2026-08-28T18:14:00.000Z",
       sessionId: pageSessionId,
     });
     const activePageGrant = await repository.findActiveWebMcpGrant(ownerSessionHash, agentId);

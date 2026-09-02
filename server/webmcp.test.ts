@@ -36,6 +36,7 @@ interface OwnerSession {
 interface ConnectedAgent {
   id: string;
   authorization?: string;
+  pairingId?: string;
 }
 
 const running: RunningServer[] = [];
@@ -252,7 +253,9 @@ async function connectAgent(
     },
   );
   assert.equal(approval.response.status, 200);
-  if (!claim) return { id: approval.json.agent.id };
+  if (!claim) {
+    return { id: approval.json.agent.id, pairingId: pairing.json.pairingId };
+  }
   const challenge = await requestJson(
     run.baseUrl,
     `/v1/pairings/${pairing.json.pairingId}/challenges`,
@@ -273,7 +276,11 @@ async function connectAgent(
     },
   });
   assert.equal(session.response.status, 201);
-  return { id: session.json.agent.id, authorization: `Bearer ${session.json.token}` };
+  return {
+    id: session.json.agent.id,
+    authorization: `Bearer ${session.json.token}`,
+    pairingId: pairing.json.pairingId,
+  };
 }
 
 async function enableGrant(
@@ -290,6 +297,34 @@ async function enableGrant(
   const cookie = cookieFrom(enabled.response);
   grantedAgentByCookie.set(cookie, agentId);
   return { cookie, ...enabled };
+}
+
+async function createBrowserAgent(
+  run: RunningServer,
+  owner: OwnerSession,
+  input: {
+    name: string;
+    handle: string;
+    tagline?: string;
+    interests?: string[];
+    personality?: string;
+    participation: "observe" | "autonomous";
+    acknowledgeAutonomous?: boolean;
+  },
+  idempotencyKey: string,
+): Promise<{ cookie: string; response: Response; json: any }> {
+  const created = await requestJson(run.baseUrl, "/v1/webmcp/session", {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey,
+    body: { createAgent: input },
+  });
+  const cookie = cookieFrom(created.response);
+  if (created.json?.agent?.id) {
+    grantedAgentByCookie.set(cookie, created.json.agent.id);
+  }
+  return { cookie, ...created };
 }
 
 const combinedCookie = (owner: OwnerSession, webMcpCookie: string): string =>
@@ -494,7 +529,501 @@ const autonomous = {
   notes: "Participate autonomously.",
 };
 
-test("a human explicitly grants one owned connected identity using only HttpOnly cookies", async () => {
+test("a human can create an observe-only agent with page authority before attaching a native runtime", async () => {
+  const run = await start();
+  const owner = await createOwner(run, "browser-first");
+  const created = await createBrowserAgent(
+    run,
+    owner,
+    {
+      name: "Browser Observer",
+      handle: "browser-observer",
+      tagline: "Starts in the page.",
+      interests: ["WebMCP", "agent commons"],
+      personality: "Curious and careful.",
+      participation: "observe",
+    },
+    "browser-agent-create-001",
+  );
+
+  assert.equal(created.response.status, 201);
+  assert.equal(created.json.enabled, true);
+  assert.equal(created.json.agent.ownerId, owner.id);
+  assert.equal(created.json.agent.handle, "browser-observer");
+  assert.deepEqual(
+    {
+      browse: created.json.agent.attention.browse,
+      rootPosts: created.json.agent.attention.rootPosts,
+      replies: created.json.agent.attention.replies,
+    },
+    {
+      browse: "public",
+      rootPosts: "never",
+      replies: "never",
+    },
+  );
+  assert.equal("token" in created.json, false);
+  assert.match(created.response.headers.get("set-cookie") ?? "", /meshr_webmcp=/);
+
+  const cookie = combinedCookie(owner, created.cookie);
+  const profile = await requestJson(run.baseUrl, "/v1/webmcp/profile", {
+    cookie,
+  });
+  assert.equal(profile.response.status, 200);
+  assert.equal(profile.json.agent.id, created.json.agent.id);
+  const portfolio = await requestJson(run.baseUrl, "/v1/agents", {
+    cookie: owner.cookie,
+  });
+  const durableAgent = portfolio.json.agents.find(
+    (agent: { id: string }) => agent.id === created.json.agent.id,
+  );
+  assert.ok(durableAgent);
+  assert.equal(durableAgent.runtimeAttached, false);
+  assert.equal(durableAgent.connectionStatus, "offline");
+  const meshes = await requestJson(run.baseUrl, "/v1/webmcp/meshes", {
+    cookie,
+  });
+  assert.equal(meshes.response.status, 200);
+  assert.ok(
+    meshes.json.meshes.some((mesh: { id: string }) => mesh.id === "mesh-public"),
+  );
+  const deniedWrite = await requestJson(run.baseUrl, "/v1/webmcp/posts", {
+    method: "POST",
+    cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "browser-observer-post-001",
+    body: {
+      meshId: "mesh-public",
+      topicId: "topic-small-discoveries",
+      body: "Observe-only agents must not publish.",
+    },
+  });
+  assert.equal(deniedWrite.response.status, 403);
+  assert.equal(deniedWrite.json.error.code, "attention_policy_denied");
+
+  const nativeState = run.app.database.sqlite
+    .prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM pairings WHERE agent_id = ?) AS pairings,
+         (SELECT COUNT(*) FROM agent_sessions WHERE agent_id = ?) AS sessions,
+         (SELECT COUNT(*) FROM mesh_members
+          WHERE mesh_id = 'mesh-public' AND agent_id = ?) AS public_memberships`,
+    )
+    .get(
+      created.json.agent.id,
+      created.json.agent.id,
+      created.json.agent.id,
+    ) as { pairings: number; sessions: number; public_memberships: number };
+  assert.deepEqual({ ...nativeState }, {
+    pairings: 0,
+    sessions: 0,
+    public_memberships: 1,
+  });
+});
+
+test("a browser-created identity survives page revocation and receives a fresh reactivation grant", async () => {
+  const run = await start();
+  const owner = await createOwner(run, "browser-reactivation");
+  const created = await createBrowserAgent(
+    run,
+    owner,
+    {
+      name: "Persistent Browser Agent",
+      handle: "persistent-browser-agent",
+      participation: "observe",
+    },
+    "browser-agent-reactivation-001",
+  );
+  const firstCookie = combinedCookie(owner, created.cookie);
+
+  const revoked = await requestJson(run.baseUrl, "/v1/webmcp/session", {
+    method: "DELETE",
+    cookie: firstCookie,
+    csrf: owner.csrf,
+  });
+  assert.equal(revoked.response.status, 200);
+  const oldGrant = await requestJson(run.baseUrl, "/v1/webmcp/profile", {
+    cookie: firstCookie,
+  });
+  assert.equal(oldGrant.response.status, 401);
+
+  const reactivated = await enableGrant(run, owner, created.json.agent.id);
+  assert.equal(reactivated.response.status, 201);
+  assert.notEqual(reactivated.cookie, created.cookie);
+  const profile = await requestJson(run.baseUrl, "/v1/webmcp/profile", {
+    cookie: combinedCookie(owner, reactivated.cookie),
+  });
+  assert.equal(profile.response.status, 200);
+  assert.equal(profile.json.agent.id, created.json.agent.id);
+  assert.equal(
+    (run.app.database.sqlite
+      .prepare("SELECT COUNT(*) AS count FROM agents WHERE id = ?")
+      .get(created.json.agent.id) as { count: number }).count,
+    1,
+  );
+});
+
+test("the first native attachment reuses a browser identity without inventing a replaced binding", async () => {
+  const run = await start();
+  const owner = await createOwner(run, "browser-native-attach");
+  const created = await createBrowserAgent(
+    run,
+    owner,
+    {
+      name: "Browser Native Attach",
+      handle: "browser-native-attach",
+      participation: "observe",
+    },
+    "browser-agent-native-attach-001",
+  );
+  const attention = {
+    browse: "public" as const,
+    rootPosts: "never" as const,
+    replies: "never" as const,
+    notes: "Observe without publishing.",
+  };
+
+  const firstNative = await connectAgent(
+    run,
+    owner,
+    "browser-native-attach",
+    attention,
+    false,
+  );
+  assert.equal(firstNative.id, created.json.agent.id);
+  assert.ok(firstNative.pairingId);
+  const firstEvent = run.app.database.sqlite
+    .prepare(
+      "SELECT data_json FROM events WHERE type = 'agent.binding.approved' AND agent_id = ? ORDER BY sequence DESC LIMIT 1",
+    )
+    .get(firstNative.id) as { data_json: string };
+  assert.deepEqual(JSON.parse(firstEvent.data_json), {
+    agentId: firstNative.id,
+    bindingId: firstNative.pairingId,
+    reusedIdentity: true,
+    replacedBinding: false,
+  });
+
+  const replacement = await connectAgent(
+    run,
+    owner,
+    "browser-native-attach",
+    attention,
+    false,
+  );
+  assert.equal(replacement.id, firstNative.id);
+  assert.ok(replacement.pairingId);
+  const replacementAudit = run.app.database.sqlite
+    .prepare(
+      "SELECT data_json FROM audit_events WHERE action = 'agent.binding.approved' AND resource_id = ?",
+    )
+    .get(replacement.pairingId) as { data_json: string };
+  assert.deepEqual(JSON.parse(replacementAudit.data_json), {
+    agentId: firstNative.id,
+    reusedIdentity: true,
+    replacedBinding: true,
+  });
+});
+
+test("browser-agent creation requires CSRF, idempotency, and autonomous acknowledgement", async () => {
+  const run = await start();
+  const owner = await createOwner(run, "browser-consent");
+  const missingCsrf = await requestJson(run.baseUrl, "/v1/webmcp/session", {
+    method: "POST",
+    cookie: owner.cookie,
+    idempotencyKey: "browser-agent-missing-csrf-001",
+    body: {
+      createAgent: {
+        name: "Missing CSRF",
+        handle: "missing-csrf",
+        participation: "observe",
+      },
+    },
+  });
+  assert.equal(missingCsrf.response.status, 403);
+  assert.equal(missingCsrf.json.error.code, "csrf_failed");
+
+  const missingIdempotency = await requestJson(
+    run.baseUrl,
+    "/v1/webmcp/session",
+    {
+      method: "POST",
+      cookie: owner.cookie,
+      csrf: owner.csrf,
+      body: {
+        createAgent: {
+          name: "Missing Idempotency",
+          handle: "missing-idempotency",
+          participation: "observe",
+        },
+      },
+    },
+  );
+  assert.equal(missingIdempotency.response.status, 400);
+  assert.equal(missingIdempotency.json.error.code, "idempotency_key_required");
+
+  const missingAcknowledgement = await requestJson(
+    run.baseUrl,
+    "/v1/webmcp/session",
+    {
+      method: "POST",
+      cookie: owner.cookie,
+      csrf: owner.csrf,
+      idempotencyKey: "browser-agent-unacknowledged-001",
+      body: {
+        createAgent: {
+          name: "Unacknowledged Participant",
+          handle: "unacknowledged-participant",
+          participation: "autonomous",
+        },
+      },
+    },
+  );
+  assert.equal(missingAcknowledgement.response.status, 400);
+  assert.equal(
+    missingAcknowledgement.json.error.code,
+    "autonomous_acknowledgement_required",
+  );
+  assert.equal(
+    (run.app.database.sqlite
+      .prepare("SELECT COUNT(*) AS count FROM agents WHERE owner_account_id = ?")
+      .get(owner.id) as { count: number }).count,
+    0,
+  );
+});
+
+test("browser-agent creation replays one grant and autonomous participation enables writes", async () => {
+  const run = await start();
+  const owner = await createOwner(run, "browser-replay");
+  const input = {
+    name: "Browser Participant",
+    handle: "browser-participant",
+    tagline: "Participates from the page.",
+    interests: ["WebMCP"],
+    personality: "Constructive and concise.",
+    participation: "autonomous" as const,
+    acknowledgeAutonomous: true,
+  };
+  const first = await createBrowserAgent(
+    run,
+    owner,
+    input,
+    "browser-agent-replay-001",
+  );
+  const replay = await createBrowserAgent(
+    run,
+    owner,
+    input,
+    "browser-agent-replay-001",
+  );
+
+  assert.equal(first.response.status, 201);
+  assert.ok(replay.response.status === 200 || replay.response.status === 201);
+  assert.equal(replay.json.agent.id, first.json.agent.id);
+  assert.equal(replay.json.createdAt, first.json.createdAt);
+  assert.equal(replay.json.expiresAt, first.json.expiresAt);
+  assert.equal(replay.cookie, first.cookie);
+  assert.equal(first.json.agent.attention.browse, "public");
+  assert.equal(first.json.agent.attention.rootPosts, "autonomous");
+  assert.equal(first.json.agent.attention.replies, "autonomous");
+
+  const cookie = combinedCookie(owner, replay.cookie);
+  const published = await requestJson(run.baseUrl, "/v1/webmcp/posts", {
+    method: "POST",
+    cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "browser-participant-post-001",
+    body: {
+      meshId: "mesh-public",
+      topicId: "topic-small-discoveries",
+      body: "A browser-first autonomous post.",
+    },
+  });
+  assert.equal(published.response.status, 201);
+  assert.equal(published.json.post.agentId, first.json.agent.id);
+
+  const conflict = await requestJson(run.baseUrl, "/v1/webmcp/session", {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "browser-agent-replay-001",
+    body: {
+      createAgent: {
+        ...input,
+        tagline: "A changed command must not reuse the key.",
+      },
+    },
+  });
+  assert.equal(conflict.response.status, 409);
+  assert.equal(conflict.json.error.code, "idempotency_conflict");
+  const identities = run.app.database.sqlite
+    .prepare("SELECT COUNT(*) AS count FROM agents WHERE handle = ?")
+    .get(input.handle) as { count: number };
+  assert.equal(identities.count, 1);
+});
+
+test("browser-agent response-loss replay survives exhausted control and cost budgets", async (context) => {
+  const previousCostMode = process.env.MESHR_COST_PROTECTION_MODE;
+  process.env.MESHR_COST_PROTECTION_MODE = "normal";
+  context.after(() => {
+    if (previousCostMode === undefined) {
+      delete process.env.MESHR_COST_PROTECTION_MODE;
+    } else {
+      process.env.MESHR_COST_PROTECTION_MODE = previousCostMode;
+    }
+  });
+
+  const run = await start();
+  const owner = await createOwner(run, "browser-recovery-budget");
+  const input = {
+    name: "Browser Recovery",
+    handle: "browser-recovery",
+    tagline: "A stable response-loss replay candidate.",
+    interests: ["WebMCP"],
+    personality: "Patient and exact.",
+    participation: "observe" as const,
+  };
+  const first = await createBrowserAgent(
+    run,
+    owner,
+    input,
+    "browser-agent-recovery-budget-001",
+  );
+  assert.equal(first.response.status, 201);
+
+  // The create consumed one account/session control token. Exact no-op owner
+  // updates consume the remaining budget without changing the deterministic
+  // profile used to recognize a response-loss replay.
+  for (let index = 0; index < 19; index += 1) {
+    const updated = await requestJson(
+      run.baseUrl,
+      `/v1/agents/${first.json.agent.id}/profile`,
+      {
+        method: "PUT",
+        cookie: owner.cookie,
+        csrf: owner.csrf,
+        body: { tagline: input.tagline },
+      },
+    );
+    assert.equal(updated.response.status, 200);
+  }
+  const overBudget = await requestJson(
+    run.baseUrl,
+    `/v1/agents/${first.json.agent.id}/profile`,
+    {
+      method: "PUT",
+      cookie: owner.cookie,
+      csrf: owner.csrf,
+      body: { tagline: input.tagline },
+    },
+  );
+  assert.equal(overBudget.response.status, 429);
+  assert.equal(overBudget.json.error.code, "human_control_rate_limited");
+
+  process.env.MESHR_COST_PROTECTION_MODE = "protect";
+  const recovered = await createBrowserAgent(
+    run,
+    owner,
+    input,
+    "browser-agent-recovery-budget-001",
+  );
+  assert.equal(recovered.response.status, 200);
+  assert.equal(recovered.cookie, first.cookie);
+  assert.equal(recovered.json.agent.id, first.json.agent.id);
+  assert.equal(recovered.json.createdAt, first.json.createdAt);
+  assert.equal(recovered.json.expiresAt, first.json.expiresAt);
+
+  // A new command still reaches the ordinary first-attempt gates. The hot
+  // owner is rate limited, while a fresh owner proves cost protection remains
+  // effective independently of that exhausted bucket.
+  const hotNewAttempt = await requestJson(run.baseUrl, "/v1/webmcp/session", {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "browser-agent-recovery-new-001",
+    body: {
+      createAgent: {
+        name: "Hot New Browser Agent",
+        handle: "hot-new-browser-agent",
+        participation: "observe",
+      },
+    },
+  });
+  assert.equal(hotNewAttempt.response.status, 429);
+  assert.equal(hotNewAttempt.json.error.code, "human_control_rate_limited");
+
+  const freshOwner = await createOwner(run, "browser-cost-protection");
+  const costBlocked = await requestJson(run.baseUrl, "/v1/webmcp/session", {
+    method: "POST",
+    cookie: freshOwner.cookie,
+    csrf: freshOwner.csrf,
+    idempotencyKey: "browser-agent-cost-blocked-001",
+    body: {
+      createAgent: {
+        name: "Cost Blocked Browser Agent",
+        handle: "cost-blocked-browser-agent",
+        participation: "observe",
+      },
+    },
+  });
+  assert.equal(costBlocked.response.status, 503);
+  assert.equal(costBlocked.json.error.code, "cost_protection_active");
+});
+
+test("browser-agent creation preserves the account portfolio limit", async () => {
+  const run = await start();
+  const owner = await createOwner(run, "browser-limit");
+  const insert = run.app.database.sqlite.prepare(
+    `INSERT INTO agents(
+       id, owner_account_id, name, handle, tagline, interests_json,
+       personality, attention_json, runtime, runtime_label, runtime_subject,
+       public_key_pem, definition_digest, created_at, updated_at
+     ) VALUES(?, ?, ?, ?, '', '[]', '', ?, 'other', 'Page WebMCP', ?, '', NULL, ?, ?)`,
+  );
+  run.app.database.transaction(() => {
+    for (let index = 0; index < 25; index += 1) {
+      insert.run(
+        `limit-agent-${index}`,
+        owner.id,
+        `Limit Agent ${index}`,
+        `limit-agent-${index}`,
+        JSON.stringify({
+          browse: "public",
+          rootPosts: "never",
+          replies: "never",
+          notes: "Observe only.",
+        }),
+        `webmcp:limit-agent-${index}`,
+        run.app.database.now(),
+        run.app.database.now(),
+      );
+    }
+  });
+
+  const limited = await requestJson(run.baseUrl, "/v1/webmcp/session", {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "browser-agent-limit-001",
+    body: {
+      createAgent: {
+        name: "Twenty Sixth Agent",
+        handle: "twenty-sixth-agent",
+        participation: "observe",
+      },
+    },
+  });
+  assert.equal(limited.response.status, 429);
+  assert.equal(limited.json.error.code, "agent_limit_reached");
+  assert.equal(
+    (run.app.database.sqlite
+      .prepare("SELECT COUNT(*) AS count FROM agents WHERE owner_account_id = ?")
+      .get(owner.id) as { count: number }).count,
+    25,
+  );
+});
+
+test("a human explicitly grants one owned identity using only HttpOnly cookies", async () => {
   const run = await start();
   const owner = await createOwner(run, "owner");
   const otherOwner = await createOwner(run, "other");
@@ -529,14 +1058,13 @@ test("a human explicitly grants one owned connected identity using only HttpOnly
   assert.equal(foreign.response.status, 404);
   assert.equal(foreign.json.error.code, "agent_not_found");
 
-  const disconnected = await requestJson(run.baseUrl, "/v1/webmcp/session", {
-    method: "POST",
-    cookie: owner.cookie,
-    csrf: owner.csrf,
-    body: { agentId: offline.id },
+  const offlineGrant = await enableGrant(run, owner, offline.id);
+  assert.equal(offlineGrant.response.status, 201);
+  const offlineProfile = await requestJson(run.baseUrl, "/v1/webmcp/profile", {
+    cookie: combinedCookie(owner, offlineGrant.cookie),
   });
-  assert.equal(disconnected.response.status, 409);
-  assert.equal(disconnected.json.error.code, "agent_not_connected");
+  assert.equal(offlineProfile.response.status, 200);
+  assert.equal(offlineProfile.json.agent.id, offline.id);
 
   const grant = await enableGrant(run, owner, connected.id);
   assert.equal(grant.response.status, 201);
@@ -838,14 +1366,35 @@ test("owner binding revocation invalidates bearer and page authority immediately
     cookie,
   });
   assert.equal(pageAfterRevocation.response.status, 401);
-  const cannotReenable = await requestJson(run.baseUrl, "/v1/webmcp/session", {
-    method: "POST",
+  const reactivated = await enableGrant(run, owner, agent.id);
+  assert.equal(reactivated.response.status, 201);
+  assert.notEqual(reactivated.cookie, grant.cookie);
+  const reactivatedProfile = await requestJson(
+    run.baseUrl,
+    "/v1/webmcp/profile",
+    { cookie: combinedCookie(owner, reactivated.cookie) },
+  );
+  assert.equal(reactivatedProfile.response.status, 200);
+  assert.equal(reactivatedProfile.json.agent.id, agent.id);
+  const portfolio = await requestJson(run.baseUrl, "/v1/agents", {
     cookie: owner.cookie,
-    csrf: owner.csrf,
-    body: { agentId: agent.id },
   });
-  assert.equal(cannotReenable.response.status, 409);
-  assert.equal(cannotReenable.json.error.code, "agent_not_connected");
+  assert.equal(portfolio.response.status, 200);
+  assert.equal(
+    portfolio.json.agents.find(
+      (candidate: { id: string }) => candidate.id === agent.id,
+    )?.runtimeAttached,
+    false,
+  );
+  const nativeState = run.app.database.sqlite
+    .prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM pairings
+          WHERE agent_id = ? AND status IN ('approved', 'claimed')) AS bindings,
+         (SELECT COUNT(*) FROM agent_sessions WHERE agent_id = ?) AS sessions`,
+    )
+    .get(agent.id, agent.id) as { bindings: number; sessions: number };
+  assert.deepEqual({ ...nativeState }, { bindings: 0, sessions: 0 });
 });
 
 test("in-flight page mutations recheck grants and policy before commit", async () => {

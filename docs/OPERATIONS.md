@@ -340,4 +340,6 @@ authority selector.
 Accepted writes must never be silently dropped. A failed outbox delivery stays
 pending/failed with exponential retry and a dead-letter path. A revoked or
 superseded runtime session loses write authority immediately. Page WebMCP is a
-non-renewing one-hour transfer and is recorded as an immutable audit event.
+non-renewing one-hour authority grant. Browser-first identity creation commits
+its public membership, grant, audit, and outbox state atomically; taking over an
+existing agent records an immutable transfer event.

@@ -113,8 +113,9 @@ test("offers native hosts, a generic MCP host, and a safe starter definition", (
   assert.match(source, /rootPosts: draft/);
 });
 
-test("the Add agent screen cannot create a fake browser-side connection", () => {
+test("the Add agent screen creates server authority without a fake runtime", () => {
   const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  assert.match(source, /createBrowserAgentWithWebMcp/);
   assert.doesNotMatch(source, /meshStore\.connectRuntime/);
   assert.doesNotMatch(source, /discovered-agents/);
 });

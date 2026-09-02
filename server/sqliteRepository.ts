@@ -32,6 +32,9 @@ import type {
   RepositoryPublicTopicDirectory,
   RepositoryRuntimeSession,
   RepositoryWebMcpGrant,
+  RepositoryBrowserAgentGrant,
+  RepositoryCreateBrowserAgentInput,
+  RepositoryCreateBrowserAgentResult,
   RepositoryAgentRevocationResult,
   RepositoryModerationCase,
   RepositoryModerationCasesPage,
@@ -52,14 +55,16 @@ import type {
   RepositoryAuditInput,
 } from "./repository.ts";
 import type { Clock, RuntimeKind, SocialProvider } from "./types.ts";
-import { publicRuntimeKind, systemClock } from "./types.ts";
+import { publicRuntimeKind } from "./types.ts";
 import { constantTimeStringEqual, hmacSha256 } from "./security.ts";
 import { requireJoinCapableAttentionPolicy } from "./attentionPolicy.ts";
 
 const HUMAN_IDLE_SECONDS = 12 * 60 * 60;
+const PAGE_AUTHORITY_GRANT_SECONDS = 60 * 60;
 const NEW_IDENTITY_REVIEW_POSTS = 5;
 const NEW_IDENTITY_REVIEW_WINDOW_MS = 24 * 60 * 60 * 1_000;
 const MODERATION_IDEMPOTENCY_RETENTION_SECONDS = 90 * 24 * 60 * 60;
+const BROWSER_AGENT_IDEMPOTENCY_RETENTION_SECONDS = 90 * 24 * 60 * 60;
 
 /**
  * SQLite conformance adapter used by isolated tests and local stories. It
@@ -72,7 +77,7 @@ export class SqliteMeshrRepository implements MeshrRepository {
   readonly clock: Clock;
   private readonly invitationPepper: string;
 
-  constructor(database: MeshrDatabase, clock: Clock = systemClock) {
+  constructor(database: MeshrDatabase, clock: Clock = database.clock) {
     this.database = database;
     this.db = database.sqlite;
     this.clock = clock;
@@ -707,6 +712,519 @@ export class SqliteMeshrRepository implements MeshrRepository {
       );
     }
     return { changed: true, updatedAt: input.updatedAt };
+  }
+
+  async createBrowserAgentWithPageAuthority(
+    input: RepositoryCreateBrowserAgentInput,
+  ): Promise<RepositoryCreateBrowserAgentResult> {
+    const now = this.now();
+    const nowMs = Date.parse(now);
+    const agent = input.agent;
+    const browserRuntimeValid =
+      agent.bindingId === undefined &&
+      agent.runtime === "other" &&
+      agent.runtimeLabel === "Page WebMCP" &&
+      agent.runtimeSubject === `webmcp:${agent.agentId}` &&
+      agent.publicKeyPem === "" &&
+      agent.definitionDigest === null;
+    if (!browserRuntimeValid) throw new Error("browser_agent_runtime_invalid");
+    if (
+      !agent.agentId ||
+      !agent.ownerAccountId ||
+      !agent.handle.trim().normalize("NFKC") ||
+      !input.grantId ||
+      !input.humanSessionHash ||
+      !input.sessionId ||
+      !input.idempotencyKey ||
+      !input.requestHash
+    ) {
+      throw new Error("browser_agent_input_invalid");
+    }
+
+    type AgentRow = {
+      id: string;
+      owner_account_id: string;
+      name: string;
+      handle: string;
+      tagline: string;
+      interests_json: string;
+      personality: string;
+      attention_json: string;
+      runtime: RuntimeKind;
+      runtime_label: string;
+      runtime_subject: string;
+      public_key_pem: string;
+      definition_digest: string | null;
+      created_at: string;
+      updated_at: string;
+    };
+    const toAgent = (row: AgentRow): RepositoryAgentInput => ({
+      agentId: row.id,
+      ownerAccountId: row.owner_account_id,
+      name: row.name,
+      handle: row.handle,
+      tagline: row.tagline,
+      interests: JSON.parse(row.interests_json) as string[],
+      personality: row.personality,
+      attention: JSON.parse(row.attention_json) as Record<string, unknown>,
+      runtime: row.runtime,
+      runtimeLabel: row.runtime_label,
+      runtimeSubject: row.runtime_subject,
+      publicKeyPem: row.public_key_pem,
+      definitionDigest: row.definition_digest,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    });
+    const profileMatches = (row: AgentRow): boolean => {
+      let interests: unknown;
+      let attention: unknown;
+      try {
+        interests = JSON.parse(row.interests_json);
+        attention = JSON.parse(row.attention_json);
+      } catch {
+        return false;
+      }
+      return (
+        row.id === agent.agentId &&
+        row.owner_account_id === agent.ownerAccountId &&
+        row.name === agent.name &&
+        row.handle === agent.handle &&
+        row.tagline === agent.tagline &&
+        isDeepStrictEqual(interests, agent.interests) &&
+        row.personality === agent.personality &&
+        isDeepStrictEqual(attention, agent.attention) &&
+        row.runtime === agent.runtime &&
+        row.runtime_label === agent.runtimeLabel &&
+        row.runtime_subject === agent.runtimeSubject &&
+        row.public_key_pem === agent.publicKeyPem &&
+        row.definition_digest === agent.definitionDigest
+      );
+    };
+
+    return this.database.transaction(() => {
+      const humanSession = this.db.prepare(
+        `SELECT account_id, expires_at, absolute_expires_at, last_seen_at
+         FROM human_sessions WHERE token_hash = ?`,
+      ).get(input.humanSessionHash) as
+        | {
+            account_id: string;
+            expires_at: string;
+            absolute_expires_at: string;
+            last_seen_at: string;
+          }
+        | undefined;
+      const humanExpiresAt = humanSession ? Date.parse(humanSession.expires_at) : NaN;
+      const humanAbsoluteExpiresAt = humanSession
+        ? Date.parse(humanSession.absolute_expires_at)
+        : NaN;
+      const humanLastSeenAt = humanSession ? Date.parse(humanSession.last_seen_at) : NaN;
+      if (
+        !humanSession ||
+        humanSession.account_id !== agent.ownerAccountId ||
+        !Number.isFinite(nowMs) ||
+        !Number.isFinite(humanExpiresAt) ||
+        !Number.isFinite(humanAbsoluteExpiresAt) ||
+        !Number.isFinite(humanLastSeenAt) ||
+        humanExpiresAt <= nowMs ||
+        humanAbsoluteExpiresAt <= nowMs ||
+        humanLastSeenAt <= nowMs - HUMAN_IDLE_SECONDS * 1_000
+      ) {
+        throw new Error("session_invalid");
+      }
+      const activeSessions = this.db.prepare(
+        `SELECT session_id, authority_epoch
+         FROM agent_sessions
+         WHERE agent_id = ? AND status = 'active' LIMIT 2`,
+      ).all(agent.agentId) as Array<{ session_id: string; authority_epoch: number }>;
+      const humanGrants = this.db.prepare(
+        `SELECT token_hash, agent_id, session_id, authority_epoch
+         FROM webmcp_grants
+         WHERE human_session_hash = ? AND revoked_at IS NULL LIMIT 2`,
+      ).all(input.humanSessionHash) as Array<{
+        token_hash: string;
+        agent_id: string;
+        session_id: string;
+        authority_epoch: number;
+      }>;
+      const agentGrants = this.db.prepare(
+        `SELECT token_hash, human_session_hash, session_id, authority_epoch
+         FROM webmcp_grants
+         WHERE agent_id = ? AND revoked_at IS NULL LIMIT 2`,
+      ).all(agent.agentId) as Array<{
+        token_hash: string;
+        human_session_hash: string;
+        session_id: string;
+        authority_epoch: number;
+      }>;
+      if (
+        activeSessions.length > 1 ||
+        humanGrants.length > 1 ||
+        agentGrants.length > 1
+      ) {
+        throw new Error("agent_authority_corrupt");
+      }
+      const idempotency = this.db.prepare(
+        `SELECT request_hash, response_json, expires_at
+         FROM human_idempotency_records
+         WHERE account_id = ? AND operation = 'webmcp.agent.create'
+           AND idempotency_key = ?`,
+      ).get(agent.ownerAccountId, input.idempotencyKey) as
+        | { request_hash: string; response_json: string; expires_at: string }
+        | undefined;
+      if (idempotency) {
+        if (!constantTimeStringEqual(idempotency.request_hash, input.requestHash)) {
+          throw new Error("idempotency_conflict");
+        }
+        const idempotencyExpiresAt = Date.parse(idempotency.expires_at);
+        if (
+          !Number.isFinite(idempotencyExpiresAt) ||
+          idempotencyExpiresAt <= nowMs
+        ) {
+          throw new Error("idempotency_expired");
+        }
+        let reference: Record<string, unknown>;
+        try {
+          reference = JSON.parse(idempotency.response_json) as Record<string, unknown>;
+        } catch {
+          throw new Error("idempotency_expired");
+        }
+        const storedAgentId = String(reference.agent_id ?? "");
+        const storedGrantId = String(reference.grant_id ?? "");
+        const storedSessionId = String(reference.session_id ?? "");
+        const storedEpoch = Number(reference.authority_epoch);
+        if (
+          storedAgentId !== agent.agentId ||
+          storedGrantId !== input.grantId ||
+          storedSessionId !== input.sessionId ||
+          !Number.isInteger(storedEpoch) ||
+          storedEpoch < 1
+        ) {
+          throw new Error("idempotency_conflict");
+        }
+        const storedAgent = this.db.prepare("SELECT * FROM agents WHERE id = ?")
+          .get(storedAgentId) as AgentRow | undefined;
+        if (!storedAgent) throw new Error("idempotency_conflict");
+        if (!profileMatches(storedAgent)) throw new Error("idempotency_conflict");
+
+        const membership = this.db.prepare(
+          `SELECT status, attention_policy_json, admission_provenance
+           FROM mesh_agent_memberships
+           WHERE mesh_id = 'mesh-public' AND agent_id = ?`,
+        ).get(storedAgentId) as
+          | { status: string; attention_policy_json: string; admission_provenance: string }
+          | undefined;
+        const activeMembership = this.db.prepare(
+          "SELECT 1 AS present FROM mesh_members WHERE mesh_id = 'mesh-public' AND agent_id = ?",
+        ).get(storedAgentId);
+        let membershipAttention: unknown;
+        try {
+          membershipAttention = membership
+            ? JSON.parse(membership.attention_policy_json)
+            : undefined;
+        } catch {
+          membershipAttention = undefined;
+        }
+        if (
+          !membership ||
+          !activeMembership ||
+          membership.status !== "joined" ||
+          membership.admission_provenance !== "open" ||
+          !isDeepStrictEqual(membershipAttention, agent.attention)
+        ) {
+          throw new Error("idempotency_conflict");
+        }
+
+        const grantRow = this.db.prepare(
+          `SELECT token_hash, human_session_hash, agent_id, session_id,
+                  authority_epoch, created_at, expires_at, last_used_at, revoked_at
+           FROM webmcp_grants WHERE token_hash = ?`,
+        ).get(storedGrantId) as
+          | {
+              token_hash: string;
+              human_session_hash: string;
+              agent_id: string;
+              session_id: string;
+              authority_epoch: number;
+              created_at: string;
+              expires_at: string;
+              last_used_at: string;
+              revoked_at: string | null;
+            }
+          | undefined;
+        const authority = this.db.prepare(
+          "SELECT epoch, authority_kind, session_id FROM agent_authority WHERE agent_id = ?",
+        ).get(storedAgentId) as
+          | { epoch: number; authority_kind: string; session_id: string }
+          | undefined;
+        const fence = this.db.prepare(
+          `SELECT epoch, grant_id, agent_id, session_id, revoked_at
+           FROM webmcp_authority WHERE human_session_hash = ?`,
+        ).get(input.humanSessionHash) as
+          | {
+              epoch: number;
+              grant_id: string | null;
+              agent_id: string | null;
+              session_id: string | null;
+              revoked_at: string | null;
+            }
+          | undefined;
+        if (!grantRow) throw new Error("idempotency_conflict");
+        if (
+          grantRow.human_session_hash !== input.humanSessionHash ||
+          grantRow.agent_id !== storedAgentId ||
+          grantRow.session_id !== storedSessionId ||
+          Number(grantRow.authority_epoch) !== storedEpoch ||
+          grantRow.revoked_at !== null ||
+          !Number.isFinite(Date.parse(grantRow.expires_at)) ||
+          Date.parse(grantRow.expires_at) <= nowMs ||
+          activeSessions.length !== 0 ||
+          humanGrants.length !== 1 ||
+          humanGrants[0]!.token_hash !== storedGrantId ||
+          agentGrants.length !== 1 ||
+          agentGrants[0]!.token_hash !== storedGrantId ||
+          !authority ||
+          authority.authority_kind !== "page" ||
+          authority.session_id !== storedSessionId ||
+          Number(authority.epoch) !== storedEpoch ||
+          !fence ||
+          fence.grant_id !== storedGrantId ||
+          fence.agent_id !== storedAgentId ||
+          fence.session_id !== storedSessionId ||
+          fence.revoked_at !== null ||
+          Number(fence.epoch) !== storedEpoch
+        ) {
+          throw new Error("idempotency_expired");
+        }
+        const grant: RepositoryBrowserAgentGrant = {
+          grantId: grantRow.token_hash,
+          tokenHash: grantRow.token_hash,
+          humanSessionHash: grantRow.human_session_hash,
+          agentId: grantRow.agent_id,
+          sessionId: grantRow.session_id,
+          authorityEpoch: Number(grantRow.authority_epoch),
+          createdAt: grantRow.created_at,
+          expiresAt: grantRow.expires_at,
+          lastUsedAt: grantRow.last_used_at,
+          revokedAt: grantRow.revoked_at,
+        };
+        return {
+          agent: toAgent(storedAgent),
+          grant,
+          authorityEpoch: storedEpoch,
+          sessionId: storedSessionId,
+          duplicate: true,
+        };
+      }
+
+      if (
+        this.db.prepare("SELECT 1 AS present FROM agents WHERE id = ?").get(agent.agentId) ||
+        this.db.prepare("SELECT 1 AS present FROM webmcp_grants WHERE token_hash = ?")
+          .get(input.grantId)
+      ) {
+        throw new Error("idempotency_conflict");
+      }
+      const handleOwner = this.db.prepare(
+        "SELECT id FROM agents WHERE handle = ? COLLATE NOCASE LIMIT 1",
+      ).get(agent.handle) as { id: string } | undefined;
+      if (handleOwner) throw new Error("handle_unavailable");
+      const owned = this.db.prepare(
+        "SELECT COUNT(*) AS count FROM agents WHERE owner_account_id = ?",
+      ).get(agent.ownerAccountId) as { count: number };
+      if (Number(owned.count) >= 25) throw new Error("agent_limit_reached");
+      const publicMesh = this.db.prepare(
+        "SELECT visibility, join_policy, lifecycle FROM meshes WHERE id = 'mesh-public'",
+      ).get() as
+        | { visibility: string; join_policy: string; lifecycle: string }
+        | undefined;
+      if (!publicMesh) throw new Error("mesh_not_found");
+      if (
+        publicMesh.visibility !== "public" ||
+        publicMesh.join_policy !== "open" ||
+        publicMesh.lifecycle !== "active"
+      ) {
+        throw new Error("mesh_unavailable");
+      }
+      const grantExpiresAt = Date.parse(input.expiresAt);
+      if (
+        !Number.isFinite(grantExpiresAt) ||
+        grantExpiresAt <= nowMs ||
+        grantExpiresAt > nowMs + PAGE_AUTHORITY_GRANT_SECONDS * 1_000 ||
+        grantExpiresAt > humanExpiresAt ||
+        grantExpiresAt > humanAbsoluteExpiresAt
+      ) {
+        throw new Error("page_grant_expiry_invalid");
+      }
+
+      const humanFence = this.db.prepare(
+        "SELECT epoch FROM webmcp_authority WHERE human_session_hash = ?",
+      ).get(input.humanSessionHash) as { epoch: number } | undefined;
+      if (humanGrants[0]) {
+        const previousFence = this.db.prepare(
+          `SELECT epoch, grant_id, agent_id, session_id, revoked_at
+           FROM webmcp_authority WHERE human_session_hash = ?`,
+        ).get(input.humanSessionHash) as
+          | {
+              epoch: number;
+              grant_id: string | null;
+              agent_id: string | null;
+              session_id: string | null;
+              revoked_at: string | null;
+            }
+          | undefined;
+        if (
+          !previousFence ||
+          previousFence.grant_id !== humanGrants[0].token_hash ||
+          previousFence.agent_id !== humanGrants[0].agent_id ||
+          previousFence.session_id !== humanGrants[0].session_id ||
+          previousFence.revoked_at !== null ||
+          Number(previousFence.epoch) !== Number(humanGrants[0].authority_epoch)
+        ) {
+          throw new Error("webmcp_authority_corrupt");
+        }
+      }
+      const agentFence = this.db.prepare(
+        "SELECT epoch FROM agent_authority WHERE agent_id = ?",
+      ).get(agent.agentId) as { epoch: number } | undefined;
+      const epoch = Math.max(
+        Number(humanFence?.epoch ?? 0),
+        Number(agentFence?.epoch ?? 0),
+      ) + 1;
+
+      this.db.prepare(
+        `INSERT INTO agents(
+           id, owner_account_id, name, handle, tagline, interests_json,
+           personality, attention_json, runtime, runtime_label, runtime_subject,
+           public_key_pem, definition_digest, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        agent.agentId,
+        agent.ownerAccountId,
+        agent.name,
+        agent.handle,
+        agent.tagline,
+        JSON.stringify(agent.interests),
+        agent.personality,
+        JSON.stringify(agent.attention),
+        agent.runtime,
+        agent.runtimeLabel,
+        agent.runtimeSubject,
+        agent.publicKeyPem,
+        agent.definitionDigest,
+        agent.createdAt,
+        agent.updatedAt,
+      );
+      this.db.prepare(
+        "INSERT INTO mesh_members(mesh_id, agent_id, joined_at) VALUES('mesh-public', ?, ?)",
+      ).run(agent.agentId, agent.createdAt);
+      this.db.prepare(
+        `INSERT INTO mesh_agent_memberships(
+           mesh_id, agent_id, status, attention_policy_json,
+           admission_provenance, joined_at, updated_at
+         ) VALUES('mesh-public', ?, 'joined', ?, 'open', ?, ?)`,
+      ).run(
+        agent.agentId,
+        JSON.stringify(agent.attention),
+        agent.createdAt,
+        agent.updatedAt,
+      );
+
+      this.db.prepare(
+        `UPDATE agent_sessions
+         SET status = 'superseded', superseded_by = ?, expires_at = ?
+         WHERE agent_id = ? AND status = 'active'`,
+      ).run(input.sessionId, now, agent.agentId);
+      this.db.prepare(
+        `UPDATE webmcp_grants SET revoked_at = ?
+         WHERE human_session_hash = ? AND revoked_at IS NULL`,
+      ).run(now, input.humanSessionHash);
+      this.db.prepare(
+        `INSERT INTO agent_authority(
+           agent_id, epoch, authority_kind, session_id, updated_at
+         ) VALUES(?, ?, 'page', ?, ?)
+         ON CONFLICT(agent_id) DO UPDATE SET
+           epoch = excluded.epoch,
+           authority_kind = excluded.authority_kind,
+           session_id = excluded.session_id,
+           updated_at = excluded.updated_at`,
+      ).run(agent.agentId, epoch, input.sessionId, now);
+      this.db.prepare(
+        `INSERT INTO webmcp_authority(
+           human_session_hash, epoch, grant_id, agent_id, session_id, updated_at, revoked_at
+         ) VALUES(?, ?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(human_session_hash) DO UPDATE SET
+           epoch = excluded.epoch,
+           grant_id = excluded.grant_id,
+           agent_id = excluded.agent_id,
+           session_id = excluded.session_id,
+           updated_at = excluded.updated_at,
+           revoked_at = NULL`,
+      ).run(
+        input.humanSessionHash,
+        epoch,
+        input.grantId,
+        agent.agentId,
+        input.sessionId,
+        now,
+      );
+      this.db.prepare(
+        `INSERT INTO webmcp_grants(
+           token_hash, human_session_hash, agent_id, created_at, expires_at,
+           last_used_at, revoked_at, session_id, authority_epoch
+         ) VALUES(?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+      ).run(
+        input.grantId,
+        input.humanSessionHash,
+        agent.agentId,
+        now,
+        input.expiresAt,
+        now,
+        input.sessionId,
+        epoch,
+      );
+
+      this.writeMutationArtifacts({ event: input.event, audit: input.audit });
+      const idempotencyExpiresAt = new Date(
+        nowMs + BROWSER_AGENT_IDEMPOTENCY_RETENTION_SECONDS * 1_000,
+      ).toISOString();
+      this.db.prepare(
+        `INSERT INTO human_idempotency_records(
+           account_id, operation, idempotency_key, request_hash,
+           response_status, response_json, created_at, expires_at
+         ) VALUES(?, 'webmcp.agent.create', ?, ?, 201, ?, ?, ?)`,
+      ).run(
+        agent.ownerAccountId,
+        input.idempotencyKey,
+        input.requestHash,
+        JSON.stringify({
+          agent_id: agent.agentId,
+          grant_id: input.grantId,
+          session_id: input.sessionId,
+          authority_epoch: epoch,
+        }),
+        now,
+        idempotencyExpiresAt,
+      );
+
+      const grant: RepositoryBrowserAgentGrant = {
+        grantId: input.grantId,
+        tokenHash: input.grantId,
+        humanSessionHash: input.humanSessionHash,
+        agentId: agent.agentId,
+        sessionId: input.sessionId,
+        authorityEpoch: epoch,
+        createdAt: now,
+        expiresAt: input.expiresAt,
+        lastUsedAt: now,
+        revokedAt: null,
+      };
+      return {
+        agent: { ...agent },
+        grant,
+        authorityEpoch: epoch,
+        sessionId: input.sessionId,
+        duplicate: false,
+      };
+    });
   }
 
   async updateAgentProfileFromSession(input: {
@@ -3737,6 +4255,26 @@ export class SqliteMeshrRepository implements MeshrRepository {
     return agents.filter((agent): agent is RepositoryAgentInput => agent !== null);
   }
 
+  async listNativeBoundAgentIds(agentIds: string[]): Promise<string[]> {
+    const unique = [...new Set(agentIds)].filter(Boolean);
+    if (!unique.length) return [];
+    const placeholders = unique.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `SELECT agent_id, COUNT(*) AS binding_count
+         FROM pairings
+         WHERE agent_id IN (${placeholders})
+           AND status IN ('approved', 'claimed')
+         GROUP BY agent_id
+         ORDER BY agent_id`,
+      )
+      .all(...unique) as Array<{ agent_id: string; binding_count: number }>;
+    if (rows.some((row) => Number(row.binding_count) > 1)) {
+      throw new Error("agent_authority_corrupt");
+    }
+    return rows.map((row) => row.agent_id);
+  }
+
   async listRuntimeSessionsForAgents(
     agentIds: string[],
     now: string,
@@ -4448,12 +4986,164 @@ export class SqliteMeshrRepository implements MeshrRepository {
     audit?: RepositoryAuditInput;
   }): Promise<{ authorityEpoch: number; sessionId: string }> {
     const now = this.now();
+    const nowMs = Date.parse(now);
+    const grantExpiresAt = Date.parse(input.expiresAt);
+    if (
+      !Number.isFinite(grantExpiresAt) ||
+      grantExpiresAt <= nowMs ||
+      grantExpiresAt > nowMs + PAGE_AUTHORITY_GRANT_SECONDS * 1_000
+    ) {
+      throw new Error("page_grant_expiry_invalid");
+    }
     const sessionId = input.sessionId;
     return this.database.transaction(() => {
+      const humanSession = this.db
+        .prepare(
+          `SELECT account_id, expires_at, absolute_expires_at, last_seen_at
+           FROM human_sessions WHERE token_hash = ?`,
+        )
+        .get(input.humanSessionHash) as
+        | {
+            account_id: string;
+            expires_at: string;
+            absolute_expires_at: string;
+            last_seen_at: string;
+          }
+        | undefined;
+      const agent = this.db
+        .prepare("SELECT owner_account_id FROM agents WHERE id = ?")
+        .get(input.agentId) as { owner_account_id: string } | undefined;
+      const authority = this.db
+        .prepare(
+          "SELECT epoch, authority_kind, session_id FROM agent_authority WHERE agent_id = ?",
+        )
+        .get(input.agentId) as
+        | { epoch: number; authority_kind: string; session_id: string }
+        | undefined;
       const fence = this.db
-        .prepare("SELECT epoch FROM webmcp_authority WHERE human_session_hash = ?")
-        .get(input.humanSessionHash) as { epoch: number } | undefined;
-      const epoch = (fence?.epoch ?? 0) + 1;
+        .prepare(
+          `SELECT epoch, grant_id, agent_id, session_id, revoked_at
+           FROM webmcp_authority WHERE human_session_hash = ?`,
+        )
+        .get(input.humanSessionHash) as
+        | {
+            epoch: number;
+            grant_id: string | null;
+            agent_id: string | null;
+            session_id: string | null;
+            revoked_at: string | null;
+          }
+        | undefined;
+      const nativeSessions = this.db
+        .prepare(
+          `SELECT session_id, authority_epoch FROM agent_sessions
+           WHERE agent_id = ? AND status = 'active' LIMIT 2`,
+        )
+        .all(input.agentId) as Array<{
+        session_id: string;
+        authority_epoch: number;
+      }>;
+      const humanGrants = this.db
+        .prepare(
+          `SELECT token_hash, agent_id, session_id, authority_epoch
+           FROM webmcp_grants
+           WHERE human_session_hash = ? AND revoked_at IS NULL LIMIT 2`,
+        )
+        .all(input.humanSessionHash) as Array<{
+        token_hash: string;
+        agent_id: string;
+        session_id: string;
+        authority_epoch: number;
+      }>;
+      const agentGrants = this.db
+        .prepare(
+          `SELECT token_hash, human_session_hash, session_id, authority_epoch
+           FROM webmcp_grants
+           WHERE agent_id = ? AND revoked_at IS NULL LIMIT 2`,
+        )
+        .all(input.agentId) as Array<{
+        token_hash: string;
+        human_session_hash: string;
+        session_id: string;
+        authority_epoch: number;
+      }>;
+      if (
+        nativeSessions.length > 1 ||
+        humanGrants.length > 1 ||
+        agentGrants.length > 1
+      ) {
+        throw new Error("agent_authority_corrupt");
+      }
+      const humanExpiresAt = humanSession
+        ? Date.parse(humanSession.expires_at)
+        : NaN;
+      const humanAbsoluteExpiresAt = humanSession
+        ? Date.parse(humanSession.absolute_expires_at)
+        : NaN;
+      const humanLastSeenAt = humanSession
+        ? Date.parse(humanSession.last_seen_at)
+        : NaN;
+      if (
+        !humanSession ||
+        !Number.isFinite(humanExpiresAt) ||
+        !Number.isFinite(humanAbsoluteExpiresAt) ||
+        !Number.isFinite(humanLastSeenAt) ||
+        humanExpiresAt <= nowMs ||
+        humanAbsoluteExpiresAt <= nowMs ||
+        humanLastSeenAt <= nowMs - HUMAN_IDLE_SECONDS * 1_000 ||
+        grantExpiresAt > humanExpiresAt ||
+        grantExpiresAt > humanAbsoluteExpiresAt ||
+        !agent ||
+        agent.owner_account_id !== humanSession.account_id
+      ) {
+        throw new Error("session_invalid");
+      }
+      if (
+        this.db
+          .prepare("SELECT 1 AS present FROM webmcp_grants WHERE token_hash = ?")
+          .get(input.grantId)
+      ) {
+        throw new Error("grant_already_exists");
+      }
+
+      const currentNative = nativeSessions[0];
+      const currentAgentGrant = agentGrants[0];
+      if (currentNative) {
+        if (
+          !authority ||
+          authority.authority_kind !== "native" ||
+          authority.session_id !== currentNative.session_id ||
+          Number(authority.epoch) !== Number(currentNative.authority_epoch) ||
+          currentAgentGrant
+        ) {
+          throw new Error("agent_authority_corrupt");
+        }
+      } else if (currentAgentGrant) {
+        if (
+          !authority ||
+          authority.authority_kind !== "page" ||
+          authority.session_id !== currentAgentGrant.session_id ||
+          Number(authority.epoch) !==
+            Number(currentAgentGrant.authority_epoch)
+        ) {
+          throw new Error("agent_authority_corrupt");
+        }
+      }
+
+      const currentHumanGrant = humanGrants[0];
+      if (
+        currentHumanGrant &&
+        (!fence ||
+          fence.grant_id !== currentHumanGrant.token_hash ||
+          fence.agent_id !== currentHumanGrant.agent_id ||
+          fence.session_id !== currentHumanGrant.session_id ||
+          fence.revoked_at !== null ||
+          Number(fence.epoch) !== Number(currentHumanGrant.authority_epoch))
+      ) {
+        throw new Error("webmcp_authority_corrupt");
+      }
+      const epoch =
+        Math.max(Number(fence?.epoch ?? 0), Number(authority?.epoch ?? 0)) + 1;
       this.db
         .prepare(
           `UPDATE agent_sessions
@@ -4464,9 +5154,9 @@ export class SqliteMeshrRepository implements MeshrRepository {
       this.db
         .prepare(
           `UPDATE webmcp_grants SET revoked_at = ?
-           WHERE agent_id = ? AND revoked_at IS NULL`,
+           WHERE (human_session_hash = ? OR agent_id = ?) AND revoked_at IS NULL`,
         )
-        .run(now, input.agentId);
+        .run(now, input.humanSessionHash, input.agentId);
       this.db
         .prepare(
           `INSERT INTO webmcp_authority(
