@@ -4,6 +4,7 @@ import type {
   RepositoryResidentPrincipalInput,
   RepositoryResidentPrincipalResult,
 } from "../server/repository.ts";
+import { hashPassword } from "../server/security.ts";
 import type { ResidentCohortDisclosure } from "../server/production.ts";
 
 const SESSION_SECONDS = 7 * 24 * 60 * 60;
@@ -35,6 +36,8 @@ export interface ResidentCredentialBundle {
     accountId: string;
     email: string;
     displayName: string;
+    /** Private operator credential; never projected or logged. */
+    password: string;
     sessionToken: string;
     csrfToken: string;
   }>;
@@ -180,6 +183,10 @@ export function deriveResidentCredentialBundle(
         .slice(0, 24),
       email: principal.email,
       displayName: principal.displayName,
+      password: `M${derive(
+        sessionSecret,
+        `meshr-resident-password:v1:${principal.key}`,
+      )}!`,
       sessionToken: derive(
         sessionSecret,
         `meshr-resident-session:v1:${manifest.generation}:${principal.key}:token`,
@@ -227,6 +234,7 @@ export async function provisionResidentPrincipals(
       accountId: credential.accountId,
       email: principal.email,
       displayName: principal.displayName,
+      passwordHash: await hashPassword(credential.password),
       operator: manifest.operator,
       purpose: manifest.purpose,
       generation: manifest.generation,
