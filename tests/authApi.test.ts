@@ -4,6 +4,7 @@ import {
   actOnModerationCase,
   createSocialSession,
   getCurrentSession,
+  linkSocialProvider,
   listMeshModerationCases,
   MeshrApiError,
 } from "../src/auth/api.ts";
@@ -47,6 +48,70 @@ test("only an expired human session dispatches the browser session-expired event
     } else {
       (globalThis as { window?: unknown }).window = originalWindow;
     }
+  }
+});
+
+test("social auth clients serialize matching GitHub provider proofs", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ path: string; init?: RequestInit }> = [];
+  try {
+    globalThis.fetch = async (input, init) => {
+      requests.push({ path: String(input), init });
+      return new Response(JSON.stringify({
+        user: { id: "account-1", email: "owner@example.test", displayName: "Owner" },
+        csrfToken: "csrf",
+        sessionExpiresAt: "2026-09-03T00:00:00.000Z",
+        identity: { provider: "github", email: "owner@example.test", linkedAt: "2026-09-02T00:00:00.000Z" },
+      }), { headers: { "Content-Type": "application/json" } });
+    };
+
+    await createSocialSession({
+      provider: "github",
+      idToken: "target-id",
+      providerAccessToken: "target-access",
+      state: "oauth-state",
+    });
+    await linkSocialProvider({
+      provider: "github",
+      idToken: "target-id",
+      providerAccessToken: "target-access",
+      currentProvider: "google",
+      currentIdToken: "current-id",
+      csrfToken: "csrf",
+    });
+    await linkSocialProvider({
+      provider: "google",
+      idToken: "target-google-id",
+      currentProvider: "github",
+      currentIdToken: "current-github-id",
+      currentProviderAccessToken: "current-github-access",
+      csrfToken: "csrf",
+    });
+
+    assert.deepEqual(JSON.parse(String(requests[0]?.init?.body)), {
+      provider: "github",
+      idToken: "target-id",
+      providerAccessToken: "target-access",
+      state: "oauth-state",
+    });
+    assert.deepEqual(JSON.parse(String(requests[1]?.init?.body)), {
+      provider: "github",
+      idToken: "target-id",
+      providerAccessToken: "target-access",
+      currentProvider: "google",
+      currentIdToken: "current-id",
+    });
+    assert.deepEqual(JSON.parse(String(requests[2]?.init?.body)), {
+      provider: "google",
+      idToken: "target-google-id",
+      currentProvider: "github",
+      currentIdToken: "current-github-id",
+      currentProviderAccessToken: "current-github-access",
+    });
+    assert.equal(new Headers(requests[1]?.init?.headers).get("X-Meshr-CSRF"), "csrf");
+    assert.equal(new Headers(requests[2]?.init?.headers).get("X-Meshr-CSRF"), "csrf");
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 

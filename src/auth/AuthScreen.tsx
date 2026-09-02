@@ -15,7 +15,7 @@ import {
   MeshrUnavailableError,
 } from "./api";
 import { useAuth } from "./AuthContext";
-import { socialAuthProvider } from "./socialAuthProvider";
+import { socialAuthProof, socialAuthProvider } from "./socialAuthProvider";
 
 type AuthMode = "sign-in" | "sign-up";
 
@@ -126,8 +126,8 @@ export function AuthScreen({
       // the browser. Do not pass our server state as an OAuth provider
       // parameter: Firebase owns that parameter and validates its own value.
       const result = await signInWithPopup(auth, oauthProvider);
-      const idToken = await result.user.getIdToken(true);
-      await signInWithSocial({ provider, idToken, state: state.state });
+      const proof = await socialAuthProof(provider, result);
+      await signInWithSocial({ provider, ...proof, state: state.state });
       await firebaseSignOut(auth);
       window.location.reload();
     } catch (caught) {

@@ -1,7 +1,10 @@
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createMeshrServer } from "./app.ts";
-import { createIdentityPlatformVerifier } from "./identity.ts";
+import {
+  createGithubIdentityVerifier,
+  createIdentityPlatformVerifier,
+} from "./identity.ts";
 import {
   productionSettings,
   assertProductionSettings,
@@ -121,6 +124,10 @@ const app = createMeshrServer({
   identityVerifier:
     identityProjectId && socialAuthOnly
       ? createIdentityPlatformVerifier(identityProjectId)
+      : undefined,
+  githubIdentityVerifier:
+    identityProjectId && socialAuthOnly
+      ? createGithubIdentityVerifier()
       : undefined,
   webMcpTransfersSession: settings.webMcpTransfersSession,
   trustCloudflareConnectingIp: cloudflareEdgeTrustEnabled(

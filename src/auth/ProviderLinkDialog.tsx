@@ -13,7 +13,7 @@ import {
   linkSocialProvider,
   type LinkedProvider,
 } from "./api";
-import { socialAuthProvider } from "./socialAuthProvider";
+import { socialAuthProof, socialAuthProvider } from "./socialAuthProvider";
 
 let firebaseAuth: Auth | null = null;
 
@@ -80,7 +80,7 @@ export function ProviderLinkDialog({
         const oauthProvider = socialAuthProvider(selected);
         try {
           const result = await signInWithPopup(auth, oauthProvider);
-          return await result.user.getIdToken(true);
+          return await socialAuthProof(selected, result);
         } finally {
           await firebaseSignOut(auth).catch(() => undefined);
         }
@@ -88,13 +88,14 @@ export function ProviderLinkDialog({
       // Linking is a two-key operation: prove the identity already attached
       // to this account, then prove the new provider. The server also checks
       // both subjects transactionally before writing the link.
-      const currentIdToken = await tokenFor(existing);
-      const idToken = await tokenFor(provider);
+      const currentProof = await tokenFor(existing);
+      const proof = await tokenFor(provider);
       const linked = await linkSocialProvider({
         provider,
-        idToken,
+        ...proof,
         currentProvider: existing,
-        currentIdToken,
+        currentIdToken: currentProof.idToken,
+        currentProviderAccessToken: currentProof.providerAccessToken,
         csrfToken,
       });
       setProviders((current) => [

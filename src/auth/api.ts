@@ -417,6 +417,7 @@ export function createSession(input: {
 export function createSocialSession(input: {
   provider: "google" | "github";
   idToken: string;
+  providerAccessToken?: string;
   state?: string;
 }): Promise<HumanSession> {
   return request<HumanSession>("/v1/sessions/social", {
@@ -458,8 +459,10 @@ export function getLinkedProviders(): Promise<{ providers: LinkedProvider[] }> {
 export function linkSocialProvider(input: {
   provider: "google" | "github";
   idToken: string;
+  providerAccessToken?: string;
   currentProvider?: "google" | "github";
   currentIdToken?: string;
+  currentProviderAccessToken?: string;
   csrfToken: string;
 }): Promise<{ identity: LinkedProvider }> {
   return request<{ identity: LinkedProvider }>("/v1/account/providers/link", {
@@ -471,8 +474,12 @@ export function linkSocialProvider(input: {
     body: JSON.stringify({
       provider: input.provider,
       idToken: input.idToken,
+      ...(input.providerAccessToken ? { providerAccessToken: input.providerAccessToken } : {}),
       ...(input.currentProvider ? { currentProvider: input.currentProvider } : {}),
       ...(input.currentIdToken ? { currentIdToken: input.currentIdToken } : {}),
+      ...(input.currentProviderAccessToken
+        ? { currentProviderAccessToken: input.currentProviderAccessToken }
+        : {}),
     }),
   });
 }
