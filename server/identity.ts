@@ -222,13 +222,23 @@ export function createIdentityPlatformVerifier(projectId: string): IdentityVerif
     if (signedProvider !== expectedProvider) {
       throw new Error("The identity token provider does not match the selected login.");
     }
-    const identities = record(firebase.identities);
-    const providerIdentities = identities[expectedProvider];
-    const providerSubject =
-      Array.isArray(providerIdentities) &&
-      typeof providerIdentities[0] === "string"
-        ? providerIdentities[0].trim()
-        : "";
+    let providerSubject: string | undefined;
+    const identities =
+      provider === "github"
+        ? record(firebase.identities)
+        : firebase.identities &&
+            typeof firebase.identities === "object" &&
+            !Array.isArray(firebase.identities)
+          ? (firebase.identities as Record<string, unknown>)
+          : undefined;
+    if (identities) {
+      const providerIdentities = identities[expectedProvider];
+      providerSubject =
+        Array.isArray(providerIdentities) &&
+        typeof providerIdentities[0] === "string"
+          ? providerIdentities[0].trim()
+          : "";
+    }
     if (provider === "github" && !providerSubject) {
       throw new Error("The identity token has no GitHub provider subject.");
     }
@@ -243,7 +253,7 @@ export function createIdentityPlatformVerifier(projectId: string): IdentityVerif
     return {
       provider,
       subject: String(payload.user_id ?? payload.sub),
-      providerSubject: providerSubject || undefined,
+      providerSubject,
       email,
       displayName,
       emailVerified: payload.email_verified === true,

@@ -15,7 +15,11 @@ function pem(publicKey: KeyObject): string {
 function identityToken(
   kid: string,
   privateKey: KeyObject,
-  options: { provider?: "google" | "github"; includeEmail?: boolean } = {},
+  options: {
+    provider?: "google" | "github";
+    includeEmail?: boolean;
+    includeIdentities?: boolean;
+  } = {},
 ): string {
   const now = Math.floor(Date.now() / 1_000);
   const providerId = options.provider === "github" ? "github.com" : "google.com";
@@ -33,7 +37,9 @@ function identityToken(
     exp: now + 3_600,
     iat: now,
     firebase: {
-      identities: { [providerId]: [`provider-${kid}`] },
+      ...(options.includeIdentities === false
+        ? {}
+        : { identities: { [providerId]: [`provider-${kid}`] } }),
       sign_in_provider: providerId,
     },
   })).toString("base64url");
@@ -170,6 +176,13 @@ test("a cached unknown signing key causes one fail-closed single-flight certific
     assert.equal(initialClaims.subject, "subject-first");
     assert.equal(initialClaims.providerSubject, "provider-first");
     assert.equal(requests, 1);
+
+    const googleWithoutIdentities = await verifier(
+      "google",
+      identityToken("first", first.privateKey, { includeIdentities: false }),
+    );
+    assert.equal(googleWithoutIdentities.subject, "subject-first");
+    assert.equal(googleWithoutIdentities.providerSubject, undefined);
 
     const githubClaims = await verifier(
       "github",
