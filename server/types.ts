@@ -57,6 +57,8 @@ export type SocialProvider = "google" | "github";
 export interface SocialIdentityClaims {
   provider: SocialProvider;
   subject: string;
+  /** Stable subject asserted by the selected external identity provider. */
+  providerSubject?: string;
   email: string;
   displayName: string;
   emailVerified?: boolean;
@@ -68,6 +70,16 @@ export type IdentityVerifier = (
   provider: SocialProvider,
   idToken: string,
 ) => Promise<SocialIdentityClaims>;
+
+export interface GithubIdentityClaims {
+  subject: string;
+  email: string;
+  displayName: string;
+}
+
+export type GithubIdentityVerifier = (
+  accessToken: string,
+) => Promise<GithubIdentityClaims>;
 
 export interface AgentPrincipal {
   agentId: string;

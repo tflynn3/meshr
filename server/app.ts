@@ -23,6 +23,7 @@ import type {
   AgentPrincipal,
   AgentProfileInput,
   Clock,
+  GithubIdentityVerifier,
   HumanPrincipal,
   IdentityVerifier,
   RuntimeKind,
@@ -448,6 +449,8 @@ export interface MeshrServerOptions {
   publicWebUrl?: string;
   /** Identity Platform verifier used by the social-login exchange route. */
   identityVerifier?: IdentityVerifier;
+  /** Verifies GitHub's OAuth token and resolves a verified provider email. */
+  githubIdentityVerifier?: GithubIdentityVerifier;
   /** Production mode disables the local password endpoints. */
   socialAuthOnly?: boolean;
   /** Production page WebMCP activation transfers write authority from a native host session. */
@@ -1024,6 +1027,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
   const db = database.sqlite;
   const secureCookies = options.secureCookies ?? false;
   const identityVerifier = options.identityVerifier;
+  const githubIdentityVerifier = options.githubIdentityVerifier;
   const identityProjectId =
     process.env.MESHR_IDENTITY_PROJECT_ID?.trim() ||
     process.env.GOOGLE_CLOUD_PROJECT?.trim() ||
@@ -4514,9 +4518,43 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     return { token, csrfToken, expiresAt };
   };
 
+  const verifySocialIdentity = async (
+    provider: Parameters<IdentityVerifier>[0],
+    idToken: string,
+    providerAccessToken?: string,
+  ) => {
+    if (!identityVerifier) {
+      throw new Error("Social login is not configured.");
+    }
+    let claims = await identityVerifier(provider, idToken);
+    if (claims.provider !== provider) {
+      throw new Error("The social identity provider does not match.");
+    }
+    if (provider === "github") {
+      if (!providerAccessToken || !githubIdentityVerifier) {
+        throw new Error("The GitHub identity proof is incomplete.");
+      }
+      const githubClaims = await githubIdentityVerifier(providerAccessToken);
+      if (
+        !claims.providerSubject ||
+        githubClaims.subject !== claims.providerSubject
+      ) {
+        throw new Error("The GitHub identity does not match the Firebase identity.");
+      }
+      claims = {
+        ...claims,
+        email: githubClaims.email,
+        displayName: githubClaims.displayName,
+        emailVerified: true,
+      };
+    }
+    return claims;
+  };
+
   const createSocialAccountSession = async (
     provider: Parameters<IdentityVerifier>[0],
     idToken: string,
+    providerAccessToken?: string,
   ) => {
     if (!identityVerifier) {
       throw new ApiError(
@@ -4527,19 +4565,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     }
     let claims;
     try {
-      claims = await identityVerifier(provider, idToken);
+      claims = await verifySocialIdentity(provider, idToken, providerAccessToken);
     } catch {
       throw new ApiError(
         401,
         "invalid_identity_token",
         "The social identity token is invalid.",
-      );
-    }
-    if (claims.provider !== provider) {
-      throw new ApiError(
-        401,
-        "invalid_identity_token",
-        "The social identity provider does not match the selected login.",
       );
     }
     if (claims.emailVerified !== true) {
@@ -7714,12 +7745,28 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       );
       const input = asObject(await readJson(request));
       for (const key of Object.keys(input)) {
-        if (key !== "provider" && key !== "idToken" && key !== "state") {
+        if (
+          key !== "provider" &&
+          key !== "idToken" &&
+          key !== "state" &&
+          key !== "providerAccessToken"
+        ) {
           throw new ApiError(400, "invalid_request", `${key} is not allowed.`);
         }
       }
       const provider = parseSocialProvider(input.provider);
       const idToken = requiredString(input, "idToken", { max: 16_384 });
+      const providerAccessToken =
+        provider === "github"
+          ? requiredString(input, "providerAccessToken", { max: 4_096 })
+          : undefined;
+      if (provider !== "github" && input.providerAccessToken !== undefined) {
+        throw new ApiError(
+          400,
+          "invalid_request",
+          "providerAccessToken is only valid for GitHub.",
+        );
+      }
       const state =
         input.state === undefined
           ? undefined
@@ -7740,7 +7787,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           );
         }
       }
-      const result = await createSocialAccountSession(provider, idToken);
+      const result = await createSocialAccountSession(
+        provider,
+        idToken,
+        providerAccessToken,
+      );
       return {
         status: 201,
         headers: {
@@ -7828,14 +7879,27 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         if (
           key !== "provider" &&
           key !== "idToken" &&
+          key !== "providerAccessToken" &&
           key !== "currentProvider" &&
-          key !== "currentIdToken"
+          key !== "currentIdToken" &&
+          key !== "currentProviderAccessToken"
         ) {
           throw new ApiError(400, "invalid_request", `${key} is not allowed.`);
         }
       }
       const provider = parseSocialProvider(input.provider);
       const idToken = requiredString(input, "idToken", { max: 16_384 });
+      const providerAccessToken =
+        provider === "github"
+          ? requiredString(input, "providerAccessToken", { max: 4_096 })
+          : undefined;
+      if (provider !== "github" && input.providerAccessToken !== undefined) {
+        throw new ApiError(
+          400,
+          "invalid_request",
+          "providerAccessToken is only valid for GitHub.",
+        );
+      }
       const currentProvider =
         input.currentProvider === undefined
           ? undefined
@@ -7844,6 +7908,20 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         input.currentIdToken === undefined
           ? undefined
           : requiredString(input, "currentIdToken", { max: 16_384 });
+      const currentProviderAccessToken =
+        currentProvider === "github"
+          ? requiredString(input, "currentProviderAccessToken", { max: 4_096 })
+          : undefined;
+      if (
+        currentProvider !== "github" &&
+        input.currentProviderAccessToken !== undefined
+      ) {
+        throw new ApiError(
+          400,
+          "invalid_request",
+          "currentProviderAccessToken is only valid for GitHub.",
+        );
+      }
       if ((currentProvider === undefined) !== (currentIdToken === undefined)) {
         throw new ApiError(
           400,
@@ -7869,9 +7947,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (currentProvider && currentIdToken) {
         let currentClaims;
         try {
-          currentClaims = await identityVerifier(
+          currentClaims = await verifySocialIdentity(
             currentProvider,
             currentIdToken,
+            currentProviderAccessToken,
           );
         } catch {
           throw new ApiError(
@@ -7957,7 +8036,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       }
       let claims;
       try {
-        claims = await identityVerifier(provider, idToken);
+        claims = await verifySocialIdentity(
+          provider,
+          idToken,
+          providerAccessToken,
+        );
       } catch {
         throw new ApiError(
           401,
