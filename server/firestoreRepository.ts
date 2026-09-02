@@ -9700,6 +9700,9 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         ) {
           throw new Error("resident_generation_conflict");
         }
+        if (!account.get("password_hash")) {
+          transaction.update(accountRef, { password_hash: input.passwordHash });
+        }
         if (!audit.exists)
           transaction.create(auditRef, this.auditDocument(input.audit));
         return {
