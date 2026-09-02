@@ -4609,6 +4609,67 @@ export class SqliteMeshrRepository implements MeshrRepository {
       : null;
   }
 
+  async createPasswordAccount(input: {
+    accountId: string;
+    email: string;
+    displayName: string;
+    passwordHash: string;
+    createdAt: string;
+  }) {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO accounts(id, email, display_name, password_hash, created_at)
+           VALUES(?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.accountId,
+          input.email.trim().toLowerCase(),
+          input.displayName,
+          input.passwordHash,
+          input.createdAt,
+        );
+    } catch (error) {
+      if (error instanceof Error && /unique/i.test(error.message)) {
+        throw new Error("account_exists");
+      }
+      throw error;
+    }
+    return {
+      accountId: input.accountId,
+      email: input.email.trim().toLowerCase(),
+      displayName: input.displayName,
+      createdAt: input.createdAt,
+    };
+  }
+
+  async findPasswordAccountByEmail(email: string) {
+    const row = this.db
+      .prepare(
+        `SELECT id, email, display_name, password_hash, created_at
+         FROM accounts WHERE email = ? COLLATE NOCASE`,
+      )
+      .get(email.trim().toLowerCase()) as
+      | {
+          id: string;
+          email: string;
+          display_name: string;
+          password_hash: string;
+          created_at: string;
+        }
+      | undefined;
+    if (!row || !row.password_hash) return null;
+    return {
+      account: {
+        accountId: row.id,
+        email: row.email,
+        displayName: row.display_name,
+        createdAt: row.created_at,
+      },
+      passwordHash: row.password_hash,
+    };
+  }
+
   async createSocialAccount(input: {
     provider: SocialProvider;
     subject: string;

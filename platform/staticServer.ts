@@ -1,7 +1,6 @@
 import { createReadStream, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { extname, join, normalize, relative, resolve } from "node:path";
-import { staticAssetForRequest } from "./staticPaths.ts";
 
 const host = process.env.MESHR_HOST?.trim() || "0.0.0.0";
 const port = Number(process.env.MESHR_PORT ?? "8080");
@@ -51,7 +50,7 @@ const server = createServer((request, response) => {
     response.end(JSON.stringify({ ok: true, service: "web" }));
     return;
   }
-  const requested = normalize(staticAssetForRequest(url.pathname))
+  const requested = normalize(url.pathname)
     .replace(/^(\.\.(\/|\\|$))+/, "");
   let path = join(root, requested);
   try {

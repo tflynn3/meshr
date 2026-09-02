@@ -3,7 +3,7 @@ import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFirestore, assertSeparatedProductionDatabases } from "./googleClients.ts";
 import { FirestoreMeshrRepository } from "../server/firestoreRepository.ts";
-import { residentCohortDisclosure } from "../server/production.ts";
+import { residentCohortDisclosure, type ResidentCohortDisclosure } from "../server/production.ts";
 import {
   deriveResidentCredentialBundle,
   parseResidentPrincipalManifest,
@@ -69,11 +69,24 @@ export async function runResidentSeeder(values = process.argv.slice(2)): Promise
   if (process.env.MESHR_RESIDENT_COHORT_ENABLED?.trim() !== "1") {
     throw new Error("Resident principal provisioning requires MESHR_RESIDENT_COHORT_ENABLED=1.");
   }
-  const disclosure = residentCohortDisclosure(
-    true,
-    process.env.MESHR_RESIDENT_DISCLOSURE_TEXT,
-    process.env.MESHR_RESIDENT_DISCLOSURE_URL,
-  )!;
+  const publicDisclosureEnabled = process.env.MESHR_RESIDENT_PUBLIC_DISCLOSURE?.trim() !== "0";
+  let disclosure: ResidentCohortDisclosure;
+  if (publicDisclosureEnabled) {
+    disclosure = residentCohortDisclosure(
+      true,
+      process.env.MESHR_RESIDENT_DISCLOSURE_TEXT,
+      process.env.MESHR_RESIDENT_DISCLOSURE_URL,
+    )!;
+  } else {
+    const webUrl = new URL(required(process.env.MESHR_WEB_URL, "MESHR_WEB_URL"));
+    if (webUrl.protocol !== "https:") {
+      throw new Error("MESHR_WEB_URL must be HTTPS when resident public disclosure is disabled.");
+    }
+    disclosure = {
+      text: "Operator-only resident cohort; public disclosure is disabled by explicit production policy.",
+      url: webUrl.toString(),
+    };
+  }
   const manifest = parseResidentPrincipalManifest(
     JSON.parse(await readFile(manifestPath, "utf8")) as unknown,
   );
@@ -105,10 +118,12 @@ export async function runResidentSeeder(values = process.argv.slice(2)): Promise
   if (process.env.MESHR_STORAGE?.trim() !== "firestore") {
     throw new Error("Resident principal provisioning requires MESHR_STORAGE=firestore.");
   }
-  await assertResidentDisclosurePublished(
-    disclosure,
-    required(process.env.MESHR_WEB_URL, "MESHR_WEB_URL"),
-  );
+  if (publicDisclosureEnabled) {
+    await assertResidentDisclosurePublished(
+      disclosure,
+      required(process.env.MESHR_WEB_URL, "MESHR_WEB_URL"),
+    );
+  }
   const projectId = required(process.env.GOOGLE_CLOUD_PROJECT, "GOOGLE_CLOUD_PROJECT");
   const databaseId = required(process.env.MESHR_FIRESTORE_DATABASE, "MESHR_FIRESTORE_DATABASE");
   const topologyDatabaseId = required(

@@ -41,7 +41,6 @@ import {
 } from "react";
 import { useAuth } from "./auth/AuthContext";
 import { ProviderLinkDialog } from "./auth/ProviderLinkDialog";
-import { ResidentCohortLink } from "./about/ResidentCohortLink";
 import {
   actOnModerationCase,
   createBrowserAgentWithWebMcp,
@@ -1099,7 +1098,6 @@ function MeshRail({
         <Plus size={22} />
         <span>New mesh</span>
       </button>
-      <ResidentCohortLink className="rail-cohort-link" />
       <div className="rail-profile">
         <span>{initials || "M"}</span>
         <div>

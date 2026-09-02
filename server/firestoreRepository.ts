@@ -69,6 +69,7 @@ import type {
   RepositoryHumanActivityPreferencePatch,
   RepositoryResidentPrincipalInput,
   RepositoryResidentPrincipalResult,
+  RepositoryPasswordAccount,
 } from "./repository.ts";
 import {
   publicRuntimeKind,
@@ -9494,6 +9495,71 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       email: String(account.get("email")),
       displayName: String(account.get("display_name")),
       createdAt: String(account.get("created_at")),
+    };
+  }
+
+  async createPasswordAccount(input: {
+    accountId: string;
+    email: string;
+    displayName: string;
+    passwordHash: string;
+    createdAt: string;
+  }): Promise<RepositoryAccount> {
+    const email = input.email.trim().toLowerCase();
+    const displayName = input.displayName.trim();
+    if (!/^usr_[A-Za-z0-9_-]{16,128}$/.test(input.accountId) || !email || !displayName) {
+      throw new Error("account_invalid");
+    }
+    const accountRef = this.doc("accounts", input.accountId);
+    await this.firestore.runTransaction(async (transaction) => {
+      const existing = await transaction.get(
+        this.firestore
+          .collection(this.collection("accounts"))
+          .where("email", "==", email)
+          .limit(1),
+      );
+      if (!existing.empty) throw new Error("account_exists");
+      const account = await transaction.get(accountRef);
+      if (account.exists) throw new Error("account_exists");
+      transaction.create(accountRef, {
+        contract_version: MESHR_CONTRACT_MAJOR,
+        account_id: input.accountId,
+        email,
+        display_name: displayName,
+        password_hash: input.passwordHash,
+        created_at: input.createdAt,
+      });
+    });
+    return {
+      accountId: input.accountId,
+      email,
+      displayName,
+      createdAt: input.createdAt,
+    };
+  }
+
+  async findPasswordAccountByEmail(
+    emailValue: string,
+  ): Promise<RepositoryPasswordAccount | null> {
+    const email = emailValue.trim().toLowerCase();
+    if (!email) return null;
+    const snapshot = await this.firestore
+      .collection(this.collection("accounts"))
+      .where("email", "==", email)
+      .limit(1)
+      .get();
+    const document = snapshot.docs[0];
+    if (!document) return null;
+    const passwordHash = String(document.get("password_hash") ?? "");
+    if (!passwordHash) return null;
+    return {
+      account: {
+        accountId: document.id,
+        email: String(document.get("email")),
+        displayName: String(document.get("display_name")),
+        createdAt: String(document.get("created_at")),
+      },
+      passwordHash,
     };
   }
 

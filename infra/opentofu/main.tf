@@ -3930,8 +3930,8 @@ resource "google_identity_platform_config" "default" {
     # explicitly links both identities in the signed-in account.
     allow_duplicate_emails = true
     email {
-      enabled           = false
-      password_required = false
+      enabled           = true
+      password_required = true
     }
     phone_number {
       enabled            = false
