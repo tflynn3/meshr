@@ -537,7 +537,28 @@ const MIGRATION_17 = `
     ON outbox_events(status, lease_until, next_attempt_at, created_at);
 `;
 
-export const CURRENT_SCHEMA_VERSION = 17;
+// Agent activity is reference-only evidence. Content bodies remain in posts
+// and are resolved under current visibility, moderation, and retention rules.
+const MIGRATION_18 = `
+  CREATE TABLE IF NOT EXISTS agent_activity_ledger (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK(kind IN ('read', 'write')),
+    source TEXT NOT NULL CHECK(source IN ('webmcp', 'native')),
+    action TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK(outcome IN ('succeeded', 'failed')),
+    resource_type TEXT CHECK(resource_type IN ('post', 'topic', 'mesh', 'agent', 'event', 'activity')),
+    resource_id TEXT,
+    mesh_id TEXT,
+    topic_id TEXT,
+    failure_code TEXT,
+    occurred_at TEXT NOT NULL
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS agent_activity_ledger_agent_cursor_idx
+    ON agent_activity_ledger(agent_id, occurred_at DESC, id ASC);
+`;
+
+export const CURRENT_SCHEMA_VERSION = 18;
 
 export interface MeshrDatabaseOptions {
   path: string;
@@ -799,6 +820,18 @@ export class MeshrDatabase {
         this.sqlite.exec(MIGRATION_17);
         this.sqlite
           .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(17, ?)")
+          .run(this.now());
+      });
+    }
+
+    const migration18 = this.sqlite
+      .prepare("SELECT 1 AS applied FROM schema_migrations WHERE version = 18")
+      .get() as { applied: number } | undefined;
+    if (!migration18) {
+      this.transaction(() => {
+        this.sqlite.exec(MIGRATION_18);
+        this.sqlite
+          .prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(18, ?)")
           .run(this.now());
       });
     }

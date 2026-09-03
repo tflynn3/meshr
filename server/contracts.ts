@@ -189,6 +189,79 @@ export const profileReloadResultSchema = z
   })
   .strict();
 
+export const agentActivityLedgerItemSchema = z
+  .object({
+    id,
+    kind: z.enum(["READ", "WRITE"]),
+    source: z.enum(["webmcp", "native"]),
+    action: z.string().min(1).max(80),
+    outcome: z.enum(["succeeded", "failed"]),
+    occurredAt: timestamp,
+    context: z
+      .object({
+        meshId: id.nullable(),
+        meshName: z.string().max(120).nullable(),
+        meshVisibility: z.enum(["public", "unlisted", "private"]).nullable(),
+        topicId: id.nullable(),
+        topicTitle: z.string().max(100).nullable(),
+      })
+      .strict(),
+    content: z
+      .object({
+        id,
+        type: z.enum(["post", "topic", "mesh", "agent", "event", "activity"]),
+        availability: z.enum([
+          "available",
+          "quarantined",
+          "removed",
+          "redacted",
+          "expired",
+          "deleted",
+          "inaccessible",
+          "unavailable",
+        ]),
+        excerpt: z.string().max(280).nullable(),
+        moderationState: z
+          .enum(["published", "quarantined", "removed", "redacted"])
+          .nullable(),
+        authorship: z.enum([
+          "verified",
+          "mismatch",
+          "not_applicable",
+          "unavailable",
+        ]),
+        untrusted: z.literal(true),
+      })
+      .strict()
+      .nullable(),
+    failureCode: z.string().min(1).max(120).nullable(),
+    target: z
+      .object({
+        meshId: id,
+        topicId: id,
+        postId: id.nullable(),
+      })
+      .strict()
+      .nullable(),
+  })
+  .strict();
+
+export const agentActivityLedgerPageSchema = z
+  .object({
+    contractVersion: z.literal(MESHR_CONTRACT_MAJOR),
+    agentId: id,
+    items: z.array(agentActivityLedgerItemSchema).max(50),
+    nextCursor: z.string().max(512).nullable(),
+    coverage: z
+      .object({
+        status: z.enum(["partial", "complete", "unavailable"]),
+        recordedSince: timestamp.nullable(),
+        message: z.string().min(1).max(280),
+      })
+      .strict(),
+  })
+  .strict();
+
 export type AgentBindingContract = z.infer<typeof agentBindingSchema>;
 export type RuntimeSessionContract = z.infer<typeof runtimeSessionSchema>;
 export type AgentProfileContract = z.infer<typeof agentProfileSchema>;
@@ -200,6 +273,12 @@ export type ModerationStateContract = z.infer<typeof moderationStateSchema>;
 export type JoinRequestContract = z.infer<typeof joinRequestSchema>;
 export type MeshInvitationContract = z.infer<typeof meshInvitationSchema>;
 export type ProfileReloadResultContract = z.infer<typeof profileReloadResultSchema>;
+export type AgentActivityLedgerItemContract = z.infer<
+  typeof agentActivityLedgerItemSchema
+>;
+export type AgentActivityLedgerPageContract = z.infer<
+  typeof agentActivityLedgerPageSchema
+>;
 
 /** Serialize the authoritative profile into the public HTTP/MCP contract. */
 export function serializeAgentProfile(profile: StoredAgentProfile): AgentProfileContract {

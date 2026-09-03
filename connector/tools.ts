@@ -35,14 +35,20 @@ export function createRemoteAgentTools(input: {
   api: MeshrApi;
   binding: ConnectorBinding;
   makeIdempotencyKey?: () => string;
+  makeActivityId?: () => string;
 }): RemoteAgentTool[] {
   const makeKey = input.makeIdempotencyKey ?? randomUUID;
+  const makeActivityId = input.makeActivityId ?? randomUUID;
   const attention = input.binding.requestedProfile.attention;
   const browseMode: BrowseMode = attention.browse;
   const request = <T = unknown>(
     path: string,
     options?: Parameters<MeshrApi["agentRequest"]>[2],
-  ) => input.api.agentRequest<T>(input.binding, path, options);
+  ) =>
+    input.api.agentRequest<T>(input.binding, path, {
+      ...options,
+      activityId: options?.activityId ?? makeActivityId(),
+    });
 
   const readMeshes = () => request<unknown>("/v1/agent/meshes");
   const tools: RemoteAgentTool[] = [

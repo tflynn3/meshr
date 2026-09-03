@@ -48,8 +48,10 @@ export function createPageWebMcpClient(input: {
   expectedAgentId: string;
   signal?: AbortSignal;
   makeIdempotencyKey?: () => string;
+  makeActivityId?: () => string;
 }): PageWebMcpClient {
   const makeKey = input.makeIdempotencyKey ?? (() => crypto.randomUUID());
+  const makeActivityId = input.makeActivityId ?? (() => crypto.randomUUID());
   const request = async (
     path: string,
     options: { method?: string; body?: unknown; mutation?: boolean } = {},
@@ -58,6 +60,7 @@ export function createPageWebMcpClient(input: {
       Accept: "application/json",
       "X-Meshr-Contract-Version": "1",
       "X-Meshr-WebMCP-Agent": input.expectedAgentId,
+      "X-Meshr-Activity-Id": makeActivityId(),
     });
     if (options.body !== undefined) headers.set("Content-Type", "application/json");
     if (options.mutation) {

@@ -260,6 +260,87 @@
         "validation_failures": { "type": "array", "maxItems": 32, "items": { "type": "string", "maxLength": 500 } }
       }
     },
+    "agentActivityLedgerItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "source", "action", "outcome", "occurredAt", "context", "content", "failureCode", "target"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["READ", "WRITE"] },
+        "source": { "enum": ["webmcp", "native"] },
+        "action": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "outcome": { "enum": ["succeeded", "failed"] },
+        "occurredAt": { "$ref": "#/$defs/timestamp" },
+        "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["meshId", "meshName", "meshVisibility", "topicId", "topicTitle"],
+          "properties": {
+            "meshId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+            "meshName": { "type": ["string", "null"], "maxLength": 120 },
+            "meshVisibility": { "enum": ["public", "unlisted", "private", null] },
+            "topicId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+            "topicTitle": { "type": ["string", "null"], "maxLength": 100 }
+          }
+        },
+        "content": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "type", "availability", "excerpt", "moderationState", "authorship", "untrusted"],
+              "properties": {
+                "id": { "$ref": "#/$defs/id" },
+                "type": { "enum": ["post", "topic", "mesh", "agent", "event", "activity"] },
+                "availability": { "enum": ["available", "quarantined", "removed", "redacted", "expired", "deleted", "inaccessible", "unavailable"] },
+                "excerpt": { "type": ["string", "null"], "maxLength": 280 },
+                "moderationState": { "enum": ["published", "quarantined", "removed", "redacted", null] },
+                "authorship": { "enum": ["verified", "mismatch", "not_applicable", "unavailable"] },
+                "untrusted": { "const": true }
+              }
+            }
+          ]
+        },
+        "failureCode": { "type": ["string", "null"], "minLength": 1, "maxLength": 120 },
+        "target": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["meshId", "topicId", "postId"],
+              "properties": {
+                "meshId": { "$ref": "#/$defs/id" },
+                "topicId": { "$ref": "#/$defs/id" },
+                "postId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "agentActivityLedgerPage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contractVersion", "agentId", "items", "nextCursor", "coverage"],
+      "properties": {
+        "contractVersion": { "const": 1 },
+        "agentId": { "$ref": "#/$defs/id" },
+        "items": { "type": "array", "maxItems": 50, "items": { "$ref": "#/$defs/agentActivityLedgerItem" } },
+        "nextCursor": { "type": ["string", "null"], "maxLength": 512 },
+        "coverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "recordedSince", "message"],
+          "properties": {
+            "status": { "enum": ["partial", "complete", "unavailable"] },
+            "recordedSince": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+            "message": { "type": "string", "minLength": 1, "maxLength": 280 }
+          }
+        }
+      }
+    },
     "eventEnvelope": {
       "type": "object",
       "additionalProperties": false,

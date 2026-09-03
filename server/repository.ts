@@ -364,6 +364,46 @@ export interface RepositoryAgentEventsPage {
   nextAfter: string | null;
 }
 
+export type RepositoryAgentActivityKind = "read" | "write";
+export type RepositoryAgentActivitySource = "webmcp" | "native";
+export type RepositoryAgentActivityOutcome = "succeeded" | "failed";
+export type RepositoryAgentActivityResourceType =
+  | "post"
+  | "topic"
+  | "mesh"
+  | "agent"
+  | "event"
+  | "activity";
+
+/**
+ * Minimal immutable evidence that an agent tool boundary was crossed. Post
+ * bodies and other attacker-authored content deliberately do not live here;
+ * the owner endpoint resolves the referenced resource under current access,
+ * moderation, redaction, and retention rules.
+ */
+export interface RepositoryAgentActivityRecord {
+  activityId: string;
+  agentId: string;
+  kind: RepositoryAgentActivityKind;
+  source: RepositoryAgentActivitySource;
+  action: string;
+  outcome: RepositoryAgentActivityOutcome;
+  resourceType: RepositoryAgentActivityResourceType | null;
+  resourceId: string | null;
+  meshId: string | null;
+  topicId: string | null;
+  failureCode: string | null;
+  occurredAt: string;
+}
+
+export interface RepositoryAgentActivityPage {
+  activities: RepositoryAgentActivityRecord[];
+  /** Stable newest-first cursor tuple; id breaks equal-timestamp ties. */
+  nextAfter: { occurredAt: string; id: string } | null;
+  /** Earliest authoritative ledger row for this agent, never an inferred date. */
+  recordedSince: string | null;
+}
+
 export interface RepositoryWebMcpGrant {
   tokenHash: string;
   humanSessionHash: string;
@@ -972,6 +1012,16 @@ export interface MeshrRepository {
   /** Returns bounded age telemetry for pending, failed, or leased events. */
   getOutboxHealth?(input: { now: string }): Promise<RepositoryOutboxHealth>;
   appendAuditEvent?(input: RepositoryAuditInput): Promise<void>;
+  /** Append one invocation's bounded evidence rows with activity-id dedupe. */
+  appendAgentActivities?(
+    inputs: RepositoryAgentActivityRecord[],
+  ): Promise<{ inserted: number; duplicates: number }>;
+  /** Owner-facing descending activity scan. Authorization remains an HTTP concern. */
+  listAgentActivities?(input: {
+    agentId: string;
+    after?: { occurredAt: string; id: string };
+    limit: number;
+  }): Promise<RepositoryAgentActivityPage>;
   /** Read the durable cross-replica event stream with an opaque cursor. */
   listAgentEvents?(input: {
     agentId: string;

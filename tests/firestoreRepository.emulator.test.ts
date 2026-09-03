@@ -1304,6 +1304,20 @@ test(
         /idempotency_replay_superseded/,
       );
 
+      const postActivity = {
+        activityId: `${prefix}_post_activity`,
+        agentId,
+        kind: "write" as const,
+        source: "native" as const,
+        action: "publish_post",
+        outcome: "succeeded" as const,
+        resourceType: "post" as const,
+        resourceId: postId,
+        meshId: "mesh-public",
+        topicId: "topic-small-discoveries",
+        failureCode: null,
+        occurredAt: now,
+      };
       const write = await repository.createPostWithOutbox({
         postId,
         meshId: "mesh-public",
@@ -1320,6 +1334,7 @@ test(
         requestHash: createHash("sha256")
           .update(`${prefix}:post-request`)
           .digest("hex"),
+        activity: postActivity,
       });
       assert.equal(write.duplicate, false);
       assert.equal(write.post.post_id, postId);
@@ -1386,8 +1401,66 @@ test(
         requestHash: createHash("sha256")
           .update(`${prefix}:post-request`)
           .digest("hex"),
+        activity: postActivity,
       });
       assert.equal(duplicate.duplicate, true);
+      const activityPage = await repository.listAgentActivities({
+        agentId,
+        limit: 1,
+      });
+      assert.deepEqual(activityPage.activities, [postActivity]);
+      assert.equal(activityPage.nextAfter, null);
+      const earlierActivity = [1, 2, 3].map((ordinal) => ({
+        activityId: `${prefix}_read_activity_${ordinal}`,
+        agentId,
+        kind: "read" as const,
+        source: "native" as const,
+        action: "read_conversation",
+        outcome: "succeeded" as const,
+        resourceType: "topic" as const,
+        resourceId: "topic-small-discoveries",
+        meshId: "mesh-public",
+        topicId: "topic-small-discoveries",
+        failureCode: null,
+        occurredAt: `2026-08-28T17:5${6 + ordinal}:00.000Z`,
+      }));
+      assert.deepEqual(
+        await repository.appendAgentActivities([
+          ...earlierActivity,
+          earlierActivity[0]!,
+        ]),
+        { inserted: 3, duplicates: 1 },
+      );
+      const firstActivityPage = await repository.listAgentActivities({
+        agentId,
+        limit: 2,
+      });
+      assert.deepEqual(
+        firstActivityPage.activities.map((activity) => activity.activityId),
+        [postActivity.activityId, earlierActivity[2]!.activityId],
+      );
+      assert.ok(firstActivityPage.nextAfter);
+      assert.equal(
+        firstActivityPage.recordedSince,
+        earlierActivity[0]!.occurredAt,
+      );
+      const secondActivityPage = await repository.listAgentActivities({
+        agentId,
+        after: firstActivityPage.nextAfter!,
+        limit: 2,
+      });
+      assert.deepEqual(
+        secondActivityPage.activities.map((activity) => activity.activityId),
+        [earlierActivity[1]!.activityId, earlierActivity[0]!.activityId],
+      );
+      assert.equal(secondActivityPage.nextAfter, null);
+      const rawActivity = await collection("agent_activity").get();
+      assert.equal(rawActivity.size, 4);
+      for (const document of rawActivity.docs) {
+        assert.equal(document.get("body"), undefined);
+        assert.equal(document.get("excerpt"), undefined);
+        assert.equal(document.get("payload"), undefined);
+      }
 
       const projection = await repository.loadProjection({
         accountId: account.accountId,

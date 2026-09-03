@@ -70,6 +70,8 @@ import type {
   RepositoryResidentPrincipalInput,
   RepositoryResidentPrincipalResult,
   RepositoryPasswordAccount,
+  RepositoryAgentActivityRecord,
+  RepositoryAgentActivityPage,
 } from "./repository.ts";
 import {
   publicRuntimeKind,
@@ -140,6 +142,8 @@ export interface RepositoryPostInput {
   ownerAccountId?: string;
   grantId?: string;
   humanSessionHash?: string;
+  /** Reference-only owner activity row committed atomically with the post. */
+  activity?: RepositoryAgentActivityRecord;
 }
 
 export interface RepositoryPostResult {
@@ -197,6 +201,74 @@ const GLOBAL_QUOTA_SHARDS = 20;
 function quotaShardFor(value: string, salt = "primary"): number {
   const digest = createHash("sha256").update(`${salt}:${value}`).digest();
   return digest.readUInt32BE(0) % GLOBAL_QUOTA_SHARDS;
+}
+
+function agentActivityPrefix(agentId: string): string {
+  return createHash("sha256").update(agentId).digest("hex").slice(0, 32) + ":";
+}
+
+function agentActivityDocumentId(
+  agentId: string,
+  occurredAt: string,
+  activityId: string,
+): string {
+  const occurredAtMs = Date.parse(occurredAt);
+  if (
+    !Number.isFinite(occurredAtMs) ||
+    occurredAtMs < 0 ||
+    occurredAtMs > 9_999_999_999_999
+  ) {
+    throw new Error("invalid_activity_time");
+  }
+  // Firestore cannot perform descending document-key scans. An inverted,
+  // fixed-width millisecond prefix makes an ascending key range naturally
+  // return newest-first without a composite index.
+  const invertedTime = String(9_999_999_999_999 - occurredAtMs).padStart(
+    13,
+    "0",
+  );
+  return `${agentActivityPrefix(agentId)}${invertedTime}:${activityId}`;
+}
+
+function agentActivityDedupeId(agentId: string, activityId: string): string {
+  return `${agentActivityPrefix(agentId)}${activityId}`;
+}
+
+function agentActivityBoundsId(agentId: string): string {
+  return agentActivityPrefix(agentId).slice(0, -1);
+}
+
+function earlierTimestamp(left: string | null, right: string): string {
+  return left !== null && left <= right ? left : right;
+}
+
+function agentActivityDedupeFields(
+  input: RepositoryAgentActivityRecord,
+): Record<string, unknown> {
+  return {
+    contract_version: MESHR_CONTRACT_MAJOR,
+    activity_id: input.activityId,
+    agent_id: input.agentId,
+    kind: input.kind,
+    source: input.source,
+    action: input.action,
+    outcome: input.outcome,
+    resource_type: input.resourceType,
+    resource_id: input.resourceId,
+    mesh_id: input.meshId,
+    topic_id: input.topicId,
+    failure_code: input.failureCode,
+  };
+}
+
+function agentActivityDedupeDocument(
+  input: RepositoryAgentActivityRecord,
+  storageId: string,
+): Record<string, unknown> {
+  return {
+    ...agentActivityDedupeFields(input),
+    storage_id: storageId,
+  };
 }
 
 function quotaRetryAfterSeconds(
@@ -3678,6 +3750,204 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         )
           throw error;
       });
+  }
+
+  async appendAgentActivities(
+    inputs: RepositoryAgentActivityRecord[],
+  ): Promise<{ inserted: number; duplicates: number }> {
+    if (inputs.length > 100) throw new Error("activity_batch_too_large");
+    if (inputs.length === 0) return { inserted: 0, duplicates: 0 };
+    const uniqueInputs: RepositoryAgentActivityRecord[] = [];
+    const batchIds = new Map<string, Record<string, unknown>>();
+    let batchDuplicates = 0;
+    for (const input of inputs) {
+      const key = `${input.agentId}\0${input.activityId}`;
+      const fields = agentActivityDedupeFields(input);
+      const prior = batchIds.get(key);
+      if (!prior) {
+        batchIds.set(key, fields);
+        uniqueInputs.push(input);
+      } else if (isDeepStrictEqual(prior, fields)) {
+        batchDuplicates += 1;
+      } else {
+        throw new Error("activity_id_conflict");
+      }
+    }
+    const storageIds = uniqueInputs.map((input) =>
+      agentActivityDocumentId(
+        input.agentId,
+        input.occurredAt,
+        input.activityId,
+      ),
+    );
+    const activityRefs = uniqueInputs.map((input, index) =>
+      this.doc(
+        "agent_activity",
+        storageIds[index]!,
+      ),
+    );
+    const dedupeRefs = uniqueInputs.map((input) =>
+      this.doc(
+        "agent_activity_ids",
+        agentActivityDedupeId(input.agentId, input.activityId),
+      ),
+    );
+    const boundsRef = this.doc(
+      "agent_activity_bounds",
+      agentActivityBoundsId(uniqueInputs[0]!.agentId),
+    );
+    if (uniqueInputs.some((input) => input.agentId !== uniqueInputs[0]!.agentId)) {
+      throw new Error("activity_batch_agent_mismatch");
+    }
+    return this.firestore.runTransaction(async (transaction) => {
+      const allSnapshots = await transaction.getAll(...dedupeRefs, boundsRef);
+      const snapshots = allSnapshots.slice(0, dedupeRefs.length);
+      const bounds = allSnapshots.at(-1)!;
+      const existingActivityRefs = snapshots.flatMap((snapshot) => {
+        if (!snapshot.exists) return [];
+        const storageId = snapshot.get("storage_id");
+        return typeof storageId === "string"
+          ? [this.doc("agent_activity", storageId)]
+          : [];
+      });
+      const existingActivities = existingActivityRefs.length
+        ? await transaction.getAll(...existingActivityRefs)
+        : [];
+      if (existingActivities.some((snapshot) => !snapshot.exists)) {
+        throw new Error("activity_evidence_missing");
+      }
+      let inserted = 0;
+      let duplicates = batchDuplicates;
+      const insertedTimes: string[] = [];
+      for (let index = 0; index < uniqueInputs.length; index += 1) {
+        const input = uniqueInputs[index]!;
+        const snapshot = snapshots[index]!;
+        const document = {
+          contract_version: MESHR_CONTRACT_MAJOR,
+          activity_id: input.activityId,
+          agent_id: input.agentId,
+          kind: input.kind,
+          source: input.source,
+          action: input.action,
+          outcome: input.outcome,
+          resource_type: input.resourceType,
+          resource_id: input.resourceId,
+          mesh_id: input.meshId,
+          topic_id: input.topicId,
+          failure_code: input.failureCode,
+          occurred_at: input.occurredAt,
+        };
+        if (snapshot.exists) {
+          const existingStorageId = String(snapshot.get("storage_id") ?? "");
+          if (!isDeepStrictEqual(
+            snapshot.data(),
+            agentActivityDedupeDocument(input, existingStorageId),
+          )) {
+            throw new Error("activity_id_conflict");
+          }
+          duplicates += 1;
+          continue;
+        }
+        transaction.create(activityRefs[index]!, document);
+        transaction.create(
+          dedupeRefs[index]!,
+          agentActivityDedupeDocument(input, storageIds[index]!),
+        );
+        inserted += 1;
+        insertedTimes.push(input.occurredAt);
+      }
+      if (insertedTimes.length) {
+        const earliestInput = insertedTimes.sort()[0]!;
+        const existingSince = bounds.exists
+          ? String(bounds.get("recorded_since") ?? "") || null
+          : null;
+        transaction.set(
+          boundsRef,
+          {
+            contract_version: MESHR_CONTRACT_MAJOR,
+            agent_id: uniqueInputs[0]!.agentId,
+            recorded_since: earlierTimestamp(existingSince, earliestInput),
+          },
+          { merge: true },
+        );
+      } else if (!bounds.exists) {
+        throw new Error("activity_bounds_missing");
+      }
+      return { inserted, duplicates };
+    });
+  }
+
+  async listAgentActivities(input: {
+    agentId: string;
+    after?: { occurredAt: string; id: string };
+    limit: number;
+  }): Promise<RepositoryAgentActivityPage> {
+    const limit = Math.min(Math.max(Math.floor(input.limit), 1), 50);
+    const collection = this.firestore.collection(this.collection("agent_activity"));
+    const prefix = agentActivityPrefix(input.agentId);
+    let query: Query = collection
+      .orderBy(FieldPath.documentId(), "asc")
+      .startAt(prefix);
+    if (input.after) {
+      query = query.startAfter(
+        agentActivityDocumentId(
+          input.agentId,
+          input.after.occurredAt,
+          input.after.id,
+        ),
+      );
+    }
+    query = query.endAt(prefix + "\uf8ff");
+    const [page, earliest] = await Promise.all([
+      query.limit(limit + 1).get(),
+      this.doc(
+        "agent_activity_bounds",
+        agentActivityBoundsId(input.agentId),
+      ).get(),
+    ]);
+    if (!page.empty && !earliest.exists) {
+      throw new Error("activity_bounds_missing");
+    }
+    const pageDocs = page.docs.slice(0, limit);
+    const activities = pageDocs.map((snapshot) => ({
+      activityId: String(snapshot.get("activity_id") ?? snapshot.id),
+      agentId: String(snapshot.get("agent_id") ?? input.agentId),
+      kind: String(snapshot.get("kind")) as RepositoryAgentActivityRecord["kind"],
+      source: String(snapshot.get("source")) as RepositoryAgentActivityRecord["source"],
+      action: String(snapshot.get("action")),
+      outcome: String(snapshot.get("outcome")) as RepositoryAgentActivityRecord["outcome"],
+      resourceType:
+        snapshot.get("resource_type") == null
+          ? null
+          : (String(snapshot.get("resource_type")) as RepositoryAgentActivityRecord["resourceType"]),
+      resourceId:
+        snapshot.get("resource_id") == null
+          ? null
+          : String(snapshot.get("resource_id")),
+      meshId:
+        snapshot.get("mesh_id") == null ? null : String(snapshot.get("mesh_id")),
+      topicId:
+        snapshot.get("topic_id") == null ? null : String(snapshot.get("topic_id")),
+      failureCode:
+        snapshot.get("failure_code") == null
+          ? null
+          : String(snapshot.get("failure_code")),
+      occurredAt: String(snapshot.get("occurred_at")),
+    }));
+    const last = pageDocs.at(-1);
+    return {
+      activities,
+      nextAfter:
+        page.docs.length > limit && last
+          ? {
+              occurredAt: String(last.get("occurred_at")),
+              id: String(last.get("activity_id")),
+            }
+          : null,
+      recordedSince: earliest.exists
+        ? String(earliest.get("recorded_since"))
+        : null,
+    };
   }
 
   private moderationCaseFromSnapshot(
@@ -10609,14 +10879,26 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     input: RepositoryPostInput,
   ): Promise<RepositoryPostResult> {
     const now = this.now();
+    if (input.activity && input.activity.agentId !== input.agentId) {
+      throw new Error("activity_agent_mismatch");
+    }
     const idempotencyRef = this.doc(
       "idempotency",
       input.agentId + ":" + input.eventType + ":" + input.idempotencyKey,
     );
     const postRef = this.doc("posts", input.postId);
     const outboxRef = this.doc("event_outbox", input.postId);
+    const activityBoundsRef = input.activity
+      ? this.doc(
+          "agent_activity_bounds",
+          agentActivityBoundsId(input.agentId),
+        )
+      : undefined;
     return this.firestore.runTransaction(async (transaction) => {
       const authority = await transaction.get(this.authorityRef(input.agentId));
+      const activityBounds = activityBoundsRef
+        ? await transaction.get(activityBoundsRef)
+        : undefined;
       if (
         !authority.exists ||
         authority.get("authority_kind") !== (input.authorityKind ?? "native") ||
@@ -11019,6 +11301,55 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         },
       };
       transaction.create(postRef, storedPost);
+      if (input.activity) {
+        const activityStorageId = agentActivityDocumentId(
+          input.agentId,
+          now,
+          input.activity.activityId,
+        );
+        transaction.create(
+          this.doc("agent_activity", activityStorageId),
+          {
+            contract_version: MESHR_CONTRACT_MAJOR,
+            activity_id: input.activity.activityId,
+            agent_id: input.activity.agentId,
+            kind: input.activity.kind,
+            source: input.activity.source,
+            action: input.activity.action,
+            outcome: input.activity.outcome,
+            resource_type: input.activity.resourceType,
+            resource_id: input.activity.resourceId,
+            mesh_id: input.activity.meshId,
+            topic_id: input.activity.topicId,
+            failure_code: input.activity.failureCode,
+            occurred_at: now,
+          },
+        );
+        transaction.create(
+          this.doc(
+            "agent_activity_ids",
+            agentActivityDedupeId(
+              input.agentId,
+              input.activity.activityId,
+            ),
+          ),
+          agentActivityDedupeDocument(input.activity, activityStorageId),
+        );
+        transaction.set(
+          activityBoundsRef!,
+          {
+            contract_version: MESHR_CONTRACT_MAJOR,
+            agent_id: input.agentId,
+            recorded_since: earlierTimestamp(
+              activityBounds?.exists
+                ? String(activityBounds.get("recorded_since") ?? "") || null
+                : null,
+              now,
+            ),
+          },
+          { merge: true },
+        );
+      }
       transaction.create(outboxRef, {
         contract_version: MESHR_CONTRACT_MAJOR,
         envelope,
