@@ -17,7 +17,7 @@ import {
   WarningCircle,
   X,
 } from "@phosphor-icons/react";
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import {
   agentProfilePayload,
   deriveAgentControlCenter,
@@ -92,6 +92,7 @@ export function AgentControlCenter({
   const [savingProfile, setSavingProfile] = useState(false);
   const [profileError, setProfileError] = useState("");
   const [profileSaved, setProfileSaved] = useState(false);
+  const tabRefs = useRef<Partial<Record<DetailTab, HTMLButtonElement | null>>>({});
   const model = deriveAgentControlCenter(input);
   const { agent, runtime, webMcp } = input;
   const action = model.lifecycle.primaryAction;
@@ -103,11 +104,11 @@ export function AgentControlCenter({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape" && !editingBehavior && !savingProfile) onClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [editingBehavior, onClose, savingProfile]);
 
   useEffect(() => {
     if (!editingBehavior) setProfileDraft(profileDraftForAgent(agent));
@@ -120,6 +121,34 @@ export function AgentControlCenter({
     setProfileError("");
     setProfileSaved(false);
     setEditingBehavior(true);
+  }
+
+  function moveTab(current: DetailTab, direction: "next" | "previous" | "first" | "last") {
+    const currentIndex = tabs.findIndex((candidate) => candidate.id === current);
+    const nextIndex = direction === "first"
+      ? 0
+      : direction === "last"
+        ? tabs.length - 1
+        : (currentIndex + (direction === "next" ? 1 : -1) + tabs.length) % tabs.length;
+    const next = tabs[nextIndex];
+    if (!next) return;
+    setTab(next.id);
+    tabRefs.current[next.id]?.focus();
+  }
+
+  function handleTabKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>, current: DetailTab) {
+    const direction = event.key === "ArrowRight" || event.key === "ArrowDown"
+      ? "next"
+      : event.key === "ArrowLeft" || event.key === "ArrowUp"
+        ? "previous"
+        : event.key === "Home"
+          ? "first"
+          : event.key === "End"
+            ? "last"
+            : null;
+    if (!direction) return;
+    event.preventDefault();
+    moveTab(current, direction);
   }
 
   function cancelEditingBehavior() {
@@ -152,10 +181,10 @@ export function AgentControlCenter({
   return (
     <main className="agent-control-center" aria-labelledby="agent-control-title">
       <header className="control-header">
-        <button className="control-back" onClick={onClose}>
+        <button className="control-back" onClick={onClose} disabled={editingBehavior || savingProfile}>
           <ArrowLeft size={17} /> <span>All agents</span>
         </button>
-        <button className="control-close" onClick={onClose} aria-label="Close agent detail">
+        <button className="control-close" onClick={onClose} disabled={editingBehavior || savingProfile} aria-label="Close agent detail">
           <X size={20} />
         </button>
       </header>
@@ -185,24 +214,31 @@ export function AgentControlCenter({
           )}
         </aside>
       </section>
-      <nav className="control-tabs" aria-label="Agent detail sections">
+      <nav className="control-tabs" aria-label="Agent detail sections" role="tablist">
         {tabs.map((candidate) => (
           <button
             key={candidate.id}
+            id={`agent-tab-${candidate.id}`}
+            ref={(element) => { tabRefs.current[candidate.id] = element; }}
+            type="button"
+            role="tab"
             className={candidate.id === tab ? "active" : ""}
-            aria-current={candidate.id === tab ? "page" : undefined}
+            aria-selected={candidate.id === tab}
+            aria-controls="agent-detail-panel"
+            tabIndex={candidate.id === tab ? 0 : -1}
+            onKeyDown={(event) => handleTabKeyDown(event, candidate.id)}
             onClick={() => setTab(candidate.id)}
           >
             {candidate.label}
           </button>
         ))}
       </nav>
-      <section className="control-content">
+      <section className="control-content" id="agent-detail-panel" role="tabpanel" tabIndex={-1} aria-labelledby={`agent-tab-${tab}`}>
         {tab === "overview" && (
           <div className="control-overview-grid">
             <article className="control-panel control-about">
               <p className="eyebrow">IDENTITY</p>
-              <h2>Built to notice the useful connection.</h2>
+              <h2>{agent.tagline || `${agent.name} is ready to participate.`}</h2>
               <p>{agent.personality || "No behavior profile has been synced for this identity yet."}</p>
               <div className="control-tags">
                 {agent.interests.map((interest) => <span key={interest}>{interest}</span>)}
@@ -252,7 +288,10 @@ export function AgentControlCenter({
                 <label>Attention note<textarea value={profileDraft.attention.notes} onChange={(event) => setProfileDraft((draft) => ({ ...draft, attention: { ...draft.attention, notes: event.target.value } }))} maxLength={2_000} rows={3} /></label>
               </fieldset>
               {profileError && <p className="control-profile-error" role="alert">{profileError}</p>}
-              <footer><span>{profileDirty ? "Changes are ready for Meshr to validate." : "No unsaved changes."}</span><button className="control-primary-action" disabled={!profileDirty || savingProfile}>{savingProfile ? "Saving…" : "Save profile"}</button></footer>
+                <footer>
+                  <span>{savingProfile ? "Saving… Keep this editor open." : profileDirty ? "Unsaved changes stay here. Use Cancel to discard them." : "No unsaved changes. Escape keeps the editor open."}</span>
+                  <button className="control-primary-action" disabled={!profileDirty || savingProfile}>{savingProfile ? "Saving…" : "Save profile"}</button>
+                </footer>
             </form>
           ) : (
             <div className="control-section-grid">

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useState } from "react";
+import { ArrowSquareOut, CheckCircle } from "@phosphor-icons/react";
 import {
   AgentActivityUnavailableError,
   listAgentActivity,
@@ -43,7 +44,15 @@ const availabilityLabel: Record<
 
 function formatWhen(value: string): string {
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      });
 }
 
 const actionLabel: Record<string, string> = {
@@ -65,15 +74,20 @@ function ActivityItem({
     .join(" · ");
   return (
     <li
+      data-activity-id={item.id}
       className={`agent-activity-ledger__item agent-activity-ledger__item--${item.kind.toLowerCase()}${failed ? " agent-activity-ledger__item--failed" : ""}`}
     >
       <div className="agent-activity-ledger__item-heading">
-        <span className="agent-activity-ledger__kind">{item.kind}</span>
-        <strong>{actionLabel[item.action] ?? item.action.replaceAll("_", " ")}</strong>
-        <span className="agent-activity-ledger__source">
-          {item.source === "webmcp" ? "Page WebMCP" : "Native connector"}
-        </span>
-        <time dateTime={item.occurredAt}>{formatWhen(item.occurredAt)}</time>
+        <div className="agent-activity-ledger__item-label">
+          <span className="agent-activity-ledger__kind">{item.kind}</span>
+          <strong>{actionLabel[item.action] ?? item.action.replaceAll("_", " ")}</strong>
+        </div>
+        <div className="agent-activity-ledger__item-meta">
+          <span className="agent-activity-ledger__source">
+            {item.source === "webmcp" ? "Page WebMCP" : "Native connector"}
+          </span>
+          <time dateTime={item.occurredAt}>{formatWhen(item.occurredAt)}</time>
+        </div>
       </div>
 
       {context ? <p className="agent-activity-ledger__context">{context}</p> : null}
@@ -110,8 +124,9 @@ function ActivityItem({
       ) : null}
 
       {item.target && onOpenTarget ? (
-        <button type="button" onClick={() => onOpenTarget(item.target!)}>
-          Open in conversation
+        <button className="agent-activity-ledger__target" type="button" onClick={() => onOpenTarget(item.target!)}>
+          <ArrowSquareOut size={15} />
+          Open exact activity target
         </button>
       ) : null}
     </li>
@@ -213,7 +228,16 @@ export function AgentActivityLedger({
         {empty && coverage?.status !== "unavailable" ? (
           <p>No recorded activity for this agent.</p>
         ) : null}
+        {coverage?.status === "complete" && coverage.recordedSince ? (
+          <p className="agent-activity-ledger__coverage"><CheckCircle size={14} weight="fill" /> Complete history · recorded since {formatWhen(coverage.recordedSince)}</p>
+        ) : null}
       </div>
+
+      {state.status === "loading" ? (
+        <div className="agent-activity-ledger__loading-list" aria-hidden="true">
+          <span /><span /><span />
+        </div>
+      ) : null}
 
       {state.items.length ? (
         <ol className="agent-activity-ledger__list" aria-label={`${agentLabel} activity`}>

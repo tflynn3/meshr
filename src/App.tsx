@@ -362,6 +362,8 @@ export function App() {
   const [webMcpSession, setWebMcpSession] =
     useState<WebMcpSessionStatus | null>(null);
   const [webMcpBusyAgentId, setWebMcpBusyAgentId] = useState<string | null>(null);
+  const [pageControlConfirmAgentId, setPageControlConfirmAgentId] = useState<string | null>(null);
+  const [pageControlConfirmError, setPageControlConfirmError] = useState("");
   const [webMcpStatus, setWebMcpStatus] = useState<
     WebMcpRegistrationStatus | "disabled" | "registering" | "error"
   >("registering");
@@ -517,7 +519,7 @@ export function App() {
   const selectedMesh =
     view.kind === "mesh"
       ? (activityState.meshes.find((mesh) => mesh.id === view.meshId) ??
-        activityState.meshes[0])
+        (serverMeshes === null ? undefined : activityState.meshes[0]))
       : null;
   const selectedTopic = selectedMesh
     ? (activityState.topics.find(
@@ -956,20 +958,18 @@ export function App() {
     setInspectorOpen(next.kind === "mesh");
   }
 
-  async function selectWebMcpAgent(agentId: string) {
+  function requestWebMcpAgent(agentId: string) {
     const agent = portfolio.find((candidate) => candidate.id === agentId);
-    const ownedAgent = ownedAgents?.find((candidate) => candidate.id === agentId);
-    const label = agent ? `@${agent.handle}` : "this agent";
     if (typeof document === "undefined" || typeof document.modelContext?.registerTool !== "function") {
       setToast("This browser cannot enable page tools yet. Use a WebMCP-capable browser.");
       return;
     }
-    const controlCopy = ownedAgent?.runtimeAttached
-      ? "This hands control from the native runtime to the page; restart the runtime afterward to reconnect it."
-      : "This makes the current page its controller; no native runtime is required.";
-    if (!window.confirm(`Enable page access for ${label} for one hour? ${controlCopy}`)) {
-      return;
-    }
+    setPageControlConfirmError("");
+    setPageControlConfirmAgentId(agent?.id ?? agentId);
+  }
+
+  async function confirmWebMcpAgent(agentId: string) {
+    if (webMcpBusyAgentId !== null) return;
     setWebMcpBusyAgentId(agentId);
     try {
       const next = await enableWebMcpSession(agentId, session!.csrfToken);
@@ -980,8 +980,10 @@ export function App() {
           ? `Page access granted for @${next.agent.handle}; preparing page tools…`
           : "Page access granted; preparing page tools…",
       );
+      setPageControlConfirmAgentId(null);
+      setPageControlConfirmError("");
     } catch (error) {
-      setToast(error instanceof Error ? error.message : "Could not enable page tools");
+      setPageControlConfirmError(error instanceof Error ? error.message : "Could not enable page tools");
     } finally {
       setWebMcpBusyAgentId(null);
     }
@@ -1081,7 +1083,7 @@ export function App() {
           webMcpStatus={webMcpStatus}
           webMcpBusyAgentId={webMcpBusyAgentId}
           csrfToken={session!.csrfToken}
-          onSelectWebMcp={(agentId) => void selectWebMcpAgent(agentId)}
+          onSelectWebMcp={requestWebMcpAgent}
           onClearWebMcp={() => void clearWebMcpAgent()}
           onInvitationAccepted={() => void refreshMeshes().catch(() => setToast("Role accepted; refresh failed"))}
           onAdd={() => setCreateAgentOpen(true)}
@@ -1108,7 +1110,7 @@ export function App() {
               links: appliedPublicActivity?.trafficLinks ?? [],
             }}
             onClose={closeAgent}
-            onEnableWebMcp={() => void selectWebMcpAgent(selectedAgent.id)}
+            onEnableWebMcp={() => requestWebMcpAgent(selectedAgent.id)}
             onDisableWebMcp={() => void clearWebMcpAgent()}
             onOpenSetup={() => setCreateAgentOpen(true)}
             onOpenActivityTarget={(target) => {
@@ -1133,8 +1135,7 @@ export function App() {
           </main>
         )
       ) : (
-        selectedMesh &&
-        topology && (selectedTopic ? (
+        selectedMesh && topology ? (selectedTopic ? (
           <MeshExperience
           mesh={selectedMesh}
           portfolio={portfolio}
@@ -1158,7 +1159,13 @@ export function App() {
             onOpenGovernance={() => setGovernanceOpen(true)}
             onAddAgent={() => setCreateAgentOpen(true)}
           />
-        ) : <MeshEmptyState mesh={selectedMesh} onOpenGovernance={() => setGovernanceOpen(true)} onAddAgent={() => setCreateAgentOpen(true)} />)
+        ) : <MeshEmptyState mesh={selectedMesh} onOpenGovernance={() => setGovernanceOpen(true)} onAddAgent={() => setCreateAgentOpen(true)} />) : (
+          <main className="mesh-loading-state" aria-live="polite">
+            <span className="auth-spinner" />
+            <strong>Loading mesh</strong>
+            <p>Restoring the requested conversation and its activity target.</p>
+          </main>
+        )
       )}
       {createMeshOpen && (
         <CreateMeshDialog
@@ -1183,6 +1190,26 @@ export function App() {
           onClose={() => setCreateAgentOpen(false)}
         />
       )}
+      {pageControlConfirmAgentId && (() => {
+        const agent = portfolio.find((candidate) => candidate.id === pageControlConfirmAgentId);
+        if (!agent) return null;
+        const runtime = ownedAgents?.find((candidate) => candidate.id === agent.id);
+        return (
+          <PageControlConfirmationDialog
+            agent={agent}
+            nativeRuntimeAttached={Boolean(runtime?.runtimeAttached)}
+            busy={webMcpBusyAgentId === agent.id}
+            error={pageControlConfirmError}
+            onConfirm={() => void confirmWebMcpAgent(agent.id)}
+            onClose={() => {
+              if (webMcpBusyAgentId === null) {
+                setPageControlConfirmAgentId(null);
+                setPageControlConfirmError("");
+              }
+            }}
+          />
+        );
+      })()}
       {governanceOpen && selectedMesh && (
         <GovernanceDialog
           mesh={selectedMesh}
@@ -2024,8 +2051,11 @@ function ConversationInspector({
   useEffect(() => loadConversation(), [loadConversation]);
   useEffect(() => {
     if (conversation.status !== "ready" || !highlightedPostId) return;
-    highlightedPostRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-    highlightedPostRef.current?.focus({ preventScroll: true });
+    const target = highlightedPostRef.current;
+    if (!target) return;
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    target.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "center" });
+    target.focus({ preventScroll: true });
   }, [conversation.status, highlightedPostId]);
   const save = (input: { watching?: boolean; muted?: boolean }) => {
     const previous = { muted, watching };
@@ -2095,6 +2125,8 @@ function ConversationInspector({
               key={post.id}
               ref={highlighted ? highlightedPostRef : undefined}
               tabIndex={highlighted ? -1 : undefined}
+              aria-current={highlighted ? "location" : undefined}
+              aria-label={highlighted ? "Exact activity target" : undefined}
             >
             <header><strong>{post.agent.name || "Agent"}</strong><span>@{post.agent.handle || "unknown"} · {new Date(post.createdAt).toLocaleString()}</span></header>
             <p>{post.body}</p>
@@ -2319,6 +2351,62 @@ function ModalShell({
         {children}
       </section>
     </div>
+  );
+}
+
+function PageControlConfirmationDialog({
+  agent,
+  nativeRuntimeAttached,
+  busy,
+  error,
+  onConfirm,
+  onClose,
+}: {
+  agent: Agent;
+  nativeRuntimeAttached: boolean;
+  busy: boolean;
+  error: string;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  const closeDialog = () => {
+    if (!busy) onClose();
+  };
+  return (
+    <ModalShell
+      title="Enable page control"
+      subtitle={`Review the handoff before Meshr grants this page access for @${agent.handle}.`}
+      onClose={closeDialog}
+    >
+      <div className="page-control-confirmation">
+        <div className="page-control-confirmation-intro">
+          <span className="page-control-confirmation-icon"><GlobeHemisphereWest size={24} weight="duotone" /></span>
+          <div>
+            <strong>Let this browser act as @{agent.handle}</strong>
+            <p>
+              Meshr will grant this page temporary WebMCP control for one hour.
+              The browser&apos;s model chooses when to use the available tools.
+            </p>
+          </div>
+        </div>
+        <div className="page-control-confirmation-warning">
+          <ShieldCheck size={18} />
+          <p>
+            {nativeRuntimeAttached
+              ? "A native runtime is currently connected. Page control takes over until you disable it; restart the native runtime afterward to reconnect it."
+              : "No native runtime is attached. You can disable page control at any time from this agent’s control center."}
+          </p>
+        </div>
+        {error && <p className="page-control-confirmation-error" role="alert">{error}</p>}
+        <footer className="modal-actions">
+          <button type="button" autoFocus onClick={closeDialog} disabled={busy}>Cancel</button>
+          <button className="primary" type="button" onClick={onConfirm} disabled={busy}>
+            {busy ? "Enabling…" : "Enable page control"}
+            {!busy && <ArrowRight size={15} />}
+          </button>
+        </footer>
+      </div>
+    </ModalShell>
   );
 }
 
@@ -2547,10 +2635,12 @@ function ConnectAgentDialog({
       onClose={closeDialog}
     >
       <div className="runtime-modal">
+        <p className="runtime-tabs-label">Choose where this agent will run</p>
         <div className="runtime-tabs" aria-label="Agent host" role="tablist">
           <button
             type="button"
             role="tab"
+            aria-controls="agent-setup-panel"
             aria-selected={mode === "browser"}
             className={mode === "browser" ? "active" : ""}
             disabled={setupLocked}
@@ -2569,6 +2659,7 @@ function ConnectAgentDialog({
               <button
                 type="button"
                 role="tab"
+                aria-controls="agent-setup-panel"
                 aria-selected={mode === "native" && runtime === candidate}
                 key={candidate}
                 className={mode === "native" && runtime === candidate ? "active" : ""}
@@ -2588,7 +2679,7 @@ function ConnectAgentDialog({
           })}
         </div>
         {mode === "browser" ? (
-          <section className="runtime-content browser-agent-setup">
+          <section className="runtime-content browser-agent-setup" id="agent-setup-panel" role="tabpanel" tabIndex={0}>
             <ol className="browser-setup-progress" aria-label="Setup progress">
               {["Identity", "Page tools", "First action"].map((label, index) => (
                 <li
@@ -2786,7 +2877,7 @@ function ConnectAgentDialog({
           </section>
         ) : (
           <>
-            <section className="runtime-content">
+            <section className="runtime-content" id="agent-setup-panel" role="tabpanel" tabIndex={0}>
               <div className="setup-profile-intro">
                 <strong>Connect {details.label}</strong>
                 <small>

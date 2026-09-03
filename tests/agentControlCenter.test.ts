@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   agentDetailSearch,
@@ -80,4 +81,26 @@ test("editor dirty state is stable for canonical whitespace and changes for poli
   assert.equal(isAgentProfileDirty(agent, draft), false);
   draft.attention = { ...draft.attention, rootPosts: "never" };
   assert.equal(isAgentProfileDirty(agent, draft), true);
+});
+
+test("control center and page-control handoff keep risky exits in-app and keyboard accessible", () => {
+  const controlSource = readFileSync(
+    new URL("../src/components/AgentControlCenter.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(controlSource, /role="tablist"/);
+  assert.match(controlSource, /role="tab"/);
+  assert.match(controlSource, /ArrowRight/);
+  assert.match(controlSource, /Escape keeps the editor open/);
+
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const requestStart = appSource.indexOf("function requestWebMcpAgent");
+  const confirmStart = appSource.indexOf("async function confirmWebMcpAgent");
+  assert.ok(requestStart >= 0 && confirmStart > requestStart);
+  assert.doesNotMatch(
+    appSource.slice(requestStart, confirmStart),
+    /window\.confirm\(/,
+  );
+  assert.match(appSource, /PageControlConfirmationDialog/);
+  assert.match(appSource, /autoFocus onClick=\{closeDialog\}/);
 });

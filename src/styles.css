@@ -875,6 +875,8 @@ button:focus-visible {
   font-weight: 700;
 }
 .control-back:hover { color: #243d1c; }
+.control-back:disabled,
+.control-close:disabled { cursor: not-allowed; opacity: 0.45; }
 .control-close { width: 34px; justify-content: center; }
 .control-close:hover { background: #f0f0e9; border-radius: 50%; }
 .control-hero {
@@ -961,6 +963,11 @@ button:focus-visible {
   font-weight: 700;
 }
 .control-tabs button.active { border-color: #8ca324; color: #344622; }
+.control-tabs button:focus-visible {
+  outline: 3px solid rgb(143 168 45 / 35%);
+  outline-offset: -3px;
+  border-radius: 5px 5px 0 0;
+}
 .control-content { padding: 24px 2px 0; }
 .control-overview-grid,
 .control-section-grid {
@@ -1129,6 +1136,20 @@ button:focus-visible {
 .control-agent-missing { display: grid; align-content: start; gap: 12px; padding-top: 32px; }
 .control-agent-missing h1 { margin: 34px 0 0; font: 500 34px/1 Georgia, "Times New Roman", serif; }
 .control-agent-missing p { margin: 0; color: var(--muted); font-size: 12px; }
+.mesh-loading-state {
+  min-height: 100vh;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  padding: 32px;
+  background: #fcfbf8;
+  color: #394235;
+  text-align: center;
+}
+.mesh-loading-state .auth-spinner { width: 28px; height: 28px; }
+.mesh-loading-state strong { font: 500 24px/1.1 Georgia, "Times New Roman", serif; }
+.mesh-loading-state p { margin: 0; color: #747970; font-size: 11px; }
 
 /* Mesh room */
 .mesh-experience {
@@ -1382,10 +1403,11 @@ button:focus-visible {
 }
 .conversation-map {
   position: relative;
+  height: 100%;
   min-height: 0;
   overflow: hidden;
 }
-.topology-canvas { position: relative; min-height: 0; }
+.topology-canvas { position: relative; height: 100%; min-height: 0; }
 .topology-view-switch {
   position: absolute;
   z-index: 8;
@@ -1798,7 +1820,8 @@ button:focus-visible {
 .conversation-posts { display: grid; gap: 9px; margin-top: 13px; }
 .conversation-posts article { padding: 9px 10px; border: 1px solid #e1e1d9; border-radius: 7px; background: #faf9f5; }
 .conversation-posts article.reply { margin-left: 12px; border-left: 3px solid #c8d86a; }
-.conversation-posts article.highlighted { border-color: #92aa22; box-shadow: 0 0 0 3px rgba(146, 170, 34, 0.18); }
+.conversation-posts article.highlighted { border-color: #92aa22; background: #f5f9df; box-shadow: 0 0 0 3px rgba(146, 170, 34, 0.18); }
+.conversation-posts article.highlighted:focus-visible { outline: 3px solid #8ea82d; outline-offset: 3px; }
 .conversation-posts header { display: grid; gap: 2px; }
 .conversation-posts strong { font-size: 9px; }
 .conversation-posts header span { color: #7b8179; font-size: 7px; }
@@ -2676,9 +2699,17 @@ button:focus-visible {
 .runtime-modal {
   padding: 20px 24px 22px;
 }
+.runtime-tabs-label {
+  margin: 0 0 9px;
+  color: #69705d;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
 .runtime-tabs {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 9px;
 }
 .runtime-tabs > button {
@@ -2691,6 +2722,10 @@ button:focus-visible {
   gap: 10px;
   text-align: left;
   padding: 0 14px;
+}
+.runtime-tabs > button:first-child {
+  grid-column: 1 / -1;
+  min-height: 74px;
 }
 .runtime-tabs > button.active {
   border-color: #9fb42d;
@@ -3313,6 +3348,65 @@ button:focus-visible {
 }
 .native-advanced .setup-command-list {
   margin: 10px 14px 14px;
+}
+
+.page-control-confirmation {
+  display: grid;
+  gap: 17px;
+  padding: 22px 24px 24px;
+}
+.page-control-confirmation-intro {
+  display: grid;
+  grid-template-columns: 42px 1fr;
+  gap: 12px;
+  align-items: start;
+}
+.page-control-confirmation-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #d3df9f;
+  border-radius: 11px;
+  background: #f2f6dd;
+  color: #617329;
+}
+.page-control-confirmation-intro strong {
+  display: block;
+  color: #303b2b;
+  font: 500 21px/1.15 Georgia, "Times New Roman", serif;
+}
+.page-control-confirmation-intro p {
+  margin: 7px 0 0;
+  color: #68715f;
+  font-size: 11px;
+  line-height: 1.55;
+}
+.page-control-confirmation-warning {
+  display: grid;
+  grid-template-columns: 21px 1fr;
+  gap: 9px;
+  padding: 12px 13px;
+  border: 1px solid #ded9bd;
+  border-radius: 8px;
+  background: #faf7e8;
+  color: #665d32;
+}
+.page-control-confirmation-warning p,
+.page-control-confirmation-error {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.page-control-confirmation-error {
+  padding: 10px 12px;
+  border: 1px solid #e7beb5;
+  border-radius: 7px;
+  background: #fff2ef;
+  color: #994734;
+}
+.page-control-confirmation .modal-actions {
+  margin-top: 1px;
 }
 
 /* Account and pairing */

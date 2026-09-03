@@ -19,7 +19,6 @@ import {
   Position,
   ReactFlow,
   type ReactFlowInstance,
-  getBezierPath,
   type Edge,
   type EdgeProps,
   type Node,
@@ -28,6 +27,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { TrafficLink, TrafficProcessor } from "../domain/topology";
 import type { Agent, Topic } from "../domain/types";
+import { routeTrafficEdge, trafficPorts, visibleTrafficLinks, type TopologyRect } from "./topologyRouting";
 import "@xyflow/react/dist/style.css";
 
 interface ConversationNodeData extends Record<string, unknown> {
@@ -47,6 +47,7 @@ interface TrafficEdgeData extends Record<string, unknown> {
   link: TrafficLink;
   selected: boolean;
   onSelect: (id: string) => void;
+  route: ReturnType<typeof routeTrafficEdge>;
 }
 
 type ConversationFlowNode = Node<ConversationNodeData, "conversation">;
@@ -204,13 +205,8 @@ function AgentNode({ data }: NodeProps<AgentFlowNode>) {
   </button>;
 }
 
-function ConversationEdge(props: EdgeProps) {
-  const [path] = getBezierPath({ ...props, curvature: 0.5 });
-  return <BaseEdge id={props.id} path={path} className="conversation-edge-path" interactionWidth={24} />;
-}
-
 function TrafficEdge(props: EdgeProps<Edge<TrafficEdgeData>>) {
-  const [path, labelX, labelY] = getBezierPath({ ...props, curvature: 0.58 });
+  const { path, label: { x: labelX, y: labelY } } = props.data!.route;
   const link = props.data!.link;
   const Icon = processorIcons[link.processor];
   return <>
@@ -231,7 +227,7 @@ function TrafficEdge(props: EdgeProps<Edge<TrafficEdgeData>>) {
 }
 
 const nodeTypes = { conversation: ConversationNode, agent: AgentNode };
-const edgeTypes = { conversation: ConversationEdge, traffic: TrafficEdge };
+const edgeTypes = { traffic: TrafficEdge };
 
 export function TopologyCanvas({
   topics,
@@ -255,7 +251,7 @@ export function TopologyCanvas({
   onSelectAgent: (id: string) => void;
 }) {
   const mapRef = useRef<HTMLDivElement>(null);
-  const flowRef = useRef<ReactFlowInstance<FlowNode, Edge> | null>(null);
+  const flowRef = useRef<ReactFlowInstance<FlowNode, Edge<TrafficEdgeData>> | null>(null);
   const [presentation, setPresentation] = useState<"map" | "list">("map");
 
   useEffect(() => {
@@ -299,17 +295,19 @@ export function TopologyCanvas({
       selectable: false,
       data: { agent, selected: agent.id === selectedAgentId, onSelect: onSelectAgent },
     }));
-    const conversationEdges: Edge[] = visibleTopics.slice(1).map((topic, index) => ({
-      id: `conversation-${index}`,
-      source: visibleTopics[index % Math.max(1, visibleTopics.length)]?.id ?? topic.id,
-      target: topic.id,
-      type: "conversation",
-      selectable: false,
+    const layoutRects: TopologyRect[] = [...conversationNodes, ...agentNodes].map((node) => ({
+      id: node.id,
+      x: node.position.x,
+      y: node.position.y,
+      width: node.width ?? 58,
+      height: node.height ?? 58,
     }));
     const agentIds = new Set(visibleAgents.map((agent) => agent.id));
-    const trafficEdges: Array<Edge<TrafficEdgeData>> = trafficLinks
+    // Topics are not connected by a domain relationship. Only render
+    // evidence-backed agent traffic; avoid implying decorative conversation
+    // links that do not exist in the projection.
+    const trafficEdges: Array<Edge<TrafficEdgeData>> = visibleTrafficLinks(trafficLinks, selectedLinkId)
       .filter((link) => agentIds.has(link.sourceAgentId) && agentIds.has(link.targetAgentId))
-      .slice(0, 5)
       .map((link) => ({
         id: link.id,
         source: link.sourceAgentId,
@@ -317,9 +315,23 @@ export function TopologyCanvas({
         type: "traffic",
         animated: true,
         selectable: true,
-        data: { link, selected: link.id === selectedLinkId, onSelect: onSelectLink },
+        data: (() => {
+          const sourceRect = layoutRects.find((rect) => rect.id === link.sourceAgentId)!;
+          const targetRect = layoutRects.find((rect) => rect.id === link.targetAgentId)!;
+          const ports = trafficPorts(sourceRect, targetRect);
+          const route = routeTrafficEdge({
+            sourceNodeId: link.sourceAgentId,
+            targetNodeId: link.targetAgentId,
+            source: ports.source,
+            target: ports.target,
+            sourceRect,
+            targetRect,
+            obstacles: layoutRects,
+          });
+          return { link, selected: link.id === selectedLinkId, onSelect: onSelectLink, route };
+        })(),
       }));
-    return { nodes: [...conversationNodes, ...agentNodes], edges: [...conversationEdges, ...trafficEdges] };
+    return { nodes: [...conversationNodes, ...agentNodes], edges: trafficEdges };
   }, [agents, onSelectAgent, onSelectLink, onSelectTopic, selectedAgentId, selectedLinkId, selectedTopicId, topics, trafficLinks]);
 
   return <section className={`topology-canvas ${presentation}`} aria-label="Mesh topology">
