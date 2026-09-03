@@ -174,3 +174,16 @@ The remaining product boundary is explicit:
   remain external launch gates.
 
 visual comparison result: passed for the archived capture scope
+
+
+## 2026-09-02 rail logo follow-up
+
+A focused QA pass replaced the former rail wordmark with the user-selected four-diamond Meshr lockup. The detailed source-plus-browser comparison is stored in the ignored local context at `.agent-context/brand-qa/design-qa.md`.
+
+- Source: selected ImageGen concept `exec-5439a2fb-d8bf-427e-8c8a-f4eb40a47246.png`.
+- Final asset: `public/meshr-wordmark.png`, 210 x 76 RGBA, rendered at 92 x 33.29 CSS pixels.
+- The first pass found and removed an opaque background matte and glow.
+- The final browser capture preserved the glyph, lime accent, lowercase wordmark, and existing home-button behavior with no console errors.
+- `npm run typecheck` and `npm run build:npm` passed.
+
+final result: passed
