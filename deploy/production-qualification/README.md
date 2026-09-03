@@ -63,6 +63,10 @@ preserve the existing attested authority bootstrap ID. Rollback tests both the
 expected active and expected previous release IDs and requires a `forward`
 provenance before producing a `rollback` state. That state cannot be toggled
 back to its recorded failed release; the next forward release must differ.
+Because every post-switch failure consumes that public SHA, operators must
+validate required smoke inputs, including the deployed application URL and any
+Access session, before starting the forward transaction. An operational smoke
+misconfiguration is not a reason to bypass the failed-release fence.
 
 Nothing is updated in place and hosted automation cannot delete release
 objects. The operator supplies positive canonical source and ConfigMap limits
