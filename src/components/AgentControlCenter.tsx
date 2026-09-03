@@ -62,7 +62,7 @@ function formatTimestamp(value: string | null | undefined): string {
 }
 
 function visibilityLabel(visibility: "public" | "unlisted" | "private") {
-  return visibility === "public" ? "Public" : visibility === "private" ? "Private" : "Unlisted";
+  return visibility === "public" ? "Public" : visibility === "private" ? "Private" : "Joined-only";
 }
 
 function EmptyState({ children }: { children: ReactNode }) {
@@ -77,6 +77,8 @@ export function AgentControlCenter({
   onOpenSetup,
   onOpenActivityTarget,
   onSaveProfile,
+  onUnsavedChangesChange,
+  discardRevision,
 }: {
   input: AgentControlCenterInput;
   onClose: () => void;
@@ -85,6 +87,8 @@ export function AgentControlCenter({
   onOpenSetup: () => void;
   onOpenActivityTarget: (target: AgentActivityTarget) => void;
   onSaveProfile: (input: AgentProfilePayload) => Promise<void>;
+  onUnsavedChangesChange: (dirty: boolean) => void;
+  discardRevision: number;
 }) {
   const [tab, setTab] = useState<DetailTab>("overview");
   const [editingBehavior, setEditingBehavior] = useState(false);
@@ -93,6 +97,7 @@ export function AgentControlCenter({
   const [profileError, setProfileError] = useState("");
   const [profileSaved, setProfileSaved] = useState(false);
   const tabRefs = useRef<Partial<Record<DetailTab, HTMLButtonElement | null>>>({});
+  const appliedDiscardRevision = useRef(discardRevision);
   const model = deriveAgentControlCenter(input);
   const { agent, runtime, webMcp } = input;
   const action = model.lifecycle.primaryAction;
@@ -104,17 +109,34 @@ export function AgentControlCenter({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !editingBehavior && !savingProfile) onClose();
+      if (event.key === "Escape" && !savingProfile) onClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [editingBehavior, onClose, savingProfile]);
+  }, [onClose, savingProfile]);
 
   useEffect(() => {
     if (!editingBehavior) setProfileDraft(profileDraftForAgent(agent));
   }, [agent, editingBehavior]);
 
+  useEffect(() => {
+    if (appliedDiscardRevision.current === discardRevision) return;
+    appliedDiscardRevision.current = discardRevision;
+    setProfileDraft(profileDraftForAgent(agent));
+    setProfileError("");
+    setEditingBehavior(false);
+  }, [agent, discardRevision]);
+
   const profileDirty = isAgentProfileDirty(agent, profileDraft);
+
+  useEffect(() => {
+    onUnsavedChangesChange(editingBehavior && profileDirty);
+  }, [editingBehavior, onUnsavedChangesChange, profileDirty]);
+
+  useEffect(
+    () => () => onUnsavedChangesChange(false),
+    [onUnsavedChangesChange],
+  );
 
   function beginEditingBehavior() {
     setProfileDraft(profileDraftForAgent(agent));
@@ -181,10 +203,10 @@ export function AgentControlCenter({
   return (
     <main className="agent-control-center" aria-labelledby="agent-control-title">
       <header className="control-header">
-        <button className="control-back" onClick={onClose} disabled={editingBehavior || savingProfile}>
+        <button className="control-back" onClick={onClose} disabled={savingProfile}>
           <ArrowLeft size={17} /> <span>All agents</span>
         </button>
-        <button className="control-close" onClick={onClose} disabled={editingBehavior || savingProfile} aria-label="Close agent detail">
+        <button className="control-close" onClick={onClose} disabled={savingProfile} aria-label="Close agent detail">
           <X size={20} />
         </button>
       </header>
@@ -289,7 +311,7 @@ export function AgentControlCenter({
               </fieldset>
               {profileError && <p className="control-profile-error" role="alert">{profileError}</p>}
                 <footer>
-                  <span>{savingProfile ? "Saving… Keep this editor open." : profileDirty ? "Unsaved changes stay here. Use Cancel to discard them." : "No unsaved changes. Escape keeps the editor open."}</span>
+                  <span>{savingProfile ? "Saving… Keep this editor open." : profileDirty ? "Unsaved changes stay here until you save or explicitly discard them." : "No unsaved changes."}</span>
                   <button className="control-primary-action" disabled={!profileDirty || savingProfile}>{savingProfile ? "Saving…" : "Save profile"}</button>
                 </footer>
             </form>

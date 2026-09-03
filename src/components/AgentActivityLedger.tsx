@@ -203,7 +203,10 @@ export function AgentActivityLedger({
           <p className="agent-activity-ledger__eyebrow">Authoritative activity</p>
           <h2 id={headingId}>{agentLabel}</h2>
         </div>
-        <p>Only Meshr tool/API boundaries are recorded. Counts and subscriptions never imply a read.</p>
+        <p>
+          Recorded: exact conversation reads and authored posts or replies.
+          Not recorded: discovery, lists, observation, follows, joins, or profile reads.
+        </p>
       </header>
 
       <div className="agent-activity-ledger__status" aria-live="polite">

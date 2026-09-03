@@ -91,7 +91,8 @@ test("control center and page-control handoff keep risky exits in-app and keyboa
   assert.match(controlSource, /role="tablist"/);
   assert.match(controlSource, /role="tab"/);
   assert.match(controlSource, /ArrowRight/);
-  assert.match(controlSource, /Escape keeps the editor open/);
+  assert.match(controlSource, /onUnsavedChangesChange\(editingBehavior && profileDirty\)/);
+  assert.match(controlSource, /until you save or explicitly discard them/);
 
   const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const requestStart = appSource.indexOf("function requestWebMcpAgent");
@@ -103,4 +104,8 @@ test("control center and page-control handoff keep risky exits in-app and keyboa
   );
   assert.match(appSource, /PageControlConfirmationDialog/);
   assert.match(appSource, /autoFocus onClick=\{closeDialog\}/);
+  assert.match(appSource, /window\.addEventListener\("beforeunload", warnBeforeUnload\)/);
+  assert.match(appSource, /UnsavedProfileNavigationDialog/);
+  assert.match(appSource, /Discard changes/);
+  assert.match(appSource, /requestAppNavigation\(\(\) => window\.history\.back\(\)\)/);
 });

@@ -253,6 +253,19 @@ export function TopologyCanvas({
   const mapRef = useRef<HTMLDivElement>(null);
   const flowRef = useRef<ReactFlowInstance<FlowNode, Edge<TrafficEdgeData>> | null>(null);
   const [presentation, setPresentation] = useState<"map" | "list">("map");
+  const [reducedMotion, setReducedMotion] = useState(() =>
+    typeof window !== "undefined" &&
+    (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false),
+  );
+
+  useEffect(() => {
+    const query = window.matchMedia?.("(prefers-reduced-motion: reduce)");
+    if (!query) return;
+    const update = () => setReducedMotion(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
 
   useEffect(() => {
     const element = mapRef.current;
@@ -313,7 +326,7 @@ export function TopologyCanvas({
         source: link.sourceAgentId,
         target: link.targetAgentId,
         type: "traffic",
-        animated: true,
+        animated: !reducedMotion,
         selectable: true,
         data: (() => {
           const sourceRect = layoutRects.find((rect) => rect.id === link.sourceAgentId)!;
@@ -332,7 +345,7 @@ export function TopologyCanvas({
         })(),
       }));
     return { nodes: [...conversationNodes, ...agentNodes], edges: trafficEdges };
-  }, [agents, onSelectAgent, onSelectLink, onSelectTopic, selectedAgentId, selectedLinkId, selectedTopicId, topics, trafficLinks]);
+  }, [agents, onSelectAgent, onSelectLink, onSelectTopic, reducedMotion, selectedAgentId, selectedLinkId, selectedTopicId, topics, trafficLinks]);
 
   return <section className={`topology-canvas ${presentation}`} aria-label="Mesh topology">
     <div className="topology-view-switch" role="group" aria-label="Topology presentation">

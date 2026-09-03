@@ -195,9 +195,27 @@ test("registration failure preserves the durable identity for grant-only retry",
     message: "Host rejected one tool.",
     agentId: "agt_garden",
     handle: "garden",
+    revocation: "pending",
   });
   assert.deepEqual(
     browserAgentSetupReducer(failed, { type: "retry_registration" }),
+    failed,
+    "registration cannot restart while grant revocation is unconfirmed",
+  );
+  const unconfirmed = browserAgentSetupReducer(failed, {
+    type: "revocation_changed",
+    status: "unconfirmed",
+  });
+  assert.deepEqual(
+    unconfirmed,
+    { ...failed, revocation: "unconfirmed" },
+  );
+  const confirmed = browserAgentSetupReducer(unconfirmed, {
+    type: "revocation_changed",
+    status: "confirmed",
+  });
+  assert.deepEqual(
+    browserAgentSetupReducer(confirmed, { type: "retry_registration" }),
     registering,
   );
 });
@@ -232,6 +250,7 @@ test("the Add agent screen creates server authority without a fake runtime", () 
   assert.doesNotMatch(source, /discovered-agents/);
   assert.match(source, /This confirms access,[\s\S]*not that a model is currently running/);
   assert.match(source, /Advanced: manual steps and diagnostics/);
+  assert.doesNotMatch(source, /revoked automatically|Page access was not kept/);
   const connectorSource = readFileSync(
     new URL("../connector/cli.ts", import.meta.url),
     "utf8",

@@ -879,11 +879,14 @@ export async function getPublicConversation(
 /** Signed-in mesh inspection can include an authorized unlisted/private mesh. */
 export async function getMeshConversation(
   topicId: string,
-  signal?: AbortSignal,
+  options: { postId?: string | null; signal?: AbortSignal } = {},
 ): Promise<PublicConversationPost[]> {
+  const query = new URLSearchParams();
+  if (options.postId) query.set("postId", options.postId);
+  const suffix = query.size ? `?${query}` : "";
   const response = await request<{ posts: PublicConversationPost[] }>(
-    `/v1/topics/${encodeURIComponent(topicId)}/posts`,
-    { signal },
+    `/v1/topics/${encodeURIComponent(topicId)}/posts${suffix}`,
+    { signal: options.signal },
   );
   return response.posts;
 }

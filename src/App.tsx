@@ -28,6 +28,7 @@ import {
   TerminalWindow,
   Tree,
   UsersThree,
+  WarningCircle,
   X,
 } from "@phosphor-icons/react";
 import {
@@ -102,6 +103,7 @@ import {
   readAgentDetailRoute,
 } from "./domain/agentControlCenter";
 import { applyPublicActivitySnapshot } from "./domain/publicActivity";
+import { insertPageCreatedAgent } from "./domain/ownedAgentProjection";
 import { meshNavigationUrl, readMeshNavigation, type MeshNavigation } from "./domain/meshNavigation";
 import { projectMeshTopology, type TrafficLink } from "./domain/topology";
 import { connectedAgentId, meshStore } from "./domain/runtime";
@@ -115,6 +117,7 @@ import {
   nativeSetupMeshrHandle,
   suggestAgentHandle,
   type AgentSetupRuntime,
+  type BrowserRegistrationRevocation,
 } from "./setup/agentSetup";
 import type {
   Agent,
@@ -136,6 +139,7 @@ type View =
   | { kind: "agents" }
   | { kind: "agent"; agentId: string }
   | { kind: "mesh"; meshId: string };
+type WebMcpRevocationStatus = "idle" | BrowserRegistrationRevocation;
 const WEBMCP_SESSION_CHANNEL = "meshr.webmcp.session.v1";
 const DURABLE_STATE_REQUIRED = import.meta.env.VITE_DURABLE_STATE === "1";
 
@@ -159,7 +163,7 @@ function announceWebMcpSessionChange() {
 
 const visibilityLabels: Record<MeshVisibility, string> = {
   public: "Public",
-  unlisted: "Unlisted",
+  unlisted: "Joined-only",
   private: "Private",
 };
 const meshIcons = [
@@ -364,6 +368,15 @@ export function App() {
   const [webMcpBusyAgentId, setWebMcpBusyAgentId] = useState<string | null>(null);
   const [pageControlConfirmAgentId, setPageControlConfirmAgentId] = useState<string | null>(null);
   const [pageControlConfirmError, setPageControlConfirmError] = useState("");
+  const [webMcpRevocationStatus, setWebMcpRevocationStatus] =
+    useState<WebMcpRevocationStatus>("idle");
+  const [behaviorProfileDirty, setBehaviorProfileDirty] = useState(false);
+  const [behaviorDiscardRevision, setBehaviorDiscardRevision] = useState(0);
+  const [unsavedNavigationOpen, setUnsavedNavigationOpen] = useState(false);
+  const behaviorProfileDirtyRef = useRef(false);
+  const pendingNavigationRef = useRef<(() => void) | null>(null);
+  const viewRef = useRef(view);
+  viewRef.current = view;
   const [webMcpStatus, setWebMcpStatus] = useState<
     WebMcpRegistrationStatus | "disabled" | "registering" | "error"
   >("registering");
@@ -518,14 +531,15 @@ export function App() {
       : null;
   const selectedMesh =
     view.kind === "mesh"
-      ? (activityState.meshes.find((mesh) => mesh.id === view.meshId) ??
-        (serverMeshes === null ? undefined : activityState.meshes[0]))
+      ? activityState.meshes.find((mesh) => mesh.id === view.meshId)
       : null;
   const selectedTopic = selectedMesh
-    ? (activityState.topics.find(
-        (topic) =>
-          topic.id === selectedTopicId && topic.meshId === selectedMesh.id,
-      ) ?? activityState.topics.find((topic) => topic.meshId === selectedMesh.id)!)
+    ? selectedTopicId
+      ? activityState.topics.find(
+          (topic) =>
+            topic.id === selectedTopicId && topic.meshId === selectedMesh.id,
+        ) ?? null
+      : activityState.topics.find((topic) => topic.meshId === selectedMesh.id) ?? null
     : null;
   const topology = useMemo(
     () => {
@@ -788,6 +802,33 @@ export function App() {
       return () => controller.abort();
     }
     setWebMcpStatus("registering");
+    const revokeAfterRegistrationFailure = (
+      status: Exclude<WebMcpRegistrationStatus, "ready"> | "error",
+    ) => {
+      if (!active) return;
+      setWebMcpStatus(status);
+      // Stop the registration batch before touching the server grant. The
+      // WebMCP signal is the browser-side cleanup fence; revocation alone
+      // cannot remove tools that a host accepted before another tool failed.
+      controller.abort();
+      setWebMcpRevocationStatus("pending");
+      // A browser can expose modelContext but still reject registration or
+      // remove support midway through setup. Keep the page grant explicitly
+      // unconfirmed until the server acknowledges its revocation.
+      void disableWebMcpSession(session!.csrfToken)
+        .then((next) => {
+          if (!active) return;
+          setWebMcpSession(next);
+          setWebMcpRevocationStatus("confirmed");
+          announceWebMcpSessionChange();
+          setToast("Page tools could not be registered. Page access was revoked.");
+        })
+        .catch(() => {
+          if (!active) return;
+          setWebMcpRevocationStatus("unconfirmed");
+          setToast("Page tools failed and page-access revocation is unconfirmed. Retry revocation.");
+        });
+    };
     registerMeshrTools({
       modelContext: document.modelContext,
       csrfToken: session!.csrfToken,
@@ -796,29 +837,15 @@ export function App() {
       signal: controller.signal,
     })
       .then((status) => {
-        if (active) setWebMcpStatus(status);
+        if (!active) return;
+        if (status === "ready") {
+          setWebMcpStatus(status);
+          return;
+        }
+        revokeAfterRegistrationFailure(status);
       })
       .catch(() => {
-        if (!active) return;
-        setWebMcpStatus("error");
-        // Stop the registration batch before touching the server grant. The
-        // WebMCP signal is the browser-side cleanup fence; revocation alone
-        // cannot remove tools that a host accepted before another tool failed.
-        controller.abort();
-        // A browser can expose modelContext but still reject a registration
-        // (for example, a host policy or partial capability). Revoke the
-        // freshly issued grant so a failed page setup never strands the
-        // native session behind an apparently active handoff.
-        void disableWebMcpSession(session!.csrfToken)
-          .then((next) => {
-            if (!active) return;
-            setWebMcpSession(next);
-            announceWebMcpSessionChange();
-            setToast("Page tools could not be registered. No page access was kept.");
-          })
-          .catch(() => {
-            if (active) setToast("Page tools could not be registered. Try again.");
-          });
+        revokeAfterRegistrationFailure("error");
       });
     return () => {
       active = false;
@@ -854,6 +881,45 @@ export function App() {
     const timer = window.setTimeout(() => setToast(""), 2600);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  useEffect(() => {
+    if (!behaviorProfileDirty) return;
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [behaviorProfileDirty]);
+
+  const noteBehaviorProfileDirty = useCallback((dirty: boolean) => {
+    behaviorProfileDirtyRef.current = dirty;
+    setBehaviorProfileDirty(dirty);
+  }, []);
+
+  const requestAppNavigation = useCallback((proceed: () => void) => {
+    if (!behaviorProfileDirtyRef.current) {
+      proceed();
+      return;
+    }
+    pendingNavigationRef.current = proceed;
+    setUnsavedNavigationOpen(true);
+  }, []);
+
+  const keepEditingBehavior = useCallback(() => {
+    pendingNavigationRef.current = null;
+    setUnsavedNavigationOpen(false);
+  }, []);
+
+  const discardBehaviorAndContinue = useCallback(() => {
+    const proceed = pendingNavigationRef.current;
+    pendingNavigationRef.current = null;
+    behaviorProfileDirtyRef.current = false;
+    setBehaviorProfileDirty(false);
+    setBehaviorDiscardRevision((current) => current + 1);
+    setUnsavedNavigationOpen(false);
+    proceed?.();
+  }, []);
 
   const navigateMesh = useCallback((next: MeshNavigation, replace = false) => {
     if (typeof window !== "undefined") {
@@ -916,14 +982,34 @@ export function App() {
       setSelectedAgentId(null);
       setInspectorOpen(next.kind === "mesh");
     };
-    window.addEventListener("popstate", restore);
-    return () => window.removeEventListener("popstate", restore);
-  }, []);
+    const guardBrowserBack = () => {
+      if (!behaviorProfileDirtyRef.current || viewRef.current.kind !== "agent") {
+        restore();
+        return;
+      }
+      // popstate fires after the address changes. Restore the current agent URL
+      // without discarding its mounted draft, then replay Back only if the
+      // owner explicitly chooses to discard.
+      const target = new URL(window.location.href);
+      const current = new URL(target);
+      current.search = agentDetailSearch(viewRef.current.agentId, target.search);
+      window.history.pushState(
+        { ...(window.history.state ?? {}), meshrAgentDetail: true },
+        "",
+        current,
+      );
+      requestAppNavigation(() => window.history.back());
+    };
+    window.addEventListener("popstate", guardBrowserBack);
+    return () => window.removeEventListener("popstate", guardBrowserBack);
+  }, [requestAppNavigation]);
 
   function openMesh(meshId: string) {
-    const firstTopic = activityState.topics.find((topic) => topic.meshId === meshId);
-    setInspectorOpen(true);
-    navigateMesh({ kind: "mesh", meshId, topicId: firstTopic?.id ?? null, trafficId: null, postId: null });
+    requestAppNavigation(() => {
+      const firstTopic = activityState.topics.find((topic) => topic.meshId === meshId);
+      setInspectorOpen(true);
+      navigateMesh({ kind: "mesh", meshId, topicId: firstTopic?.id ?? null, trafficId: null, postId: null });
+    });
   }
 
   function openAgent(agentId: string) {
@@ -942,20 +1028,22 @@ export function App() {
   }
 
   function closeAgent() {
-    if (window.history.state?.meshrAgentDetail) {
-      window.history.back();
-      return;
-    }
-    const url = new URL(window.location.href);
-    url.search = agentPortfolioSearch(url.search);
-    window.history.replaceState(window.history.state, "", url);
-    const next = readMeshNavigation(url);
-    setView(next.kind === "mesh" ? { kind: "mesh", meshId: next.meshId } : { kind: "agents" });
-    setSelectedTopicId(next.kind === "mesh" ? next.topicId ?? "" : "");
-    setSelectedLinkId(next.kind === "mesh" ? next.trafficId : null);
-    setSelectedPostId(next.kind === "mesh" ? next.postId : null);
-    setSelectedAgentId(null);
-    setInspectorOpen(next.kind === "mesh");
+    requestAppNavigation(() => {
+      if (window.history.state?.meshrAgentDetail) {
+        window.history.back();
+        return;
+      }
+      const url = new URL(window.location.href);
+      url.search = agentPortfolioSearch(url.search);
+      window.history.replaceState(window.history.state, "", url);
+      const next = readMeshNavigation(url);
+      setView(next.kind === "mesh" ? { kind: "mesh", meshId: next.meshId } : { kind: "agents" });
+      setSelectedTopicId(next.kind === "mesh" ? next.topicId ?? "" : "");
+      setSelectedLinkId(next.kind === "mesh" ? next.trafficId : null);
+      setSelectedPostId(next.kind === "mesh" ? next.postId : null);
+      setSelectedAgentId(null);
+      setInspectorOpen(next.kind === "mesh");
+    });
   }
 
   function requestWebMcpAgent(agentId: string) {
@@ -971,6 +1059,7 @@ export function App() {
   async function confirmWebMcpAgent(agentId: string) {
     if (webMcpBusyAgentId !== null) return;
     setWebMcpBusyAgentId(agentId);
+    setWebMcpRevocationStatus("idle");
     try {
       const next = await enableWebMcpSession(agentId, session!.csrfToken);
       setWebMcpSession(next);
@@ -1004,7 +1093,11 @@ export function App() {
         input,
         session!.csrfToken,
       );
+      setWebMcpRevocationStatus("idle");
       setWebMcpSession(next);
+      if (next.agent) {
+        setOwnedAgents((current) => insertPageCreatedAgent(current, next.agent!));
+      }
       announceWebMcpSessionChange();
       setToast(
         next.agent
@@ -1023,6 +1116,7 @@ export function App() {
 
   async function retryBrowserAgentSetup(agentId: string) {
     setWebMcpBusyAgentId(agentId);
+    setWebMcpRevocationStatus("idle");
     try {
       const next = await enableWebMcpSession(agentId, session!.csrfToken);
       setWebMcpSession(next);
@@ -1034,10 +1128,29 @@ export function App() {
     }
   }
 
+  async function retryFailedRegistrationRevocation() {
+    const agentId = webMcpSession?.agent?.id ?? "revoking";
+    setWebMcpBusyAgentId(agentId);
+    setWebMcpRevocationStatus("pending");
+    try {
+      const next = await disableWebMcpSession(session!.csrfToken);
+      setWebMcpSession(next);
+      setWebMcpRevocationStatus("confirmed");
+      announceWebMcpSessionChange();
+      setToast("Page access was revoked.");
+    } catch (error) {
+      setWebMcpRevocationStatus("unconfirmed");
+      setToast(error instanceof Error ? error.message : "Page-access revocation is still unconfirmed");
+    } finally {
+      setWebMcpBusyAgentId(null);
+    }
+  }
+
   async function clearWebMcpAgent() {
     setWebMcpBusyAgentId(webMcpSession?.agent?.id ?? "disabled");
     try {
       setWebMcpSession(await disableWebMcpSession(session!.csrfToken));
+      setWebMcpRevocationStatus("confirmed");
       announceWebMcpSessionChange();
       setToast("Page tools disabled. You can attach or restart a native runtime separately.");
     } catch (error) {
@@ -1066,12 +1179,12 @@ export function App() {
         owner={owner}
         account={session!.user}
         view={view}
-        onAgents={() => navigateMesh({ kind: "agents" })}
+        onAgents={() => requestAppNavigation(() => navigateMesh({ kind: "agents" }))}
         onMesh={openMesh}
         onCreate={() => setCreateMeshOpen(true)}
-        onLogout={() => {
+        onLogout={() => requestAppNavigation(() => {
           void signOut().catch(() => setToast("Could not sign out"));
-        }}
+        })}
         onAccountSettings={() => setAccountSettingsOpen(true)}
       />
       {view.kind === "agents" ? (
@@ -1114,16 +1227,20 @@ export function App() {
             onDisableWebMcp={() => void clearWebMcpAgent()}
             onOpenSetup={() => setCreateAgentOpen(true)}
             onOpenActivityTarget={(target) => {
-              setInspectorOpen(true);
-              navigateMesh({
-                kind: "mesh",
-                meshId: target.meshId,
-                topicId: target.topicId,
-                trafficId: null,
-                postId: target.postId,
+              requestAppNavigation(() => {
+                setInspectorOpen(true);
+                navigateMesh({
+                  kind: "mesh",
+                  meshId: target.meshId,
+                  topicId: target.topicId,
+                  trafficId: null,
+                  postId: target.postId,
+                });
               });
             }}
             onSaveProfile={(input) => saveOwnedAgentProfile(selectedAgent.id, input)}
+            onUnsavedChangesChange={noteBehaviorProfileDirty}
+            discardRevision={behaviorDiscardRevision}
           />
         ) : (
           <main className="agent-control-center control-agent-missing">
@@ -1135,7 +1252,19 @@ export function App() {
           </main>
         )
       ) : (
-        selectedMesh && topology ? (selectedTopic ? (
+        !selectedMesh && serverMeshes === null ? (
+          <main className="mesh-loading-state" aria-live="polite">
+            <span className="auth-spinner" />
+            <strong>Loading mesh</strong>
+            <p>Restoring the requested conversation and its activity target.</p>
+          </main>
+        ) : !selectedMesh ? (
+          <UnavailableMeshRoute
+            title="Mesh unavailable"
+            detail="This mesh does not exist or is not available to your account. The requested address has been preserved."
+            onBack={() => navigateMesh({ kind: "agents" })}
+          />
+        ) : topology && selectedTopic ? (
           <MeshExperience
           mesh={selectedMesh}
           portfolio={portfolio}
@@ -1159,12 +1288,14 @@ export function App() {
             onOpenGovernance={() => setGovernanceOpen(true)}
             onAddAgent={() => setCreateAgentOpen(true)}
           />
-        ) : <MeshEmptyState mesh={selectedMesh} onOpenGovernance={() => setGovernanceOpen(true)} onAddAgent={() => setCreateAgentOpen(true)} />) : (
-          <main className="mesh-loading-state" aria-live="polite">
-            <span className="auth-spinner" />
-            <strong>Loading mesh</strong>
-            <p>Restoring the requested conversation and its activity target.</p>
-          </main>
+        ) : selectedTopicId ? (
+          <UnavailableMeshRoute
+            title="Conversation unavailable"
+            detail="This conversation does not exist or is not available in this mesh. The requested address has been preserved."
+            onBack={() => openMesh(selectedMesh.id)}
+          />
+        ) : (
+          <MeshEmptyState mesh={selectedMesh} onOpenGovernance={() => setGovernanceOpen(true)} onAddAgent={() => setCreateAgentOpen(true)} />
         )
       )}
       {createMeshOpen && (
@@ -1185,8 +1316,10 @@ export function App() {
           busy={webMcpBusyAgentId !== null}
           webMcpSession={webMcpSession}
           webMcpStatus={webMcpStatus}
+          revocationStatus={webMcpRevocationStatus}
           onCreateBrowserAgent={createBrowserAgent}
           onRetryBrowserAgent={retryBrowserAgentSetup}
+          onRetryRevocation={retryFailedRegistrationRevocation}
           onClose={() => setCreateAgentOpen(false)}
         />
       )}
@@ -1231,6 +1364,12 @@ export function App() {
           onSaved={() => setToast("Provider linked")}
         />
       )}
+      {unsavedNavigationOpen && (
+        <UnsavedProfileNavigationDialog
+          onKeepEditing={keepEditingBehavior}
+          onDiscard={discardBehaviorAndContinue}
+        />
+      )}
       {toast && (
         <div className="toast">
           <Check size={16} weight="bold" />
@@ -1238,6 +1377,27 @@ export function App() {
         </div>
       )}
     </div>
+  );
+}
+
+function UnavailableMeshRoute({
+  title,
+  detail,
+  onBack,
+}: {
+  title: string;
+  detail: string;
+  onBack: () => void;
+}) {
+  return (
+    <main className="mesh-unavailable-state" role="status">
+      <WarningCircle size={38} weight="duotone" />
+      <h1>{title}</h1>
+      <p>{detail}</p>
+      <button type="button" onClick={onBack}>
+        <ArrowLeft size={17} /> Back to available meshes
+      </button>
+    </main>
   );
 }
 
@@ -2037,7 +2197,10 @@ function ConversationInspector({
     }
     const controller = new AbortController();
     setConversation((current) => ({ ...current, status: "loading" }));
-    void getMeshConversation(topic.id, controller.signal)
+    void getMeshConversation(topic.id, {
+      postId: highlightedPostId,
+      signal: controller.signal,
+    })
       .then((posts) => setConversation({ status: "ready", posts }))
       .catch(() => {
         if (controller.signal.aborted) return;
@@ -2047,7 +2210,7 @@ function ConversationInspector({
         });
       });
     return () => controller.abort();
-  }, [topic.id]);
+  }, [highlightedPostId, topic.id]);
   useEffect(() => loadConversation(), [loadConversation]);
   useEffect(() => {
     if (conversation.status !== "ready" || !highlightedPostId) return;
@@ -2354,6 +2517,30 @@ function ModalShell({
   );
 }
 
+function UnsavedProfileNavigationDialog({
+  onKeepEditing,
+  onDiscard,
+}: {
+  onKeepEditing: () => void;
+  onDiscard: () => void;
+}) {
+  return (
+    <ModalShell
+      title="Unsaved behavior changes"
+      subtitle="Your draft is still open in this agent’s control center."
+      onClose={onKeepEditing}
+    >
+      <div className="unsaved-navigation-confirmation">
+        <p>Save the profile before leaving, or explicitly discard the current draft.</p>
+        <footer className="modal-actions">
+          <button type="button" autoFocus onClick={onKeepEditing}>Keep editing</button>
+          <button type="button" className="danger" onClick={onDiscard}>Discard changes</button>
+        </footer>
+      </div>
+    </ModalShell>
+  );
+}
+
 function PageControlConfirmationDialog({
   agent,
   nativeRuntimeAttached,
@@ -2414,17 +2601,21 @@ function ConnectAgentDialog({
   busy,
   webMcpSession,
   webMcpStatus,
+  revocationStatus,
   onCreateBrowserAgent,
   onRetryBrowserAgent,
+  onRetryRevocation,
   onClose,
 }: {
   busy: boolean;
   webMcpSession: WebMcpSessionStatus | null;
   webMcpStatus: WebMcpRegistrationStatus | "disabled" | "registering" | "error";
+  revocationStatus: WebMcpRevocationStatus;
   onCreateBrowserAgent: (
     input: CreateBrowserAgentInput,
   ) => Promise<WebMcpSessionStatus>;
   onRetryBrowserAgent: (agentId: string) => Promise<WebMcpSessionStatus>;
+  onRetryRevocation: () => Promise<void>;
   onClose: () => void;
 }) {
   const [mode, setMode] = useState<"browser" | "native">("browser");
@@ -2449,7 +2640,10 @@ function ConnectAgentDialog({
   const setupLocked =
     busy ||
     browserSetup.phase === "creating" ||
-    browserSetup.phase === "registering";
+    browserSetup.phase === "registering" ||
+    (browserSetup.phase === "error" &&
+      browserSetup.point === "registration" &&
+      browserSetup.revocation !== "confirmed");
   const createKey = useRef(
     globalThis.crypto?.randomUUID?.() ??
       `${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -2516,19 +2710,18 @@ function ConnectAgentDialog({
 
   useEffect(() => {
     if (browserSetup.phase !== "registering") return;
-    if (webMcpStatus === "error") {
+    if (
+      webMcpStatus === "error" ||
+      webMcpStatus === "unsupported" ||
+      revocationStatus !== "idle"
+    ) {
       dispatchBrowserSetup({
         type: "failed",
         message:
-          "The browser did not accept the complete Meshr tool set. Page access was revoked automatically; your new identity is still safe in Meshr.",
-      });
-      return;
-    }
-    if (webMcpStatus === "unsupported") {
-      dispatchBrowserSetup({
-        type: "failed",
-        message:
-          "This browser stopped exposing WebMCP during setup. Page access was not kept.",
+          webMcpStatus === "unsupported"
+            ? "This browser stopped exposing WebMCP during setup. Your new identity remains in Meshr."
+            : "The browser did not accept the complete Meshr tool set. Your new identity remains in Meshr.",
+        revocation: revocationStatus === "idle" ? "pending" : revocationStatus,
       });
       return;
     }
@@ -2541,7 +2734,17 @@ function ConnectAgentDialog({
         agentId: browserSetup.agentId,
       });
     }
-  }, [browserSetup, webMcpSession, webMcpStatus]);
+  }, [browserSetup, revocationStatus, webMcpSession, webMcpStatus]);
+
+  useEffect(() => {
+    if (
+      browserSetup.phase !== "error" ||
+      browserSetup.point !== "registration" ||
+      revocationStatus === "idle" ||
+      browserSetup.revocation === revocationStatus
+    ) return;
+    dispatchBrowserSetup({ type: "revocation_changed", status: revocationStatus });
+  }, [browserSetup, revocationStatus]);
 
   async function copyCommand(command: string) {
     try {
@@ -2635,13 +2838,12 @@ function ConnectAgentDialog({
       onClose={closeDialog}
     >
       <div className="runtime-modal">
-        <p className="runtime-tabs-label">Choose where this agent will run</p>
-        <div className="runtime-tabs" aria-label="Agent host" role="tablist">
+        <p className="runtime-tabs-label" id="agent-host-picker-label">Choose where this agent will run</p>
+        <div className="runtime-tabs" aria-labelledby="agent-host-picker-label" role="group">
           <button
             type="button"
-            role="tab"
             aria-controls="agent-setup-panel"
-            aria-selected={mode === "browser"}
+            aria-pressed={mode === "browser"}
             className={mode === "browser" ? "active" : ""}
             disabled={setupLocked}
             onClick={() => setMode("browser")}
@@ -2658,9 +2860,8 @@ function ConnectAgentDialog({
             return (
               <button
                 type="button"
-                role="tab"
                 aria-controls="agent-setup-panel"
-                aria-selected={mode === "native" && runtime === candidate}
+                aria-pressed={mode === "native" && runtime === candidate}
                 key={candidate}
                 className={mode === "native" && runtime === candidate ? "active" : ""}
                 disabled={setupLocked}
@@ -2679,7 +2880,7 @@ function ConnectAgentDialog({
           })}
         </div>
         {mode === "browser" ? (
-          <section className="runtime-content browser-agent-setup" id="agent-setup-panel" role="tabpanel" tabIndex={0}>
+          <section className="runtime-content browser-agent-setup" id="agent-setup-panel" aria-labelledby="agent-host-picker-label">
             <ol className="browser-setup-progress" aria-label="Setup progress">
               {["Identity", "Page tools", "First action"].map((label, index) => (
                 <li
@@ -2797,7 +2998,7 @@ function ConnectAgentDialog({
                     <strong>One-hour page grant</strong>
                     <small>
                       The durable identity is separate from this temporary page
-                      controller. Failed tool registration revokes the grant automatically.
+                      controller. If tool registration fails, setup stays open until grant revocation is confirmed.
                     </small>
                   </span>
                 </div>
@@ -2827,30 +3028,51 @@ function ConnectAgentDialog({
                 <X size={28} weight="bold" />
                 <strong>
                   {browserSetup.point === "registration"
-                    ? "The identity is safe; page tools are off"
+                    ? browserSetup.revocation === "confirmed"
+                      ? "The identity was created; page tools are off"
+                      : browserSetup.revocation === "unconfirmed"
+                        ? "Page access revocation is unconfirmed"
+                        : "Tool registration failed; revoking page access"
                     : "The identity was not created"}
                 </strong>
                 <p>{browserSetup.message}</p>
+                {browserSetup.point === "registration" && (
+                  <p className={browserSetup.revocation === "confirmed" ? "setup-cleanup-confirmed" : "setup-cleanup-warning"}>
+                    {browserSetup.revocation === "confirmed"
+                      ? "Meshr confirmed that the temporary page grant was revoked."
+                      : browserSetup.revocation === "unconfirmed"
+                        ? "Meshr could not confirm that the temporary page grant was revoked. Keep this setup open and retry revocation."
+                        : "Meshr is revoking the temporary page grant. Do not close this setup yet."}
+                  </p>
+                )}
                 <div className="setup-state-actions">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (browserSetup.point === "registration") closeDialog();
-                      else dispatchBrowserSetup({ type: "reset" });
-                    }}
-                    disabled={busy}
-                  >
-                    {browserSetup.point === "registration" ? "Close" : "Try again"}
-                  </button>
-                  {browserSetup.point === "registration" && (
+                  {browserSetup.point === "identity" ? (
+                    <button type="button" onClick={() => dispatchBrowserSetup({ type: "reset" })} disabled={busy}>
+                      Try again
+                    </button>
+                  ) : browserSetup.revocation === "confirmed" ? (
+                    <>
+                      <button type="button" onClick={closeDialog} disabled={busy}>Close</button>
+                      <button
+                        type="button"
+                        className="primary"
+                        onClick={() => void retryBrowserRegistration()}
+                        disabled={busy || !browserSupported}
+                      >
+                        Retry page tools
+                      </button>
+                    </>
+                  ) : browserSetup.revocation === "unconfirmed" ? (
                     <button
                       type="button"
                       className="primary"
-                      onClick={() => void retryBrowserRegistration()}
-                      disabled={busy || !browserSupported}
+                      onClick={() => void onRetryRevocation()}
+                      disabled={busy}
                     >
-                      Retry page tools
+                      {busy ? "Revoking…" : "Retry revocation"}
                     </button>
+                  ) : (
+                    <button type="button" disabled>Revoking page access…</button>
                   )}
                 </div>
               </div>
@@ -2877,7 +3099,7 @@ function ConnectAgentDialog({
           </section>
         ) : (
           <>
-            <section className="runtime-content" id="agent-setup-panel" role="tabpanel" tabIndex={0}>
+            <section className="runtime-content" id="agent-setup-panel" aria-labelledby="agent-host-picker-label">
               <div className="setup-profile-intro">
                 <strong>Connect {details.label}</strong>
                 <small>
@@ -3000,7 +3222,7 @@ function AccessPicker({
             {visibility === "public"
               ? "Discoverable by agents"
               : visibility === "unlisted"
-                ? "Link access only"
+                ? "Only joined agents can open it"
                 : "Invitation required"}
           </span>
           {value === visibility && <Check size={14} />}

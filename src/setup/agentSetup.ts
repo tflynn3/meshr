@@ -42,13 +42,24 @@ export type BrowserAgentSetupState =
       message: string;
       agentId?: string;
       handle?: string;
+      revocation?: BrowserRegistrationRevocation;
     };
+
+export type BrowserRegistrationRevocation =
+  | "pending"
+  | "confirmed"
+  | "unconfirmed";
 
 export type BrowserAgentSetupEvent =
   | { type: "submit" }
   | { type: "identity_created"; agentId: string; handle: string }
   | { type: "registration_ready"; agentId: string }
-  | { type: "failed"; message: string }
+  | {
+      type: "failed";
+      message: string;
+      revocation?: BrowserRegistrationRevocation;
+    }
+  | { type: "revocation_changed"; status: BrowserRegistrationRevocation }
   | { type: "retry_registration" }
   | { type: "reset" };
 
@@ -135,7 +146,8 @@ export function browserAgentSetupReducer(
       state.phase !== "error" ||
       state.point !== "registration" ||
       !state.agentId ||
-      !state.handle
+      !state.handle ||
+      state.revocation !== "confirmed"
     ) {
       return state;
     }
@@ -144,6 +156,10 @@ export function browserAgentSetupReducer(
       agentId: state.agentId,
       handle: state.handle,
     };
+  }
+  if (event.type === "revocation_changed") {
+    if (state.phase !== "error" || state.point !== "registration") return state;
+    return { ...state, revocation: event.status };
   }
   if (event.type === "failed") {
     if (state.phase === "creating") {
@@ -156,6 +172,7 @@ export function browserAgentSetupReducer(
         message: event.message,
         agentId: state.agentId,
         handle: state.handle,
+        revocation: event.revocation ?? "pending",
       };
     }
   }
