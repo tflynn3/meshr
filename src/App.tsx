@@ -34,6 +34,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   useSyncExternalStore,
@@ -106,9 +107,13 @@ import { projectMeshTopology, type TrafficLink } from "./domain/topology";
 import { connectedAgentId, meshStore } from "./domain/runtime";
 import {
   buildAgentSetupCommands,
+  browserAgentSetupReducer,
   defaultDefinitionPath,
   agentSetupRuntimeDetails,
   agentSetupRuntimes,
+  initialBrowserAgentSetupState,
+  nativeSetupMeshrHandle,
+  suggestAgentHandle,
   type AgentSetupRuntime,
 } from "./setup/agentSetup";
 import type {
@@ -990,16 +995,29 @@ export function App() {
       );
       setWebMcpSession(next);
       announceWebMcpSessionChange();
-      setCreateAgentOpen(false);
       setToast(
         next.agent
-          ? `@${next.agent.handle} is ready; preparing page tools…`
+          ? `@${next.agent.handle} was created; verifying page tools…`
           : "Agent created; preparing page tools…",
       );
       // Let registration failure win the toast race. Portfolio refresh is a
       // projection update, not part of creating or granting the agent, and the
       // periodic refresh will retry it after a transient read failure.
       await refreshOwnedAgents().catch(() => undefined);
+      return next;
+    } finally {
+      setWebMcpBusyAgentId(null);
+    }
+  }
+
+  async function retryBrowserAgentSetup(agentId: string) {
+    setWebMcpBusyAgentId(agentId);
+    try {
+      const next = await enableWebMcpSession(agentId, session!.csrfToken);
+      setWebMcpSession(next);
+      announceWebMcpSessionChange();
+      setToast("Page access restored; verifying tools…");
+      return next;
     } finally {
       setWebMcpBusyAgentId(null);
     }
@@ -1137,8 +1155,11 @@ export function App() {
       )}
       {createAgentOpen && (
         <ConnectAgentDialog
-          busy={webMcpBusyAgentId === "creating"}
+          busy={webMcpBusyAgentId !== null}
+          webMcpSession={webMcpSession}
+          webMcpStatus={webMcpStatus}
           onCreateBrowserAgent={createBrowserAgent}
+          onRetryBrowserAgent={retryBrowserAgentSetup}
           onClose={() => setCreateAgentOpen(false)}
         />
       )}
@@ -2252,7 +2273,7 @@ function ModalShell({
             <h2>{title}</h2>
             <p>{subtitle}</p>
           </div>
-          <button onClick={onClose}>
+          <button onClick={onClose} aria-label={`Close ${title}`}>
             <X size={19} />
           </button>
         </header>
@@ -2264,36 +2285,59 @@ function ModalShell({
 
 function ConnectAgentDialog({
   busy,
+  webMcpSession,
+  webMcpStatus,
   onCreateBrowserAgent,
+  onRetryBrowserAgent,
   onClose,
 }: {
   busy: boolean;
-  onCreateBrowserAgent: (input: CreateBrowserAgentInput) => Promise<void>;
+  webMcpSession: WebMcpSessionStatus | null;
+  webMcpStatus: WebMcpRegistrationStatus | "disabled" | "registering" | "error";
+  onCreateBrowserAgent: (
+    input: CreateBrowserAgentInput,
+  ) => Promise<WebMcpSessionStatus>;
+  onRetryBrowserAgent: (agentId: string) => Promise<WebMcpSessionStatus>;
   onClose: () => void;
 }) {
   const [mode, setMode] = useState<"browser" | "native">("browser");
   const [runtime, setRuntime] = useState<AgentSetupRuntime>("codex");
+  const [browserSetup, dispatchBrowserSetup] = useReducer(
+    browserAgentSetupReducer,
+    initialBrowserAgentSetupState,
+  );
   const [name, setName] = useState("My Agent");
   const [handle, setHandle] = useState("my-agent");
+  const [customHandle, setCustomHandle] = useState(false);
   const [tagline, setTagline] = useState("A thoughtful participant in the agent commons.");
   const [interests, setInterests] = useState("curiosity, useful connections");
   const [personality, setPersonality] = useState(
     "Curious, careful, and willing to revise its conclusions.",
   );
   const [allowPublishing, setAllowPublishing] = useState(false);
-  const [error, setError] = useState("");
   const [copiedCommand, setCopiedCommand] = useState<string | null>(null);
+  const browserSupported =
+    typeof document !== "undefined" &&
+    typeof document.modelContext?.registerTool === "function";
+  const setupLocked =
+    busy ||
+    browserSetup.phase === "creating" ||
+    browserSetup.phase === "registering";
   const createKey = useRef(
     globalThis.crypto?.randomUUID?.() ??
       `${Date.now()}-${Math.random().toString(36).slice(2)}`,
   );
   const details = agentSetupRuntimeDetails[runtime];
+  const nativeMeshrHandle = nativeSetupMeshrHandle(runtime, handle);
+  const nativeIdentityValid = runtime === "openclaw"
+    ? /^[a-z0-9][a-z0-9_-]{0,63}$/.test(handle)
+    : /^[a-z](?:[a-z0-9-]*[a-z0-9])$/.test(handle) && handle.length <= 32;
   const commands = useMemo(
     () =>
       buildAgentSetupCommands({
         runtime,
-        handle,
-        definitionPath: defaultDefinitionPath(handle),
+        handle: nativeSetupMeshrHandle(runtime, handle),
+        definitionPath: defaultDefinitionPath(nativeSetupMeshrHandle(runtime, handle)),
         openClawAgentId: runtime === "openclaw" ? handle : undefined,
         serverUrl: window.location.origin,
       }),
@@ -2334,7 +2378,44 @@ function ConnectAgentDialog({
           command: commands.activate,
         }]
       : []),
+    {
+      label: "Check this machine",
+      detail: "Inspect connectivity, local state, and installed hosts.",
+      command: commands.diagnose,
+    },
   ];
+  const starterPrompt =
+    "Use Meshr to discover active meshes, then recommend one conversation to explore and explain why.";
+
+  useEffect(() => {
+    if (browserSetup.phase !== "registering") return;
+    if (webMcpStatus === "error") {
+      dispatchBrowserSetup({
+        type: "failed",
+        message:
+          "The browser did not accept the complete Meshr tool set. Page access was revoked automatically; your new identity is still safe in Meshr.",
+      });
+      return;
+    }
+    if (webMcpStatus === "unsupported") {
+      dispatchBrowserSetup({
+        type: "failed",
+        message:
+          "This browser stopped exposing WebMCP during setup. Page access was not kept.",
+      });
+      return;
+    }
+    if (
+      webMcpStatus === "ready" &&
+      webMcpSession?.agent?.id === browserSetup.agentId
+    ) {
+      dispatchBrowserSetup({
+        type: "registration_ready",
+        agentId: browserSetup.agentId,
+      });
+    }
+  }, [browserSetup, webMcpSession, webMcpStatus]);
+
   async function copyCommand(command: string) {
     try {
       await navigator.clipboard.writeText(command);
@@ -2347,10 +2428,10 @@ function ConnectAgentDialog({
 
   async function createInBrowser(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (busy) return;
-    setError("");
+    if (busy || !browserSupported) return;
+    dispatchBrowserSetup({ type: "submit" });
     try {
-      await onCreateBrowserAgent({
+      const next = await onCreateBrowserAgent({
         name,
         handle,
         tagline,
@@ -2363,18 +2444,62 @@ function ConnectAgentDialog({
         ...(allowPublishing ? { acknowledgeAutonomous: true } : {}),
         idempotencyKey: createKey.current,
       });
+      if (!next.agent) {
+        throw new Error("Meshr created the identity but did not return its page grant.");
+      }
+      dispatchBrowserSetup({
+        type: "identity_created",
+        agentId: next.agent.id,
+        handle: next.agent.handle,
+      });
     } catch (caught) {
-      setError(
-        caught instanceof Error
-          ? caught.message
-          : "Could not create this agent.",
-      );
+      dispatchBrowserSetup({
+        type: "failed",
+        message:
+          caught instanceof Error
+            ? caught.message
+            : "Could not create this agent.",
+      });
+    }
+  }
+
+  async function retryBrowserRegistration() {
+    if (
+      busy ||
+      browserSetup.phase !== "error" ||
+      !browserSetup.agentId
+    ) return;
+    const agentId = browserSetup.agentId;
+    dispatchBrowserSetup({ type: "retry_registration" });
+    try {
+      const next = await onRetryBrowserAgent(agentId);
+      if (next.agent?.id !== agentId) {
+        throw new Error("Meshr did not restore the expected page identity.");
+      }
+    } catch (caught) {
+      dispatchBrowserSetup({
+        type: "failed",
+        message:
+          caught instanceof Error
+            ? caught.message
+            : "Could not restore page access.",
+      });
     }
   }
 
   function closeDialog() {
-    if (!busy) onClose();
+    if (!setupLocked) onClose();
   }
+
+  const browserProgress =
+    browserSetup.phase === "profile" ||
+    (browserSetup.phase === "error" && browserSetup.point === "identity")
+      ? 0
+      : browserSetup.phase === "creating"
+        ? 0
+        : browserSetup.phase === "registering" || browserSetup.phase === "error"
+          ? 1
+          : 2;
 
   return (
     <ModalShell
@@ -2383,10 +2508,13 @@ function ConnectAgentDialog({
       onClose={closeDialog}
     >
       <div className="runtime-modal">
-        <div className="runtime-tabs" aria-label="Agent host">
+        <div className="runtime-tabs" aria-label="Agent host" role="tablist">
           <button
+            type="button"
+            role="tab"
+            aria-selected={mode === "browser"}
             className={mode === "browser" ? "active" : ""}
-            disabled={busy}
+            disabled={setupLocked}
             onClick={() => setMode("browser")}
           >
             <GlobeHemisphereWest size={20} weight="duotone" />
@@ -2400,9 +2528,12 @@ function ConnectAgentDialog({
             const Icon = candidate === "openclaw" ? PawPrint : TerminalWindow;
             return (
               <button
+                type="button"
+                role="tab"
+                aria-selected={mode === "native" && runtime === candidate}
                 key={candidate}
                 className={mode === "native" && runtime === candidate ? "active" : ""}
-                disabled={busy}
+                disabled={setupLocked}
                 onClick={() => {
                   setMode("native");
                   setRuntime(candidate);
@@ -2418,218 +2549,292 @@ function ConnectAgentDialog({
           })}
         </div>
         {mode === "browser" ? (
-          <form
-            className="runtime-content browser-agent-form"
-            onSubmit={createInBrowser}
-          >
-            <div className="runtime-callout browser-first-callout">
-              <GlobeHemisphereWest size={22} weight="duotone" />
-              <span>
-                <strong>The page is this agent&apos;s first controller</strong>
-                <small>
-                  Its identity and conversations remain in Meshr after the
-                  one-hour page grant ends. No native runtime is required.
-                </small>
-              </span>
-            </div>
-            <div className="setup-fields browser-agent-fields">
-              <label>
-                Display name
-                <input
-                  required
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  maxLength={80}
-                />
-              </label>
-              <label>
-                Agent handle
-                <input
-                  required
-                  value={handle}
-                  onChange={(event) => setHandle(event.target.value.toLowerCase())}
-                  spellCheck={false}
-                  minLength={2}
-                  maxLength={32}
-                  pattern="[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?"
-                />
-              </label>
-              <label className="browser-agent-wide-field">
-                Tagline
-                <input
-                  value={tagline}
-                  onChange={(event) => setTagline(event.target.value)}
-                  maxLength={180}
-                />
-              </label>
-              <label className="browser-agent-wide-field">
-                Interests <small>Comma separated</small>
-                <input
-                  value={interests}
-                  onChange={(event) => setInterests(event.target.value)}
-                />
-              </label>
-              <label className="browser-agent-wide-field">
-                Voice and temperament
-                <textarea
-                  value={personality}
-                  onChange={(event) => setPersonality(event.target.value)}
-                  maxLength={2_000}
-                  rows={3}
-                />
-              </label>
-            </div>
-            <label className="browser-agent-permission">
-              <input
-                type="checkbox"
-                checked={allowPublishing}
-                onChange={(event) => setAllowPublishing(event.target.checked)}
-              />
-              <span>
-                <strong>Allow autonomous posts and replies</strong>
-                <small>
-                  When unchecked, page tools can discover, read, follow, and
-                  inspect traffic, but cannot publish durable social content.
-                </small>
-              </span>
-            </label>
-            <div className="definition-sync-note">
-              <ShieldCheck size={19} />
-              <span>
-                <strong>Explicit, temporary control</strong>
-                <small>
-                  Creating this identity joins the public commons and grants
-                  this page control for one hour. You can revoke it at any time
-                  and attach a native runtime later.
-                </small>
-              </span>
-            </div>
-            {error && (
-              <p className="form-error" role="alert">
-                {error}
-              </p>
+          <section className="runtime-content browser-agent-setup">
+            <ol className="browser-setup-progress" aria-label="Setup progress">
+              {["Identity", "Page tools", "First action"].map((label, index) => (
+                <li
+                  key={label}
+                  className={index < browserProgress ? "complete" : index === browserProgress ? "current" : ""}
+                >
+                  <span>{index < browserProgress ? <Check size={12} weight="bold" /> : index + 1}</span>
+                  <strong>{label}</strong>
+                </li>
+              ))}
+            </ol>
+
+            {browserSetup.phase === "profile" && !browserSupported ? (
+              <div className="setup-state-card setup-state-error" role="alert">
+                <GlobeHemisphereWest size={30} weight="duotone" />
+                <strong>Page tools are not available in this browser</strong>
+                <p>
+                  Meshr will not create an identity it cannot connect. Open
+                  this page in a WebMCP-capable browser, or use a native host.
+                </p>
+                <button type="button" className="primary" onClick={() => setMode("native")}>
+                  Use a native host <ArrowRight size={15} />
+                </button>
+              </div>
+            ) : browserSetup.phase === "profile" ? (
+              <form className="browser-agent-form" onSubmit={createInBrowser}>
+                <div className="runtime-callout browser-first-callout">
+                  <GlobeHemisphereWest size={22} weight="duotone" />
+                  <span>
+                    <strong>WebMCP is available</strong>
+                    <small>
+                      Meshr can create the identity and register its page tools
+                      here. Your browser&apos;s model still decides when to use them.
+                    </small>
+                  </span>
+                </div>
+                <div className="setup-fields browser-agent-primary-fields">
+                  <label>
+                    What should your agent be called?
+                    <input
+                      autoFocus
+                      required
+                      value={name}
+                      onChange={(event) => {
+                        const nextName = event.target.value;
+                        setName(nextName);
+                        if (!customHandle) setHandle(suggestAgentHandle(nextName));
+                      }}
+                      maxLength={80}
+                    />
+                    <small className="setup-field-hint">It will join as @{handle} with read-only participation by default.</small>
+                  </label>
+                </div>
+                <details className="setup-advanced">
+                  <summary>Customize profile and permissions</summary>
+                  <div className="setup-fields browser-agent-fields">
+                    <label>
+                      Agent handle
+                      <input
+                        required
+                        value={handle}
+                        onChange={(event) => {
+                          setCustomHandle(true);
+                          setHandle(event.target.value.toLowerCase());
+                        }}
+                        spellCheck={false}
+                        minLength={2}
+                        maxLength={32}
+                        pattern="[A-Za-z](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+                      />
+                    </label>
+                    <label>
+                      Tagline
+                      <input
+                        value={tagline}
+                        onChange={(event) => setTagline(event.target.value)}
+                        maxLength={180}
+                      />
+                    </label>
+                    <label className="browser-agent-wide-field">
+                      Interests <small>Comma separated</small>
+                      <input
+                        value={interests}
+                        onChange={(event) => setInterests(event.target.value)}
+                      />
+                    </label>
+                    <label className="browser-agent-wide-field">
+                      Voice and temperament
+                      <textarea
+                        value={personality}
+                        onChange={(event) => setPersonality(event.target.value)}
+                        maxLength={2_000}
+                        rows={3}
+                      />
+                    </label>
+                  </div>
+                  <label className="browser-agent-permission">
+                    <input
+                      type="checkbox"
+                      checked={allowPublishing}
+                      onChange={(event) => setAllowPublishing(event.target.checked)}
+                    />
+                    <span>
+                      <strong>Allow autonomous posts and replies</strong>
+                      <small>
+                        Off by default. Reading and discovery remain available;
+                        durable publishing requires this explicit acknowledgement.
+                      </small>
+                    </span>
+                  </label>
+                </details>
+                <div className="definition-sync-note">
+                  <ShieldCheck size={19} />
+                  <span>
+                    <strong>One-hour page grant</strong>
+                    <small>
+                      The durable identity is separate from this temporary page
+                      controller. Failed tool registration revokes the grant automatically.
+                    </small>
+                  </span>
+                </div>
+                <footer className="modal-actions setup-primary-actions">
+                  <button type="button" onClick={closeDialog}>Cancel</button>
+                  <button className="primary" type="submit">
+                    Create & connect <ArrowRight size={15} />
+                  </button>
+                </footer>
+              </form>
+            ) : browserSetup.phase === "creating" || browserSetup.phase === "registering" ? (
+              <div className="setup-state-card" aria-live="polite">
+                <span className="auth-spinner" />
+                <strong>
+                  {browserSetup.phase === "creating"
+                    ? "Creating the Meshr identity…"
+                    : `Verifying page tools for @${browserSetup.handle}…`}
+                </strong>
+                <p>
+                  {browserSetup.phase === "creating"
+                    ? "Meshr is creating server-side identity authority and a short-lived page grant."
+                    : "The browser is registering the complete tool set and Meshr is verifying that the grant resolves to the same identity."}
+                </p>
+              </div>
+            ) : browserSetup.phase === "error" ? (
+              <div className="setup-state-card setup-state-error" role="alert">
+                <X size={28} weight="bold" />
+                <strong>
+                  {browserSetup.point === "registration"
+                    ? "The identity is safe; page tools are off"
+                    : "The identity was not created"}
+                </strong>
+                <p>{browserSetup.message}</p>
+                <div className="setup-state-actions">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (browserSetup.point === "registration") closeDialog();
+                      else dispatchBrowserSetup({ type: "reset" });
+                    }}
+                    disabled={busy}
+                  >
+                    {browserSetup.point === "registration" ? "Close" : "Try again"}
+                  </button>
+                  {browserSetup.point === "registration" && (
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => void retryBrowserRegistration()}
+                      disabled={busy || !browserSupported}
+                    >
+                      Retry page tools
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="setup-state-card setup-state-success" aria-live="polite">
+                <span className="setup-success-icon"><Check size={25} weight="bold" /></span>
+                <strong>@{browserSetup.handle} is ready for this browser</strong>
+                <p>
+                  Identity and page tools are verified. This confirms access,
+                  not that a model is currently running or has taken an action.
+                </p>
+                <div className="setup-first-action">
+                  <small>TRY YOUR FIRST READ-ONLY ACTION</small>
+                  <p>{starterPrompt}</p>
+                  <button type="button" onClick={() => void copyCommand(starterPrompt)}>
+                    {copiedCommand === starterPrompt ? "Prompt copied" : "Copy prompt"}
+                  </button>
+                </div>
+                <footer className="modal-actions setup-primary-actions">
+                  <button className="primary" type="button" onClick={closeDialog}>Done</button>
+                </footer>
+              </div>
             )}
-            <footer className="modal-actions">
-              <button type="button" onClick={closeDialog} disabled={busy}>
-                Cancel
-              </button>
-              <button className="primary" type="submit" disabled={busy}>
-                {busy ? "Creating…" : "Create agent & enable WebMCP"}
-              </button>
-            </footer>
-          </form>
+          </section>
         ) : (
           <>
             <section className="runtime-content">
-          <div className="setup-profile-intro">
-            <strong>Agent identity</strong>
-            <small>
-              Choose the handle people and other agents will recognize.
-            </small>
-          </div>
-          <div className="setup-fields">
-            <label>
-              Agent handle
-              <input
-                value={handle}
-                onChange={(event) => setHandle(event.target.value)}
-                spellCheck={false}
-              />
-            </label>
-          </div>
-
-          <div className="runtime-callout">
-            {runtime === "openclaw" ? (
-              <PawPrint size={22} weight="duotone" />
-            ) : (
-              <TerminalWindow size={22} weight="duotone" />
-            )}
-            <span>
-              <strong>{details.label} keeps control of the session</strong>
-              <small>
-                Start the agent in its usual host. Meshr will ask you to
-                approve its identity when it connects.
-              </small>
-            </span>
-          </div>
-
-          <ol className="setup-steps">
-            <li>
-              <span>1</span>
-              <div>
-                <strong>Start your agent</strong>
+              <div className="setup-profile-intro">
+                <strong>Connect {details.label}</strong>
                 <small>
-                  Your host sends a one-time connection request for this
-                  handle.
+                  Choose one handle, then run one command in the project where
+                  the agent works.
                 </small>
               </div>
-            </li>
-            <li>
-              <span>2</span>
-              <div>
-                <strong>Approve the identity</strong>
-                <small>
-                  Review the profile and access before the agent can
-                  participate.
-                </small>
+              <div className="setup-fields native-setup-fields">
+                <label>
+                  {runtime === "openclaw" ? "OpenClaw agent ID" : "Agent handle"}
+                  <input
+                    value={handle}
+                    onChange={(event) => setHandle(event.target.value.toLowerCase())}
+                    spellCheck={false}
+                    minLength={2}
+                    maxLength={runtime === "openclaw" ? 64 : 32}
+                    pattern={runtime === "openclaw" ? "[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?" : "[A-Za-z](?:[A-Za-z0-9-]*[A-Za-z0-9])?"}
+                    aria-invalid={!nativeIdentityValid}
+                  />
+                  {runtime === "openclaw" && (
+                    <small className="setup-field-hint">Use the exact canonical ID. Meshr will create @{nativeMeshrHandle}.</small>
+                  )}
+                  {!nativeIdentityValid && (
+                    <small className="setup-field-error">
+                      {runtime === "openclaw"
+                        ? "Use 1–64 lowercase letters, numbers, underscores, or hyphens."
+                        : "Use 2–32 lowercase letters, numbers, or hyphens; start with a letter."}
+                    </small>
+                  )}
+                </label>
               </div>
-            </li>
-            <li>
-              <span>3</span>
-              <div>
-                <strong>Watch it come online</strong>
-                <small>
-                  It is online while its host is running and disappears when
-                  that session ends.
-                </small>
-              </div>
-            </li>
-          </ol>
 
-          <div className="definition-sync-note">
-            <FileText size={19} />
-            <span>
-              <strong>Local profile, shared presence</strong>
-              <small>
-                The definition stays on the host. Reload it there to apply edits
-                to this connected identity.
-              </small>
-            </span>
-          </div>
-          <div className="setup-command-list">
-            <div className="setup-command-heading">
-              <div>
-                <strong>Connect from your agent's machine</strong>
-                <small>No manual import. The local definition remains the source of truth.</small>
-              </div>
-              <span>{defaultDefinitionPath(handle)}</span>
-            </div>
-            {commandRows.map((row) => (
-              <div className="setup-command" key={row.label}>
+              <div className="setup-quick-command">
                 <div>
-                  <strong>{row.label}</strong>
-                  <small>{row.detail}</small>
+                  <span>ONE-TIME SETUP</span>
+                  <strong>Run this on the {details.label} machine</strong>
+                  <small>
+                    Creates the local profile, opens approval, verifies the
+                    signed session, and {runtime === "mcp" ? "prepares the MCP server" : "configures the host"}.
+                  </small>
                 </div>
-                <code>{row.command}</code>
-                <button
-                  type="button"
-                  onClick={() => void copyCommand(row.command)}
-                  aria-label={`Copy ${row.label.toLowerCase()} command`}
-                >
-                  {copiedCommand === row.command ? "Copied" : "Copy"}
+                <code>{commands.bootstrap}</code>
+                <button type="button" disabled={!nativeIdentityValid} onClick={() => void copyCommand(commands.bootstrap)}>
+                  {copiedCommand === commands.bootstrap ? <><Check size={14} /> Copied</> : "Copy setup command"}
                 </button>
               </div>
-            ))}
-          </div>
-          {runtime === "openclaw" && (
-            <p className="openclaw-config-note">
-              OpenClaw agents use the same approval flow and remain attached to
-              their OpenClaw session.
-            </p>
-          )}
+
+              <ol className="setup-steps native-setup-outcomes">
+                <li>
+                  <span><ShieldCheck size={14} /></span>
+                  <div><strong>You approve the identity</strong><small>The command opens the same review flow with expiry and least-privilege policy intact.</small></div>
+                </li>
+                <li>
+                  <span><FileText size={14} /></span>
+                  <div><strong>The local profile stays local</strong><small>{defaultDefinitionPath(nativeMeshrHandle)} remains the source of truth.</small></div>
+                </li>
+                <li>
+                  <span><Pulse size={14} /></span>
+                  <div><strong>The host provides the running signal</strong><small>Meshr shows the agent online only while the real host session is alive.</small></div>
+                </li>
+              </ol>
+
+              {runtime === "mcp" && (
+                <div className="native-manual-boundary">
+                  <TerminalWindow size={19} />
+                  <span><strong>One host-native action remains</strong><small>Generic MCP hosts have no shared installer. The setup command prints the exact server command to add after approval.</small></span>
+                </div>
+              )}
+
+              <details className="setup-advanced native-advanced">
+                <summary>Advanced: manual steps and diagnostics</summary>
+                <p>Use these only for recovery or a custom host configuration.</p>
+                <div className="setup-command-list">
+                  {commandRows.map((row) => (
+                    <div className="setup-command" key={row.label}>
+                      <div><strong>{row.label}</strong><small>{row.detail}</small></div>
+                      <code>{row.command}</code>
+                      <button type="button" onClick={() => void copyCommand(row.command)} aria-label={`Copy ${row.label.toLowerCase()} command`}>
+                        {copiedCommand === row.command ? "Copied" : "Copy"}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </details>
             </section>
             <footer className="modal-actions">
-              <button className="primary" onClick={closeDialog}>
+              <button className="primary" onClick={closeDialog} disabled={setupLocked}>
                 Done
               </button>
             </footer>

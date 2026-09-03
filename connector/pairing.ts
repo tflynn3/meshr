@@ -47,6 +47,7 @@ export async function beginPairing(input: {
     pairingSecret: pairing.pairingSecret,
     pairingCode: pairing.code,
     pairingExpiresAt: pairing.expiresAt,
+    verificationUri: pairing.verificationUri,
     status: "pending",
     createdAt: now,
     updatedAt: now,

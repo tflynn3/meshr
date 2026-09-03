@@ -2,10 +2,17 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
+  browserAgentSetupReducer,
   buildAgentSetupCommands,
   defaultDefinitionPath,
+  initialBrowserAgentSetupState,
+  nativeSetupMeshrHandle,
+  suggestAgentHandle,
 } from "../src/setup/agentSetup.ts";
-import { starterDefinitionSource } from "../connector/cli.ts";
+import {
+  connectorSetupHandle,
+  starterDefinitionSource,
+} from "../connector/cli.ts";
 
 test("builds the real native pairing, claim, and MCP commands", () => {
   assert.deepEqual(
@@ -15,12 +22,16 @@ test("builds the real native pairing, claim, and MCP commands", () => {
       definitionPath: ".meshr/agents/euclid.md",
     }),
     {
+      bootstrap:
+        "npx --yes --package @meshr/mcp@0.1.0 meshr-mcp setup codex euclid",
       init:
         "npx --yes --package @meshr/mcp@0.1.0 meshr-mcp init --handle 'euclid' --definition '.meshr/agents/euclid.md'",
       connect:
         "npx --yes --package @meshr/mcp@0.1.0 meshr-mcp connect --runtime codex --definition '.meshr/agents/euclid.md'",
       claim: "npx --yes --package @meshr/mcp@0.1.0 meshr-mcp claim --binding 'euclid'",
       sync: "npx --yes --package @meshr/mcp@0.1.0 meshr-mcp sync --binding 'euclid'",
+      diagnose:
+        "npx --yes --package @meshr/mcp@0.1.0 meshr-mcp doctor",
       activate:
         "codex mcp add 'meshr-euclid' -- npx --yes --package @meshr/mcp@0.1.0 meshr-mcp mcp serve --binding 'euclid'",
       openClawInstall: undefined,
@@ -88,6 +99,107 @@ test("includes the same-origin server in browser-generated setup commands", () =
     serverUrl: "https://meshr.social/",
   });
   assert.match(commands.connect, /--server 'https:\/\/meshr\.social\/'/);
+  assert.equal(
+    commands.bootstrap,
+    "npx --yes --package @meshr/mcp@0.1.0 meshr-mcp setup codex euclid --server https://meshr.social",
+  );
+  assert.match(commands.diagnose, /--server 'https:\/\/meshr\.social\/'/);
+});
+
+test("refuses unsafe or ambiguous servers in the copyable bootstrap command", () => {
+  for (const serverUrl of [
+    "javascript:alert(1)",
+    "https://owner:secret@meshr.social/",
+    "https://meshr.social/connect?next=setup",
+  ]) {
+    assert.throws(
+      () =>
+        buildAgentSetupCommands({
+          runtime: "codex",
+          handle: "euclid",
+          definitionPath: ".meshr/agents/euclid.md",
+          serverUrl,
+        }),
+      /must be an HTTP\(S\) origin/,
+    );
+  }
+});
+
+test("derives a safe handle while keeping customization optional", () => {
+  assert.equal(suggestAgentHandle("Garden Researcher"), "garden-researcher");
+  assert.equal(suggestAgentHandle("  🌿 Field Notes  "), "field-notes");
+  assert.equal(suggestAgentHandle("7"), "my-agent");
+  assert.equal(suggestAgentHandle("A very long agent name that should be bounded cleanly"), "a-very-long-agent-name-that-shou");
+  assert.equal(nativeSetupMeshrHandle("openclaw", "garden_main"), "garden-main");
+  assert.equal(nativeSetupMeshrHandle("openclaw", "7-garden"), "agent-7-garden");
+  assert.equal(nativeSetupMeshrHandle("openclaw", "a"), "my-agent");
+  for (const identity of ["garden_main", "7-garden", "a", "garden-main"]) {
+    assert.equal(
+      connectorSetupHandle("openclaw", identity),
+      nativeSetupMeshrHandle("openclaw", identity),
+    );
+  }
+});
+
+test("keeps the exact OpenClaw host identity out of the public handle mapping", () => {
+  const commands = buildAgentSetupCommands({
+    runtime: "openclaw",
+    handle: "garden-main",
+    definitionPath: ".meshr/agents/garden-main.md",
+    openClawAgentId: "garden_main",
+  });
+  assert.match(commands.bootstrap, /setup openclaw garden_main/);
+  assert.match(commands.connect, /--subject 'openclaw:garden_main'/);
+  assert.match(commands.connect, /garden-main\.md/);
+});
+
+test("browser setup cannot report success before the exact identity tool set is registered", () => {
+  const creating = browserAgentSetupReducer(initialBrowserAgentSetupState, {
+    type: "submit",
+  });
+  const registering = browserAgentSetupReducer(creating, {
+    type: "identity_created",
+    agentId: "agt_garden",
+    handle: "garden",
+  });
+  assert.equal(registering.phase, "registering");
+  assert.deepEqual(
+    browserAgentSetupReducer(registering, {
+      type: "registration_ready",
+      agentId: "agt_stale",
+    }),
+    registering,
+  );
+  assert.deepEqual(
+    browserAgentSetupReducer(registering, {
+      type: "registration_ready",
+      agentId: "agt_garden",
+    }),
+    { phase: "ready", agentId: "agt_garden", handle: "garden" },
+  );
+});
+
+test("registration failure preserves the durable identity for grant-only retry", () => {
+  const registering = {
+    phase: "registering" as const,
+    agentId: "agt_garden",
+    handle: "garden",
+  };
+  const failed = browserAgentSetupReducer(registering, {
+    type: "failed",
+    message: "Host rejected one tool.",
+  });
+  assert.deepEqual(failed, {
+    phase: "error",
+    point: "registration",
+    message: "Host rejected one tool.",
+    agentId: "agt_garden",
+    handle: "garden",
+  });
+  assert.deepEqual(
+    browserAgentSetupReducer(failed, { type: "retry_registration" }),
+    registering,
+  );
 });
 
 test("user-facing package bootstrap commands are release-pinned", () => {
@@ -118,4 +230,12 @@ test("the Add agent screen creates server authority without a fake runtime", () 
   assert.match(source, /createBrowserAgentWithWebMcp/);
   assert.doesNotMatch(source, /meshStore\.connectRuntime/);
   assert.doesNotMatch(source, /discovered-agents/);
+  assert.match(source, /This confirms access,[\s\S]*not that a model is currently running/);
+  assert.match(source, /Advanced: manual steps and diagnostics/);
+  const connectorSource = readFileSync(
+    new URL("../connector/cli.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(connectorSource, /args\.command === "setup"/);
+  assert.match(connectorSource, /Waiting for approval; this terminal will continue automatically/);
 });
