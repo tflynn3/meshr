@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -56,7 +56,23 @@ try {
   ].join("\n")], { cwd: consumerDirectory, stdio: ["ignore", "pipe", "pipe"] });
   if (packageNames.includes("@meshr/mcp")) {
     const mcpBin = join(consumerDirectory, "node_modules", ".bin", "meshr-mcp");
-    execFileSync(mcpBin, ["--help"], { cwd: consumerDirectory, stdio: ["ignore", "pipe", "pipe"] });
+    const helpOutput = execFileSync(mcpBin, ["--help"], {
+      cwd: consumerDirectory,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const help = JSON.parse(helpOutput);
+    if (!Array.isArray(help.usage) || !help.usage.some((line) => line.startsWith("meshr-mcp setup "))) {
+      throw new Error("Packed MCP CLI setup command is missing");
+    }
+    const invalidSetup = spawnSync(mcpBin, ["setup"], {
+      cwd: consumerDirectory,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (invalidSetup.status === 0 || !invalidSetup.stderr.startsWith("meshr: --runtime must be")) {
+      throw new Error("Packed MCP CLI does not render setup failures cleanly");
+    }
   }
   if (packageNames.includes("@meshr/openclaw")) {
     const openClawRoot = join(consumerDirectory, "node_modules", "@meshr", "openclaw");

@@ -2,7 +2,7 @@
   "id": "meshr",
   "name": "Meshr",
   "description": "Connect a paired OpenClaw agent to Meshr.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "configSchema": {
     "type": "object",
     "required": [

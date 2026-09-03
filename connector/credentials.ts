@@ -5,6 +5,8 @@ import type { ConnectorBinding } from "./types";
 const execFileAsync = promisify(execFile);
 const KEYCHAIN_ACCOUNT = "meshr";
 const KEYCHAIN_COMMAND_TIMEOUT_MS = 10_000;
+const EXPECT_COMMAND = "/usr/bin/expect";
+const SECURITY_COMMAND = "/usr/bin/security";
 
 export interface BindingCredentials {
   privateKeyPem: string;
@@ -39,7 +41,11 @@ type KeychainManifest = {
 export function osKeychainSupported(): boolean {
   if (process.platform !== "darwin") return false;
   try {
-    execFileSync("security", ["help"], {
+    execFileSync(SECURITY_COMMAND, ["help"], {
+      stdio: "ignore",
+      timeout: KEYCHAIN_COMMAND_TIMEOUT_MS,
+    });
+    execFileSync(EXPECT_COMMAND, ["-v"], {
       stdio: "ignore",
       timeout: KEYCHAIN_COMMAND_TIMEOUT_MS,
     });
@@ -224,8 +230,38 @@ async function readSecurityChunks(ref: string, field: string, count: number): Pr
 }
 
 async function runSecurityPrompt(args: string[], secret: string): Promise<void> {
+  if (/[\r\n]/.test(secret)) throw new Error("os_keychain_write_failed");
+  const command = [SECURITY_COMMAND, ...args].map(expectArgument).join(" ");
+  const expectScript = [
+    "log_user 0",
+    `set timeout ${Math.ceil(KEYCHAIN_COMMAND_TIMEOUT_MS / 1_000)}`,
+    "set secret [gets stdin]",
+    `spawn -noecho ${command}`,
+    "expect {",
+    '  -exact "password data for new item: " {}',
+    "  timeout { exit 124 }",
+    "  eof { exit 125 }",
+    "}",
+    'send -- "$secret\\r"',
+    "expect {",
+    '  -exact "retype password for new item: " {}',
+    "  timeout { exit 124 }",
+    "  eof { exit 125 }",
+    "}",
+    'send -- "$secret\\r"',
+    "expect {",
+    "  eof {}",
+    "  timeout { exit 124 }",
+    "}",
+    "set result [wait]",
+    "exit [lindex $result 3]",
+  ].join("\n");
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("security", args, {
+    // `security ... -w` deliberately reads from a terminal instead of stdin.
+    // Expect provides that pseudoterminal while the credential itself still
+    // arrives over a private pipe rather than argv or the environment.
+    const child = spawn(EXPECT_COMMAND, ["-c", expectScript], {
+      env: { ...process.env, LANG: "C", LC_ALL: "C" },
       stdio: ["pipe", "ignore", "pipe"],
     });
     let forceKill: NodeJS.Timeout | undefined;
@@ -258,11 +294,17 @@ async function runSecurityPrompt(args: string[], secret: string): Promise<void> 
       void stderr;
       reject(new Error("os_keychain_write_failed"));
     });
-    // `security` prompts for the value twice when stdin is non-interactive.
-    // Supplying both copies keeps the payload off argv while satisfying that
-    // confirmation prompt.
-    child.stdin.end(secret + "\n" + secret + "\n");
+    child.stdin.end(secret + "\n");
   });
+}
+
+function expectArgument(value: string): string {
+  // Every current argument is generated internally from fixed labels and a
+  // UUID. Keep that boundary explicit before embedding it in the Tcl command.
+  if (!/^[A-Za-z0-9_./:+-]+$/.test(value)) {
+    throw new Error("os_keychain_write_failed");
+  }
+  return `{${value}}`;
 }
 
 export const systemBindingCredentialBackend: BindingCredentialBackend = {

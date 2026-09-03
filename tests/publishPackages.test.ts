@@ -77,8 +77,31 @@ test("resumable npm publication refuses an existing mismatched artifact", () => 
       integrity: "sha512-current",
       shasum: "current",
     }], {
-      "@meshr/mcp@0.1.0": { integrity: "sha512-different", shasum: "different" },
+      "@meshr/mcp@0.1.0": {
+        integrity: "sha512-different",
+        shasum: "different",
+        contentsMatch: false,
+      },
     }),
-    /different integrity/,
+    /different package contents/,
   );
+});
+
+test("resumable npm publication accepts identical contents from a different npm tar encoding", () => {
+  const actions = planPublication([{
+    name: "@meshr/mcp",
+    version: "0.1.0",
+    directory: "packages/mcp",
+    filename: "meshr-mcp-0.1.0.tgz",
+    integrity: "sha512-npm-11",
+    shasum: "npm-11",
+  }], {
+    "@meshr/mcp@0.1.0": {
+      integrity: "sha512-npm-10",
+      shasum: "npm-10",
+      contentsMatch: true,
+    },
+  });
+
+  assert.equal(actions[0]?.action, "skip");
 });

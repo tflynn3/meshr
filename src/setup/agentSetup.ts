@@ -7,8 +7,8 @@ export const agentSetupRuntimes = [
 
 export type AgentSetupRuntime = (typeof agentSetupRuntimes)[number];
 
-const MESHR_MCP_PACKAGE = "@meshr/mcp@0.1.0";
-const MESHR_OPENCLAW_PACKAGE = "npm:@meshr/openclaw@0.1.0";
+const MESHR_MCP_PACKAGE = "@meshr/mcp@0.1.1";
+const MESHR_OPENCLAW_PACKAGE = "npm:@meshr/openclaw@0.1.1";
 
 export const agentSetupRuntimeDetails: Record<
   AgentSetupRuntime,
