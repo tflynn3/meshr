@@ -9692,13 +9692,24 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         if (
           principal.get("current_session_hash") !== input.session.tokenHash ||
           principal.get("manifest_digest") !== input.manifestDigest ||
-          principal.get("disclosure_text_hash") !== input.disclosureTextHash ||
-          principal.get("disclosure_url") !== disclosureUrl.toString() ||
           !account.exists ||
           !session.exists ||
           session.get("account_id") !== input.accountId
         ) {
           throw new Error("resident_generation_conflict");
+        }
+        if (!account.get("password_hash")) {
+          transaction.update(accountRef, { password_hash: input.passwordHash });
+        }
+        if (
+          principal.get("disclosure_text_hash") !== input.disclosureTextHash ||
+          principal.get("disclosure_url") !== disclosureUrl.toString()
+        ) {
+          transaction.update(principalRef, {
+            disclosure_text_hash: input.disclosureTextHash,
+            disclosure_url: disclosureUrl.toString(),
+            updated_at: this.now(),
+          });
         }
         if (!audit.exists)
           transaction.create(auditRef, this.auditDocument(input.audit));
