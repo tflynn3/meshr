@@ -10932,6 +10932,12 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     if (input.activity && input.activity.agentId !== input.agentId) {
       throw new Error("activity_agent_mismatch");
     }
+    if (
+      input.authorityKind === "page" &&
+      (!input.grantId || !input.humanSessionHash || !input.ownerAccountId)
+    ) {
+      throw new Error("session_invalid");
+    }
     const idempotencyRef = this.doc(
       "idempotency",
       input.agentId + ":" + input.eventType + ":" + input.idempotencyKey,
@@ -10973,42 +10979,25 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           throw new Error("session_invalid");
         }
       } else {
-        const grant = input.grantId
-          ? await transaction.get(this.doc("webmcp_grants", input.grantId))
-          : undefined;
-        const humanSession = input.humanSessionHash
-          ? await transaction.get(
-              this.doc("human_sessions", input.humanSessionHash),
-            )
-          : undefined;
-        const fence = input.humanSessionHash
-          ? await transaction.get(
-              this.webMcpAuthorityRef(input.humanSessionHash),
-            )
-          : undefined;
-        if (grant) {
-          if (
-            !grant.exists ||
-            grant.get("agent_id") !== input.agentId ||
-            grant.get("session_id") !== input.sessionId ||
-            grant.get("revoked_at") !== null ||
-            Date.parse(String(grant.get("expires_at"))) <= Date.parse(now)
-          ) {
-            throw new Error("session_invalid");
-          }
-        } else {
-          const grants = await transaction.get(
-            this.firestore
-              .collection(this.collection("webmcp_grants"))
-              .where("agent_id", "==", input.agentId)
-              .where("session_id", "==", input.sessionId)
-              .where("revoked_at", "==", null)
-              .limit(2),
-          );
-          if (grants.size !== 1) throw new Error("session_invalid");
+        const grant = await transaction.get(
+          this.doc("webmcp_grants", input.grantId!),
+        );
+        const humanSession = await transaction.get(
+          this.doc("human_sessions", input.humanSessionHash!),
+        );
+        const fence = await transaction.get(
+          this.webMcpAuthorityRef(input.humanSessionHash!),
+        );
+        if (
+          !grant.exists ||
+          grant.get("agent_id") !== input.agentId ||
+          grant.get("session_id") !== input.sessionId ||
+          grant.get("revoked_at") !== null ||
+          Date.parse(String(grant.get("expires_at"))) <= Date.parse(now)
+        ) {
+          throw new Error("session_invalid");
         }
         if (
-          !humanSession ||
           !humanSession.exists ||
           humanSession.get("account_id") !== input.ownerAccountId ||
           Date.parse(String(humanSession.get("expires_at"))) <=
@@ -11020,15 +11009,13 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         )
           throw new Error("session_invalid");
         if (
-          !fence ||
           !fence.exists ||
           fence.get("agent_id") !== input.agentId ||
           fence.get("session_id") !== input.sessionId ||
           fence.get("revoked_at") != null ||
           Number(fence.get("epoch") ?? -1) !==
             Number(authority.get("epoch") ?? -2) ||
-          (input.grantId !== undefined &&
-            fence.get("grant_id") !== input.grantId)
+          fence.get("grant_id") !== input.grantId
         )
           throw new Error("session_invalid");
       }
@@ -11104,10 +11091,15 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       const attention = agent.get("attention_policy");
       const attentionField =
         input.eventType === "post.created" ? "rootPosts" : "replies";
+      const writePolicy =
+        attention && typeof attention === "object"
+          ? (attention as Record<string, unknown>)[attentionField]
+          : undefined;
+      // An active page grant makes this invocation the approval for a draft
+      // write. Native runtimes still need explicit autonomous authority.
       if (
-        !attention ||
-        typeof attention !== "object" ||
-        (attention as Record<string, unknown>)[attentionField] !== "autonomous"
+        writePolicy !== "autonomous" &&
+        !(input.authorityKind === "page" && writePolicy === "draft")
       ) {
         throw new Error("attention_policy_denied");
       }
