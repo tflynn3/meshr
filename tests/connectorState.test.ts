@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { deleteBindingCredentials } from "../connector/credentials.ts";
 import { assertNativeStatePlatform, ConnectorStateStore } from "../connector/state.ts";
 import {
   CONNECTOR_STATE_VERSION,
@@ -149,6 +151,33 @@ test("credential storage mode rejects unsafe configuration typos", () => {
     if (previous === undefined) delete process.env.MESHR_CREDENTIAL_STORAGE;
     else process.env.MESHR_CREDENTIAL_STORAGE = previous;
   }
+});
+
+test("macOS keychain storage writes and reloads connector credentials non-interactively", {
+  skip: process.platform !== "darwin",
+}, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "meshr-keychain-test-"));
+  const pairingId = `pair-${randomUUID()}`;
+  const credentialRef = `pairing:${pairingId}`;
+  t.after(async () => {
+    await deleteBindingCredentials(credentialRef).catch(() => undefined);
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const expected = binding({
+    pairingId,
+    status: "pending",
+    createdAt: "2026-09-03T00:00:00.000Z",
+    handle: "keychain-test",
+  });
+  const store = new ConnectorStateStore(directory, { useKeychain: true });
+  await store.save({ version: CONNECTOR_STATE_VERSION, bindings: [expected] });
+
+  const persisted = await readFile(join(directory, "state.json"), "utf8");
+  assert.doesNotMatch(persisted, /private-key|secret-/);
+  const loaded = await store.require(expected.pairingId);
+  assert.equal(loaded.privateKeyPem, expected.privateKeyPem);
+  assert.equal(loaded.pairingSecret, expected.pairingSecret);
 });
 
 test("Windows native state fails closed unless explicitly opted into a non-production mode", () => {

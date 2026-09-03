@@ -2,10 +2,10 @@
 
 /**
  * Publish the release packages in a resumable order. A package version that
- * already exists is only skipped when the registry tarball has exactly the
- * same integrity as the freshly packed artifact; a partial previous run can
- * therefore be retried without publishing a second version or silently
- * accepting a mismatched artifact.
+ * already exists is only skipped when the registry tarball has the same
+ * integrity or npm confirms that its unpacked package contents are identical.
+ * The content fallback handles byte-level tarball differences between npm
+ * versions without accepting a mismatched release.
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
@@ -63,6 +63,23 @@ function registryRecord(name, version) {
   throw new Error(`Unable to inspect ${spec} on npm: ${errorText.trim() || "registry request failed"}`);
 }
 
+function registryContentsMatch(artifact) {
+  const spec = `${artifact.name}@${artifact.version}`;
+  const result = spawnSync(
+    "npm",
+    ["diff", "--diff", spec, "--diff", artifact.directory],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (result.status !== 0) {
+    const errorText = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim();
+    throw new Error(`Unable to compare ${spec} with the release package: ${errorText || "npm diff failed"}`);
+  }
+  return result.stdout.trim() === "";
+}
+
 /**
  * Return the idempotent action for every artifact. `records` is injectable so
  * the exact partial-publish behavior can be tested without network access.
@@ -77,9 +94,9 @@ function planPublication(artifacts, records) {
     const shasumMatches = artifact.shasum && existing.shasum
       ? artifact.shasum === existing.shasum
       : false;
-    if (!integrityMatches && !shasumMatches) {
+    if (!integrityMatches && !shasumMatches && existing.contentsMatch !== true) {
       throw new Error(
-        `${artifact.name}@${artifact.version} already exists with a different integrity; refusing to publish or skip it.`,
+        `${artifact.name}@${artifact.version} already exists with different package contents; refusing to publish or skip it.`,
       );
     }
     return { action: "skip", artifact, existing };
@@ -92,10 +109,23 @@ function main() {
     throw new Error("Pass at least one package directory to publish.");
   }
   const artifacts = directories.map(packPackage);
-  const records = Object.fromEntries(artifacts.map((artifact) => [
-    `${artifact.name}@${artifact.version}`,
-    registryRecord(artifact.name, artifact.version),
-  ]));
+  const records = Object.fromEntries(artifacts.map((artifact) => {
+    const key = `${artifact.name}@${artifact.version}`;
+    const existing = registryRecord(artifact.name, artifact.version);
+    if (!existing) return [key, null];
+    const integrityMatches = artifact.integrity && existing.integrity
+      ? artifact.integrity === existing.integrity
+      : false;
+    const shasumMatches = artifact.shasum && existing.shasum
+      ? artifact.shasum === existing.shasum
+      : false;
+    return [key, {
+      ...existing,
+      contentsMatch: integrityMatches || shasumMatches
+        ? undefined
+        : registryContentsMatch(artifact),
+    }];
+  }));
   const actions = planPublication(artifacts, records);
   for (const plan of actions) {
     const { artifact } = plan;
