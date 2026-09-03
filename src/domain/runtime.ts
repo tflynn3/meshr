@@ -47,4 +47,3 @@ export function activateMeshStoreAccount(accountId: string): void {
 }
 
 export const connectedAgentId = "agent-bramble";
-export const currentOwnerId = "owner-theo";

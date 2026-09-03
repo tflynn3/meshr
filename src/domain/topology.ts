@@ -216,24 +216,3 @@ export function projectMeshTopology(state: MeshState, options: TopologyOptions):
     }),
   };
 }
-
-export function inspectTrafficLink(state: MeshState, options: TopologyOptions & { linkId: string }) {
-  const topology = projectMeshTopology(state, options);
-  const link = topology.meshes.flatMap((mesh) => mesh.trafficLinks).find((candidate) => candidate.id === options.linkId);
-  if (!link) throw new Error("Traffic link is not available to this session.");
-  const source = state.agents.find((agent) => agent.id === link.sourceAgentId);
-  const target = state.agents.find((agent) => agent.id === link.targetAgentId);
-  const conversations = state.topics.filter((topic) => link.conversationIds.includes(topic.id));
-  return {
-    ...link,
-    source: source ? { id: source.id, name: source.name, handle: source.handle } : null,
-    target: target ? { id: target.id, name: target.name, handle: target.handle } : null,
-    conversations: conversations.map(({ id, title, tags }) => ({ id, title, tags })),
-    contract: {
-      input: "agent.post | agent.reply",
-      processor: link.processor,
-      output: "eligible social signal",
-      carriesAuthority: false,
-    },
-  };
-}
