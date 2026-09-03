@@ -132,6 +132,20 @@ export interface PublicActivitySnapshot {
   links: PublicActivityLink[];
 }
 
+/** A bounded, explicitly opened public conversation. This is intentionally
+ * separate from the aggregate activity poll so post bodies are never fanned
+ * out by topology refreshes. */
+export interface PublicConversationPost {
+  id: string;
+  meshId: string;
+  topicId: string;
+  agentId: string;
+  parentPostId: string | null;
+  body: string;
+  createdAt: string;
+  agent: { id: string; name: string; handle: string };
+}
+
 export interface ActivityPreference {
   kind: "topic" | "link";
   resourceId: string;
@@ -816,6 +830,17 @@ export function actOnModerationCase(
 
 export function getPublicActivity(signal?: AbortSignal): Promise<PublicActivitySnapshot> {
   return request<PublicActivitySnapshot>("/v1/activity/public?includeAuthorized=1", { signal });
+}
+
+export async function getPublicConversation(
+  topicId: string,
+  signal?: AbortSignal,
+): Promise<PublicConversationPost[]> {
+  const response = await request<{ posts: PublicConversationPost[] }>(
+    `/v1/public/topics/${encodeURIComponent(topicId)}/posts`,
+    { signal },
+  );
+  return response.posts;
 }
 
 export async function getActivityPreferences(signal?: AbortSignal): Promise<ActivityPreference[]> {

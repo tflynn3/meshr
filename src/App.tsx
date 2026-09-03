@@ -49,6 +49,7 @@ import {
   enableWebMcpSession,
   createMesh,
   getActivityPreferences,
+  getPublicConversation,
   getPublicActivity,
   getMeshGovernance,
   listMeshInvitations,
@@ -88,6 +89,7 @@ import {
   type OwnedAgent,
   type CreateBrowserAgentInput,
   type PublicActivitySnapshot,
+  type PublicConversationPost,
   type WebMcpSessionStatus,
 } from "./auth/api";
 import { TopologyCanvas } from "./components/TopologyCanvas";
@@ -98,6 +100,7 @@ import {
   readAgentDetailRoute,
 } from "./domain/agentControlCenter";
 import { applyPublicActivitySnapshot } from "./domain/publicActivity";
+import { meshNavigationUrl, readMeshNavigation, type MeshNavigation } from "./domain/meshNavigation";
 import { projectMeshTopology, type TrafficLink } from "./domain/topology";
 import { connectedAgentId, meshStore } from "./domain/runtime";
 import {
@@ -316,11 +319,25 @@ export function App() {
     meshStore.subscribe,
     meshStore.getSnapshot,
   );
+  const initialAgentNavigation = typeof window === "undefined"
+    ? { kind: "agents" as const }
+    : readAgentDetailRoute(window.location.search);
+  const initialMeshNavigation = typeof window === "undefined"
+    ? { kind: "agents" as const }
+    : readMeshNavigation(window.location);
   const [view, setView] = useState<View>(() =>
-    typeof window === "undefined" ? { kind: "agents" } : readAgentDetailRoute(window.location.search),
+    initialAgentNavigation.kind === "agent"
+      ? initialAgentNavigation
+      : initialMeshNavigation.kind === "mesh"
+        ? { kind: "mesh", meshId: initialMeshNavigation.meshId }
+        : { kind: "agents" },
   );
-  const [selectedTopicId, setSelectedTopicId] = useState("topic-native-shade");
-  const [selectedLinkId, setSelectedLinkId] = useState<string | null>(null);
+  const [selectedTopicId, setSelectedTopicId] = useState(() =>
+    initialMeshNavigation.kind === "mesh" ? initialMeshNavigation.topicId ?? "" : "topic-native-shade");
+  const [selectedLinkId, setSelectedLinkId] = useState<string | null>(() =>
+    initialMeshNavigation.kind === "mesh" ? initialMeshNavigation.trafficId : null);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(initialMeshNavigation.kind === "mesh");
   const [createMeshOpen, setCreateMeshOpen] = useState(false);
   const [createAgentOpen, setCreateAgentOpen] = useState(false);
   const [governanceOpen, setGovernanceOpen] = useState(false);
@@ -823,22 +840,74 @@ export function App() {
   }, [webMcpSession]);
 
   useEffect(() => {
-    const onPopState = () => setView(readAgentDetailRoute(window.location.search));
-    window.addEventListener("popstate", onPopState);
-    return () => window.removeEventListener("popstate", onPopState);
-  }, []);
-
-  useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(""), 2600);
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  const navigateMesh = useCallback((next: MeshNavigation, replace = false) => {
+    if (typeof window !== "undefined") {
+      const url = new URL(meshNavigationUrl(window.location, next), window.location.origin);
+      url.search = agentPortfolioSearch(url.search);
+      window.history[replace ? "replaceState" : "pushState"](
+        {}, "", `${url.pathname}${url.search}${url.hash}`,
+      );
+    }
+    if (next.kind === "agents") {
+      setView({ kind: "agents" });
+      setSelectedLinkId(null);
+      setSelectedAgentId(null);
+      setInspectorOpen(false);
+      return;
+    }
+    setView({ kind: "mesh", meshId: next.meshId });
+    setSelectedTopicId(next.topicId ?? "");
+    setSelectedLinkId(next.trafficId);
+  }, []);
+
+  useEffect(() => {
+    if (!selectedMesh || !selectedTopic || typeof window === "undefined") return;
+    const current = readMeshNavigation(window.location);
+    if (
+      current.kind !== "mesh" ||
+      current.meshId !== selectedMesh.id ||
+      current.topicId !== selectedTopic.id ||
+      (current.trafficId !== null && selectedLink === null)
+    ) {
+      navigateMesh({
+        kind: "mesh",
+        meshId: selectedMesh.id,
+        topicId: selectedTopic.id,
+        trafficId: selectedLink?.id ?? null,
+      }, true);
+    }
+  }, [navigateMesh, selectedLink, selectedMesh, selectedTopic]);
+
+  useEffect(() => {
+    const restore = () => {
+      if (typeof window === "undefined") return;
+      const agentNavigation = readAgentDetailRoute(window.location.search);
+      if (agentNavigation.kind === "agent") {
+        setView(agentNavigation);
+        setSelectedAgentId(null);
+        setInspectorOpen(false);
+        return;
+      }
+      const next = readMeshNavigation(window.location);
+      setView(next.kind === "mesh" ? { kind: "mesh", meshId: next.meshId } : { kind: "agents" });
+      setSelectedTopicId(next.kind === "mesh" ? next.topicId ?? "" : "");
+      setSelectedLinkId(next.kind === "mesh" ? next.trafficId : null);
+      setSelectedAgentId(null);
+      setInspectorOpen(next.kind === "mesh");
+    };
+    window.addEventListener("popstate", restore);
+    return () => window.removeEventListener("popstate", restore);
+  }, []);
+
   function openMesh(meshId: string) {
     const firstTopic = activityState.topics.find((topic) => topic.meshId === meshId);
-    setView({ kind: "mesh", meshId });
-    setSelectedTopicId(firstTopic?.id ?? "");
-    setSelectedLinkId(null);
+    setInspectorOpen(true);
+    navigateMesh({ kind: "mesh", meshId, topicId: firstTopic?.id ?? null, trafficId: null });
   }
 
   function openAgent(agentId: string) {
@@ -864,7 +933,12 @@ export function App() {
     const url = new URL(window.location.href);
     url.search = agentPortfolioSearch(url.search);
     window.history.replaceState(window.history.state, "", url);
-    setView({ kind: "agents" });
+    const next = readMeshNavigation(url);
+    setView(next.kind === "mesh" ? { kind: "mesh", meshId: next.meshId } : { kind: "agents" });
+    setSelectedTopicId(next.kind === "mesh" ? next.topicId ?? "" : "");
+    setSelectedLinkId(next.kind === "mesh" ? next.trafficId : null);
+    setSelectedAgentId(null);
+    setInspectorOpen(next.kind === "mesh");
   }
 
   async function selectWebMcpAgent(agentId: string) {
@@ -952,7 +1026,7 @@ export function App() {
         owner={owner}
         account={session!.user}
         view={view}
-        onAgents={() => setView({ kind: "agents" })}
+        onAgents={() => navigateMesh({ kind: "agents" })}
         onMesh={openMesh}
         onCreate={() => setCreateMeshOpen(true)}
         onLogout={() => {
@@ -1011,8 +1085,7 @@ export function App() {
         )
       ) : (
         selectedMesh &&
-        selectedTopic &&
-        topology && (
+        topology && (selectedTopic ? (
           <MeshExperience
           mesh={selectedMesh}
           portfolio={portfolio}
@@ -1021,19 +1094,21 @@ export function App() {
             topic={selectedTopic}
             trafficLinks={topology.meshes[0]?.trafficLinks ?? []}
             selectedLink={selectedLink}
+            selectedAgentId={selectedAgentId}
+            inspectorOpen={inspectorOpen}
             webMcpStatus={webMcpStatus}
             webMcpAgentHandle={webMcpSession?.agent?.handle ?? null}
             activityPreferences={activityPreferences}
             onSaveActivityPreference={saveActivityPreference}
-            onSelectTopic={(topicId) => {
-              setSelectedTopicId(topicId);
-              setSelectedLinkId(null);
-            }}
-            onSelectLink={setSelectedLinkId}
+            onSelectTopic={(topicId) => { setInspectorOpen(true); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId, trafficId: null }); }}
+            onSelectLink={(trafficId) => { setInspectorOpen(true); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId: selectedTopic.id, trafficId }); }}
+            onSelectAgent={setSelectedAgentId}
+            onOpenInspector={() => setInspectorOpen(true)}
+            onCloseInspector={() => { setInspectorOpen(false); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId: selectedTopic.id, trafficId: null }); }}
             onOpenGovernance={() => setGovernanceOpen(true)}
             onAddAgent={() => setCreateAgentOpen(true)}
           />
-        )
+        ) : <MeshEmptyState mesh={selectedMesh} onOpenGovernance={() => setGovernanceOpen(true)} onAddAgent={() => setCreateAgentOpen(true)} />)
       )}
       {createMeshOpen && (
         <CreateMeshDialog
@@ -1042,9 +1117,8 @@ export function App() {
           onClose={() => setCreateMeshOpen(false)}
           onCreated={(meshId, topicId) => {
             setCreateMeshOpen(false);
-            setView({ kind: "mesh", meshId });
-            setSelectedTopicId(topicId);
-            setSelectedLinkId(null);
+            setInspectorOpen(true);
+            navigateMesh({ kind: "mesh", meshId, topicId, trafficId: null });
             void refreshMeshes().catch(() => setToast("Mesh created; refresh failed"));
           }}
         />
@@ -1085,6 +1159,23 @@ export function App() {
       )}
     </div>
   );
+}
+
+function MeshEmptyState({
+  mesh,
+  onOpenGovernance,
+  onAddAgent,
+}: {
+  mesh: Mesh;
+  onOpenGovernance: () => void;
+  onAddAgent: () => void;
+}) {
+  return <main className="mesh-empty-state">
+    <span className={`access-chip ${mesh.visibility}`}><AccessIcon visibility={mesh.visibility} /> {visibilityLabels[mesh.visibility]}</span>
+    <h1>{mesh.name} is ready for a first conversation</h1>
+    <p>There are no visible topics yet. Add an agent, or open mesh details to create a topic if you manage this mesh.</p>
+    <div><button className="primary" type="button" onClick={onAddAgent}><Plus size={17} /> Add agent</button><button type="button" onClick={onOpenGovernance}><Gear size={17} /> Mesh details</button></div>
+  </main>;
 }
 
 function MeshRail({
@@ -1621,12 +1712,17 @@ function MeshExperience({
   topic,
   trafficLinks,
   selectedLink,
+  selectedAgentId,
+  inspectorOpen,
   webMcpStatus,
   webMcpAgentHandle,
   activityPreferences,
   onSaveActivityPreference,
   onSelectTopic,
   onSelectLink,
+  onSelectAgent,
+  onOpenInspector,
+  onCloseInspector,
   onOpenGovernance,
   onAddAgent,
 }: {
@@ -1637,6 +1733,8 @@ function MeshExperience({
   topic: Topic;
   trafficLinks: TrafficLink[];
   selectedLink: TrafficLink | null;
+  selectedAgentId: string | null;
+  inspectorOpen: boolean;
   webMcpStatus: WebMcpRegistrationStatus | "disabled" | "registering" | "error";
   webMcpAgentHandle: string | null;
   activityPreferences: Record<string, ActivityPreference>;
@@ -1647,6 +1745,9 @@ function MeshExperience({
   ) => Promise<ActivityPreference>;
   onSelectTopic: (id: string) => void;
   onSelectLink: (id: string) => void;
+  onSelectAgent: (id: string) => void;
+  onOpenInspector: () => void;
+  onCloseInspector: () => void;
   onOpenGovernance: () => void;
   onAddAgent: () => void;
 }) {
@@ -1657,13 +1758,15 @@ function MeshExperience({
     .map((id) => state.agents.find((agent) => agent.id === id))
     .filter(Boolean) as Agent[];
   return (
-    <div className="mesh-experience">
+    <div className={`mesh-experience ${inspectorOpen ? "" : "inspector-closed"}`}>
       <MeshAgentPanel
         mesh={mesh}
         portfolio={portfolio}
         state={state}
         webMcpStatus={webMcpStatus}
         webMcpAgentHandle={webMcpAgentHandle}
+        selectedAgentId={selectedAgentId}
+        onSelectAgent={onSelectAgent}
         onAddAgent={onAddAgent}
       />
       <main className="mesh-stage">
@@ -1686,20 +1789,23 @@ function MeshExperience({
           trafficLinks={trafficLinks}
           selectedTopicId={topic.id}
           selectedLinkId={selectedLink?.id ?? null}
+          selectedAgentId={selectedAgentId}
           onSelectTopic={onSelectTopic}
           onSelectLink={onSelectLink}
+          onSelectAgent={onSelectAgent}
         />
+        {!inspectorOpen && <button type="button" className="inspector-reopen" onClick={onOpenInspector}>Open conversation details</button>}
       </main>
-      {selectedLink ? (
+      {inspectorOpen && selectedLink ? (
         <TrafficInspector
           link={selectedLink}
           state={state}
           mesh={mesh}
           preference={activityPreferences[`link:${selectedLink.id}`]}
           onSavePreference={onSaveActivityPreference}
-          onClose={() => onSelectTopic(topic.id)}
+          onClose={onCloseInspector}
         />
-      ) : (
+      ) : inspectorOpen ? (
         <ConversationInspector
           topic={topic}
           mesh={mesh}
@@ -1707,8 +1813,9 @@ function MeshExperience({
           ownerId={ownerId}
           preference={activityPreferences[`topic:${topic.id}`]}
           onSavePreference={onSaveActivityPreference}
+          onClose={onCloseInspector}
         />
-      )}
+      ) : null}
     </div>
   );
 }
@@ -1719,6 +1826,8 @@ function MeshAgentPanel({
   state,
   webMcpStatus,
   webMcpAgentHandle,
+  selectedAgentId,
+  onSelectAgent,
   onAddAgent,
 }: {
   mesh: Mesh;
@@ -1726,6 +1835,8 @@ function MeshAgentPanel({
   state: ReturnType<typeof meshStore.getSnapshot>;
   webMcpStatus: WebMcpRegistrationStatus | "disabled" | "registering" | "error";
   webMcpAgentHandle: string | null;
+  selectedAgentId: string | null;
+  onSelectAgent: (id: string) => void;
   onAddAgent: () => void;
 }) {
   return (
@@ -1749,7 +1860,7 @@ function MeshAgentPanel({
             (binding) => binding.agentId === agent.id,
           );
           return (
-            <article key={agent.id} className={joined ? "joined" : "away"}>
+            <button type="button" key={agent.id} className={`${joined ? "joined" : "away"} ${selectedAgentId === agent.id ? "selected" : ""}`} onClick={() => onSelectAgent(agent.id)} aria-pressed={selectedAgentId === agent.id}>
               <AgentAvatar agent={agent} />
               <div>
                 <strong>{agent.name}</strong>
@@ -1762,10 +1873,14 @@ function MeshAgentPanel({
                 </span>
               </div>
               <i className={runtime?.status ?? "offline"} />
-            </article>
+            </button>
           );
         })}
       </div>
+      {selectedAgentId && (() => {
+        const selected = state.agents.find((agent) => agent.id === selectedAgentId);
+        return selected ? <div className="selected-agent-summary" role="status"><strong>Inspecting @{selected.handle}</strong><span>{selected.tagline || "Agent profile selected from the topology."}</span></div> : null;
+      })()}
       <button className="panel-add" onClick={onAddAgent}>
         <Plus size={17} /> Add agent
       </button>
@@ -1805,6 +1920,7 @@ function ConversationInspector({
   ownerId,
   preference,
   onSavePreference,
+  onClose,
 }: {
   topic: Topic;
   mesh: Mesh;
@@ -1816,13 +1932,37 @@ function ConversationInspector({
     resourceId: string,
     input: { watching?: boolean; muted?: boolean },
   ) => Promise<ActivityPreference>;
+  onClose: () => void;
 }) {
   const [muted, setMuted] = useState(preference?.muted ?? false);
   const [watching, setWatching] = useState(preference?.watching ?? false);
+  const [conversation, setConversation] = useState<{
+    status: "not-loaded" | "loading" | "ready" | "offline" | "error";
+    posts: PublicConversationPost[];
+  }>({ status: "not-loaded", posts: [] });
   useEffect(() => {
     setMuted(preference?.muted ?? false);
     setWatching(preference?.watching ?? false);
   }, [preference?.muted, preference?.resourceId, preference?.updatedAt, preference?.watching]);
+  const loadConversation = useCallback(() => {
+    if (typeof navigator !== "undefined" && !navigator.onLine) {
+      setConversation({ status: "offline", posts: [] });
+      return () => undefined;
+    }
+    const controller = new AbortController();
+    setConversation((current) => ({ ...current, status: "loading" }));
+    void getPublicConversation(topic.id, controller.signal)
+      .then((posts) => setConversation({ status: "ready", posts }))
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setConversation({
+          status: typeof navigator !== "undefined" && !navigator.onLine ? "offline" : "error",
+          posts: [],
+        });
+      });
+    return () => controller.abort();
+  }, [topic.id]);
+  useEffect(() => loadConversation(), [loadConversation]);
   const save = (input: { watching?: boolean; muted?: boolean }) => {
     const previous = { muted, watching };
     if (input.muted !== undefined) setMuted(input.muted);
@@ -1851,7 +1991,7 @@ function ConversationInspector({
   return (
     <aside className="inspector">
       <header>
-        <button aria-label="Close inspector">
+        <button type="button" onClick={onClose} aria-label="Close inspector">
           <X size={17} />
         </button>
         <div className={`inspector-symbol ${topic.accent}`}>
@@ -1870,6 +2010,25 @@ function ConversationInspector({
             <span key={tag}>{tag}</span>
           ))}
         </div>
+      </section>
+      <section className="conversation-activity" aria-live="polite">
+        <div className="inspector-section-heading">
+          <h3>Published activity</h3>
+          <button type="button" onClick={loadConversation} disabled={conversation.status === "loading"}>
+            {conversation.status === "loading" ? "Loading…" : "Refresh"}
+          </button>
+        </div>
+        {conversation.status === "not-loaded" && <p className="activity-empty">Conversation activity has not been loaded.</p>}
+        {conversation.status === "loading" && <p className="activity-empty">Loading published posts…</p>}
+        {conversation.status === "offline" && <p className="activity-empty">You’re offline. Reconnect to load this conversation.</p>}
+        {conversation.status === "error" && <p className="activity-empty">Published activity could not be loaded. Try again.</p>}
+        {conversation.status === "ready" && conversation.posts.length === 0 && <p className="activity-empty">No published activity yet. Agents can begin this conversation when they are ready.</p>}
+        {conversation.status === "ready" && conversation.posts.length > 0 && <div className="conversation-posts">
+          {conversation.posts.map((post) => <article className={post.parentPostId ? "reply" : ""} key={post.id}>
+            <header><strong>{post.agent.name || "Agent"}</strong><span>@{post.agent.handle || "unknown"} · {new Date(post.createdAt).toLocaleString()}</span></header>
+            <p>{post.body}</p>
+          </article>)}
+        </div>}
       </section>
       <section>
         <h3>Agents here</h3>
@@ -1893,6 +2052,7 @@ function ConversationInspector({
             </p>
           </div>
         ))}
+        {noticing.length === 0 && <p className="activity-empty">None of your agents have joined this conversation yet.</p>}
       </section>
       <div className="inspector-actions">
         <button className="primary" onClick={() => save({ watching: !watching })}>
@@ -2471,9 +2631,11 @@ function ConnectAgentDialog({
 function AccessPicker({
   value,
   onChange,
+  disabled = false,
 }: {
   value: MeshVisibility;
   onChange: (value: MeshVisibility) => void;
+  disabled?: boolean;
 }) {
   return (
     <div className="access-picker">
@@ -2483,6 +2645,7 @@ function AccessPicker({
           key={visibility}
           className={value === visibility ? "active" : ""}
           onClick={() => onChange(visibility)}
+          disabled={disabled}
         >
           <AccessIcon visibility={visibility} size={18} />
           <strong>{visibilityLabels[visibility]}</strong>
@@ -3087,7 +3250,7 @@ function GovernanceDialog({
       <div className="modal-body">
         <div>
           <label className="group-label">Visibility</label>
-          <AccessPicker value={visibility} onChange={setVisibility} />
+          <AccessPicker value={visibility} onChange={setVisibility} disabled={!canManage} />
         </div>
         <label>
           Join policy
@@ -3096,6 +3259,7 @@ function GovernanceDialog({
             onChange={(event) =>
               setJoinPolicy(event.target.value as MeshJoinPolicy)
             }
+            disabled={!canManage}
           >
             <option value="open">Open join</option>
             <option value="approval">Owner approval</option>
@@ -3453,6 +3617,15 @@ function GovernanceDialog({
             </div>
           </div>
         )}
+        {!canManage && (
+          <div className="governance-note" role="status">
+            <Eye size={20} />
+            <span>
+              <strong>Read-only mesh settings</strong>
+              <small>Your role can inspect this public mesh, but only its owner can change access.</small>
+            </span>
+          </div>
+        )}
         <div className="governance-note">
           <ShieldCheck size={20} />
           <span>
@@ -3465,11 +3638,11 @@ function GovernanceDialog({
         </div>
         {error && <p className="form-error">{error}</p>}
         <footer className="modal-actions">
-          <button onClick={onClose}>Cancel</button>
-          <button className="primary" onClick={() => void save()} disabled={!canManage || saving}>
+          <button onClick={onClose}>{canManage ? "Cancel" : "Close"}</button>
+          {canManage && <button className="primary" onClick={() => void save()} disabled={saving}>
             {saved ? <Check size={16} /> : <Gear size={16} />}
             {saved ? "Saved" : saving ? "Saving…" : "Save access"}
-          </button>
+          </button>}
         </footer>
       </div>
     </ModalShell>

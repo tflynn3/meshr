@@ -1042,6 +1042,19 @@ button:focus-visible {
   grid-template-columns: 218px minmax(520px, 1fr) 322px;
   background: #fcfbf8;
 }
+.mesh-experience.inspector-closed {
+  grid-template-columns: 218px minmax(0, 1fr);
+}
+.mesh-empty-state {
+  min-height: 100vh;
+  padding: min(18vh, 170px) clamp(28px, 9vw, 160px);
+  background: radial-gradient(circle at top right, #eef3d8, transparent 36%), #fcfbf8;
+}
+.mesh-empty-state h1 { max-width: 620px; margin: 16px 0 10px; font-family: Georgia, "Times New Roman", serif; font-size: clamp(30px, 4vw, 48px); font-weight: 500; letter-spacing: -1.1px; }
+.mesh-empty-state p { max-width: 540px; color: #636a60; font-size: 13px; line-height: 1.55; }
+.mesh-empty-state > div { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 25px; }
+.mesh-empty-state button { min-height: 42px; border: 1px solid #c7c9bf; border-radius: 6px; background: #fff; display: inline-flex; align-items: center; gap: 7px; padding: 0 13px; color: #394239; font-size: 10px; font-weight: 650; }
+.mesh-empty-state button.primary { border-color: #9db329; background: var(--lime); }
 .mesh-agent-panel {
   margin: 96px 0 36px 10px;
   height: 515px;
@@ -1077,40 +1090,55 @@ button:focus-visible {
 .mesh-agent-list {
   margin-top: 5px;
 }
-.mesh-agent-list article {
+.mesh-agent-list > button {
+  width: 100%;
   height: 70px;
   border-bottom: 1px solid #364036;
+  border-top: 0;
+  border-left: 0;
+  border-right: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
   display: grid;
   grid-template-columns: 44px 1fr 8px;
   align-items: center;
   gap: 10px;
 }
-.mesh-agent-list article > div strong,
-.mesh-agent-list article > div span {
+.mesh-agent-list > button:hover,
+.mesh-agent-list > button.selected {
+  background: rgba(200, 226, 60, 0.1);
+}
+.mesh-agent-list > button:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: -2px;
+}
+.mesh-agent-list > button > div strong,
+.mesh-agent-list > button > div span {
   display: block;
 }
-.mesh-agent-list article > div strong {
+.mesh-agent-list > button > div strong {
   font-size: 12px;
 }
-.mesh-agent-list article > div span {
+.mesh-agent-list > button > div span {
   font-size: 9px;
   color: #a8b0a6;
   margin-top: 4px;
 }
-.mesh-agent-list article.joined > div span {
+.mesh-agent-list > button.joined > div span {
   color: #c9df4a;
 }
-.mesh-agent-list article > i {
+.mesh-agent-list > button > i {
   width: 7px;
   height: 7px;
   border-radius: 50%;
   background: #697068;
 }
-.mesh-agent-list article > i.connected {
+.mesh-agent-list > button > i.connected {
   background: var(--lime);
   box-shadow: 0 0 0 3px rgba(200, 226, 60, 0.12);
 }
-.mesh-agent-list article > i.sleeping {
+.mesh-agent-list > button > i.sleeping {
   background: var(--yellow);
 }
 .panel-add {
@@ -1127,6 +1155,17 @@ button:focus-visible {
   font-size: 11px;
   font-weight: 600;
 }
+.selected-agent-summary {
+  margin-top: 10px;
+  padding: 9px 10px;
+  border: 1px solid #465046;
+  border-radius: 6px;
+  display: grid;
+  gap: 3px;
+  color: #dce7ac;
+}
+.selected-agent-summary strong { font-size: 9px; }
+.selected-agent-summary span { color: #a9b0a7; font-size: 8px; line-height: 1.35; }
 .sync-summary {
   height: 36px;
   margin-top: 8px;
@@ -1177,6 +1216,7 @@ button:focus-visible {
   margin-top: 3px;
 }
 .mesh-stage {
+  position: relative;
   min-width: 0;
   display: grid;
   grid-template-rows: 142px minmax(0, 1fr);
@@ -1213,6 +1253,20 @@ button:focus-visible {
   padding: 0 12px;
   font-size: 10px;
 }
+.inspector-reopen {
+  position: absolute;
+  right: 22px;
+  bottom: 18px;
+  z-index: 9;
+  min-height: 36px;
+  border: 1px solid #a9bd28;
+  border-radius: 6px;
+  background: #f4f8dc;
+  color: #405221;
+  padding: 0 11px;
+  font-size: 9px;
+  font-weight: 700;
+}
 .access-chip {
   display: inline-flex;
   align-items: center;
@@ -1235,6 +1289,62 @@ button:focus-visible {
   min-height: 0;
   overflow: hidden;
 }
+.topology-canvas { position: relative; min-height: 0; }
+.topology-view-switch {
+  position: absolute;
+  z-index: 8;
+  top: 14px;
+  right: 16px;
+  display: inline-flex;
+  padding: 3px;
+  border: 1px solid #d8d8cf;
+  border-radius: 7px;
+  background: rgba(255, 254, 250, 0.94);
+}
+.topology-view-switch button {
+  min-height: 27px;
+  border: 0;
+  border-radius: 4px;
+  padding: 0 9px;
+  background: transparent;
+  color: #677064;
+  font-size: 9px;
+  font-weight: 650;
+}
+.topology-view-switch button.active { background: #eaf0cd; color: #3e4e25; }
+.topology-view-switch button:focus-visible { outline: 2px solid #8fa724; outline-offset: 1px; }
+.topology-list {
+  height: 100%;
+  min-height: 490px;
+  overflow: auto;
+  padding: 60px 24px 28px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 18px;
+  background: #faf9f5;
+}
+.topology-list section { min-width: 0; }
+.topology-list h2 { margin: 0 0 8px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: #666d62; }
+.topology-list section > p { margin: 0; padding: 12px; border: 1px dashed #d5d7cf; border-radius: 7px; color: #767c73; font-size: 10px; line-height: 1.45; }
+.topology-list button {
+  width: 100%;
+  margin-top: 7px;
+  padding: 11px 10px;
+  border: 1px solid #deded6;
+  border-radius: 7px;
+  background: #fff;
+  color: #303830;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  text-align: left;
+}
+.topology-list button:hover, .topology-list button.selected { border-color: #a9bd28; background: #f6f9e8; }
+.topology-list button:focus-visible { outline: 3px solid #a9bd28; outline-offset: 2px; }
+.topology-list strong, .topology-list small { display: block; }
+.topology-list strong { font-size: 10px; }
+.topology-list small { margin-top: 3px; color: #777d73; font-size: 8px; }
+.topology-list button > span:last-child { align-self: center; color: #6b7a32; font-size: 8px; font-weight: 700; }
 .conversation-map .react-flow__pane {
   cursor: grab;
 }
@@ -1420,6 +1530,7 @@ button:focus-visible {
 .map-agent.yellow {
   border-color: #c6a243;
 }
+.map-agent.selected { border-style: solid; box-shadow: 0 0 0 4px rgba(181, 207, 45, 0.22), 0 3px 9px rgba(25, 34, 25, 0.1); }
 .map-handle {
   opacity: 0;
   width: 1px !important;
@@ -1583,6 +1694,18 @@ button:focus-visible {
   line-height: 1.55;
   color: #5f645c;
 }
+.inspector-section-heading { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.inspector-section-heading h3 { margin-bottom: 0 !important; }
+.inspector-section-heading button { border: 1px solid #cdd0c7; border-radius: 5px; background: #fff; padding: 5px 8px; color: #596153; font-size: 8px; font-weight: 650; }
+.inspector-section-heading button:disabled { opacity: 0.6; }
+.activity-empty { margin: 12px 0 0 !important; color: #737970 !important; font-size: 9px !important; }
+.conversation-posts { display: grid; gap: 9px; margin-top: 13px; }
+.conversation-posts article { padding: 9px 10px; border: 1px solid #e1e1d9; border-radius: 7px; background: #faf9f5; }
+.conversation-posts article.reply { margin-left: 12px; border-left: 3px solid #c8d86a; }
+.conversation-posts header { display: grid; gap: 2px; }
+.conversation-posts strong { font-size: 9px; }
+.conversation-posts header span { color: #7b8179; font-size: 7px; }
+.conversation-posts p { margin: 7px 0 0; color: #4e564d; font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; white-space: pre-wrap; }
 .inspector-tags {
   display: flex;
   flex-wrap: wrap;
@@ -3318,6 +3441,7 @@ button:focus-visible {
   .mesh-experience {
     grid-template-columns: 205px minmax(510px, 1fr) 300px;
   }
+  .mesh-experience.inspector-closed { grid-template-columns: 205px minmax(0, 1fr); }
   .portfolio-view {
     padding-left: 30px;
     padding-right: 30px;
@@ -3413,10 +3537,22 @@ button:focus-visible {
   .mesh-experience {
     height: auto;
     min-height: 100vh;
-    grid-template-columns: 190px minmax(520px, 1fr);
+    grid-template-columns: 190px minmax(0, 1fr);
   }
+  .mesh-experience.inspector-closed { display: block; }
   .inspector {
-    display: none;
+    display: block;
+    position: fixed;
+    z-index: 30;
+    right: 14px;
+    bottom: 14px;
+    left: 286px;
+    height: auto;
+    max-height: min(62vh, 650px);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    box-shadow: 0 18px 46px rgba(28, 36, 27, 0.22);
+    padding: 0 18px 16px;
   }
   .mesh-stage {
     min-height: 100vh;
@@ -3424,6 +3560,7 @@ button:focus-visible {
   .mesh-agent-panel {
     margin-left: 8px;
   }
+  .topology-list { grid-template-columns: repeat(2, minmax(180px, 1fr)); }
 }
 @media (max-width: 720px) {
   .meshr-app {
@@ -3547,6 +3684,13 @@ button:focus-visible {
   .conversation-map {
     height: 760px;
   }
+  .inspector {
+    right: 10px;
+    bottom: 10px;
+    left: 74px;
+    max-height: 58vh;
+  }
+  .topology-list { grid-template-columns: 1fr; min-height: 640px; }
   .modal {
     width: 96vw;
   }

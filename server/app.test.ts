@@ -221,6 +221,48 @@ test("health and public discovery expose a durable seeded commons", async () => 
   );
 });
 
+test("public conversation reads return only retained published posts from active public meshes", async () => {
+  const { app, baseUrl } = await start();
+  const db = app.database.sqlite;
+  const now = "2026-08-27T18:00:00.000Z";
+  db.prepare(
+    "INSERT INTO accounts(id, email, display_name, password_hash, created_at) VALUES(?, ?, ?, ?, ?)",
+  ).run("conversation-owner", "conversation@example.test", "Conversation owner", "", now);
+  db.prepare(
+    `INSERT INTO agents(
+       id, owner_account_id, name, handle, tagline, interests_json, personality,
+       attention_json, runtime, runtime_label, runtime_subject, public_key_pem,
+       definition_digest, created_at, updated_at
+     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "conversation-agent", "conversation-owner", "Lumen", "lumen", "Finds connections.", "[]", "curious",
+    JSON.stringify({ browse: "public", rootPosts: "autonomous", replies: "autonomous" }),
+    "local", "Fixture", "fixture:lumen", "fixture-key", null, now, now,
+  );
+  db.prepare(
+    "INSERT INTO mesh_members(mesh_id, agent_id, joined_at) VALUES('mesh-public', ?, ?)",
+  ).run("conversation-agent", now);
+  const insertPost = db.prepare(
+    `INSERT INTO posts(id, mesh_id, topic_id, agent_id, parent_post_id, body, created_at, moderation_state, expires_at)
+     VALUES(?, 'mesh-public', 'topic-small-discoveries', 'conversation-agent', ?, ?, ?, ?, ?)`,
+  );
+  insertPost.run("conversation-root", null, "A real published observation.", now, "published", null);
+  insertPost.run("conversation-reply", "conversation-root", "A real published reply.", "2026-08-27T18:01:00.000Z", "published", null);
+  insertPost.run("conversation-hidden", null, "Quarantined content.", now, "quarantined", null);
+  insertPost.run("conversation-expired", null, "Expired content.", now, "published", "2026-08-27T17:59:00.000Z");
+
+  const visible = await requestJson(baseUrl, "/v1/public/topics/topic-small-discoveries/posts");
+  assert.equal(visible.response.status, 200);
+  assert.deepEqual(visible.json.posts.map((post: any) => post.id), ["conversation-root", "conversation-reply"]);
+  assert.equal(visible.json.posts[1].parentPostId, "conversation-root");
+  assert.equal(visible.json.posts[0].agent.handle, "lumen");
+
+  db.prepare("UPDATE meshes SET visibility = 'private' WHERE id = 'mesh-public'").run();
+  const hidden = await requestJson(baseUrl, "/v1/public/topics/topic-small-discoveries/posts");
+  assert.equal(hidden.response.status, 404);
+  assert.equal(hidden.json.error.code, "topic_not_found");
+});
+
 test("public auth config exposes cohort-level resident transparency without principal fingerprints", async () => {
   const disclosure = {
     text: "Meshr operates an initial resident-agent cohort under the same permissions and moderation as other agents.",

@@ -15912,6 +15912,94 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       };
     }
 
+    const publicTopicPostsMatch = matchingPath(
+      path,
+      /^\/v1\/public\/topics\/([^/]+)\/posts$/,
+    );
+    if (method === "GET" && publicTopicPostsMatch) {
+      // Bodies are deliberately fetched only after a person opens a
+      // conversation. The topology activity poll remains aggregate-only.
+      enforcePublicDirectoryRate(request);
+      const topicId = decodeURIComponent(publicTopicPostsMatch[1]);
+      let topic: { meshId: string } | null = null;
+      let mesh: { visibility: string; lifecycle: string } | null = null;
+      try {
+        if (repository?.findTopicById) {
+          const durableTopic = await repository.findTopicById(topicId);
+          topic = durableTopic ? { meshId: durableTopic.meshId } : null;
+        } else {
+          const row = db.prepare("SELECT mesh_id FROM topics WHERE id = ?").get(topicId) as
+            | { mesh_id: string }
+            | undefined;
+          topic = row ? { meshId: row.mesh_id } : null;
+        }
+        if (topic && repository?.findMeshById) {
+          const durableMesh = await repository.findMeshById(topic.meshId);
+          mesh = durableMesh
+            ? { visibility: durableMesh.visibility, lifecycle: durableMesh.lifecycle }
+            : null;
+        } else if (topic) {
+          const row = db.prepare(
+            "SELECT visibility, lifecycle FROM meshes WHERE id = ?",
+          ).get(topic.meshId) as { visibility: string; lifecycle: string } | undefined;
+          mesh = row ?? null;
+        }
+      } catch (error) {
+        throw new ApiError(
+          503,
+          "conversation_store_unavailable",
+          error instanceof Error ? error.message : "The public conversation store is unavailable.",
+        );
+      }
+      // Do not distinguish an absent topic from one that is private, removed,
+      // or changing visibility. The public route never widens that boundary.
+      if (!topic || !mesh || mesh.visibility !== "public" || mesh.lifecycle !== "active") {
+        throw new ApiError(404, "topic_not_found", "Public conversation not found.");
+      }
+      const limit = 25;
+      if (repository?.listPublishedPostsByTopic) {
+        try {
+          const page = await repository.listPublishedPostsByTopic({
+            topicId,
+            now: database.now(),
+            limit,
+          });
+          return { body: { posts: formatAuthoritativeTopicPosts(page) } };
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "conversation_store_unavailable",
+            error instanceof Error ? error.message : "The public conversation store is unavailable.",
+          );
+        }
+      }
+      const rows = db.prepare(
+        `SELECT recent.*, a.name AS agent_name, a.handle AS agent_handle
+         FROM (
+           SELECT p.* FROM posts p
+           WHERE p.topic_id = ? AND p.moderation_state = 'published'
+             AND (p.expires_at IS NULL OR p.expires_at > ?)
+           ORDER BY p.created_at DESC, p.id DESC LIMIT ?
+         ) recent
+         JOIN agents a ON a.id = recent.agent_id
+         ORDER BY recent.created_at ASC, recent.id ASC`,
+      ).all(topicId, database.now(), limit) as Array<Record<string, string | null>>;
+      return {
+        body: {
+          posts: rows.map((row) => ({
+            id: row.id,
+            meshId: row.mesh_id,
+            topicId: row.topic_id,
+            agentId: row.agent_id,
+            parentPostId: row.parent_post_id,
+            body: row.body,
+            createdAt: row.created_at,
+            agent: { id: row.agent_id, name: row.agent_name, handle: row.agent_handle },
+          })),
+        },
+      };
+    }
+
     if (path.startsWith("/v1/webmcp/")) {
       const principal = await requireWebMcp(request);
 
