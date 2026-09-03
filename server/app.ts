@@ -14019,64 +14019,75 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         audit: joinResolutionAudit,
       });
       if (authoritativeOutcome) {
-        const resolvedRequest = await findJoinRequestForRoute(requestId);
-        if (!resolvedRequest) {
-          throw new ApiError(
-            503,
-            "governance_store_unavailable",
-            "The resolved join request could not be read back.",
+        // The repository mutation is the commit point. Do not make the
+        // response depend on a second read that may hit a lagging or
+        // temporarily unavailable replica after the decision has succeeded.
+        const resolvedRequest: RepositoryJoinRequest = {
+          ...pendingJoinRequest,
+          status: authoritativeOutcome.status,
+          resolvedAt: now,
+        };
+        try {
+          database.transaction(() => {
+            db.prepare(
+              `INSERT INTO mesh_join_requests(
+                 id, mesh_id, agent_id, requested_by_account_id, status, created_at, resolved_at
+               ) VALUES(?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET status = excluded.status, resolved_at = excluded.resolved_at`,
+            ).run(
+              resolvedRequest.requestId,
+              resolvedRequest.meshId,
+              resolvedRequest.agentId,
+              resolvedRequest.requestedByAccountId,
+              resolvedRequest.status,
+              resolvedRequest.createdAt,
+              resolvedRequest.resolvedAt,
+            );
+            if (authoritativeOutcome.status === "approved") {
+              db.prepare(
+                "INSERT OR IGNORE INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)",
+              ).run(meshId, authoritativeOutcome.agentId, now);
+            }
+            emitAudit({
+              auditId: joinResolutionAuditId,
+              createdAt: now,
+              actorType: "human",
+              actorId: principal.accountId,
+              sessionId: principal.sessionHash,
+              action: `mesh.join_request.${decision}`,
+              resourceType: "mesh_join_request",
+              resourceId: requestId,
+              data: { agentId: authoritativeOutcome.agentId, meshId, decision },
+              durable: Boolean(repository?.resolveJoinRequest),
+            });
+            emitEvent(
+              `mesh.agent.${decision}`,
+              authoritativeOutcome.agentId,
+              meshId,
+              null,
+              {
+                requestId,
+                agentId: authoritativeOutcome.agentId,
+                meshId,
+              },
+              {
+                eventId: joinResolutionEventId,
+                occurredAt: now,
+                sessionId: principal.sessionHash,
+                durable: Boolean(repository?.resolveJoinRequest),
+              },
+            );
+          });
+        } catch (error) {
+          // Firestore has already committed the governance decision. SQLite is
+          // a per-replica projection and may not yet contain the mesh, agent,
+          // or account rows needed by its foreign keys. A cold projection must
+          // not turn an authoritative success into a retryable 500.
+          console.warn(
+            "mesh join request committed durably but local projection refresh failed",
+            error,
           );
         }
-        database.transaction(() => {
-          db.prepare(
-            `INSERT INTO mesh_join_requests(
-               id, mesh_id, agent_id, requested_by_account_id, status, created_at, resolved_at
-             ) VALUES(?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET status = excluded.status, resolved_at = excluded.resolved_at`,
-          ).run(
-            resolvedRequest.requestId,
-            resolvedRequest.meshId,
-            resolvedRequest.agentId,
-            resolvedRequest.requestedByAccountId,
-            resolvedRequest.status,
-            resolvedRequest.createdAt,
-            resolvedRequest.resolvedAt,
-          );
-          if (authoritativeOutcome.status === "approved") {
-            db.prepare(
-              "INSERT OR IGNORE INTO mesh_members(mesh_id, agent_id, joined_at) VALUES(?, ?, ?)",
-            ).run(meshId, authoritativeOutcome.agentId, now);
-          }
-          emitAudit({
-            auditId: joinResolutionAuditId,
-            createdAt: now,
-            actorType: "human",
-            actorId: principal.accountId,
-            sessionId: principal.sessionHash,
-            action: `mesh.join_request.${decision}`,
-            resourceType: "mesh_join_request",
-            resourceId: requestId,
-            data: { agentId: authoritativeOutcome.agentId, meshId, decision },
-            durable: Boolean(repository?.resolveJoinRequest),
-          });
-          emitEvent(
-            `mesh.agent.${decision}`,
-            authoritativeOutcome.agentId,
-            meshId,
-            null,
-            {
-              requestId,
-              agentId: authoritativeOutcome.agentId,
-              meshId,
-            },
-            {
-              eventId: joinResolutionEventId,
-              occurredAt: now,
-              sessionId: principal.sessionHash,
-              durable: Boolean(repository?.resolveJoinRequest),
-            },
-          );
-        });
         return {
           body: {
             requestId,
