@@ -60,9 +60,17 @@ test("topology badges retain full agent identity in accessible labels", () => {
 test("topology refits after React Flow has measured a new layout", () => {
   assert.match(topologySource, /const nodesInitialized = useNodesInitialized\(\)/);
   assert.match(topologySource, /if \(!nodesInitialized\) return/);
+  assert.match(topologySource, /const frame = window\.requestAnimationFrame\(\(\) => \{/);
   assert.match(topologySource, /fitView\(\{ padding: 0\.04, duration: 0 \}\)/);
+  assert.match(topologySource, /return \(\) => window\.cancelAnimationFrame\(frame\)/);
+  assert.match(topologySource, /key=\{layoutKey\}/);
   assert.match(topologySource, /<FitTopologyToNodes layoutKey=/);
   assert.match(topologySource, /observer\.disconnect\(\);\n  \}, \[presentation\]\);/);
+});
+
+test("changing the selected topic or traffic link remounts its inspector", () => {
+  assert.match(appSource, /<TrafficInspector\s+key=\{selectedLink\.id\}/);
+  assert.match(appSource, /<ConversationInspector\s+key=\{topic\.id\}/);
 });
 
 test("closing the inspector preserves the medium-width mesh columns", () => {

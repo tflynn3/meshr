@@ -2120,6 +2120,7 @@ function MeshExperience({
       </main>
       {inspectorOpen && selectedLink ? (
         <TrafficInspector
+          key={selectedLink.id}
           link={selectedLink}
           state={state}
           mesh={mesh}
@@ -2129,6 +2130,7 @@ function MeshExperience({
         />
       ) : inspectorOpen ? (
         <ConversationInspector
+          key={topic.id}
           topic={topic}
           mesh={mesh}
           state={state}

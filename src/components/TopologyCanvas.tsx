@@ -64,7 +64,10 @@ function FitTopologyToNodes({ layoutKey }: { layoutKey: string }) {
 
   useEffect(() => {
     if (!nodesInitialized) return;
-    void fitView({ padding: 0.04, duration: 0 });
+    const frame = window.requestAnimationFrame(() => {
+      void fitView({ padding: 0.04, duration: 0 });
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [fitView, layoutKey, nodesInitialized]);
 
   return null;
@@ -326,6 +329,9 @@ export function TopologyCanvas({
       }));
     return { nodes: [...conversationNodes, ...agentNodes], edges: trafficEdges };
   }, [agents, onSelectAgent, onSelectLink, onSelectTopic, reducedMotion, runtimeBindings, selectedAgentId, selectedLinkId, selectedTopicId, topics, trafficLinks]);
+  const layoutKey = nodes
+    .map((node) => `${node.id}:${node.position.x}:${node.position.y}:${node.width}:${node.height}`)
+    .join("|");
 
   return <section className={`topology-canvas ${presentation}`} aria-label="Mesh topology">
     <div className="topology-view-switch" role="group" aria-label="Topology presentation">
@@ -338,6 +344,7 @@ export function TopologyCanvas({
       <section><h2>Reply traffic</h2>{trafficLinks.length ? trafficLinks.map((link) => <button type="button" key={link.id} className={link.id === selectedLinkId ? "selected" : ""} onClick={() => onSelectLink(link.id)}><span><strong>{processorLabels[link.processor]} · {link.messagesPerMinute}/m</strong><small>{link.recentEventCount ? "Active now" : "Observed route"}</small></span><span aria-hidden="true">Inspect</span></button>) : <p>No reply traffic has been recorded yet.</p>}</section>
     </div> : <div ref={mapRef} className="conversation-map" aria-label="Live conversation map">
     <ReactFlow
+      key={layoutKey}
       nodes={nodes}
       edges={edges}
       nodeTypes={nodeTypes}
@@ -356,7 +363,7 @@ export function TopologyCanvas({
       onEdgeClick={(_, edge) => edge.type === "traffic" && onSelectLink(edge.id)}
       proOptions={{ hideAttribution: true }}
     >
-      <FitTopologyToNodes layoutKey={nodes.map((node) => `${node.id}:${node.position.x}:${node.position.y}:${node.width}:${node.height}`).join("|")} />
+      <FitTopologyToNodes layoutKey={layoutKey} />
       <Background color="#dddcd5" gap={46} size={0.7} />
     </ReactFlow>
     <div className="map-key"><ArrowsClockwise size={13} /><span>Agent reply traffic</span><small>Select a traffic node to inspect activity</small></div>
