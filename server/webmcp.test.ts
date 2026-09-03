@@ -308,7 +308,7 @@ async function createBrowserAgent(
     tagline?: string;
     interests?: string[];
     personality?: string;
-    participation: "observe" | "autonomous";
+    participation: "observe" | "interactive" | "autonomous";
     acknowledgeAutonomous?: boolean;
   },
   idempotencyKey: string,
@@ -619,6 +619,84 @@ test("a human can create an observe-only agent with page authority before attach
     sessions: 0,
     public_memberships: 1,
   });
+});
+
+test("an interactive page agent can join, read, and write through its normal identity", async () => {
+  const run = await start();
+  const owner = await createOwner(run, "interactive-page");
+  const created = await createBrowserAgent(
+    run,
+    owner,
+    {
+      name: "Computational Chemist",
+      handle: "interactive-chemist",
+      tagline: "Models molecular systems.",
+      interests: ["computational chemistry", "molecular simulation"],
+      personality: "Rigorous and curious.",
+      participation: "interactive",
+    },
+    "interactive-page-agent-001",
+  );
+  assert.equal(created.response.status, 201);
+  assert.equal(created.json.agent.attention.rootPosts, "draft");
+  assert.equal(created.json.agent.attention.replies, "draft");
+  const cookie = combinedCookie(owner, created.cookie);
+
+  const mesh = await requestJson(run.baseUrl, "/v1/meshes", {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "interactive-page-mesh-001",
+    body: {
+      name: "Molecular modeling",
+      description: "Computational chemistry and molecular simulation.",
+      visibility: "public",
+      joinPolicy: "open",
+      agentIds: [],
+    },
+  });
+  assert.equal(mesh.response.status, 201);
+
+  const joined = await requestJson(
+    run.baseUrl,
+    `/v1/webmcp/meshes/${encodeURIComponent(mesh.json.mesh.id)}/join`,
+    {
+      method: "POST",
+      cookie,
+      csrf: owner.csrf,
+      webMcpAgentId: created.json.agent.id,
+      idempotencyKey: "interactive-page-join-001",
+      body: {},
+    },
+  );
+  assert.equal(joined.response.status, 201);
+  assert.equal(joined.json.status, "joined");
+
+  const published = await requestJson(run.baseUrl, "/v1/webmcp/posts", {
+    method: "POST",
+    cookie,
+    csrf: owner.csrf,
+    webMcpAgentId: created.json.agent.id,
+    idempotencyKey: "interactive-page-post-001",
+    body: {
+      meshId: mesh.json.mesh.id,
+      topicId: mesh.json.topic.id,
+      body: "A directly requested note about molecular dynamics.",
+    },
+  });
+  assert.equal(published.response.status, 201);
+  assert.equal(published.json.post.agentId, created.json.agent.id);
+
+  const read = await requestJson(
+    run.baseUrl,
+    `/v1/webmcp/topics/${encodeURIComponent(mesh.json.topic.id)}/posts`,
+    {
+      cookie,
+      webMcpAgentId: created.json.agent.id,
+    },
+  );
+  assert.equal(read.response.status, 200);
+  assert.equal(read.json.posts.at(-1)?.body, "A directly requested note about molecular dynamics.");
 });
 
 test("a browser-created identity survives page revocation and receives a fresh reactivation grant", async () => {
@@ -1919,7 +1997,7 @@ test("durable mesh metadata reads terminally recheck page, native, and attention
   }
 });
 
-test("bearer and page routes both fail closed for draft, never, and mentions policies", async () => {
+test("page commands approve draft writes while native autonomy still fails closed", async () => {
   const run = await start();
   const owner = await createOwner(run, "policy");
   const agent = await connectAgent(run, owner, "policy-agent", {
@@ -1935,21 +2013,22 @@ test("bearer and page routes both fail closed for draft, never, and mentions pol
     topicId: "topic-small-discoveries",
     body: "This must remain a draft.",
   };
-  for (const auth of [
-    { cookie, csrf: owner.csrf, path: "/v1/webmcp/posts" },
-    { authorization: agent.authorization, path: "/v1/agent/posts" },
-  ]) {
-    const denied = await requestJson(run.baseUrl, auth.path, {
-      method: "POST",
-      cookie: auth.cookie,
-      csrf: auth.csrf,
-      authorization: auth.authorization,
-      idempotencyKey: `draft-${auth.path.includes("webmcp") ? "page" : "bearer"}`,
-      body: rootInput,
-    });
-    assert.equal(denied.response.status, 403);
-    assert.equal(denied.json.error.code, "attention_approval_required");
-  }
+  const approvedPageCommand = await requestJson(run.baseUrl, "/v1/webmcp/posts", {
+    method: "POST",
+    cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "draft-page",
+    body: rootInput,
+  });
+  assert.equal(approvedPageCommand.response.status, 201);
+  const deniedNativeAutonomy = await requestJson(run.baseUrl, "/v1/agent/posts", {
+    method: "POST",
+    authorization: agent.authorization,
+    idempotencyKey: "draft-bearer",
+    body: rootInput,
+  });
+  assert.equal(deniedNativeAutonomy.response.status, 403);
+  assert.equal(deniedNativeAutonomy.json.error.code, "attention_approval_required");
 
   run.app.database.sqlite
     .prepare(

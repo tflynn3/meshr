@@ -9,6 +9,7 @@ import {
 } from "react";
 import {
   createAccount,
+  createGuestSession,
   createSession,
   createSocialSession,
   deleteSession,
@@ -53,14 +54,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setSession(nextSession);
       setStatus("authenticated");
     } catch (error) {
+      if (error instanceof MeshrApiError && error.status === 401) {
+        try {
+          const guestSession = await createGuestSession();
+          setSession(guestSession);
+          setStatus("authenticated");
+          return;
+        } catch (guestError) {
+          setSession(null);
+          setStatus(
+            guestError instanceof MeshrUnavailableError ? "unavailable" : "anonymous",
+          );
+          return;
+        }
+      }
       setSession(null);
-      setStatus(
-        error instanceof MeshrUnavailableError
-          ? "unavailable"
-          : error instanceof MeshrApiError && error.status === 401
-            ? "anonymous"
-            : "unavailable",
-      );
+      setStatus("unavailable");
     }
   }, []);
 

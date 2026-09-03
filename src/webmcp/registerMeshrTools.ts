@@ -1,10 +1,21 @@
 import {
   createAgentToolCatalog,
+  createAgentSetupTool,
+  type ConversationalAgentProfile,
   type PageAgentAttention,
   type PageWebMcpClient,
 } from "../domain/agentTools";
+import {
+  createBrowserAgentWithWebMcp,
+  MeshrApiError,
+  type WebMcpSessionStatus,
+} from "../auth/api";
+import {
+  rankMeshRecommendations,
+  type RecommendationMesh,
+} from "../domain/meshRecommendations";
 
-export type WebMcpRegistrationStatus = "ready" | "unsupported";
+export type WebMcpRegistrationStatus = "ready" | "setup-ready" | "unsupported";
 
 const result = (value: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(value) }],
@@ -40,6 +51,92 @@ function errorMessage(value: unknown): string {
   if (typeof envelope.message === "string") return envelope.message;
   if (typeof envelope.error === "string") return envelope.error;
   return "The Meshr page request failed.";
+}
+
+function meshDirectory(value: unknown): RecommendationMesh[] {
+  if (!value || typeof value !== "object") return [];
+  const meshes = (value as { meshes?: unknown }).meshes;
+  if (!Array.isArray(meshes)) return [];
+  return meshes.flatMap((mesh) => {
+    if (!mesh || typeof mesh !== "object") return [];
+    const row = mesh as Record<string, unknown>;
+    if (
+      typeof row.id !== "string" ||
+      typeof row.name !== "string" ||
+      typeof row.description !== "string" ||
+      typeof row.visibility !== "string" ||
+      typeof row.joinPolicy !== "string" ||
+      typeof row.joined !== "boolean"
+    ) return [];
+    return [{
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      visibility: row.visibility,
+      joinPolicy: row.joinPolicy,
+      joined: row.joined,
+    }];
+  });
+}
+
+function collisionSafeHandle(handle: string): string {
+  const suffix = (globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2))
+    .replaceAll("-", "")
+    .slice(0, 5);
+  return `${handle.slice(0, Math.max(2, 26 - suffix.length)).replace(/-+$/u, "")}-${suffix}`;
+}
+
+export async function createConversationalAgent(input: {
+  profile: ConversationalAgentProfile;
+  csrfToken: string;
+  signal?: AbortSignal;
+  onCreated?: (session: WebMcpSessionStatus) => void;
+}): Promise<WebMcpSessionStatus & {
+  recommendations: ReturnType<typeof rankMeshRecommendations>;
+  recommendationStatus: "ready" | "unavailable";
+  nextStep: string;
+}> {
+  const create = (profile: ConversationalAgentProfile) =>
+    createBrowserAgentWithWebMcp(
+      { ...profile, participation: "interactive" },
+      input.csrfToken,
+    );
+  let profile = input.profile;
+  let session: WebMcpSessionStatus;
+  try {
+    session = await create(profile);
+  } catch (error) {
+    if (!(error instanceof MeshrApiError) || error.code !== "handle_unavailable") throw error;
+    profile = { ...profile, handle: collisionSafeHandle(profile.handle) };
+    session = await create(profile);
+  }
+  if (!session.agent) throw new Error("Meshr created no usable agent identity.");
+  const client = createPageWebMcpClient({
+    csrfToken: input.csrfToken,
+    expectedAgentId: session.agent.id,
+    signal: input.signal,
+  });
+  let recommendations: ReturnType<typeof rankMeshRecommendations> = [];
+  let recommendationStatus: "ready" | "unavailable" = "ready";
+  try {
+    const directory = await client.discoverMeshes();
+    recommendations = rankMeshRecommendations(profile, meshDirectory(directory));
+  } catch {
+    // The durable identity already exists. Treat discovery as enrichment so a
+    // transient directory failure cannot misreport creation or invite a retry
+    // that would create another agent.
+    recommendationStatus = "unavailable";
+  }
+  const result = {
+    ...session,
+    recommendations,
+    recommendationStatus,
+    nextStep: recommendations[0]
+      ? `Tell the person about @${session.agent.handle} and ask whether to explore ${recommendations[0].name}.`
+      : `Tell the person about @${session.agent.handle} and offer to explore the public mesh.`,
+  };
+  input.onCreated?.(session);
+  return result;
 }
 
 /** Same-origin page client. Agent identity comes only from the HttpOnly grant cookie. */
@@ -106,11 +203,42 @@ export function createPageWebMcpClient(input: {
         method: "PUT",
         mutation: true,
       }),
+    joinMesh: ({ meshId, invitationToken }) =>
+      request(`/v1/webmcp/meshes/${encodeURIComponent(meshId)}/join`, {
+        method: "POST",
+        mutation: true,
+        body: invitationToken ? { invitationToken } : {},
+      }),
     inspectTrafficLink: ({ meshId, linkId }) =>
       request(
         `/v1/webmcp/meshes/${encodeURIComponent(meshId)}/traffic/${encodeURIComponent(linkId)}`,
       ),
   };
+}
+
+export async function registerMeshrSetupTools({
+  modelContext,
+  signal,
+  createAgent,
+}: {
+  modelContext: ModelContext | undefined;
+  signal: AbortSignal;
+  createAgent: (profile: ConversationalAgentProfile) => Promise<unknown>;
+}): Promise<"setup-ready" | "unsupported"> {
+  if (!modelContext) return "unsupported";
+  const tool = createAgentSetupTool(createAgent);
+  await modelContext.registerTool(
+    {
+      name: tool.name,
+      title: tool.title,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      annotations: tool.annotations,
+      execute: async (toolInput) => result(await tool.execute(toolInput)),
+    },
+    { signal },
+  );
+  return "setup-ready";
 }
 
 /** Register native page tools only after a human has selected an owned agent. */
@@ -128,7 +256,7 @@ export async function registerMeshrTools({
   attention: PageAgentAttention;
   signal: AbortSignal;
   client?: PageWebMcpClient;
-}): Promise<WebMcpRegistrationStatus> {
+}): Promise<"ready" | "unsupported"> {
   if (!modelContext) return "unsupported";
   const resolvedClient = client ?? createPageWebMcpClient({
     csrfToken,

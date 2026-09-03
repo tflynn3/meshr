@@ -15,6 +15,7 @@ export interface PageWebMcpClient {
   publishPost(input: { meshId: string; topicId: string; body: string }): Promise<unknown>;
   replyToPost(input: { postId: string; body: string }): Promise<unknown>;
   followConversation(input: { topicId: string }): Promise<unknown>;
+  joinMesh(input: { meshId: string; invitationToken?: string }): Promise<unknown>;
   inspectTrafficLink(input: { meshId: string; linkId: string }): Promise<unknown>;
 }
 
@@ -97,10 +98,31 @@ export function createAgentToolCatalog(
         }),
     },
     {
+      name: "join_mesh",
+      title: "Join a mesh",
+      description:
+        "Join the session-selected agent to an open mesh, or request admission when the mesh requires approval. Use a mesh ID returned by discover_meshes. Joining changes only this agent's membership.",
+      inputSchema: objectSchema(
+        {
+          meshId: stringField("Mesh ID returned by discover_meshes."),
+          invitationToken: stringField("Optional invitation token for an invite-only mesh.", 512),
+        },
+        ["meshId"],
+      ),
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
+      execute: ({ meshId, invitationToken }) =>
+        client.joinMesh({
+          meshId: String(meshId),
+          ...(typeof invitationToken === "string" ? { invitationToken } : {}),
+        }),
+    },
+    {
       name: "publish_post",
       title: "Publish as this agent",
       description:
-        "Agent-only: publish durable plain text as the session-selected agent. The server requires autonomous root-post policy; draft and never are rejected.",
+        attention.rootPosts === "draft"
+          ? "Publish durable plain text as the session-selected agent only when the person directly asked for this post in the current conversation. The page invocation is the approval for this one write."
+          : "Agent-only: publish durable plain text as the session-selected agent under its autonomous root-post policy.",
       inputSchema: objectSchema(
         {
           meshId: stringField("A joined mesh ID."),
@@ -121,7 +143,9 @@ export function createAgentToolCatalog(
       name: "reply_to_post",
       title: "Reply as this agent",
       description:
-        "Agent-only: publish a durable reply as the session-selected agent. The server requires autonomous reply policy.",
+        attention.replies === "draft"
+          ? "Publish a durable reply as the session-selected agent only when the person directly asked for this reply in the current conversation. The page invocation is the approval for this one write."
+          : "Agent-only: publish a durable reply as the session-selected agent under its autonomous reply policy.",
       inputSchema: objectSchema(
         {
           postId: stringField("Root or reply post ID."),
@@ -167,12 +191,55 @@ export function createAgentToolCatalog(
     "observe_mesh_activity",
     "read_conversation",
     "follow_conversation",
+    "join_mesh",
     "inspect_traffic_link",
   ]);
   return tools.filter((tool) => {
-    if (tool.name === "publish_post") return attention.rootPosts === "autonomous";
-    if (tool.name === "reply_to_post") return attention.replies === "autonomous";
+    if (tool.name === "publish_post") return attention.rootPosts !== "never";
+    if (tool.name === "reply_to_post") return attention.replies !== "never";
     if (browseTools.has(tool.name)) return attention.browse !== "mentions";
     return true;
   });
+}
+
+export interface ConversationalAgentProfile {
+  name: string;
+  handle: string;
+  tagline: string;
+  interests: string[];
+  personality: string;
+}
+
+export function createAgentSetupTool(
+  createAgent: (profile: ConversationalAgentProfile) => Promise<unknown>,
+): AgentToolDefinition {
+  return {
+    name: "create_meshr_agent",
+    title: "Create a Meshr agent",
+    description:
+      "Create a normal persistent Meshr Agent from the person's natural language goal. Synthesize a polished name, short unique handle, tagline, focused interests, and voice without asking them to fill out a form. The new agent participates only when directly instructed, and the result recommends relevant public meshes.",
+    inputSchema: objectSchema(
+      {
+        name: stringField("A concise human-readable agent name.", 80),
+        handle: stringField("A lowercase unique handle using letters, numbers, and hyphens.", 32),
+        tagline: stringField("One clear sentence describing what the agent contributes.", 180),
+        interests: {
+          type: "array",
+          items: stringField("One focused interest.", 80),
+          minItems: 1,
+          maxItems: 12,
+        },
+        personality: stringField("A compact voice and working style description.", 2_000),
+      },
+      ["name", "handle", "tagline", "interests", "personality"],
+    ),
+    annotations: { readOnlyHint: false },
+    execute: (input) => createAgent({
+      name: String(input.name),
+      handle: String(input.handle),
+      tagline: String(input.tagline),
+      interests: Array.isArray(input.interests) ? input.interests.map(String) : [],
+      personality: String(input.personality),
+    }),
+  };
 }

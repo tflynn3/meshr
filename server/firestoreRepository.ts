@@ -5864,6 +5864,9 @@ export class FirestoreMeshrRepository implements MeshrRepository {
     sessionId: string;
     authorityEpoch: number;
     runtimeKind: RuntimeKind;
+    authorityKind?: "native" | "page";
+    grantId?: string;
+    humanSessionHash?: string;
     idempotencyKey: string;
     requestId: string;
     requestedAt: string;
@@ -5898,7 +5901,22 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           .limit(1)
       : null;
     const authorityRef = this.authorityRef(input.agentId);
-    const sessionRef = this.doc("runtime_sessions", input.sessionId);
+    const authorityKind = input.authorityKind ?? "native";
+    if (
+      authorityKind === "page" &&
+      (!input.grantId || !input.humanSessionHash)
+    ) {
+      throw new Error("session_invalid");
+    }
+    const sessionRef = authorityKind === "page"
+      ? this.doc("webmcp_grants", input.grantId!)
+      : this.doc("runtime_sessions", input.sessionId);
+    const humanSessionRef = authorityKind === "page"
+      ? this.doc("human_sessions", input.humanSessionHash!)
+      : null;
+    const pageFenceRef = authorityKind === "page"
+      ? this.webMcpAuthorityRef(input.humanSessionHash!)
+      : null;
     const now = input.requestedAt;
     if (!Number.isFinite(Date.parse(now)))
       throw new Error("invalid_request_timestamp");
@@ -5913,6 +5931,8 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         membership,
         pendingRequests,
         invitationCandidates,
+        humanSession,
+        pageFence,
       ] = await Promise.all([
         transaction.get(idempotencyRef),
         transaction.get(authorityRef),
@@ -5931,25 +5951,55 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         invitationQuery
           ? transaction.get(invitationQuery)
           : Promise.resolve(null),
+        humanSessionRef
+          ? transaction.get(humanSessionRef)
+          : Promise.resolve(null),
+        pageFenceRef
+          ? transaction.get(pageFenceRef)
+          : Promise.resolve(null),
       ]);
 
       if (
         !authority.exists ||
-        authority.get("authority_kind") !== "native" ||
+        authority.get("authority_kind") !== authorityKind ||
         authority.get("session_id") !== input.sessionId ||
         Number(authority.get("epoch") ?? -1) !== input.authorityEpoch
       ) {
         throw new Error("session_superseded");
       }
-      if (
+      if (authorityKind === "page") {
+        if (
+          !session.exists ||
+          session.get("revoked_at") != null ||
+          session.get("human_session_hash") !== input.humanSessionHash ||
+          session.get("agent_id") !== input.agentId ||
+          session.get("session_id") !== input.sessionId ||
+          Number(session.get("authority_epoch") ?? -1) !== input.authorityEpoch ||
+          Date.parse(String(session.get("expires_at") ?? "")) <= Date.parse(now) ||
+          !humanSession ||
+          !humanSession.exists ||
+          humanSession.get("account_id") !== input.ownerAccountId ||
+          Date.parse(String(humanSession.get("expires_at") ?? "")) <= Date.parse(now) ||
+          Date.parse(String(humanSession.get("absolute_expires_at") ?? "")) <= Date.parse(now) ||
+          Date.parse(String(humanSession.get("last_seen_at") ?? "")) <=
+            Date.parse(now) - HUMAN_IDLE_SECONDS * 1_000 ||
+          !pageFence ||
+          !pageFence.exists ||
+          pageFence.get("grant_id") !== input.grantId ||
+          pageFence.get("agent_id") !== input.agentId ||
+          pageFence.get("session_id") !== input.sessionId ||
+          Number(pageFence.get("epoch") ?? -1) !== input.authorityEpoch ||
+          pageFence.get("revoked_at") != null
+        ) {
+          throw new Error("session_invalid");
+        }
+      } else if (
         !session.exists ||
         session.get("status") !== "active" ||
         session.get("agent_id") !== input.agentId ||
         Number(session.get("authority_epoch") ?? -1) !== input.authorityEpoch ||
-        Date.parse(String(session.get("expires_at") ?? "")) <=
-          Date.parse(now) ||
-        Date.parse(String(session.get("last_seen_at") ?? "")) <
-          Date.parse(now) - 90 * 1_000
+        Date.parse(String(session.get("expires_at") ?? "")) <= Date.parse(now) ||
+        Date.parse(String(session.get("last_seen_at") ?? "")) < Date.parse(now) - 90 * 1_000
       ) {
         throw new Error("session_invalid");
       }

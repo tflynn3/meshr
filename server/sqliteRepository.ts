@@ -2613,6 +2613,9 @@ export class SqliteMeshrRepository implements MeshrRepository {
     sessionId: string;
     authorityEpoch: number;
     runtimeKind: RuntimeKind;
+    authorityKind?: "native" | "page";
+    grantId?: string;
+    humanSessionHash?: string;
     idempotencyKey: string;
     requestId: string;
     requestedAt: string;
@@ -2626,27 +2629,60 @@ export class SqliteMeshrRepository implements MeshrRepository {
         }))
         .digest("hex");
       // A replayed idempotency key is still an authenticated mutation. Check
-      // the current native session and authority fence before returning the
+      // the current session and authority fence before returning the
       // cached response; otherwise a superseded token could keep replaying an
       // old successful join indefinitely.
-      const active = this.db.prepare(
-        `SELECT s.agent_id
-         FROM agent_sessions s
-         JOIN agent_authority aa ON aa.agent_id = s.agent_id
-           AND aa.authority_kind = 'native'
-           AND aa.session_id = s.session_id
-           AND aa.epoch = s.authority_epoch
-         WHERE s.session_id = ? AND s.agent_id = ? AND s.runtime_kind = ?
-           AND s.authority_epoch = ? AND s.status = 'active'
-           AND s.expires_at > ? AND s.last_seen_at >= ?`,
-      ).get(
-        input.sessionId,
-        input.agentId,
-        input.runtimeKind,
-        input.authorityEpoch,
-        input.requestedAt,
-        new Date(Date.parse(input.requestedAt) - 90_000).toISOString(),
-      ) as { agent_id: string } | undefined;
+      const active = input.authorityKind === "page"
+        ? this.db.prepare(
+            `SELECT g.agent_id
+             FROM webmcp_grants g
+             JOIN human_sessions hs ON hs.token_hash = g.human_session_hash
+             JOIN webmcp_authority wa ON wa.human_session_hash = g.human_session_hash
+               AND wa.grant_id = g.token_hash
+               AND wa.agent_id = g.agent_id
+               AND wa.session_id = g.session_id
+               AND wa.epoch = g.authority_epoch
+               AND wa.revoked_at IS NULL
+             JOIN agent_authority aa ON aa.agent_id = g.agent_id
+               AND aa.authority_kind = 'page'
+               AND aa.session_id = g.session_id
+               AND aa.epoch = g.authority_epoch
+             WHERE g.token_hash = ? AND g.human_session_hash = ?
+               AND g.session_id = ? AND g.agent_id = ?
+               AND g.authority_epoch = ? AND g.revoked_at IS NULL
+               AND g.expires_at > ? AND hs.account_id = ?
+               AND hs.expires_at > ? AND hs.absolute_expires_at > ?
+               AND hs.last_seen_at > ?`,
+          ).get(
+            input.grantId ?? "",
+            input.humanSessionHash ?? "",
+            input.sessionId,
+            input.agentId,
+            input.authorityEpoch,
+            input.requestedAt,
+            input.ownerAccountId,
+            input.requestedAt,
+            input.requestedAt,
+            new Date(Date.parse(input.requestedAt) - 12 * 60 * 60 * 1_000).toISOString(),
+          ) as { agent_id: string } | undefined
+        : this.db.prepare(
+            `SELECT s.agent_id
+             FROM agent_sessions s
+             JOIN agent_authority aa ON aa.agent_id = s.agent_id
+               AND aa.authority_kind = 'native'
+               AND aa.session_id = s.session_id
+               AND aa.epoch = s.authority_epoch
+             WHERE s.session_id = ? AND s.agent_id = ? AND s.runtime_kind = ?
+               AND s.authority_epoch = ? AND s.status = 'active'
+               AND s.expires_at > ? AND s.last_seen_at >= ?`,
+          ).get(
+            input.sessionId,
+            input.agentId,
+            input.runtimeKind,
+            input.authorityEpoch,
+            input.requestedAt,
+            new Date(Date.parse(input.requestedAt) - 90_000).toISOString(),
+          ) as { agent_id: string } | undefined;
       if (!active) throw new Error("session_invalid");
       const agent = this.db.prepare(
         "SELECT owner_account_id, attention_json FROM agents WHERE id = ?",

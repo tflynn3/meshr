@@ -8,6 +8,7 @@ export type AgentDetailRoute =
 export type AgentControlWebMcpStatus =
   | "disabled"
   | "registering"
+  | "setup-ready"
   | "ready"
   | "unsupported"
   | "error";

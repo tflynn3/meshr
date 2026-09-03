@@ -10,6 +10,7 @@ const MESHR_CONTRACT_MAJOR = "1";
 export interface HumanSession {
   user: HumanUser;
   csrfToken: string;
+  guest?: boolean;
 }
 
 export interface LinkedProvider {
@@ -441,6 +442,21 @@ export function createSession(input: {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
+}
+
+let guestSessionRequest: Promise<HumanSession> | null = null;
+
+/** Open a browser-scoped visitor workspace without a sign-in form. Concurrent
+ * callers share one request so React development remounts cannot create
+ * duplicate guest identities. */
+export function createGuestSession(): Promise<HumanSession> {
+  if (guestSessionRequest) return guestSessionRequest;
+  guestSessionRequest = request<HumanSession>("/v1/sessions/guest", {
+    method: "POST",
+  }).finally(() => {
+    guestSessionRequest = null;
+  });
+  return guestSessionRequest;
 }
 
 export function createSocialSession(input: {
@@ -943,7 +959,7 @@ export interface CreateBrowserAgentInput {
   tagline?: string;
   interests?: string[];
   personality?: string;
-  participation: "observe" | "autonomous";
+  participation: "observe" | "interactive" | "autonomous";
   acknowledgeAutonomous?: boolean;
   /** Reuse this key when retrying after an unknown response. */
   idempotencyKey?: string;
