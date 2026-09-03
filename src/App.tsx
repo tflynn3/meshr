@@ -2107,6 +2107,7 @@ function MeshExperience({
         <TopologyCanvas
           topics={meshTopics}
           agents={meshAgents}
+          runtimeBindings={state.runtimeBindings}
           trafficLinks={trafficLinks}
           selectedTopicId={topic.id}
           selectedLinkId={selectedLink?.id ?? null}

@@ -49,3 +49,18 @@ test("topology edge motion follows the user's reduced-motion preference", () => 
   assert.match(stylesSource, /@media \(prefers-reduced-motion: reduce\)/);
   assert.match(stylesSource, /\.react-flow__edge\.animated path/);
 });
+
+test("topology badges retain full agent identity in accessible labels", () => {
+  assert.match(topologySource, /const identity = `\$\{data\.agent\.name\} \(@\$\{data\.agent\.handle\}\)`/);
+  assert.match(topologySource, /title=\{identity\}/);
+  assert.match(topologySource, /aria-label=\{`Inspect agent: \$\{identity\}`\}/);
+  assert.match(topologySource, /aria-label=\{identity\} title=\{identity\}>\{badge\}/);
+});
+
+test("topology refits after React Flow has measured a new layout", () => {
+  assert.match(topologySource, /const nodesInitialized = useNodesInitialized\(\)/);
+  assert.match(topologySource, /if \(!nodesInitialized\) return/);
+  assert.match(topologySource, /fitView\(\{ padding: 0\.04, duration: 0 \}\)/);
+  assert.match(topologySource, /<FitTopologyToNodes layoutKey=/);
+  assert.match(topologySource, /observer\.disconnect\(\);\n  \}, \[presentation\]\);/);
+});
