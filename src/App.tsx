@@ -342,6 +342,8 @@ export function App() {
     initialMeshNavigation.kind === "mesh" ? initialMeshNavigation.topicId ?? "" : "topic-native-shade");
   const [selectedLinkId, setSelectedLinkId] = useState<string | null>(() =>
     initialMeshNavigation.kind === "mesh" ? initialMeshNavigation.trafficId : null);
+  const [selectedPostId, setSelectedPostId] = useState<string | null>(() =>
+    initialMeshNavigation.kind === "mesh" ? initialMeshNavigation.postId : null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(initialMeshNavigation.kind === "mesh");
   const [createMeshOpen, setCreateMeshOpen] = useState(false);
@@ -862,6 +864,7 @@ export function App() {
     if (next.kind === "agents") {
       setView({ kind: "agents" });
       setSelectedLinkId(null);
+      setSelectedPostId(null);
       setSelectedAgentId(null);
       setInspectorOpen(false);
       return;
@@ -869,6 +872,7 @@ export function App() {
     setView({ kind: "mesh", meshId: next.meshId });
     setSelectedTopicId(next.topicId ?? "");
     setSelectedLinkId(next.trafficId);
+    setSelectedPostId(next.postId);
   }, []);
 
   useEffect(() => {
@@ -878,6 +882,7 @@ export function App() {
       current.kind !== "mesh" ||
       current.meshId !== selectedMesh.id ||
       current.topicId !== selectedTopic.id ||
+      current.postId !== selectedPostId ||
       (current.trafficId !== null && selectedLink === null)
     ) {
       navigateMesh({
@@ -885,9 +890,10 @@ export function App() {
         meshId: selectedMesh.id,
         topicId: selectedTopic.id,
         trafficId: selectedLink?.id ?? null,
+        postId: selectedPostId,
       }, true);
     }
-  }, [navigateMesh, selectedLink, selectedMesh, selectedTopic]);
+  }, [navigateMesh, selectedLink, selectedMesh, selectedPostId, selectedTopic]);
 
   useEffect(() => {
     const restore = () => {
@@ -896,6 +902,7 @@ export function App() {
       if (agentNavigation.kind === "agent") {
         setView(agentNavigation);
         setSelectedAgentId(null);
+        setSelectedPostId(null);
         setInspectorOpen(false);
         return;
       }
@@ -903,6 +910,7 @@ export function App() {
       setView(next.kind === "mesh" ? { kind: "mesh", meshId: next.meshId } : { kind: "agents" });
       setSelectedTopicId(next.kind === "mesh" ? next.topicId ?? "" : "");
       setSelectedLinkId(next.kind === "mesh" ? next.trafficId : null);
+      setSelectedPostId(next.kind === "mesh" ? next.postId : null);
       setSelectedAgentId(null);
       setInspectorOpen(next.kind === "mesh");
     };
@@ -913,7 +921,7 @@ export function App() {
   function openMesh(meshId: string) {
     const firstTopic = activityState.topics.find((topic) => topic.meshId === meshId);
     setInspectorOpen(true);
-    navigateMesh({ kind: "mesh", meshId, topicId: firstTopic?.id ?? null, trafficId: null });
+    navigateMesh({ kind: "mesh", meshId, topicId: firstTopic?.id ?? null, trafficId: null, postId: null });
   }
 
   function openAgent(agentId: string) {
@@ -943,6 +951,7 @@ export function App() {
     setView(next.kind === "mesh" ? { kind: "mesh", meshId: next.meshId } : { kind: "agents" });
     setSelectedTopicId(next.kind === "mesh" ? next.topicId ?? "" : "");
     setSelectedLinkId(next.kind === "mesh" ? next.trafficId : null);
+    setSelectedPostId(next.kind === "mesh" ? next.postId : null);
     setSelectedAgentId(null);
     setInspectorOpen(next.kind === "mesh");
   }
@@ -1102,6 +1111,16 @@ export function App() {
             onEnableWebMcp={() => void selectWebMcpAgent(selectedAgent.id)}
             onDisableWebMcp={() => void clearWebMcpAgent()}
             onOpenSetup={() => setCreateAgentOpen(true)}
+            onOpenActivityTarget={(target) => {
+              setInspectorOpen(true);
+              navigateMesh({
+                kind: "mesh",
+                meshId: target.meshId,
+                topicId: target.topicId,
+                trafficId: null,
+                postId: target.postId,
+              });
+            }}
             onSaveProfile={(input) => saveOwnedAgentProfile(selectedAgent.id, input)}
           />
         ) : (
@@ -1124,17 +1143,18 @@ export function App() {
             topic={selectedTopic}
             trafficLinks={topology.meshes[0]?.trafficLinks ?? []}
             selectedLink={selectedLink}
+            selectedPostId={selectedPostId}
             selectedAgentId={selectedAgentId}
             inspectorOpen={inspectorOpen}
             webMcpStatus={webMcpStatus}
             webMcpAgentHandle={webMcpSession?.agent?.handle ?? null}
             activityPreferences={activityPreferences}
             onSaveActivityPreference={saveActivityPreference}
-            onSelectTopic={(topicId) => { setInspectorOpen(true); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId, trafficId: null }); }}
-            onSelectLink={(trafficId) => { setInspectorOpen(true); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId: selectedTopic.id, trafficId }); }}
+            onSelectTopic={(topicId) => { setInspectorOpen(true); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId, trafficId: null, postId: null }); }}
+            onSelectLink={(trafficId) => { setInspectorOpen(true); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId: selectedTopic.id, trafficId, postId: null }); }}
             onSelectAgent={setSelectedAgentId}
             onOpenInspector={() => setInspectorOpen(true)}
-            onCloseInspector={() => { setInspectorOpen(false); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId: selectedTopic.id, trafficId: null }); }}
+            onCloseInspector={() => { setInspectorOpen(false); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId: selectedTopic.id, trafficId: null, postId: null }); }}
             onOpenGovernance={() => setGovernanceOpen(true)}
             onAddAgent={() => setCreateAgentOpen(true)}
           />
@@ -1148,7 +1168,7 @@ export function App() {
           onCreated={(meshId, topicId) => {
             setCreateMeshOpen(false);
             setInspectorOpen(true);
-            navigateMesh({ kind: "mesh", meshId, topicId, trafficId: null });
+            navigateMesh({ kind: "mesh", meshId, topicId, trafficId: null, postId: null });
             void refreshMeshes().catch(() => setToast("Mesh created; refresh failed"));
           }}
         />
@@ -1745,6 +1765,7 @@ function MeshExperience({
   topic,
   trafficLinks,
   selectedLink,
+  selectedPostId,
   selectedAgentId,
   inspectorOpen,
   webMcpStatus,
@@ -1766,6 +1787,7 @@ function MeshExperience({
   topic: Topic;
   trafficLinks: TrafficLink[];
   selectedLink: TrafficLink | null;
+  selectedPostId: string | null;
   selectedAgentId: string | null;
   inspectorOpen: boolean;
   webMcpStatus: WebMcpRegistrationStatus | "disabled" | "registering" | "error";
@@ -1845,6 +1867,7 @@ function MeshExperience({
           state={state}
           ownerId={ownerId}
           preference={activityPreferences[`topic:${topic.id}`]}
+          highlightedPostId={selectedPostId}
           onSavePreference={onSaveActivityPreference}
           onClose={onCloseInspector}
         />
@@ -1952,6 +1975,7 @@ function ConversationInspector({
   state,
   ownerId,
   preference,
+  highlightedPostId,
   onSavePreference,
   onClose,
 }: {
@@ -1960,6 +1984,7 @@ function ConversationInspector({
   state: ReturnType<typeof meshStore.getSnapshot>;
   ownerId: string;
   preference?: ActivityPreference;
+  highlightedPostId: string | null;
   onSavePreference: (
     kind: ActivityPreference["kind"],
     resourceId: string,
@@ -1973,6 +1998,7 @@ function ConversationInspector({
     status: "not-loaded" | "loading" | "ready" | "offline" | "error";
     posts: PublicConversationPost[];
   }>({ status: "not-loaded", posts: [] });
+  const highlightedPostRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     setMuted(preference?.muted ?? false);
     setWatching(preference?.watching ?? false);
@@ -1996,6 +2022,11 @@ function ConversationInspector({
     return () => controller.abort();
   }, [topic.id]);
   useEffect(() => loadConversation(), [loadConversation]);
+  useEffect(() => {
+    if (conversation.status !== "ready" || !highlightedPostId) return;
+    highlightedPostRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    highlightedPostRef.current?.focus({ preventScroll: true });
+  }, [conversation.status, highlightedPostId]);
   const save = (input: { watching?: boolean; muted?: boolean }) => {
     const previous = { muted, watching };
     if (input.muted !== undefined) setMuted(input.muted);
@@ -2057,10 +2088,18 @@ function ConversationInspector({
         {conversation.status === "error" && <p className="activity-empty">Published activity could not be loaded. Try again.</p>}
         {conversation.status === "ready" && conversation.posts.length === 0 && <p className="activity-empty">No published activity yet. Agents can begin this conversation when they are ready.</p>}
         {conversation.status === "ready" && conversation.posts.length > 0 && <div className="conversation-posts">
-          {conversation.posts.map((post) => <article className={post.parentPostId ? "reply" : ""} key={post.id}>
+          {conversation.posts.map((post) => {
+            const highlighted = post.id === highlightedPostId;
+            return <article
+              className={`${post.parentPostId ? "reply" : ""}${highlighted ? " highlighted" : ""}`.trim()}
+              key={post.id}
+              ref={highlighted ? highlightedPostRef : undefined}
+              tabIndex={highlighted ? -1 : undefined}
+            >
             <header><strong>{post.agent.name || "Agent"}</strong><span>@{post.agent.handle || "unknown"} · {new Date(post.createdAt).toLocaleString()}</span></header>
             <p>{post.body}</p>
-          </article>)}
+            </article>;
+          })}
         </div>}
       </section>
       <section>

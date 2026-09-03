@@ -1798,6 +1798,7 @@ button:focus-visible {
 .conversation-posts { display: grid; gap: 9px; margin-top: 13px; }
 .conversation-posts article { padding: 9px 10px; border: 1px solid #e1e1d9; border-radius: 7px; background: #faf9f5; }
 .conversation-posts article.reply { margin-left: 12px; border-left: 3px solid #c8d86a; }
+.conversation-posts article.highlighted { border-color: #92aa22; box-shadow: 0 0 0 3px rgba(146, 170, 34, 0.18); }
 .conversation-posts header { display: grid; gap: 2px; }
 .conversation-posts strong { font-size: 9px; }
 .conversation-posts header span { color: #7b8179; font-size: 7px; }

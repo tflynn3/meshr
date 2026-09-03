@@ -27,6 +27,8 @@ import {
   type AgentControlCenterInput,
 } from "../domain/agentControlCenter";
 import type { Agent } from "../domain/types";
+import type { AgentActivityTarget } from "../agentActivity/api";
+import { AgentActivityLedger } from "./AgentActivityLedger";
 
 type DetailTab = "overview" | "behavior" | "runtime" | "activity" | "connections" | "diagnostics";
 
@@ -73,6 +75,7 @@ export function AgentControlCenter({
   onEnableWebMcp,
   onDisableWebMcp,
   onOpenSetup,
+  onOpenActivityTarget,
   onSaveProfile,
 }: {
   input: AgentControlCenterInput;
@@ -80,6 +83,7 @@ export function AgentControlCenter({
   onEnableWebMcp: () => void;
   onDisableWebMcp: () => void;
   onOpenSetup: () => void;
+  onOpenActivityTarget: (target: AgentActivityTarget) => void;
   onSaveProfile: (input: AgentProfilePayload) => Promise<void>;
 }) {
   const [tab, setTab] = useState<DetailTab>("overview");
@@ -306,15 +310,16 @@ export function AgentControlCenter({
         )}
         {tab === "activity" && (
           <div className="control-section-grid">
-            <article className="control-panel control-wide-panel">
-              <p className="eyebrow">PARTICIPATION</p>
-              <h2>Observed conversation participation</h2>
-              {model.participatedTopics.length ? <ul className="control-activity-list">{model.participatedTopics.map((topic) => <li key={topic.id}><Pulse size={17} /><div><strong>{topic.title}</strong><small>{topic.activityCount} observed posts in this conversation · {topic.lastActivityAt ? `last activity ${formatTimestamp(topic.lastActivityAt)}` : "last activity unavailable"}</small></div></li>)}</ul> : <EmptyState>No participation is present in the current activity projection.</EmptyState>}
-            </article>
+            <AgentActivityLedger
+              agentId={agent.id}
+              agentLabel={`@${agent.handle} reads and writes`}
+              className="control-panel control-wide-panel"
+              onOpenTarget={onOpenActivityTarget}
+            />
             <article className="control-panel">
-              <p className="eyebrow">AUTHORED POSTS</p>
-              <h2>{model.observedPosts.length}</h2>
-              <p>Only posts included in the current client projection are counted here.</p>
+              <p className="eyebrow">CURRENT PROJECTION</p>
+              <h2>{model.participatedTopics.length} conversations</h2>
+              <p>Supporting context only. Conversation membership and counts never prove that the agent read content.</p>
             </article>
             <article className="control-panel">
               <p className="eyebrow">RUNTIME SIGNAL</p>

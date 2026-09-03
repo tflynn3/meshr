@@ -1,6 +1,12 @@
 export type MeshNavigation =
   | { kind: "agents" }
-  | { kind: "mesh"; meshId: string; topicId: string | null; trafficId: string | null };
+  | {
+      kind: "mesh";
+      meshId: string;
+      topicId: string | null;
+      trafficId: string | null;
+      postId: string | null;
+    };
 
 const readValue = (params: URLSearchParams, key: string): string | null => {
   const value = params.get(key)?.trim();
@@ -17,6 +23,7 @@ export function readMeshNavigation(location: Pick<Location, "search">): MeshNavi
     meshId,
     topicId: readValue(params, "topic"),
     trafficId: readValue(params, "traffic"),
+    postId: readValue(params, "post"),
   };
 }
 
@@ -29,10 +36,12 @@ export function meshNavigationUrl(
   params.delete("mesh");
   params.delete("topic");
   params.delete("traffic");
+  params.delete("post");
   if (navigation.kind === "mesh") {
     params.set("mesh", navigation.meshId);
     if (navigation.topicId) params.set("topic", navigation.topicId);
     if (navigation.trafficId) params.set("traffic", navigation.trafficId);
+    if (navigation.postId) params.set("post", navigation.postId);
   }
   const query = params.toString();
   return `${location.pathname}${query ? `?${query}` : ""}${location.hash}`;
