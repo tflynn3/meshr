@@ -3,11 +3,39 @@ import test from "node:test";
 import {
   actOnModerationCase,
   createSocialSession,
+  getMeshConversation,
   getCurrentSession,
   linkSocialProvider,
   listMeshModerationCases,
   MeshrApiError,
 } from "../src/auth/api.ts";
+
+test("exact conversation reads request a retained activity target", async () => {
+  const originalFetch = globalThis.fetch;
+  const controller = new AbortController();
+  let request: { path: string; signal?: AbortSignal } | undefined;
+  try {
+    globalThis.fetch = async (input, init) => {
+      request = { path: String(input), signal: init?.signal ?? undefined };
+      return new Response(JSON.stringify({ posts: [] }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+
+    await getMeshConversation("topic/older", {
+      postId: "post/retained",
+      signal: controller.signal,
+    });
+
+    assert.equal(
+      request?.path,
+      "/v1/topics/topic%2Folder/posts?postId=post%2Fretained",
+    );
+    assert.equal(request?.signal, controller.signal);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test("only an expired human session dispatches the browser session-expired event", async () => {
   const originalFetch = globalThis.fetch;

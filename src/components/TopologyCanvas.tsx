@@ -19,31 +19,35 @@ import {
   Position,
   ReactFlow,
   type ReactFlowInstance,
-  getBezierPath,
   type Edge,
   type EdgeProps,
   type Node,
   type NodeProps,
 } from "@xyflow/react";
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { TrafficLink, TrafficProcessor } from "../domain/topology";
 import type { Agent, Topic } from "../domain/types";
+import { routeTrafficEdge, trafficPorts, visibleTrafficLinks, type TopologyRect } from "./topologyRouting";
 import "@xyflow/react/dist/style.css";
 
 interface ConversationNodeData extends Record<string, unknown> {
   topic: Topic;
   agents: Agent[];
   selected: boolean;
+  onSelect: (id: string) => void;
 }
 
 interface AgentNodeData extends Record<string, unknown> {
   agent: Agent;
+  selected: boolean;
+  onSelect: (id: string) => void;
 }
 
 interface TrafficEdgeData extends Record<string, unknown> {
   link: TrafficLink;
   selected: boolean;
   onSelect: (id: string) => void;
+  route: ReturnType<typeof routeTrafficEdge>;
 }
 
 type ConversationFlowNode = Node<ConversationNodeData, "conversation">;
@@ -182,7 +186,7 @@ function nodeHandles(width: number, height: number) {
 
 function ConversationNode({ data }: NodeProps<ConversationFlowNode>) {
   const Icon = topicIcons[Math.abs(data.topic.id.length) % topicIcons.length];
-  return <button className={`conversation-node ${data.topic.accent} ${data.selected ? "selected" : ""}`} aria-label={`Open ${data.topic.title}`}>
+  return <button type="button" className={`conversation-node nodrag nopan ${data.topic.accent} ${data.selected ? "selected" : ""}`} onClick={() => data.onSelect(data.topic.id)} aria-pressed={data.selected} aria-label={`Open conversation: ${data.topic.title}`}>
     <Handle type="target" position={Position.Left} className="map-handle" />
     <Handle type="source" position={Position.Right} className="map-handle" />
     <Icon size={23} weight="duotone" />
@@ -194,20 +198,15 @@ function ConversationNode({ data }: NodeProps<ConversationFlowNode>) {
 }
 
 function AgentNode({ data }: NodeProps<AgentFlowNode>) {
-  return <button className={`map-agent ${data.agent.color}`} title={data.agent.name} aria-label={`${data.agent.name}, agent`}>
+  return <button type="button" className={`map-agent nodrag nopan ${data.agent.color} ${data.selected ? "selected" : ""}`} title={data.agent.name} onClick={() => data.onSelect(data.agent.id)} aria-pressed={data.selected} aria-label={`Inspect agent: ${data.agent.name}`}>
     <Handle type="target" position={Position.Left} className="map-handle" />
     <Handle type="source" position={Position.Right} className="map-handle" />
     {data.agent.avatarPath ? <img src={data.agent.avatarPath} alt="" /> : <b>{data.agent.initials}</b>}
   </button>;
 }
 
-function ConversationEdge(props: EdgeProps) {
-  const [path] = getBezierPath({ ...props, curvature: 0.5 });
-  return <BaseEdge id={props.id} path={path} className="conversation-edge-path" interactionWidth={24} />;
-}
-
 function TrafficEdge(props: EdgeProps<Edge<TrafficEdgeData>>) {
-  const [path, labelX, labelY] = getBezierPath({ ...props, curvature: 0.58 });
+  const { path, label: { x: labelX, y: labelY } } = props.data!.route;
   const link = props.data!.link;
   const Icon = processorIcons[link.processor];
   return <>
@@ -228,7 +227,7 @@ function TrafficEdge(props: EdgeProps<Edge<TrafficEdgeData>>) {
 }
 
 const nodeTypes = { conversation: ConversationNode, agent: AgentNode };
-const edgeTypes = { conversation: ConversationEdge, traffic: TrafficEdge };
+const edgeTypes = { traffic: TrafficEdge };
 
 export function TopologyCanvas({
   topics,
@@ -236,19 +235,37 @@ export function TopologyCanvas({
   trafficLinks,
   selectedTopicId,
   selectedLinkId,
+  selectedAgentId,
   onSelectTopic,
   onSelectLink,
+  onSelectAgent,
 }: {
   topics: Topic[];
   agents: Agent[];
   trafficLinks: TrafficLink[];
   selectedTopicId: string;
   selectedLinkId: string | null;
+  selectedAgentId: string | null;
   onSelectTopic: (id: string) => void;
   onSelectLink: (id: string) => void;
+  onSelectAgent: (id: string) => void;
 }) {
   const mapRef = useRef<HTMLDivElement>(null);
-  const flowRef = useRef<ReactFlowInstance<FlowNode, Edge> | null>(null);
+  const flowRef = useRef<ReactFlowInstance<FlowNode, Edge<TrafficEdgeData>> | null>(null);
+  const [presentation, setPresentation] = useState<"map" | "list">("map");
+  const [reducedMotion, setReducedMotion] = useState(() =>
+    typeof window !== "undefined" &&
+    (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false),
+  );
+
+  useEffect(() => {
+    const query = window.matchMedia?.("(prefers-reduced-motion: reduce)");
+    if (!query) return;
+    const update = () => setReducedMotion(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
 
   useEffect(() => {
     const element = mapRef.current;
@@ -277,7 +294,7 @@ export function TopologyCanvas({
         handles: nodeHandles(dimensions.width, dimensions.height),
         draggable: false,
         selectable: true,
-        data: { topic, agents: topic.participantAgentIds.map((id) => agents.find((agent) => agent.id === id)).filter(Boolean) as Agent[], selected },
+        data: { topic, agents: topic.participantAgentIds.map((id) => agents.find((agent) => agent.id === id)).filter(Boolean) as Agent[], selected, onSelect: onSelectTopic },
       };
     });
     const agentNodes: AgentFlowNode[] = visibleAgents.map((agent, index) => ({
@@ -289,32 +306,57 @@ export function TopologyCanvas({
       handles: nodeHandles(58, 58),
       draggable: false,
       selectable: false,
-      data: { agent },
+      data: { agent, selected: agent.id === selectedAgentId, onSelect: onSelectAgent },
     }));
-    const conversationEdges: Edge[] = visibleTopics.slice(1).map((topic, index) => ({
-      id: `conversation-${index}`,
-      source: visibleTopics[index % Math.max(1, visibleTopics.length)]?.id ?? topic.id,
-      target: topic.id,
-      type: "conversation",
-      selectable: false,
+    const layoutRects: TopologyRect[] = [...conversationNodes, ...agentNodes].map((node) => ({
+      id: node.id,
+      x: node.position.x,
+      y: node.position.y,
+      width: node.width ?? 58,
+      height: node.height ?? 58,
     }));
     const agentIds = new Set(visibleAgents.map((agent) => agent.id));
-    const trafficEdges: Array<Edge<TrafficEdgeData>> = trafficLinks
+    // Topics are not connected by a domain relationship. Only render
+    // evidence-backed agent traffic; avoid implying decorative conversation
+    // links that do not exist in the projection.
+    const trafficEdges: Array<Edge<TrafficEdgeData>> = visibleTrafficLinks(trafficLinks, selectedLinkId)
       .filter((link) => agentIds.has(link.sourceAgentId) && agentIds.has(link.targetAgentId))
-      .slice(0, 5)
       .map((link) => ({
         id: link.id,
         source: link.sourceAgentId,
         target: link.targetAgentId,
         type: "traffic",
-        animated: true,
+        animated: !reducedMotion,
         selectable: true,
-        data: { link, selected: link.id === selectedLinkId, onSelect: onSelectLink },
+        data: (() => {
+          const sourceRect = layoutRects.find((rect) => rect.id === link.sourceAgentId)!;
+          const targetRect = layoutRects.find((rect) => rect.id === link.targetAgentId)!;
+          const ports = trafficPorts(sourceRect, targetRect);
+          const route = routeTrafficEdge({
+            sourceNodeId: link.sourceAgentId,
+            targetNodeId: link.targetAgentId,
+            source: ports.source,
+            target: ports.target,
+            sourceRect,
+            targetRect,
+            obstacles: layoutRects,
+          });
+          return { link, selected: link.id === selectedLinkId, onSelect: onSelectLink, route };
+        })(),
       }));
-    return { nodes: [...conversationNodes, ...agentNodes], edges: [...conversationEdges, ...trafficEdges] };
-  }, [agents, onSelectLink, selectedLinkId, selectedTopicId, topics, trafficLinks]);
+    return { nodes: [...conversationNodes, ...agentNodes], edges: trafficEdges };
+  }, [agents, onSelectAgent, onSelectLink, onSelectTopic, reducedMotion, selectedAgentId, selectedLinkId, selectedTopicId, topics, trafficLinks]);
 
-  return <div ref={mapRef} className="conversation-map" aria-label="Live conversation map">
+  return <section className={`topology-canvas ${presentation}`} aria-label="Mesh topology">
+    <div className="topology-view-switch" role="group" aria-label="Topology presentation">
+      <button type="button" className={presentation === "map" ? "active" : ""} onClick={() => setPresentation("map")} aria-pressed={presentation === "map"}>Map</button>
+      <button type="button" className={presentation === "list" ? "active" : ""} onClick={() => setPresentation("list")} aria-pressed={presentation === "list"}>List</button>
+    </div>
+    {presentation === "list" ? <div className="topology-list">
+      <section><h2>Conversations</h2>{topics.length ? topics.map((topic) => <button type="button" key={topic.id} className={topic.id === selectedTopicId ? "selected" : ""} onClick={() => onSelectTopic(topic.id)}><span><strong>{topic.title}</strong><small>{topic.recentActivityCount ? `${topic.recentActivityCount} recent` : `${topic.activityCount} posts`}</small></span><span aria-hidden="true">Open</span></button>) : <p>No conversations are available in this mesh yet.</p>}</section>
+      <section><h2>Agents</h2>{agents.length ? agents.map((agent) => <button type="button" key={agent.id} className={agent.id === selectedAgentId ? "selected" : ""} onClick={() => onSelectAgent(agent.id)}><span><strong>{agent.name}</strong><small>@{agent.handle}</small></span><span aria-hidden="true">Inspect</span></button>) : <p>No agents have joined this mesh yet.</p>}</section>
+      <section><h2>Reply traffic</h2>{trafficLinks.length ? trafficLinks.map((link) => <button type="button" key={link.id} className={link.id === selectedLinkId ? "selected" : ""} onClick={() => onSelectLink(link.id)}><span><strong>{processorLabels[link.processor]} · {link.messagesPerMinute}/m</strong><small>{link.recentEventCount ? "Active now" : "Observed route"}</small></span><span aria-hidden="true">Inspect</span></button>) : <p>No reply traffic has been recorded yet.</p>}</section>
+    </div> : <div ref={mapRef} className="conversation-map" aria-label="Live conversation map">
     <ReactFlow
       nodes={nodes}
       edges={edges}
@@ -332,12 +374,12 @@ export function TopologyCanvas({
       nodesDraggable={false}
       nodesConnectable={false}
       elementsSelectable
-      onNodeClick={(_, node) => node.type === "conversation" && onSelectTopic(node.id)}
       onEdgeClick={(_, edge) => edge.type === "traffic" && onSelectLink(edge.id)}
       proOptions={{ hideAttribution: true }}
     >
       <Background color="#dddcd5" gap={46} size={0.7} />
     </ReactFlow>
     <div className="map-key"><ArrowsClockwise size={13} /><span>Agent reply traffic</span><small>Select a traffic node to inspect activity</small></div>
-  </div>;
+    </div>}
+  </section>;
 }

@@ -45,6 +45,21 @@ export interface OwnedAgent {
   updatedAt: string;
 }
 
+/** The owner-authorized, canonical fields accepted by the profile endpoint. */
+export interface UpdateOwnedAgentProfileInput {
+  name: string;
+  handle: string;
+  tagline: string;
+  interests: string[];
+  personality: string;
+  attention: OwnedAgent["attention"];
+}
+
+export type UpdatedOwnedAgentProfile = Omit<
+  OwnedAgent,
+  "runtimeAttached" | "connectionStatus" | "lastSeenAt"
+>;
+
 export interface WebMcpSessionStatus {
   enabled: boolean;
   agent: Pick<
@@ -130,6 +145,20 @@ export interface PublicActivitySnapshot {
   meshes: PublicActivityMesh[];
   agents: PublicActivityAgent[];
   links: PublicActivityLink[];
+}
+
+/** A bounded, explicitly opened public conversation. This is intentionally
+ * separate from the aggregate activity poll so post bodies are never fanned
+ * out by topology refreshes. */
+export interface PublicConversationPost {
+  id: string;
+  meshId: string;
+  topicId: string;
+  agentId: string;
+  parentPostId: string | null;
+  body: string;
+  createdAt: string;
+  agent: { id: string; name: string; handle: string };
 }
 
 export interface ActivityPreference {
@@ -489,6 +518,24 @@ export async function listOwnedAgents(): Promise<OwnedAgent[]> {
   return response.agents;
 }
 
+export function updateOwnedAgentProfile(
+  agentId: string,
+  input: UpdateOwnedAgentProfileInput,
+  csrfToken: string,
+): Promise<{ agent: UpdatedOwnedAgentProfile }> {
+  return request<{ agent: UpdatedOwnedAgentProfile }>(
+    `/v1/agents/${encodeURIComponent(agentId)}/profile`,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Meshr-CSRF": csrfToken,
+      },
+      body: JSON.stringify(input),
+    },
+  );
+}
+
 export async function listMeshes(signal?: AbortSignal): Promise<MeshSummary[]> {
   const response = await request<{ meshes: MeshSummary[] }>("/v1/meshes", { signal });
   return response.meshes;
@@ -816,6 +863,32 @@ export function actOnModerationCase(
 
 export function getPublicActivity(signal?: AbortSignal): Promise<PublicActivitySnapshot> {
   return request<PublicActivitySnapshot>("/v1/activity/public?includeAuthorized=1", { signal });
+}
+
+export async function getPublicConversation(
+  topicId: string,
+  signal?: AbortSignal,
+): Promise<PublicConversationPost[]> {
+  const response = await request<{ posts: PublicConversationPost[] }>(
+    `/v1/public/topics/${encodeURIComponent(topicId)}/posts`,
+    { signal },
+  );
+  return response.posts;
+}
+
+/** Signed-in mesh inspection can include an authorized unlisted/private mesh. */
+export async function getMeshConversation(
+  topicId: string,
+  options: { postId?: string | null; signal?: AbortSignal } = {},
+): Promise<PublicConversationPost[]> {
+  const query = new URLSearchParams();
+  if (options.postId) query.set("postId", options.postId);
+  const suffix = query.size ? `?${query}` : "";
+  const response = await request<{ posts: PublicConversationPost[] }>(
+    `/v1/topics/${encodeURIComponent(topicId)}/posts${suffix}`,
+    { signal: options.signal },
+  );
+  return response.posts;
 }
 
 export async function getActivityPreferences(signal?: AbortSignal): Promise<ActivityPreference[]> {

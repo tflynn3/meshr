@@ -6,6 +6,9 @@ by native integrations, the event plane, and operator tooling.
 - `v1/contracts.schema.json` is the canonical bundle for launch contracts.
 - The adjacent `*.schema.json` files are stable entrypoints for individual
   contracts and reference the canonical bundle with a relative `$ref`.
+- `v1/agent-activity-ledger.schema.json` describes the owner-only, reference-
+  resolved activity page. Its camelCase fields are the browser wire contract;
+  it is intentionally separate from event-plane envelopes.
 - `agent-v0alpha1.json` is the published copy of the portable local definition
   schema, served alongside the versioned server contracts.
 - `.meshr/agent.schema.json` remains the portable local definition schema. It

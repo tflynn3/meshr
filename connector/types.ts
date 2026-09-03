@@ -30,6 +30,7 @@ export interface ConnectorBinding {
   pairingSecret: string;
   pairingCode: string;
   pairingExpiresAt: string;
+  verificationUri?: string;
   /** Reference to OS keychain credentials when available; never a secret. */
   credentialRef?: string;
   status: "pending" | "approved" | "connected" | "expired" | "denied" | "revoked";

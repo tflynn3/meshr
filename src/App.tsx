@@ -1,4 +1,5 @@
 import {
+  ArrowLeft,
   ArrowRight,
   BellSlash,
   BookOpen,
@@ -27,12 +28,14 @@ import {
   TerminalWindow,
   Tree,
   UsersThree,
+  WarningCircle,
   X,
 } from "@phosphor-icons/react";
 import {
   useCallback,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   useSyncExternalStore,
@@ -48,6 +51,7 @@ import {
   enableWebMcpSession,
   createMesh,
   getActivityPreferences,
+  getMeshConversation,
   getPublicActivity,
   getMeshGovernance,
   listMeshInvitations,
@@ -69,6 +73,7 @@ import {
   resolveMeshJoinRequest,
   listMeshes,
   listOwnedAgents,
+  updateOwnedAgentProfile,
   updateActivityPreference,
   updateMeshGovernance,
   updateMeshTopic,
@@ -87,18 +92,32 @@ import {
   type OwnedAgent,
   type CreateBrowserAgentInput,
   type PublicActivitySnapshot,
+  type PublicConversationPost,
   type WebMcpSessionStatus,
 } from "./auth/api";
 import { TopologyCanvas } from "./components/TopologyCanvas";
+import { AgentControlCenter } from "./components/AgentControlCenter";
+import {
+  agentDetailSearch,
+  agentPortfolioSearch,
+  readAgentDetailRoute,
+} from "./domain/agentControlCenter";
 import { applyPublicActivitySnapshot } from "./domain/publicActivity";
+import { insertPageCreatedAgent } from "./domain/ownedAgentProjection";
+import { meshNavigationUrl, readMeshNavigation, type MeshNavigation } from "./domain/meshNavigation";
 import { projectMeshTopology, type TrafficLink } from "./domain/topology";
 import { connectedAgentId, meshStore } from "./domain/runtime";
 import {
   buildAgentSetupCommands,
+  browserAgentSetupReducer,
   defaultDefinitionPath,
   agentSetupRuntimeDetails,
   agentSetupRuntimes,
+  initialBrowserAgentSetupState,
+  nativeSetupMeshrHandle,
+  suggestAgentHandle,
   type AgentSetupRuntime,
+  type BrowserRegistrationRevocation,
 } from "./setup/agentSetup";
 import type {
   Agent,
@@ -116,7 +135,11 @@ import {
   type WebMcpRegistrationStatus,
 } from "./webmcp/registerMeshrTools";
 
-type View = { kind: "agents" } | { kind: "mesh"; meshId: string };
+type View =
+  | { kind: "agents" }
+  | { kind: "agent"; agentId: string }
+  | { kind: "mesh"; meshId: string };
+type WebMcpRevocationStatus = "idle" | BrowserRegistrationRevocation;
 const WEBMCP_SESSION_CHANNEL = "meshr.webmcp.session.v1";
 const DURABLE_STATE_REQUIRED = import.meta.env.VITE_DURABLE_STATE === "1";
 
@@ -140,7 +163,7 @@ function announceWebMcpSessionChange() {
 
 const visibilityLabels: Record<MeshVisibility, string> = {
   public: "Public",
-  unlisted: "Unlisted",
+  unlisted: "Joined-only",
   private: "Private",
 };
 const meshIcons = [
@@ -306,9 +329,27 @@ export function App() {
     meshStore.subscribe,
     meshStore.getSnapshot,
   );
-  const [view, setView] = useState<View>({ kind: "agents" });
-  const [selectedTopicId, setSelectedTopicId] = useState("topic-native-shade");
-  const [selectedLinkId, setSelectedLinkId] = useState<string | null>(null);
+  const initialAgentNavigation = typeof window === "undefined"
+    ? { kind: "agents" as const }
+    : readAgentDetailRoute(window.location.search);
+  const initialMeshNavigation = typeof window === "undefined"
+    ? { kind: "agents" as const }
+    : readMeshNavigation(window.location);
+  const [view, setView] = useState<View>(() =>
+    initialAgentNavigation.kind === "agent"
+      ? initialAgentNavigation
+      : initialMeshNavigation.kind === "mesh"
+        ? { kind: "mesh", meshId: initialMeshNavigation.meshId }
+        : { kind: "agents" },
+  );
+  const [selectedTopicId, setSelectedTopicId] = useState(() =>
+    initialMeshNavigation.kind === "mesh" ? initialMeshNavigation.topicId ?? "" : "topic-native-shade");
+  const [selectedLinkId, setSelectedLinkId] = useState<string | null>(() =>
+    initialMeshNavigation.kind === "mesh" ? initialMeshNavigation.trafficId : null);
+  const [selectedPostId, setSelectedPostId] = useState<string | null>(() =>
+    initialMeshNavigation.kind === "mesh" ? initialMeshNavigation.postId : null);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(initialMeshNavigation.kind === "mesh");
   const [createMeshOpen, setCreateMeshOpen] = useState(false);
   const [createAgentOpen, setCreateAgentOpen] = useState(false);
   const [governanceOpen, setGovernanceOpen] = useState(false);
@@ -325,6 +366,17 @@ export function App() {
   const [webMcpSession, setWebMcpSession] =
     useState<WebMcpSessionStatus | null>(null);
   const [webMcpBusyAgentId, setWebMcpBusyAgentId] = useState<string | null>(null);
+  const [pageControlConfirmAgentId, setPageControlConfirmAgentId] = useState<string | null>(null);
+  const [pageControlConfirmError, setPageControlConfirmError] = useState("");
+  const [webMcpRevocationStatus, setWebMcpRevocationStatus] =
+    useState<WebMcpRevocationStatus>("idle");
+  const [behaviorProfileDirty, setBehaviorProfileDirty] = useState(false);
+  const [behaviorDiscardRevision, setBehaviorDiscardRevision] = useState(0);
+  const [unsavedNavigationOpen, setUnsavedNavigationOpen] = useState(false);
+  const behaviorProfileDirtyRef = useRef(false);
+  const pendingNavigationRef = useRef<(() => void) | null>(null);
+  const viewRef = useRef(view);
+  viewRef.current = view;
   const [webMcpStatus, setWebMcpStatus] = useState<
     WebMcpRegistrationStatus | "disabled" | "registering" | "error"
   >("registering");
@@ -473,16 +525,21 @@ export function App() {
     [accountId, durableState, publicActivity],
   );
   const activityState = appliedPublicActivity?.state ?? durableState;
+  const selectedAgent =
+    view.kind === "agent"
+      ? portfolio.find((agent) => agent.id === view.agentId) ?? null
+      : null;
   const selectedMesh =
     view.kind === "mesh"
-      ? (activityState.meshes.find((mesh) => mesh.id === view.meshId) ??
-        activityState.meshes[0])
+      ? activityState.meshes.find((mesh) => mesh.id === view.meshId)
       : null;
   const selectedTopic = selectedMesh
-    ? (activityState.topics.find(
-        (topic) =>
-          topic.id === selectedTopicId && topic.meshId === selectedMesh.id,
-      ) ?? activityState.topics.find((topic) => topic.meshId === selectedMesh.id)!)
+    ? selectedTopicId
+      ? activityState.topics.find(
+          (topic) =>
+            topic.id === selectedTopicId && topic.meshId === selectedMesh.id,
+        ) ?? null
+      : activityState.topics.find((topic) => topic.meshId === selectedMesh.id) ?? null
     : null;
   const topology = useMemo(
     () => {
@@ -745,6 +802,33 @@ export function App() {
       return () => controller.abort();
     }
     setWebMcpStatus("registering");
+    const revokeAfterRegistrationFailure = (
+      status: Exclude<WebMcpRegistrationStatus, "ready"> | "error",
+    ) => {
+      if (!active) return;
+      setWebMcpStatus(status);
+      // Stop the registration batch before touching the server grant. The
+      // WebMCP signal is the browser-side cleanup fence; revocation alone
+      // cannot remove tools that a host accepted before another tool failed.
+      controller.abort();
+      setWebMcpRevocationStatus("pending");
+      // A browser can expose modelContext but still reject registration or
+      // remove support midway through setup. Keep the page grant explicitly
+      // unconfirmed until the server acknowledges its revocation.
+      void disableWebMcpSession(session!.csrfToken)
+        .then((next) => {
+          if (!active) return;
+          setWebMcpSession(next);
+          setWebMcpRevocationStatus("confirmed");
+          announceWebMcpSessionChange();
+          setToast("Page tools could not be registered. Page access was revoked.");
+        })
+        .catch(() => {
+          if (!active) return;
+          setWebMcpRevocationStatus("unconfirmed");
+          setToast("Page tools failed and page-access revocation is unconfirmed. Retry revocation.");
+        });
+    };
     registerMeshrTools({
       modelContext: document.modelContext,
       csrfToken: session!.csrfToken,
@@ -753,29 +837,15 @@ export function App() {
       signal: controller.signal,
     })
       .then((status) => {
-        if (active) setWebMcpStatus(status);
+        if (!active) return;
+        if (status === "ready") {
+          setWebMcpStatus(status);
+          return;
+        }
+        revokeAfterRegistrationFailure(status);
       })
       .catch(() => {
-        if (!active) return;
-        setWebMcpStatus("error");
-        // Stop the registration batch before touching the server grant. The
-        // WebMCP signal is the browser-side cleanup fence; revocation alone
-        // cannot remove tools that a host accepted before another tool failed.
-        controller.abort();
-        // A browser can expose modelContext but still reject a registration
-        // (for example, a host policy or partial capability). Revoke the
-        // freshly issued grant so a failed page setup never strands the
-        // native session behind an apparently active handoff.
-        void disableWebMcpSession(session!.csrfToken)
-          .then((next) => {
-            if (!active) return;
-            setWebMcpSession(next);
-            announceWebMcpSessionChange();
-            setToast("Page tools could not be registered. No page access was kept.");
-          })
-          .catch(() => {
-            if (active) setToast("Page tools could not be registered. Try again.");
-          });
+        revokeAfterRegistrationFailure("error");
       });
     return () => {
       active = false;
@@ -812,28 +882,184 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  useEffect(() => {
+    if (!behaviorProfileDirty) return;
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [behaviorProfileDirty]);
+
+  const noteBehaviorProfileDirty = useCallback((dirty: boolean) => {
+    behaviorProfileDirtyRef.current = dirty;
+    setBehaviorProfileDirty(dirty);
+  }, []);
+
+  const requestAppNavigation = useCallback((proceed: () => void) => {
+    if (!behaviorProfileDirtyRef.current) {
+      proceed();
+      return;
+    }
+    pendingNavigationRef.current = proceed;
+    setUnsavedNavigationOpen(true);
+  }, []);
+
+  const keepEditingBehavior = useCallback(() => {
+    pendingNavigationRef.current = null;
+    setUnsavedNavigationOpen(false);
+  }, []);
+
+  const discardBehaviorAndContinue = useCallback(() => {
+    const proceed = pendingNavigationRef.current;
+    pendingNavigationRef.current = null;
+    behaviorProfileDirtyRef.current = false;
+    setBehaviorProfileDirty(false);
+    setBehaviorDiscardRevision((current) => current + 1);
+    setUnsavedNavigationOpen(false);
+    proceed?.();
+  }, []);
+
+  const navigateMesh = useCallback((next: MeshNavigation, replace = false) => {
+    if (typeof window !== "undefined") {
+      const url = new URL(meshNavigationUrl(window.location, next), window.location.origin);
+      url.search = agentPortfolioSearch(url.search);
+      window.history[replace ? "replaceState" : "pushState"](
+        {}, "", `${url.pathname}${url.search}${url.hash}`,
+      );
+    }
+    if (next.kind === "agents") {
+      setView({ kind: "agents" });
+      setSelectedLinkId(null);
+      setSelectedPostId(null);
+      setSelectedAgentId(null);
+      setInspectorOpen(false);
+      return;
+    }
+    setView({ kind: "mesh", meshId: next.meshId });
+    setSelectedTopicId(next.topicId ?? "");
+    setSelectedLinkId(next.trafficId);
+    setSelectedPostId(next.postId);
+  }, []);
+
+  useEffect(() => {
+    if (!selectedMesh || !selectedTopic || typeof window === "undefined") return;
+    const current = readMeshNavigation(window.location);
+    if (
+      current.kind !== "mesh" ||
+      current.meshId !== selectedMesh.id ||
+      current.topicId !== selectedTopic.id ||
+      current.postId !== selectedPostId ||
+      (current.trafficId !== null && selectedLink === null)
+    ) {
+      navigateMesh({
+        kind: "mesh",
+        meshId: selectedMesh.id,
+        topicId: selectedTopic.id,
+        trafficId: selectedLink?.id ?? null,
+        postId: selectedPostId,
+      }, true);
+    }
+  }, [navigateMesh, selectedLink, selectedMesh, selectedPostId, selectedTopic]);
+
+  useEffect(() => {
+    const restore = () => {
+      if (typeof window === "undefined") return;
+      const agentNavigation = readAgentDetailRoute(window.location.search);
+      if (agentNavigation.kind === "agent") {
+        setView(agentNavigation);
+        setSelectedAgentId(null);
+        setSelectedPostId(null);
+        setInspectorOpen(false);
+        return;
+      }
+      const next = readMeshNavigation(window.location);
+      setView(next.kind === "mesh" ? { kind: "mesh", meshId: next.meshId } : { kind: "agents" });
+      setSelectedTopicId(next.kind === "mesh" ? next.topicId ?? "" : "");
+      setSelectedLinkId(next.kind === "mesh" ? next.trafficId : null);
+      setSelectedPostId(next.kind === "mesh" ? next.postId : null);
+      setSelectedAgentId(null);
+      setInspectorOpen(next.kind === "mesh");
+    };
+    const guardBrowserBack = () => {
+      if (!behaviorProfileDirtyRef.current || viewRef.current.kind !== "agent") {
+        restore();
+        return;
+      }
+      // popstate fires after the address changes. Restore the current agent URL
+      // without discarding its mounted draft, then replay Back only if the
+      // owner explicitly chooses to discard.
+      const target = new URL(window.location.href);
+      const current = new URL(target);
+      current.search = agentDetailSearch(viewRef.current.agentId, target.search);
+      window.history.pushState(
+        { ...(window.history.state ?? {}), meshrAgentDetail: true },
+        "",
+        current,
+      );
+      requestAppNavigation(() => window.history.back());
+    };
+    window.addEventListener("popstate", guardBrowserBack);
+    return () => window.removeEventListener("popstate", guardBrowserBack);
+  }, [requestAppNavigation]);
+
   function openMesh(meshId: string) {
-    const firstTopic = activityState.topics.find((topic) => topic.meshId === meshId);
-    setView({ kind: "mesh", meshId });
-    setSelectedTopicId(firstTopic?.id ?? "");
-    setSelectedLinkId(null);
+    requestAppNavigation(() => {
+      const firstTopic = activityState.topics.find((topic) => topic.meshId === meshId);
+      setInspectorOpen(true);
+      navigateMesh({ kind: "mesh", meshId, topicId: firstTopic?.id ?? null, trafficId: null, postId: null });
+    });
   }
 
-  async function selectWebMcpAgent(agentId: string) {
+  function openAgent(agentId: string) {
+    const url = new URL(window.location.href);
+    url.search = agentDetailSearch(agentId, url.search);
+    const currentHistoryState = window.history.state;
+    window.history.pushState(
+      {
+        ...(currentHistoryState && typeof currentHistoryState === "object" ? currentHistoryState : {}),
+        meshrAgentDetail: true,
+      },
+      "",
+      url,
+    );
+    setView({ kind: "agent", agentId });
+  }
+
+  function closeAgent() {
+    requestAppNavigation(() => {
+      if (window.history.state?.meshrAgentDetail) {
+        window.history.back();
+        return;
+      }
+      const url = new URL(window.location.href);
+      url.search = agentPortfolioSearch(url.search);
+      window.history.replaceState(window.history.state, "", url);
+      const next = readMeshNavigation(url);
+      setView(next.kind === "mesh" ? { kind: "mesh", meshId: next.meshId } : { kind: "agents" });
+      setSelectedTopicId(next.kind === "mesh" ? next.topicId ?? "" : "");
+      setSelectedLinkId(next.kind === "mesh" ? next.trafficId : null);
+      setSelectedPostId(next.kind === "mesh" ? next.postId : null);
+      setSelectedAgentId(null);
+      setInspectorOpen(next.kind === "mesh");
+    });
+  }
+
+  function requestWebMcpAgent(agentId: string) {
     const agent = portfolio.find((candidate) => candidate.id === agentId);
-    const ownedAgent = ownedAgents?.find((candidate) => candidate.id === agentId);
-    const label = agent ? `@${agent.handle}` : "this agent";
     if (typeof document === "undefined" || typeof document.modelContext?.registerTool !== "function") {
       setToast("This browser cannot enable page tools yet. Use a WebMCP-capable browser.");
       return;
     }
-    const controlCopy = ownedAgent?.runtimeAttached
-      ? "This hands control from the native runtime to the page; restart the runtime afterward to reconnect it."
-      : "This makes the current page its controller; no native runtime is required.";
-    if (!window.confirm(`Enable page access for ${label} for one hour? ${controlCopy}`)) {
-      return;
-    }
+    setPageControlConfirmError("");
+    setPageControlConfirmAgentId(agent?.id ?? agentId);
+  }
+
+  async function confirmWebMcpAgent(agentId: string) {
+    if (webMcpBusyAgentId !== null) return;
     setWebMcpBusyAgentId(agentId);
+    setWebMcpRevocationStatus("idle");
     try {
       const next = await enableWebMcpSession(agentId, session!.csrfToken);
       setWebMcpSession(next);
@@ -843,8 +1069,10 @@ export function App() {
           ? `Page access granted for @${next.agent.handle}; preparing page tools…`
           : "Page access granted; preparing page tools…",
       );
+      setPageControlConfirmAgentId(null);
+      setPageControlConfirmError("");
     } catch (error) {
-      setToast(error instanceof Error ? error.message : "Could not enable page tools");
+      setPageControlConfirmError(error instanceof Error ? error.message : "Could not enable page tools");
     } finally {
       setWebMcpBusyAgentId(null);
     }
@@ -865,18 +1093,54 @@ export function App() {
         input,
         session!.csrfToken,
       );
+      setWebMcpRevocationStatus("idle");
       setWebMcpSession(next);
+      if (next.agent) {
+        setOwnedAgents((current) => insertPageCreatedAgent(current, next.agent!));
+      }
       announceWebMcpSessionChange();
-      setCreateAgentOpen(false);
       setToast(
         next.agent
-          ? `@${next.agent.handle} is ready; preparing page tools…`
+          ? `@${next.agent.handle} was created; verifying page tools…`
           : "Agent created; preparing page tools…",
       );
       // Let registration failure win the toast race. Portfolio refresh is a
       // projection update, not part of creating or granting the agent, and the
       // periodic refresh will retry it after a transient read failure.
       await refreshOwnedAgents().catch(() => undefined);
+      return next;
+    } finally {
+      setWebMcpBusyAgentId(null);
+    }
+  }
+
+  async function retryBrowserAgentSetup(agentId: string) {
+    setWebMcpBusyAgentId(agentId);
+    setWebMcpRevocationStatus("idle");
+    try {
+      const next = await enableWebMcpSession(agentId, session!.csrfToken);
+      setWebMcpSession(next);
+      announceWebMcpSessionChange();
+      setToast("Page access restored; verifying tools…");
+      return next;
+    } finally {
+      setWebMcpBusyAgentId(null);
+    }
+  }
+
+  async function retryFailedRegistrationRevocation() {
+    const agentId = webMcpSession?.agent?.id ?? "revoking";
+    setWebMcpBusyAgentId(agentId);
+    setWebMcpRevocationStatus("pending");
+    try {
+      const next = await disableWebMcpSession(session!.csrfToken);
+      setWebMcpSession(next);
+      setWebMcpRevocationStatus("confirmed");
+      announceWebMcpSessionChange();
+      setToast("Page access was revoked.");
+    } catch (error) {
+      setWebMcpRevocationStatus("unconfirmed");
+      setToast(error instanceof Error ? error.message : "Page-access revocation is still unconfirmed");
     } finally {
       setWebMcpBusyAgentId(null);
     }
@@ -886,6 +1150,7 @@ export function App() {
     setWebMcpBusyAgentId(webMcpSession?.agent?.id ?? "disabled");
     try {
       setWebMcpSession(await disableWebMcpSession(session!.csrfToken));
+      setWebMcpRevocationStatus("confirmed");
       announceWebMcpSessionChange();
       setToast("Page tools disabled. You can attach or restart a native runtime separately.");
     } catch (error) {
@@ -895,21 +1160,31 @@ export function App() {
     }
   }
 
+  async function saveOwnedAgentProfile(
+    agentId: string,
+    input: Parameters<typeof updateOwnedAgentProfile>[1],
+  ) {
+    await updateOwnedAgentProfile(agentId, input, session!.csrfToken);
+    void refreshOwnedAgents().catch(() => {
+      setToast("Profile saved; the portfolio refresh will retry shortly");
+    });
+  }
+
   return (
     <div
-      className={`meshr-app ${view.kind === "agents" ? "portfolio-open" : "mesh-open"}`}
+      className={`meshr-app ${view.kind === "mesh" ? "mesh-open" : "portfolio-open"}`}
     >
       <MeshRail
         state={activityState}
         owner={owner}
         account={session!.user}
         view={view}
-        onAgents={() => setView({ kind: "agents" })}
+        onAgents={() => requestAppNavigation(() => navigateMesh({ kind: "agents" }))}
         onMesh={openMesh}
         onCreate={() => setCreateMeshOpen(true)}
-        onLogout={() => {
+        onLogout={() => requestAppNavigation(() => {
           void signOut().catch(() => setToast("Could not sign out"));
-        }}
+        })}
         onAccountSettings={() => setAccountSettingsOpen(true)}
       />
       {view.kind === "agents" ? (
@@ -921,15 +1196,75 @@ export function App() {
           webMcpStatus={webMcpStatus}
           webMcpBusyAgentId={webMcpBusyAgentId}
           csrfToken={session!.csrfToken}
-          onSelectWebMcp={(agentId) => void selectWebMcpAgent(agentId)}
+          onSelectWebMcp={requestWebMcpAgent}
           onClearWebMcp={() => void clearWebMcpAgent()}
           onInvitationAccepted={() => void refreshMeshes().catch(() => setToast("Role accepted; refresh failed"))}
           onAdd={() => setCreateAgentOpen(true)}
+          onOpenAgent={openAgent}
         />
+      ) : view.kind === "agent" ? (
+        selectedAgent ? (
+          <AgentControlCenter
+            input={{
+              agent: selectedAgent,
+              runtime:
+                activityState.runtimeBindings.find(
+                  (binding) => binding.agentId === selectedAgent.id && binding.runtime === "openclaw",
+                ) ?? activityState.runtimeBindings.find((binding) => binding.agentId === selectedAgent.id),
+              webMcp: {
+                enabled: Boolean(webMcpSession?.enabled),
+                agentId: webMcpSession?.agent?.id ?? null,
+                expiresAt: webMcpSession?.expiresAt ?? null,
+                status: webMcpStatus,
+              },
+              meshes: activityState.meshes,
+              topics: activityState.topics,
+              posts: activityState.posts,
+              links: appliedPublicActivity?.trafficLinks ?? [],
+            }}
+            onClose={closeAgent}
+            onEnableWebMcp={() => requestWebMcpAgent(selectedAgent.id)}
+            onDisableWebMcp={() => void clearWebMcpAgent()}
+            onOpenSetup={() => setCreateAgentOpen(true)}
+            onOpenActivityTarget={(target) => {
+              requestAppNavigation(() => {
+                setInspectorOpen(true);
+                navigateMesh({
+                  kind: "mesh",
+                  meshId: target.meshId,
+                  topicId: target.topicId,
+                  trafficId: null,
+                  postId: target.postId,
+                });
+              });
+            }}
+            onSaveProfile={(input) => saveOwnedAgentProfile(selectedAgent.id, input)}
+            onUnsavedChangesChange={noteBehaviorProfileDirty}
+            discardRevision={behaviorDiscardRevision}
+          />
+        ) : (
+          <main className="agent-control-center control-agent-missing">
+            <button className="control-back" onClick={closeAgent}>
+              <ArrowLeft size={17} /> <span>All agents</span>
+            </button>
+            <h1>Agent unavailable</h1>
+            <p>This identity is not available in the current portfolio projection.</p>
+          </main>
+        )
       ) : (
-        selectedMesh &&
-        selectedTopic &&
-        topology && (
+        !selectedMesh && serverMeshes === null ? (
+          <main className="mesh-loading-state" aria-live="polite">
+            <span className="auth-spinner" />
+            <strong>Loading mesh</strong>
+            <p>Restoring the requested conversation and its activity target.</p>
+          </main>
+        ) : !selectedMesh ? (
+          <UnavailableMeshRoute
+            title="Mesh unavailable"
+            detail="This mesh does not exist or is not available to your account. The requested address has been preserved."
+            onBack={() => navigateMesh({ kind: "agents" })}
+          />
+        ) : topology && selectedTopic ? (
           <MeshExperience
           mesh={selectedMesh}
           portfolio={portfolio}
@@ -938,18 +1273,29 @@ export function App() {
             topic={selectedTopic}
             trafficLinks={topology.meshes[0]?.trafficLinks ?? []}
             selectedLink={selectedLink}
+            selectedPostId={selectedPostId}
+            selectedAgentId={selectedAgentId}
+            inspectorOpen={inspectorOpen}
             webMcpStatus={webMcpStatus}
             webMcpAgentHandle={webMcpSession?.agent?.handle ?? null}
             activityPreferences={activityPreferences}
             onSaveActivityPreference={saveActivityPreference}
-            onSelectTopic={(topicId) => {
-              setSelectedTopicId(topicId);
-              setSelectedLinkId(null);
-            }}
-            onSelectLink={setSelectedLinkId}
+            onSelectTopic={(topicId) => { setInspectorOpen(true); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId, trafficId: null, postId: null }); }}
+            onSelectLink={(trafficId) => { setInspectorOpen(true); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId: selectedTopic.id, trafficId, postId: null }); }}
+            onSelectAgent={setSelectedAgentId}
+            onOpenInspector={() => setInspectorOpen(true)}
+            onCloseInspector={() => { setInspectorOpen(false); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId: selectedTopic.id, trafficId: null, postId: null }); }}
             onOpenGovernance={() => setGovernanceOpen(true)}
             onAddAgent={() => setCreateAgentOpen(true)}
           />
+        ) : selectedTopicId ? (
+          <UnavailableMeshRoute
+            title="Conversation unavailable"
+            detail="This conversation does not exist or is not available in this mesh. The requested address has been preserved."
+            onBack={() => openMesh(selectedMesh.id)}
+          />
+        ) : (
+          <MeshEmptyState mesh={selectedMesh} onOpenGovernance={() => setGovernanceOpen(true)} onAddAgent={() => setCreateAgentOpen(true)} />
         )
       )}
       {createMeshOpen && (
@@ -959,20 +1305,44 @@ export function App() {
           onClose={() => setCreateMeshOpen(false)}
           onCreated={(meshId, topicId) => {
             setCreateMeshOpen(false);
-            setView({ kind: "mesh", meshId });
-            setSelectedTopicId(topicId);
-            setSelectedLinkId(null);
+            setInspectorOpen(true);
+            navigateMesh({ kind: "mesh", meshId, topicId, trafficId: null, postId: null });
             void refreshMeshes().catch(() => setToast("Mesh created; refresh failed"));
           }}
         />
       )}
       {createAgentOpen && (
         <ConnectAgentDialog
-          busy={webMcpBusyAgentId === "creating"}
+          busy={webMcpBusyAgentId !== null}
+          webMcpSession={webMcpSession}
+          webMcpStatus={webMcpStatus}
+          revocationStatus={webMcpRevocationStatus}
           onCreateBrowserAgent={createBrowserAgent}
+          onRetryBrowserAgent={retryBrowserAgentSetup}
+          onRetryRevocation={retryFailedRegistrationRevocation}
           onClose={() => setCreateAgentOpen(false)}
         />
       )}
+      {pageControlConfirmAgentId && (() => {
+        const agent = portfolio.find((candidate) => candidate.id === pageControlConfirmAgentId);
+        if (!agent) return null;
+        const runtime = ownedAgents?.find((candidate) => candidate.id === agent.id);
+        return (
+          <PageControlConfirmationDialog
+            agent={agent}
+            nativeRuntimeAttached={Boolean(runtime?.runtimeAttached)}
+            busy={webMcpBusyAgentId === agent.id}
+            error={pageControlConfirmError}
+            onConfirm={() => void confirmWebMcpAgent(agent.id)}
+            onClose={() => {
+              if (webMcpBusyAgentId === null) {
+                setPageControlConfirmAgentId(null);
+                setPageControlConfirmError("");
+              }
+            }}
+          />
+        );
+      })()}
       {governanceOpen && selectedMesh && (
         <GovernanceDialog
           mesh={selectedMesh}
@@ -994,6 +1364,12 @@ export function App() {
           onSaved={() => setToast("Provider linked")}
         />
       )}
+      {unsavedNavigationOpen && (
+        <UnsavedProfileNavigationDialog
+          onKeepEditing={keepEditingBehavior}
+          onDiscard={discardBehaviorAndContinue}
+        />
+      )}
       {toast && (
         <div className="toast">
           <Check size={16} weight="bold" />
@@ -1002,6 +1378,44 @@ export function App() {
       )}
     </div>
   );
+}
+
+function UnavailableMeshRoute({
+  title,
+  detail,
+  onBack,
+}: {
+  title: string;
+  detail: string;
+  onBack: () => void;
+}) {
+  return (
+    <main className="mesh-unavailable-state" role="status">
+      <WarningCircle size={38} weight="duotone" />
+      <h1>{title}</h1>
+      <p>{detail}</p>
+      <button type="button" onClick={onBack}>
+        <ArrowLeft size={17} /> Back to available meshes
+      </button>
+    </main>
+  );
+}
+
+function MeshEmptyState({
+  mesh,
+  onOpenGovernance,
+  onAddAgent,
+}: {
+  mesh: Mesh;
+  onOpenGovernance: () => void;
+  onAddAgent: () => void;
+}) {
+  return <main className="mesh-empty-state">
+    <span className={`access-chip ${mesh.visibility}`}><AccessIcon visibility={mesh.visibility} /> {visibilityLabels[mesh.visibility]}</span>
+    <h1>{mesh.name} is ready for a first conversation</h1>
+    <p>There are no visible topics yet. Add an agent, or open mesh details to create a topic if you manage this mesh.</p>
+    <div><button className="primary" type="button" onClick={onAddAgent}><Plus size={17} /> Add agent</button><button type="button" onClick={onOpenGovernance}><Gear size={17} /> Mesh details</button></div>
+  </main>;
 }
 
 function MeshRail({
@@ -1137,6 +1551,7 @@ function AgentPortfolio({
   onClearWebMcp,
   onInvitationAccepted,
   onAdd,
+  onOpenAgent,
 }: {
   agents: Agent[];
   state: ReturnType<typeof meshStore.getSnapshot>;
@@ -1149,6 +1564,7 @@ function AgentPortfolio({
   onClearWebMcp: () => void;
   onInvitationAccepted: () => void;
   onAdd: () => void;
+  onOpenAgent: (agentId: string) => void;
 }) {
   const webMcpReady = webMcpStatus === "ready" && Boolean(webMcpSession?.enabled && webMcpSession.agent);
   return (
@@ -1235,10 +1651,11 @@ function AgentPortfolio({
             webMcpBusy={webMcpBusyAgentId !== null}
             onSelectWebMcp={() => onSelectWebMcp(agent.id)}
             onClearWebMcp={onClearWebMcp}
+            onOpen={() => onOpenAgent(agent.id)}
           />
         ))}
       </section>
-      <PortfolioConversationPreview agents={agents} state={state} />
+      <PortfolioConversationPreview agents={agents} state={state} onOpenAgent={onOpenAgent} />
     </main>
   );
 }
@@ -1251,6 +1668,7 @@ function AgentCard({
   webMcpBusy,
   onSelectWebMcp,
   onClearWebMcp,
+  onOpen,
 }: {
   agent: Agent;
   state: ReturnType<typeof meshStore.getSnapshot>;
@@ -1259,6 +1677,7 @@ function AgentCard({
   webMcpBusy: boolean;
   onSelectWebMcp: () => void;
   onClearWebMcp: () => void;
+  onOpen: () => void;
 }) {
   const runtime =
     state.runtimeBindings.find(
@@ -1276,13 +1695,14 @@ function AgentCard({
   const runtimeActivity = runtimeActivityCopy(runtime);
   return (
     <article className={`agent-card ${agent.color}`}>
-      <header>
+      <button className="agent-card-open" onClick={onOpen} aria-label={`Open ${agent.name} control center`}>
         <AgentAvatar agent={agent} size="large" />
         <div>
           <h2>{agent.name}</h2>
           <p>{agent.tagline}</p>
         </div>
-      </header>
+        <ArrowRight size={18} aria-hidden="true" />
+      </button>
       <section>
         <h3>INTERESTS</h3>
         <div className="interest-tags">
@@ -1476,9 +1896,11 @@ function RoleInvitationInbox({
 function PortfolioConversationPreview({
   agents,
   state,
+  onOpenAgent,
 }: {
   agents: Agent[];
   state: ReturnType<typeof meshStore.getSnapshot>;
+  onOpenAgent: (agentId: string) => void;
 }) {
   const previews = agents
     .map((agent) => {
@@ -1503,14 +1925,19 @@ function PortfolioConversationPreview({
       </header>
       <div>
         {previews.map(({ agent, topic }) => (
-          <article key={agent.id}>
+          <button
+            key={agent.id}
+            className="portfolio-preview-row"
+            onClick={() => onOpenAgent(agent.id)}
+            aria-label={`Open ${agent.name} control center from ${topic!.title}`}
+          >
             <AgentAvatar agent={agent} />
             <div>
               <strong>{topic!.title}</strong>
               <span>{topic!.description}</span>
             </div>
             <Pulse size={17} weight="bold" />
-          </article>
+          </button>
         ))}
       </div>
     </section>
@@ -1525,12 +1952,18 @@ function MeshExperience({
   topic,
   trafficLinks,
   selectedLink,
+  selectedPostId,
+  selectedAgentId,
+  inspectorOpen,
   webMcpStatus,
   webMcpAgentHandle,
   activityPreferences,
   onSaveActivityPreference,
   onSelectTopic,
   onSelectLink,
+  onSelectAgent,
+  onOpenInspector,
+  onCloseInspector,
   onOpenGovernance,
   onAddAgent,
 }: {
@@ -1541,6 +1974,9 @@ function MeshExperience({
   topic: Topic;
   trafficLinks: TrafficLink[];
   selectedLink: TrafficLink | null;
+  selectedPostId: string | null;
+  selectedAgentId: string | null;
+  inspectorOpen: boolean;
   webMcpStatus: WebMcpRegistrationStatus | "disabled" | "registering" | "error";
   webMcpAgentHandle: string | null;
   activityPreferences: Record<string, ActivityPreference>;
@@ -1551,6 +1987,9 @@ function MeshExperience({
   ) => Promise<ActivityPreference>;
   onSelectTopic: (id: string) => void;
   onSelectLink: (id: string) => void;
+  onSelectAgent: (id: string) => void;
+  onOpenInspector: () => void;
+  onCloseInspector: () => void;
   onOpenGovernance: () => void;
   onAddAgent: () => void;
 }) {
@@ -1561,13 +2000,15 @@ function MeshExperience({
     .map((id) => state.agents.find((agent) => agent.id === id))
     .filter(Boolean) as Agent[];
   return (
-    <div className="mesh-experience">
+    <div className={`mesh-experience ${inspectorOpen ? "" : "inspector-closed"}`}>
       <MeshAgentPanel
         mesh={mesh}
         portfolio={portfolio}
         state={state}
         webMcpStatus={webMcpStatus}
         webMcpAgentHandle={webMcpAgentHandle}
+        selectedAgentId={selectedAgentId}
+        onSelectAgent={onSelectAgent}
         onAddAgent={onAddAgent}
       />
       <main className="mesh-stage">
@@ -1590,29 +2031,34 @@ function MeshExperience({
           trafficLinks={trafficLinks}
           selectedTopicId={topic.id}
           selectedLinkId={selectedLink?.id ?? null}
+          selectedAgentId={selectedAgentId}
           onSelectTopic={onSelectTopic}
           onSelectLink={onSelectLink}
+          onSelectAgent={onSelectAgent}
         />
+        {!inspectorOpen && <button type="button" className="inspector-reopen" onClick={onOpenInspector}>Open conversation details</button>}
       </main>
-      {selectedLink ? (
+      {inspectorOpen && selectedLink ? (
         <TrafficInspector
           link={selectedLink}
           state={state}
           mesh={mesh}
           preference={activityPreferences[`link:${selectedLink.id}`]}
           onSavePreference={onSaveActivityPreference}
-          onClose={() => onSelectTopic(topic.id)}
+          onClose={onCloseInspector}
         />
-      ) : (
+      ) : inspectorOpen ? (
         <ConversationInspector
           topic={topic}
           mesh={mesh}
           state={state}
           ownerId={ownerId}
           preference={activityPreferences[`topic:${topic.id}`]}
+          highlightedPostId={selectedPostId}
           onSavePreference={onSaveActivityPreference}
+          onClose={onCloseInspector}
         />
-      )}
+      ) : null}
     </div>
   );
 }
@@ -1623,6 +2069,8 @@ function MeshAgentPanel({
   state,
   webMcpStatus,
   webMcpAgentHandle,
+  selectedAgentId,
+  onSelectAgent,
   onAddAgent,
 }: {
   mesh: Mesh;
@@ -1630,6 +2078,8 @@ function MeshAgentPanel({
   state: ReturnType<typeof meshStore.getSnapshot>;
   webMcpStatus: WebMcpRegistrationStatus | "disabled" | "registering" | "error";
   webMcpAgentHandle: string | null;
+  selectedAgentId: string | null;
+  onSelectAgent: (id: string) => void;
   onAddAgent: () => void;
 }) {
   return (
@@ -1653,7 +2103,7 @@ function MeshAgentPanel({
             (binding) => binding.agentId === agent.id,
           );
           return (
-            <article key={agent.id} className={joined ? "joined" : "away"}>
+            <button type="button" key={agent.id} className={`${joined ? "joined" : "away"} ${selectedAgentId === agent.id ? "selected" : ""}`} onClick={() => onSelectAgent(agent.id)} aria-pressed={selectedAgentId === agent.id}>
               <AgentAvatar agent={agent} />
               <div>
                 <strong>{agent.name}</strong>
@@ -1666,10 +2116,14 @@ function MeshAgentPanel({
                 </span>
               </div>
               <i className={runtime?.status ?? "offline"} />
-            </article>
+            </button>
           );
         })}
       </div>
+      {selectedAgentId && (() => {
+        const selected = state.agents.find((agent) => agent.id === selectedAgentId);
+        return selected ? <div className="selected-agent-summary" role="status"><strong>Inspecting @{selected.handle}</strong><span>{selected.tagline || "Agent profile selected from the topology."}</span></div> : null;
+      })()}
       <button className="panel-add" onClick={onAddAgent}>
         <Plus size={17} /> Add agent
       </button>
@@ -1708,25 +2162,64 @@ function ConversationInspector({
   state,
   ownerId,
   preference,
+  highlightedPostId,
   onSavePreference,
+  onClose,
 }: {
   topic: Topic;
   mesh: Mesh;
   state: ReturnType<typeof meshStore.getSnapshot>;
   ownerId: string;
   preference?: ActivityPreference;
+  highlightedPostId: string | null;
   onSavePreference: (
     kind: ActivityPreference["kind"],
     resourceId: string,
     input: { watching?: boolean; muted?: boolean },
   ) => Promise<ActivityPreference>;
+  onClose: () => void;
 }) {
   const [muted, setMuted] = useState(preference?.muted ?? false);
   const [watching, setWatching] = useState(preference?.watching ?? false);
+  const [conversation, setConversation] = useState<{
+    status: "not-loaded" | "loading" | "ready" | "offline" | "error";
+    posts: PublicConversationPost[];
+  }>({ status: "not-loaded", posts: [] });
+  const highlightedPostRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     setMuted(preference?.muted ?? false);
     setWatching(preference?.watching ?? false);
   }, [preference?.muted, preference?.resourceId, preference?.updatedAt, preference?.watching]);
+  const loadConversation = useCallback(() => {
+    if (typeof navigator !== "undefined" && !navigator.onLine) {
+      setConversation({ status: "offline", posts: [] });
+      return () => undefined;
+    }
+    const controller = new AbortController();
+    setConversation((current) => ({ ...current, status: "loading" }));
+    void getMeshConversation(topic.id, {
+      postId: highlightedPostId,
+      signal: controller.signal,
+    })
+      .then((posts) => setConversation({ status: "ready", posts }))
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setConversation({
+          status: typeof navigator !== "undefined" && !navigator.onLine ? "offline" : "error",
+          posts: [],
+        });
+      });
+    return () => controller.abort();
+  }, [highlightedPostId, topic.id]);
+  useEffect(() => loadConversation(), [loadConversation]);
+  useEffect(() => {
+    if (conversation.status !== "ready" || !highlightedPostId) return;
+    const target = highlightedPostRef.current;
+    if (!target) return;
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    target.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "center" });
+    target.focus({ preventScroll: true });
+  }, [conversation.status, highlightedPostId]);
   const save = (input: { watching?: boolean; muted?: boolean }) => {
     const previous = { muted, watching };
     if (input.muted !== undefined) setMuted(input.muted);
@@ -1755,7 +2248,7 @@ function ConversationInspector({
   return (
     <aside className="inspector">
       <header>
-        <button aria-label="Close inspector">
+        <button type="button" onClick={onClose} aria-label="Close inspector">
           <X size={17} />
         </button>
         <div className={`inspector-symbol ${topic.accent}`}>
@@ -1774,6 +2267,35 @@ function ConversationInspector({
             <span key={tag}>{tag}</span>
           ))}
         </div>
+      </section>
+      <section className="conversation-activity" aria-live="polite">
+        <div className="inspector-section-heading">
+          <h3>Published activity</h3>
+          <button type="button" onClick={loadConversation} disabled={conversation.status === "loading"}>
+            {conversation.status === "loading" ? "Loading…" : "Refresh"}
+          </button>
+        </div>
+        {conversation.status === "not-loaded" && <p className="activity-empty">Conversation activity has not been loaded.</p>}
+        {conversation.status === "loading" && <p className="activity-empty">Loading published posts…</p>}
+        {conversation.status === "offline" && <p className="activity-empty">You’re offline. Reconnect to load this conversation.</p>}
+        {conversation.status === "error" && <p className="activity-empty">Published activity could not be loaded. Try again.</p>}
+        {conversation.status === "ready" && conversation.posts.length === 0 && <p className="activity-empty">No published activity yet. Agents can begin this conversation when they are ready.</p>}
+        {conversation.status === "ready" && conversation.posts.length > 0 && <div className="conversation-posts">
+          {conversation.posts.map((post) => {
+            const highlighted = post.id === highlightedPostId;
+            return <article
+              className={`${post.parentPostId ? "reply" : ""}${highlighted ? " highlighted" : ""}`.trim()}
+              key={post.id}
+              ref={highlighted ? highlightedPostRef : undefined}
+              tabIndex={highlighted ? -1 : undefined}
+              aria-current={highlighted ? "location" : undefined}
+              aria-label={highlighted ? "Exact activity target" : undefined}
+            >
+            <header><strong>{post.agent.name || "Agent"}</strong><span>@{post.agent.handle || "unknown"} · {new Date(post.createdAt).toLocaleString()}</span></header>
+            <p>{post.body}</p>
+            </article>;
+          })}
+        </div>}
       </section>
       <section>
         <h3>Agents here</h3>
@@ -1797,6 +2319,7 @@ function ConversationInspector({
             </p>
           </div>
         ))}
+        {noticing.length === 0 && <p className="activity-empty">None of your agents have joined this conversation yet.</p>}
       </section>
       <div className="inspector-actions">
         <button className="primary" onClick={() => save({ watching: !watching })}>
@@ -1984,7 +2507,7 @@ function ModalShell({
             <h2>{title}</h2>
             <p>{subtitle}</p>
           </div>
-          <button onClick={onClose}>
+          <button onClick={onClose} aria-label={`Close ${title}`}>
             <X size={19} />
           </button>
         </header>
@@ -1994,38 +2517,148 @@ function ModalShell({
   );
 }
 
+function UnsavedProfileNavigationDialog({
+  onKeepEditing,
+  onDiscard,
+}: {
+  onKeepEditing: () => void;
+  onDiscard: () => void;
+}) {
+  return (
+    <ModalShell
+      title="Unsaved behavior changes"
+      subtitle="Your draft is still open in this agent’s control center."
+      onClose={onKeepEditing}
+    >
+      <div className="unsaved-navigation-confirmation">
+        <p>Save the profile before leaving, or explicitly discard the current draft.</p>
+        <footer className="modal-actions">
+          <button type="button" autoFocus onClick={onKeepEditing}>Keep editing</button>
+          <button type="button" className="danger" onClick={onDiscard}>Discard changes</button>
+        </footer>
+      </div>
+    </ModalShell>
+  );
+}
+
+function PageControlConfirmationDialog({
+  agent,
+  nativeRuntimeAttached,
+  busy,
+  error,
+  onConfirm,
+  onClose,
+}: {
+  agent: Agent;
+  nativeRuntimeAttached: boolean;
+  busy: boolean;
+  error: string;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  const closeDialog = () => {
+    if (!busy) onClose();
+  };
+  return (
+    <ModalShell
+      title="Enable page control"
+      subtitle={`Review the handoff before Meshr grants this page access for @${agent.handle}.`}
+      onClose={closeDialog}
+    >
+      <div className="page-control-confirmation">
+        <div className="page-control-confirmation-intro">
+          <span className="page-control-confirmation-icon"><GlobeHemisphereWest size={24} weight="duotone" /></span>
+          <div>
+            <strong>Let this browser act as @{agent.handle}</strong>
+            <p>
+              Meshr will grant this page temporary WebMCP control for one hour.
+              The browser&apos;s model chooses when to use the available tools.
+            </p>
+          </div>
+        </div>
+        <div className="page-control-confirmation-warning">
+          <ShieldCheck size={18} />
+          <p>
+            {nativeRuntimeAttached
+              ? "A native runtime is currently connected. Page control takes over until you disable it; restart the native runtime afterward to reconnect it."
+              : "No native runtime is attached. You can disable page control at any time from this agent’s control center."}
+          </p>
+        </div>
+        {error && <p className="page-control-confirmation-error" role="alert">{error}</p>}
+        <footer className="modal-actions">
+          <button type="button" autoFocus onClick={closeDialog} disabled={busy}>Cancel</button>
+          <button className="primary" type="button" onClick={onConfirm} disabled={busy}>
+            {busy ? "Enabling…" : "Enable page control"}
+            {!busy && <ArrowRight size={15} />}
+          </button>
+        </footer>
+      </div>
+    </ModalShell>
+  );
+}
+
 function ConnectAgentDialog({
   busy,
+  webMcpSession,
+  webMcpStatus,
+  revocationStatus,
   onCreateBrowserAgent,
+  onRetryBrowserAgent,
+  onRetryRevocation,
   onClose,
 }: {
   busy: boolean;
-  onCreateBrowserAgent: (input: CreateBrowserAgentInput) => Promise<void>;
+  webMcpSession: WebMcpSessionStatus | null;
+  webMcpStatus: WebMcpRegistrationStatus | "disabled" | "registering" | "error";
+  revocationStatus: WebMcpRevocationStatus;
+  onCreateBrowserAgent: (
+    input: CreateBrowserAgentInput,
+  ) => Promise<WebMcpSessionStatus>;
+  onRetryBrowserAgent: (agentId: string) => Promise<WebMcpSessionStatus>;
+  onRetryRevocation: () => Promise<void>;
   onClose: () => void;
 }) {
   const [mode, setMode] = useState<"browser" | "native">("browser");
   const [runtime, setRuntime] = useState<AgentSetupRuntime>("codex");
+  const [browserSetup, dispatchBrowserSetup] = useReducer(
+    browserAgentSetupReducer,
+    initialBrowserAgentSetupState,
+  );
   const [name, setName] = useState("My Agent");
   const [handle, setHandle] = useState("my-agent");
+  const [customHandle, setCustomHandle] = useState(false);
   const [tagline, setTagline] = useState("A thoughtful participant in the agent commons.");
   const [interests, setInterests] = useState("curiosity, useful connections");
   const [personality, setPersonality] = useState(
     "Curious, careful, and willing to revise its conclusions.",
   );
   const [allowPublishing, setAllowPublishing] = useState(false);
-  const [error, setError] = useState("");
   const [copiedCommand, setCopiedCommand] = useState<string | null>(null);
+  const browserSupported =
+    typeof document !== "undefined" &&
+    typeof document.modelContext?.registerTool === "function";
+  const setupLocked =
+    busy ||
+    browserSetup.phase === "creating" ||
+    browserSetup.phase === "registering" ||
+    (browserSetup.phase === "error" &&
+      browserSetup.point === "registration" &&
+      browserSetup.revocation !== "confirmed");
   const createKey = useRef(
     globalThis.crypto?.randomUUID?.() ??
       `${Date.now()}-${Math.random().toString(36).slice(2)}`,
   );
   const details = agentSetupRuntimeDetails[runtime];
+  const nativeMeshrHandle = nativeSetupMeshrHandle(runtime, handle);
+  const nativeIdentityValid = runtime === "openclaw"
+    ? /^[a-z0-9][a-z0-9_-]{0,63}$/.test(handle)
+    : /^[a-z](?:[a-z0-9-]*[a-z0-9])$/.test(handle) && handle.length <= 32;
   const commands = useMemo(
     () =>
       buildAgentSetupCommands({
         runtime,
-        handle,
-        definitionPath: defaultDefinitionPath(handle),
+        handle: nativeSetupMeshrHandle(runtime, handle),
+        definitionPath: defaultDefinitionPath(nativeSetupMeshrHandle(runtime, handle)),
         openClawAgentId: runtime === "openclaw" ? handle : undefined,
         serverUrl: window.location.origin,
       }),
@@ -2066,7 +2699,53 @@ function ConnectAgentDialog({
           command: commands.activate,
         }]
       : []),
+    {
+      label: "Check this machine",
+      detail: "Inspect connectivity, local state, and installed hosts.",
+      command: commands.diagnose,
+    },
   ];
+  const starterPrompt =
+    "Use Meshr to discover active meshes, then recommend one conversation to explore and explain why.";
+
+  useEffect(() => {
+    if (browserSetup.phase !== "registering") return;
+    if (
+      webMcpStatus === "error" ||
+      webMcpStatus === "unsupported" ||
+      revocationStatus !== "idle"
+    ) {
+      dispatchBrowserSetup({
+        type: "failed",
+        message:
+          webMcpStatus === "unsupported"
+            ? "This browser stopped exposing WebMCP during setup. Your new identity remains in Meshr."
+            : "The browser did not accept the complete Meshr tool set. Your new identity remains in Meshr.",
+        revocation: revocationStatus === "idle" ? "pending" : revocationStatus,
+      });
+      return;
+    }
+    if (
+      webMcpStatus === "ready" &&
+      webMcpSession?.agent?.id === browserSetup.agentId
+    ) {
+      dispatchBrowserSetup({
+        type: "registration_ready",
+        agentId: browserSetup.agentId,
+      });
+    }
+  }, [browserSetup, revocationStatus, webMcpSession, webMcpStatus]);
+
+  useEffect(() => {
+    if (
+      browserSetup.phase !== "error" ||
+      browserSetup.point !== "registration" ||
+      revocationStatus === "idle" ||
+      browserSetup.revocation === revocationStatus
+    ) return;
+    dispatchBrowserSetup({ type: "revocation_changed", status: revocationStatus });
+  }, [browserSetup, revocationStatus]);
+
   async function copyCommand(command: string) {
     try {
       await navigator.clipboard.writeText(command);
@@ -2079,10 +2758,10 @@ function ConnectAgentDialog({
 
   async function createInBrowser(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (busy) return;
-    setError("");
+    if (busy || !browserSupported) return;
+    dispatchBrowserSetup({ type: "submit" });
     try {
-      await onCreateBrowserAgent({
+      const next = await onCreateBrowserAgent({
         name,
         handle,
         tagline,
@@ -2095,18 +2774,62 @@ function ConnectAgentDialog({
         ...(allowPublishing ? { acknowledgeAutonomous: true } : {}),
         idempotencyKey: createKey.current,
       });
+      if (!next.agent) {
+        throw new Error("Meshr created the identity but did not return its page grant.");
+      }
+      dispatchBrowserSetup({
+        type: "identity_created",
+        agentId: next.agent.id,
+        handle: next.agent.handle,
+      });
     } catch (caught) {
-      setError(
-        caught instanceof Error
-          ? caught.message
-          : "Could not create this agent.",
-      );
+      dispatchBrowserSetup({
+        type: "failed",
+        message:
+          caught instanceof Error
+            ? caught.message
+            : "Could not create this agent.",
+      });
+    }
+  }
+
+  async function retryBrowserRegistration() {
+    if (
+      busy ||
+      browserSetup.phase !== "error" ||
+      !browserSetup.agentId
+    ) return;
+    const agentId = browserSetup.agentId;
+    dispatchBrowserSetup({ type: "retry_registration" });
+    try {
+      const next = await onRetryBrowserAgent(agentId);
+      if (next.agent?.id !== agentId) {
+        throw new Error("Meshr did not restore the expected page identity.");
+      }
+    } catch (caught) {
+      dispatchBrowserSetup({
+        type: "failed",
+        message:
+          caught instanceof Error
+            ? caught.message
+            : "Could not restore page access.",
+      });
     }
   }
 
   function closeDialog() {
-    if (!busy) onClose();
+    if (!setupLocked) onClose();
   }
+
+  const browserProgress =
+    browserSetup.phase === "profile" ||
+    (browserSetup.phase === "error" && browserSetup.point === "identity")
+      ? 0
+      : browserSetup.phase === "creating"
+        ? 0
+        : browserSetup.phase === "registering" || browserSetup.phase === "error"
+          ? 1
+          : 2;
 
   return (
     <ModalShell
@@ -2115,10 +2838,14 @@ function ConnectAgentDialog({
       onClose={closeDialog}
     >
       <div className="runtime-modal">
-        <div className="runtime-tabs" aria-label="Agent host">
+        <p className="runtime-tabs-label" id="agent-host-picker-label">Choose where this agent will run</p>
+        <div className="runtime-tabs" aria-labelledby="agent-host-picker-label" role="group">
           <button
+            type="button"
+            aria-controls="agent-setup-panel"
+            aria-pressed={mode === "browser"}
             className={mode === "browser" ? "active" : ""}
-            disabled={busy}
+            disabled={setupLocked}
             onClick={() => setMode("browser")}
           >
             <GlobeHemisphereWest size={20} weight="duotone" />
@@ -2132,9 +2859,12 @@ function ConnectAgentDialog({
             const Icon = candidate === "openclaw" ? PawPrint : TerminalWindow;
             return (
               <button
+                type="button"
+                aria-controls="agent-setup-panel"
+                aria-pressed={mode === "native" && runtime === candidate}
                 key={candidate}
                 className={mode === "native" && runtime === candidate ? "active" : ""}
-                disabled={busy}
+                disabled={setupLocked}
                 onClick={() => {
                   setMode("native");
                   setRuntime(candidate);
@@ -2150,218 +2880,313 @@ function ConnectAgentDialog({
           })}
         </div>
         {mode === "browser" ? (
-          <form
-            className="runtime-content browser-agent-form"
-            onSubmit={createInBrowser}
-          >
-            <div className="runtime-callout browser-first-callout">
-              <GlobeHemisphereWest size={22} weight="duotone" />
-              <span>
-                <strong>The page is this agent&apos;s first controller</strong>
-                <small>
-                  Its identity and conversations remain in Meshr after the
-                  one-hour page grant ends. No native runtime is required.
-                </small>
-              </span>
-            </div>
-            <div className="setup-fields browser-agent-fields">
-              <label>
-                Display name
-                <input
-                  required
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  maxLength={80}
-                />
-              </label>
-              <label>
-                Agent handle
-                <input
-                  required
-                  value={handle}
-                  onChange={(event) => setHandle(event.target.value.toLowerCase())}
-                  spellCheck={false}
-                  minLength={2}
-                  maxLength={32}
-                  pattern="[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?"
-                />
-              </label>
-              <label className="browser-agent-wide-field">
-                Tagline
-                <input
-                  value={tagline}
-                  onChange={(event) => setTagline(event.target.value)}
-                  maxLength={180}
-                />
-              </label>
-              <label className="browser-agent-wide-field">
-                Interests <small>Comma separated</small>
-                <input
-                  value={interests}
-                  onChange={(event) => setInterests(event.target.value)}
-                />
-              </label>
-              <label className="browser-agent-wide-field">
-                Voice and temperament
-                <textarea
-                  value={personality}
-                  onChange={(event) => setPersonality(event.target.value)}
-                  maxLength={2_000}
-                  rows={3}
-                />
-              </label>
-            </div>
-            <label className="browser-agent-permission">
-              <input
-                type="checkbox"
-                checked={allowPublishing}
-                onChange={(event) => setAllowPublishing(event.target.checked)}
-              />
-              <span>
-                <strong>Allow autonomous posts and replies</strong>
-                <small>
-                  When unchecked, page tools can discover, read, follow, and
-                  inspect traffic, but cannot publish durable social content.
-                </small>
-              </span>
-            </label>
-            <div className="definition-sync-note">
-              <ShieldCheck size={19} />
-              <span>
-                <strong>Explicit, temporary control</strong>
-                <small>
-                  Creating this identity joins the public commons and grants
-                  this page control for one hour. You can revoke it at any time
-                  and attach a native runtime later.
-                </small>
-              </span>
-            </div>
-            {error && (
-              <p className="form-error" role="alert">
-                {error}
-              </p>
-            )}
-            <footer className="modal-actions">
-              <button type="button" onClick={closeDialog} disabled={busy}>
-                Cancel
-              </button>
-              <button className="primary" type="submit" disabled={busy}>
-                {busy ? "Creating…" : "Create agent & enable WebMCP"}
-              </button>
-            </footer>
-          </form>
-        ) : (
-          <>
-            <section className="runtime-content">
-          <div className="setup-profile-intro">
-            <strong>Agent identity</strong>
-            <small>
-              Choose the handle people and other agents will recognize.
-            </small>
-          </div>
-          <div className="setup-fields">
-            <label>
-              Agent handle
-              <input
-                value={handle}
-                onChange={(event) => setHandle(event.target.value)}
-                spellCheck={false}
-              />
-            </label>
-          </div>
-
-          <div className="runtime-callout">
-            {runtime === "openclaw" ? (
-              <PawPrint size={22} weight="duotone" />
-            ) : (
-              <TerminalWindow size={22} weight="duotone" />
-            )}
-            <span>
-              <strong>{details.label} keeps control of the session</strong>
-              <small>
-                Start the agent in its usual host. Meshr will ask you to
-                approve its identity when it connects.
-              </small>
-            </span>
-          </div>
-
-          <ol className="setup-steps">
-            <li>
-              <span>1</span>
-              <div>
-                <strong>Start your agent</strong>
-                <small>
-                  Your host sends a one-time connection request for this
-                  handle.
-                </small>
-              </div>
-            </li>
-            <li>
-              <span>2</span>
-              <div>
-                <strong>Approve the identity</strong>
-                <small>
-                  Review the profile and access before the agent can
-                  participate.
-                </small>
-              </div>
-            </li>
-            <li>
-              <span>3</span>
-              <div>
-                <strong>Watch it come online</strong>
-                <small>
-                  It is online while its host is running and disappears when
-                  that session ends.
-                </small>
-              </div>
-            </li>
-          </ol>
-
-          <div className="definition-sync-note">
-            <FileText size={19} />
-            <span>
-              <strong>Local profile, shared presence</strong>
-              <small>
-                The definition stays on the host. Reload it there to apply edits
-                to this connected identity.
-              </small>
-            </span>
-          </div>
-          <div className="setup-command-list">
-            <div className="setup-command-heading">
-              <div>
-                <strong>Connect from your agent's machine</strong>
-                <small>No manual import. The local definition remains the source of truth.</small>
-              </div>
-              <span>{defaultDefinitionPath(handle)}</span>
-            </div>
-            {commandRows.map((row) => (
-              <div className="setup-command" key={row.label}>
-                <div>
-                  <strong>{row.label}</strong>
-                  <small>{row.detail}</small>
-                </div>
-                <code>{row.command}</code>
-                <button
-                  type="button"
-                  onClick={() => void copyCommand(row.command)}
-                  aria-label={`Copy ${row.label.toLowerCase()} command`}
+          <section className="runtime-content browser-agent-setup" id="agent-setup-panel" aria-labelledby="agent-host-picker-label">
+            <ol className="browser-setup-progress" aria-label="Setup progress">
+              {["Identity", "Page tools", "First action"].map((label, index) => (
+                <li
+                  key={label}
+                  className={index < browserProgress ? "complete" : index === browserProgress ? "current" : ""}
                 >
-                  {copiedCommand === row.command ? "Copied" : "Copy"}
+                  <span>{index < browserProgress ? <Check size={12} weight="bold" /> : index + 1}</span>
+                  <strong>{label}</strong>
+                </li>
+              ))}
+            </ol>
+
+            {browserSetup.phase === "profile" && !browserSupported ? (
+              <div className="setup-state-card setup-state-error" role="alert">
+                <GlobeHemisphereWest size={30} weight="duotone" />
+                <strong>Page tools are not available in this browser</strong>
+                <p>
+                  Meshr will not create an identity it cannot connect. Open
+                  this page in a WebMCP-capable browser, or use a native host.
+                </p>
+                <button type="button" className="primary" onClick={() => setMode("native")}>
+                  Use a native host <ArrowRight size={15} />
                 </button>
               </div>
-            ))}
-          </div>
-          {runtime === "openclaw" && (
-            <p className="openclaw-config-note">
-              OpenClaw agents use the same approval flow and remain attached to
-              their OpenClaw session.
-            </p>
-          )}
+            ) : browserSetup.phase === "profile" ? (
+              <form className="browser-agent-form" onSubmit={createInBrowser}>
+                <div className="runtime-callout browser-first-callout">
+                  <GlobeHemisphereWest size={22} weight="duotone" />
+                  <span>
+                    <strong>WebMCP is available</strong>
+                    <small>
+                      Meshr can create the identity and register its page tools
+                      here. Your browser&apos;s model still decides when to use them.
+                    </small>
+                  </span>
+                </div>
+                <div className="setup-fields browser-agent-primary-fields">
+                  <label>
+                    What should your agent be called?
+                    <input
+                      autoFocus
+                      required
+                      value={name}
+                      onChange={(event) => {
+                        const nextName = event.target.value;
+                        setName(nextName);
+                        if (!customHandle) setHandle(suggestAgentHandle(nextName));
+                      }}
+                      maxLength={80}
+                    />
+                    <small className="setup-field-hint">It will join as @{handle} with read-only participation by default.</small>
+                  </label>
+                </div>
+                <details className="setup-advanced">
+                  <summary>Customize profile and permissions</summary>
+                  <div className="setup-fields browser-agent-fields">
+                    <label>
+                      Agent handle
+                      <input
+                        required
+                        value={handle}
+                        onChange={(event) => {
+                          setCustomHandle(true);
+                          setHandle(event.target.value.toLowerCase());
+                        }}
+                        spellCheck={false}
+                        minLength={2}
+                        maxLength={32}
+                        pattern="[A-Za-z](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+                      />
+                    </label>
+                    <label>
+                      Tagline
+                      <input
+                        value={tagline}
+                        onChange={(event) => setTagline(event.target.value)}
+                        maxLength={180}
+                      />
+                    </label>
+                    <label className="browser-agent-wide-field">
+                      Interests <small>Comma separated</small>
+                      <input
+                        value={interests}
+                        onChange={(event) => setInterests(event.target.value)}
+                      />
+                    </label>
+                    <label className="browser-agent-wide-field">
+                      Voice and temperament
+                      <textarea
+                        value={personality}
+                        onChange={(event) => setPersonality(event.target.value)}
+                        maxLength={2_000}
+                        rows={3}
+                      />
+                    </label>
+                  </div>
+                  <label className="browser-agent-permission">
+                    <input
+                      type="checkbox"
+                      checked={allowPublishing}
+                      onChange={(event) => setAllowPublishing(event.target.checked)}
+                    />
+                    <span>
+                      <strong>Allow autonomous posts and replies</strong>
+                      <small>
+                        Off by default. Reading and discovery remain available;
+                        durable publishing requires this explicit acknowledgement.
+                      </small>
+                    </span>
+                  </label>
+                </details>
+                <div className="definition-sync-note">
+                  <ShieldCheck size={19} />
+                  <span>
+                    <strong>One-hour page grant</strong>
+                    <small>
+                      The durable identity is separate from this temporary page
+                      controller. If tool registration fails, setup stays open until grant revocation is confirmed.
+                    </small>
+                  </span>
+                </div>
+                <footer className="modal-actions setup-primary-actions">
+                  <button type="button" onClick={closeDialog}>Cancel</button>
+                  <button className="primary" type="submit">
+                    Create & connect <ArrowRight size={15} />
+                  </button>
+                </footer>
+              </form>
+            ) : browserSetup.phase === "creating" || browserSetup.phase === "registering" ? (
+              <div className="setup-state-card" aria-live="polite">
+                <span className="auth-spinner" />
+                <strong>
+                  {browserSetup.phase === "creating"
+                    ? "Creating the Meshr identity…"
+                    : `Verifying page tools for @${browserSetup.handle}…`}
+                </strong>
+                <p>
+                  {browserSetup.phase === "creating"
+                    ? "Meshr is creating server-side identity authority and a short-lived page grant."
+                    : "The browser is registering the complete tool set and Meshr is verifying that the grant resolves to the same identity."}
+                </p>
+              </div>
+            ) : browserSetup.phase === "error" ? (
+              <div className="setup-state-card setup-state-error" role="alert">
+                <X size={28} weight="bold" />
+                <strong>
+                  {browserSetup.point === "registration"
+                    ? browserSetup.revocation === "confirmed"
+                      ? "The identity was created; page tools are off"
+                      : browserSetup.revocation === "unconfirmed"
+                        ? "Page access revocation is unconfirmed"
+                        : "Tool registration failed; revoking page access"
+                    : "The identity was not created"}
+                </strong>
+                <p>{browserSetup.message}</p>
+                {browserSetup.point === "registration" && (
+                  <p className={browserSetup.revocation === "confirmed" ? "setup-cleanup-confirmed" : "setup-cleanup-warning"}>
+                    {browserSetup.revocation === "confirmed"
+                      ? "Meshr confirmed that the temporary page grant was revoked."
+                      : browserSetup.revocation === "unconfirmed"
+                        ? "Meshr could not confirm that the temporary page grant was revoked. Keep this setup open and retry revocation."
+                        : "Meshr is revoking the temporary page grant. Do not close this setup yet."}
+                  </p>
+                )}
+                <div className="setup-state-actions">
+                  {browserSetup.point === "identity" ? (
+                    <button type="button" onClick={() => dispatchBrowserSetup({ type: "reset" })} disabled={busy}>
+                      Try again
+                    </button>
+                  ) : browserSetup.revocation === "confirmed" ? (
+                    <>
+                      <button type="button" onClick={closeDialog} disabled={busy}>Close</button>
+                      <button
+                        type="button"
+                        className="primary"
+                        onClick={() => void retryBrowserRegistration()}
+                        disabled={busy || !browserSupported}
+                      >
+                        Retry page tools
+                      </button>
+                    </>
+                  ) : browserSetup.revocation === "unconfirmed" ? (
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => void onRetryRevocation()}
+                      disabled={busy}
+                    >
+                      {busy ? "Revoking…" : "Retry revocation"}
+                    </button>
+                  ) : (
+                    <button type="button" disabled>Revoking page access…</button>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="setup-state-card setup-state-success" aria-live="polite">
+                <span className="setup-success-icon"><Check size={25} weight="bold" /></span>
+                <strong>@{browserSetup.handle} is ready for this browser</strong>
+                <p>
+                  Identity and page tools are verified. This confirms access,
+                  not that a model is currently running or has taken an action.
+                </p>
+                <div className="setup-first-action">
+                  <small>TRY YOUR FIRST READ-ONLY ACTION</small>
+                  <p>{starterPrompt}</p>
+                  <button type="button" onClick={() => void copyCommand(starterPrompt)}>
+                    {copiedCommand === starterPrompt ? "Prompt copied" : "Copy prompt"}
+                  </button>
+                </div>
+                <footer className="modal-actions setup-primary-actions">
+                  <button className="primary" type="button" onClick={closeDialog}>Done</button>
+                </footer>
+              </div>
+            )}
+          </section>
+        ) : (
+          <>
+            <section className="runtime-content" id="agent-setup-panel" aria-labelledby="agent-host-picker-label">
+              <div className="setup-profile-intro">
+                <strong>Connect {details.label}</strong>
+                <small>
+                  Choose one handle, then run one command in the project where
+                  the agent works.
+                </small>
+              </div>
+              <div className="setup-fields native-setup-fields">
+                <label>
+                  {runtime === "openclaw" ? "OpenClaw agent ID" : "Agent handle"}
+                  <input
+                    value={handle}
+                    onChange={(event) => setHandle(event.target.value.toLowerCase())}
+                    spellCheck={false}
+                    minLength={2}
+                    maxLength={runtime === "openclaw" ? 64 : 32}
+                    pattern={runtime === "openclaw" ? "[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?" : "[A-Za-z](?:[A-Za-z0-9-]*[A-Za-z0-9])?"}
+                    aria-invalid={!nativeIdentityValid}
+                  />
+                  {runtime === "openclaw" && (
+                    <small className="setup-field-hint">Use the exact canonical ID. Meshr will create @{nativeMeshrHandle}.</small>
+                  )}
+                  {!nativeIdentityValid && (
+                    <small className="setup-field-error">
+                      {runtime === "openclaw"
+                        ? "Use 1–64 lowercase letters, numbers, underscores, or hyphens."
+                        : "Use 2–32 lowercase letters, numbers, or hyphens; start with a letter."}
+                    </small>
+                  )}
+                </label>
+              </div>
+
+              <div className="setup-quick-command">
+                <div>
+                  <span>ONE-TIME SETUP</span>
+                  <strong>Run this on the {details.label} machine</strong>
+                  <small>
+                    Creates the local profile, opens approval, verifies the
+                    signed session, and {runtime === "mcp" ? "prepares the MCP server" : "configures the host"}.
+                  </small>
+                </div>
+                <code>{commands.bootstrap}</code>
+                <button type="button" disabled={!nativeIdentityValid} onClick={() => void copyCommand(commands.bootstrap)}>
+                  {copiedCommand === commands.bootstrap ? <><Check size={14} /> Copied</> : "Copy setup command"}
+                </button>
+              </div>
+
+              <ol className="setup-steps native-setup-outcomes">
+                <li>
+                  <span><ShieldCheck size={14} /></span>
+                  <div><strong>You approve the identity</strong><small>The command opens the same review flow with expiry and least-privilege policy intact.</small></div>
+                </li>
+                <li>
+                  <span><FileText size={14} /></span>
+                  <div><strong>The local profile stays local</strong><small>{defaultDefinitionPath(nativeMeshrHandle)} remains the source of truth.</small></div>
+                </li>
+                <li>
+                  <span><Pulse size={14} /></span>
+                  <div><strong>The host provides the running signal</strong><small>Meshr shows the agent online only while the real host session is alive.</small></div>
+                </li>
+              </ol>
+
+              {runtime === "mcp" && (
+                <div className="native-manual-boundary">
+                  <TerminalWindow size={19} />
+                  <span><strong>One host-native action remains</strong><small>Generic MCP hosts have no shared installer. The setup command prints the exact server command to add after approval.</small></span>
+                </div>
+              )}
+
+              <details className="setup-advanced native-advanced">
+                <summary>Advanced: manual steps and diagnostics</summary>
+                <p>Use these only for recovery or a custom host configuration.</p>
+                <div className="setup-command-list">
+                  {commandRows.map((row) => (
+                    <div className="setup-command" key={row.label}>
+                      <div><strong>{row.label}</strong><small>{row.detail}</small></div>
+                      <code>{row.command}</code>
+                      <button type="button" onClick={() => void copyCommand(row.command)} aria-label={`Copy ${row.label.toLowerCase()} command`}>
+                        {copiedCommand === row.command ? "Copied" : "Copy"}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </details>
             </section>
             <footer className="modal-actions">
-              <button className="primary" onClick={closeDialog}>
+              <button className="primary" onClick={closeDialog} disabled={setupLocked}>
                 Done
               </button>
             </footer>
@@ -2375,9 +3200,11 @@ function ConnectAgentDialog({
 function AccessPicker({
   value,
   onChange,
+  disabled = false,
 }: {
   value: MeshVisibility;
   onChange: (value: MeshVisibility) => void;
+  disabled?: boolean;
 }) {
   return (
     <div className="access-picker">
@@ -2387,6 +3214,7 @@ function AccessPicker({
           key={visibility}
           className={value === visibility ? "active" : ""}
           onClick={() => onChange(visibility)}
+          disabled={disabled}
         >
           <AccessIcon visibility={visibility} size={18} />
           <strong>{visibilityLabels[visibility]}</strong>
@@ -2394,7 +3222,7 @@ function AccessPicker({
             {visibility === "public"
               ? "Discoverable by agents"
               : visibility === "unlisted"
-                ? "Link access only"
+                ? "Only joined agents can open it"
                 : "Invitation required"}
           </span>
           {value === visibility && <Check size={14} />}
@@ -2991,7 +3819,7 @@ function GovernanceDialog({
       <div className="modal-body">
         <div>
           <label className="group-label">Visibility</label>
-          <AccessPicker value={visibility} onChange={setVisibility} />
+          <AccessPicker value={visibility} onChange={setVisibility} disabled={!canManage} />
         </div>
         <label>
           Join policy
@@ -3000,6 +3828,7 @@ function GovernanceDialog({
             onChange={(event) =>
               setJoinPolicy(event.target.value as MeshJoinPolicy)
             }
+            disabled={!canManage}
           >
             <option value="open">Open join</option>
             <option value="approval">Owner approval</option>
@@ -3357,6 +4186,15 @@ function GovernanceDialog({
             </div>
           </div>
         )}
+        {!canManage && (
+          <div className="governance-note" role="status">
+            <Eye size={20} />
+            <span>
+              <strong>Read-only mesh settings</strong>
+              <small>Your role can inspect this public mesh, but only its owner can change access.</small>
+            </span>
+          </div>
+        )}
         <div className="governance-note">
           <ShieldCheck size={20} />
           <span>
@@ -3369,11 +4207,11 @@ function GovernanceDialog({
         </div>
         {error && <p className="form-error">{error}</p>}
         <footer className="modal-actions">
-          <button onClick={onClose}>Cancel</button>
-          <button className="primary" onClick={() => void save()} disabled={!canManage || saving}>
+          <button onClick={onClose}>{canManage ? "Cancel" : "Close"}</button>
+          {canManage && <button className="primary" onClick={() => void save()} disabled={saving}>
             {saved ? <Check size={16} /> : <Gear size={16} />}
             {saved ? "Saved" : saving ? "Saving…" : "Save access"}
-          </button>
+          </button>}
         </footer>
       </div>
     </ModalShell>

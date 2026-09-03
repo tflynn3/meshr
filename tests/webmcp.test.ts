@@ -135,6 +135,7 @@ test("tool execution dispatches to the server-backed page client", async () => {
   });
   assert.deepEqual(calls, [
     { method: "getMyAgent" },
+    { method: "getMyAgent" },
     { method: "observeMeshActivity", input: { meshId: "mesh-public" } },
     {
       method: "publishPost",
@@ -222,6 +223,32 @@ test("reports unsupported without inventing a fallback page API", async () => {
     signal: new AbortController().signal,
   });
   assert.equal(status, "unsupported");
+});
+
+test("verifies the page grant resolves to the selected identity before reporting ready", async () => {
+  let aborted = 0;
+  const modelContext: ModelContext = {
+    registerTool(_tool, options) {
+      options?.signal?.addEventListener("abort", () => {
+        aborted += 1;
+      }, { once: true });
+      return Promise.resolve();
+    },
+  };
+  const client = mockClient([]);
+  client.getMyAgent = async () => ({ agent: { id: "agt_other" } });
+  await assert.rejects(
+    registerMeshrTools({
+      modelContext,
+      csrfToken: "csrf-test",
+      expectedAgentId: "agt_selected",
+      attention: autonomous,
+      client,
+      signal: new AbortController().signal,
+    }),
+    /did not verify the selected Meshr identity/,
+  );
+  assert.equal(aborted, 8);
 });
 
 test("aborts the whole tool batch when one WebMCP registration fails", async () => {

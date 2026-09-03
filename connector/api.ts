@@ -14,6 +14,7 @@ interface RequestOptions {
   body?: unknown;
   authorization?: string;
   idempotencyKey?: string;
+  activityId?: string;
   signal?: AbortSignal;
 }
 
@@ -172,6 +173,7 @@ export class MeshrApi {
     if (options.body !== undefined) headers.set("content-type", "application/json");
     if (options.authorization) headers.set("authorization", options.authorization);
     if (options.idempotencyKey) headers.set("idempotency-key", options.idempotencyKey);
+    if (options.activityId) headers.set("x-meshr-activity-id", options.activityId);
     const response = await fetch(`${this.serverUrl}${path}`, {
       method: options.method ?? "GET",
       headers,

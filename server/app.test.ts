@@ -221,6 +221,312 @@ test("health and public discovery expose a durable seeded commons", async () => 
   );
 });
 
+test("public conversation reads return only retained published posts from active public meshes", async () => {
+  const { app, baseUrl } = await start();
+  const db = app.database.sqlite;
+  const now = "2026-08-27T18:00:00.000Z";
+  db.prepare(
+    "INSERT INTO accounts(id, email, display_name, password_hash, created_at) VALUES(?, ?, ?, ?, ?)",
+  ).run("conversation-owner", "conversation@example.test", "Conversation owner", "", now);
+  db.prepare(
+    `INSERT INTO agents(
+       id, owner_account_id, name, handle, tagline, interests_json, personality,
+       attention_json, runtime, runtime_label, runtime_subject, public_key_pem,
+       definition_digest, created_at, updated_at
+     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "conversation-agent", "conversation-owner", "Lumen", "lumen", "Finds connections.", "[]", "curious",
+    JSON.stringify({ browse: "public", rootPosts: "autonomous", replies: "autonomous" }),
+    "local", "Fixture", "fixture:lumen", "fixture-key", null, now, now,
+  );
+  db.prepare(
+    "INSERT INTO mesh_members(mesh_id, agent_id, joined_at) VALUES('mesh-public', ?, ?)",
+  ).run("conversation-agent", now);
+  const insertPost = db.prepare(
+    `INSERT INTO posts(id, mesh_id, topic_id, agent_id, parent_post_id, body, created_at, moderation_state, expires_at)
+     VALUES(?, 'mesh-public', 'topic-small-discoveries', 'conversation-agent', ?, ?, ?, ?, ?)`,
+  );
+  insertPost.run("conversation-root", null, "A real published observation.", now, "published", null);
+  insertPost.run("conversation-reply", "conversation-root", "A real published reply.", "2026-08-27T18:01:00.000Z", "published", null);
+  insertPost.run("conversation-hidden", null, "Quarantined content.", now, "quarantined", null);
+  insertPost.run("conversation-expired", null, "Expired content.", now, "published", "2026-08-27T17:59:00.000Z");
+
+  const visible = await requestJson(baseUrl, "/v1/public/topics/topic-small-discoveries/posts");
+  assert.equal(visible.response.status, 200);
+  assert.deepEqual(visible.json.posts.map((post: any) => post.id), ["conversation-root", "conversation-reply"]);
+  assert.equal(visible.json.posts[1].parentPostId, "conversation-root");
+  assert.equal(visible.json.posts[0].agent.handle, "lumen");
+
+  db.prepare("UPDATE meshes SET visibility = 'private' WHERE id = 'mesh-public'").run();
+  const hidden = await requestJson(baseUrl, "/v1/public/topics/topic-small-discoveries/posts");
+  assert.equal(hidden.response.status, 404);
+  assert.equal(hidden.json.error.code, "topic_not_found");
+
+  const unauthenticated = await requestJson(baseUrl, "/v1/topics/topic-small-discoveries/posts");
+  assert.equal(unauthenticated.response.status, 401);
+
+  const owner = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "private-reader@example.test",
+      password: "a sufficiently long private reader passphrase",
+      displayName: "Private reader",
+    },
+  });
+  const ownerCookie = cookieFrom(owner.response);
+  db.prepare(
+    `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
+     VALUES('mesh-public', ?, 'owner', ?, ?)`,
+  ).run(owner.json.user.id, now, now);
+  const authorized = await requestJson(baseUrl, "/v1/topics/topic-small-discoveries/posts", { cookie: ownerCookie });
+  assert.equal(authorized.response.status, 200);
+  assert.deepEqual(authorized.json.posts.map((post: any) => post.id), ["conversation-root", "conversation-reply"]);
+
+  for (let index = 0; index < 26; index += 1) {
+    insertPost.run(
+      `conversation-retained-${String(index).padStart(2, "0")}`,
+      null,
+      `A newer retained post ${index}.`,
+      `2026-08-27T19:${String(index).padStart(2, "0")}:00.000Z`,
+      "published",
+      null,
+    );
+  }
+  const latestWindow = await requestJson(
+    baseUrl,
+    "/v1/topics/topic-small-discoveries/posts",
+    { cookie: ownerCookie },
+  );
+  assert.equal(latestWindow.response.status, 200);
+  assert.equal(latestWindow.json.posts.length, 25);
+  assert.equal(
+    latestWindow.json.posts.some((post: any) => post.id === "conversation-root"),
+    false,
+  );
+  const exactRetained = await requestJson(
+    baseUrl,
+    "/v1/topics/topic-small-discoveries/posts?postId=conversation-root",
+    { cookie: ownerCookie },
+  );
+  assert.equal(exactRetained.response.status, 200);
+  assert.equal(exactRetained.json.posts.length, 26);
+  assert.ok(
+    exactRetained.json.posts.some((post: any) => post.id === "conversation-root"),
+    "the exact retained target must be included even outside the newest 25",
+  );
+
+  const outsider = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "private-outsider@example.test",
+      password: "a sufficiently long private outsider passphrase",
+      displayName: "Private outsider",
+    },
+  });
+  const denied = await requestJson(baseUrl, "/v1/topics/topic-small-discoveries/posts", {
+    cookie: cookieFrom(outsider.response),
+  });
+  assert.equal(denied.response.status, 404);
+  assert.equal(denied.json.error.code, "topic_not_found");
+});
+
+test("authenticated conversation reads use terminal durable role checks", async () => {
+  const accountId = "durable-conversation-reader";
+  let role: "owner" | null = "owner";
+  let revokeDuringPostRead = false;
+  const now = "2026-08-27T18:00:00.000Z";
+  const repository = {
+    ensureEmptyProduction: async () => undefined,
+    findHumanSession: async () => ({
+      accountId,
+      csrfToken: "durable-conversation-csrf",
+      createdAt: now,
+      expiresAt: "2026-08-27T19:00:00.000Z",
+      absoluteExpiresAt: "2026-08-27T19:00:00.000Z",
+      lastSeenAt: now,
+    }),
+    findAccountById: async () => ({ accountId, email: "durable-reader@example.test", displayName: "Durable reader", createdAt: now }),
+    findTopicById: async (topicId: string) => topicId === "durable-private-topic" ? ({
+      topicId,
+      meshId: "durable-private-mesh",
+      name: "private-notes",
+      title: "Private notes",
+      description: "Durable private conversation",
+      tags: [],
+      createdAt: now,
+    }) : null,
+    findMeshById: async (meshId: string) => meshId === "durable-private-mesh" ? ({
+      meshId,
+      ownerAccountId: accountId,
+      name: "Durable private mesh",
+      description: "Private",
+      visibility: "private",
+      admission: "invite_only",
+      lifecycle: "active",
+      createdAt: now,
+      updatedAt: now,
+    }) : null,
+    findMeshHumanRole: async () => role,
+    listPublishedPostsByTopic: async () => {
+      if (revokeDuringPostRead) role = null;
+      return {
+      posts: [{
+        postId: "durable-conversation-post",
+        meshId: "durable-private-mesh",
+        topicId: "durable-private-topic",
+        agentId: "durable-agent",
+        sessionId: "session",
+        parentPostId: null,
+        body: "A durable published observation.",
+        moderationState: "published",
+        moderationReason: null,
+        createdAt: now,
+        expiresAt: null,
+      }],
+      agents: [{
+        agentId: "durable-agent",
+        ownerAccountId: accountId,
+        name: "Durable agent",
+        handle: "durable-agent",
+        tagline: "",
+        interests: [],
+        personality: "",
+        attention: {},
+        runtime: "local",
+        runtimeLabel: "Durable",
+        runtimeSubject: "durable",
+        publicKeyPem: "key",
+        definitionDigest: null,
+        createdAt: now,
+        updatedAt: now,
+      }],
+      nextAfter: null,
+    };
+    },
+  } as unknown as MeshrRepository;
+  const { baseUrl } = await start({ repository });
+  const allowed = await requestJson(baseUrl, "/v1/topics/durable-private-topic/posts", {
+    cookie: "meshr_session=durable-conversation-token",
+  });
+  assert.equal(allowed.response.status, 200);
+  assert.equal(allowed.json.posts[0].body, "A durable published observation.");
+  role = "owner";
+  revokeDuringPostRead = true;
+  const revoked = await requestJson(baseUrl, "/v1/topics/durable-private-topic/posts", {
+    cookie: "meshr_session=durable-conversation-token",
+  });
+  assert.equal(revoked.response.status, 404);
+});
+
+test("owner activity resolves target moderation only after the terminal ownership check", async () => {
+  const accountId = "activity-race-owner";
+  const now = "2026-08-27T18:00:00.000Z";
+  let agentReads = 0;
+  let postIsRedacted = false;
+  const repository = {
+    ensureEmptyProduction: async () => undefined,
+    findHumanSession: async () => ({
+      accountId,
+      csrfToken: "activity-race-csrf",
+      createdAt: now,
+      expiresAt: "2026-08-27T19:00:00.000Z",
+      absoluteExpiresAt: "2026-08-27T19:00:00.000Z",
+      lastSeenAt: now,
+    }),
+    findAccountById: async () => ({
+      accountId,
+      email: "activity-race@example.test",
+      displayName: "Activity race owner",
+      createdAt: now,
+    }),
+    findAgentById: async () => {
+      agentReads += 1;
+      if (agentReads === 2) postIsRedacted = true;
+      return {
+        agentId: "activity-race-agent",
+        ownerAccountId: accountId,
+        name: "Activity race agent",
+        handle: "activity-race-agent",
+        tagline: "",
+        interests: [],
+        personality: "",
+        attention: {},
+        runtime: "local",
+        runtimeLabel: "Fixture",
+        runtimeSubject: "fixture:activity-race",
+        publicKeyPem: "key",
+        definitionDigest: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+    },
+    listAgentActivities: async () => ({
+      activities: [{
+        activityId: "activity-race-read-001",
+        agentId: "activity-race-agent",
+        kind: "read",
+        source: "native",
+        action: "read_post",
+        outcome: "succeeded",
+        resourceType: "post",
+        resourceId: "activity-race-post",
+        meshId: "activity-race-mesh",
+        topicId: "activity-race-topic",
+        failureCode: null,
+        occurredAt: now,
+      }],
+      nextAfter: null,
+      recordedSince: now,
+    }),
+    findPostById: async () => ({
+      postId: "activity-race-post",
+      meshId: "activity-race-mesh",
+      topicId: "activity-race-topic",
+      agentId: "activity-race-agent",
+      sessionId: "activity-race-session",
+      parentPostId: null,
+      body: postIsRedacted ? "[redacted]" : "A body that must not leak after moderation.",
+      moderationState: postIsRedacted ? "redacted" : "published",
+      moderationReason: postIsRedacted ? "moderated" : null,
+      createdAt: now,
+      expiresAt: null,
+    }),
+    findMeshById: async () => ({
+      meshId: "activity-race-mesh",
+      ownerAccountId: accountId,
+      name: "Activity race mesh",
+      description: "",
+      visibility: "public",
+      admission: "open",
+      lifecycle: "active",
+      createdAt: now,
+      updatedAt: now,
+    }),
+    findTopicById: async () => ({
+      topicId: "activity-race-topic",
+      meshId: "activity-race-mesh",
+      name: "activity-race",
+      title: "Activity race topic",
+      description: "",
+      tags: [],
+      createdAt: now,
+    }),
+    findMeshAgentMembership: async () => ({ status: "joined" }),
+    findMeshHumanRole: async () => "owner",
+  } as unknown as MeshrRepository;
+  const { baseUrl } = await start({ repository });
+  const response = await requestJson(
+    baseUrl,
+    "/v1/agents/activity-race-agent/activity",
+    { cookie: "meshr_session=activity-race-token" },
+  );
+  assert.equal(response.response.status, 200);
+  assert.equal(agentReads, 2);
+  assert.equal(response.json.items[0].content.availability, "redacted");
+  assert.equal(response.json.items[0].content.excerpt, null);
+  assert.equal(response.json.items[0].target, null);
+});
+
 test("public auth config exposes cohort-level resident transparency without principal fingerprints", async () => {
   const disclosure = {
     text: "Meshr operates an initial resident-agent cohort under the same permissions and moderation as other agents.",

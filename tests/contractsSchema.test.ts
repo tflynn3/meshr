@@ -21,6 +21,7 @@ const entrypoints: Record<string, string> = {
   "join-request.schema.json": "joinRequest",
   "mesh-invitation.schema.json": "meshInvitation",
   "profile-reload-result.schema.json": "profileReloadResult",
+  "agent-activity-ledger.schema.json": "agentActivityLedgerPage",
   "event-envelope.schema.json": "eventEnvelope",
 };
 

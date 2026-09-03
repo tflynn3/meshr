@@ -46,7 +46,18 @@ import {
   WEBMCP_ACTIVITY_LIMITS,
 } from "./webmcpActivity.ts";
 import { moderatePost, TokenBucketLimiter } from "./policy.ts";
-import { MESHR_CONTRACT_MAJOR, serializeAgentProfile } from "./contracts.ts";
+import {
+  MESHR_CONTRACT_MAJOR,
+  agentActivityLedgerPageSchema,
+  serializeAgentProfile,
+} from "./contracts.ts";
+import {
+  AGENT_ACTIVITY_PAGE_LIMIT,
+  conversationReadActivity,
+  failedAgentActivity,
+  postWriteActivity,
+  safeActivityExcerpt,
+} from "./agentActivity.ts";
 import {
   MAX_ACTIVITY_PREFERENCES_PER_ACCOUNT,
   MAX_MESH_DETAIL_ROLE_ROWS,
@@ -80,6 +91,8 @@ import type {
   RepositoryOutboxCompletion,
   RepositoryAuditInput,
   RepositoryWebMcpGrant,
+  RepositoryAgentActivityRecord,
+  RepositoryAgentActivitySource,
 } from "./repository.ts";
 import type {
   RepositoryAccount,
@@ -299,6 +312,7 @@ const isExpensiveAuthenticatedRead = (method: string, path: string): boolean =>
     path === "/v1/activity/preferences" ||
     path === "/v1/meshes" ||
     path === "/v1/account/role-invitations" ||
+    /^\/v1\/agents\/[^/]+\/activity$/.test(path) ||
     /^\/v1\/agents\/[^/]+\/profile\/proposals$/.test(path) ||
     /^\/v1\/meshes\/[^/]+\/(?:governance|topics|invitations|join-requests|moderation|role-invitations)$/.test(
       path,
@@ -307,6 +321,7 @@ const isExpensiveAuthenticatedRead = (method: string, path: string): boolean =>
     path === "/v1/webmcp/activity" ||
     /^\/v1\/webmcp\/topics\/[^/]+\/posts$/.test(path) ||
     /^\/v1\/webmcp\/meshes\/[^/]+\/traffic\/[^/]+$/.test(path) ||
+    /^\/v1\/topics\/[^/]+\/posts$/.test(path) ||
     path === "/v1/agent/meshes" ||
     /^\/v1\/agent\/meshes\/[^/]+\/topics$/.test(path) ||
     /^\/v1\/agent\/topics\/[^/]+\/posts$/.test(path));
@@ -322,6 +337,75 @@ const isAgentControlMutation = (method: string, path: string): boolean =>
   ((method === "PUT" || method === "DELETE") &&
     /^\/v1\/agent\/topics\/[^/]+\/follow$/.test(path)) ||
   (method === "PUT" && /^\/v1\/webmcp\/topics\/[^/]+\/follow$/.test(path));
+
+interface AgentActivityRequestContext {
+  invocationId: string;
+  agentId?: string;
+  source: RepositoryAgentActivitySource;
+  kind: "read" | "write";
+  action: "read_conversation" | "publish_post" | "reply_to_post";
+  resourceType: RepositoryAgentActivityRecord["resourceType"];
+  resourceId: string | null;
+  meshId: string | null;
+  topicId: string | null;
+}
+
+function trackedAgentActivity(
+  method: string,
+  path: string,
+  invocationId: string,
+): AgentActivityRequestContext | undefined {
+  const decode = (value: string): string => {
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+  };
+  const source: RepositoryAgentActivitySource = path.startsWith("/v1/webmcp/")
+    ? "webmcp"
+    : "native";
+  const read = /^\/v1\/(?:webmcp|agent)\/topics\/([^/]+)\/posts$/.exec(path);
+  if (method === "GET" && read) {
+    const topicId = decode(read[1]!);
+    return {
+      invocationId,
+      source,
+      kind: "read",
+      action: "read_conversation",
+      resourceType: "topic",
+      resourceId: topicId,
+      meshId: null,
+      topicId,
+    };
+  }
+  if (method === "POST" && /^\/v1\/(?:webmcp|agent)\/posts$/.test(path)) {
+    return {
+      invocationId,
+      source,
+      kind: "write",
+      action: "publish_post",
+      resourceType: null,
+      resourceId: null,
+      meshId: null,
+      topicId: null,
+    };
+  }
+  const reply = /^\/v1\/(?:webmcp|agent)\/posts\/([^/]+)\/replies$/.exec(path);
+  if (method === "POST" && reply) {
+    return {
+      invocationId,
+      source,
+      kind: "write",
+      action: "reply_to_post",
+      resourceType: "post",
+      resourceId: decode(reply[1]!),
+      meshId: null,
+      topicId: null,
+    };
+  }
+  return undefined;
+}
 
 const isCsrfAuthenticatedHumanControlWrite = (
   method: string,
@@ -987,6 +1071,16 @@ function requireIdempotencyKey(request: IncomingMessage): string {
   return raw;
 }
 
+function activityInvocationId(
+  request: IncomingMessage,
+  requestId: string,
+): string {
+  const raw = request.headers["x-meshr-activity-id"];
+  return typeof raw === "string" && /^[A-Za-z0-9._:-]{8,128}$/.test(raw)
+    ? raw
+    : requestId;
+}
+
 function parseCursor(
   cursor: string | null,
 ): { createdAt: string; id: string } | null {
@@ -1077,6 +1171,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
   const localRepository = repository
     ? undefined
     : new SqliteMeshrRepository(database);
+  const agentActivityStore: MeshrRepository = repository ?? localRepository!;
   const roleInvitationStore: MeshrRepository =
     repository ?? localRepository!;
   const browserAgentStore: MeshrRepository =
@@ -5395,6 +5490,266 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     });
   };
 
+  const appendActivityEvidence = async (
+    records: RepositoryAgentActivityRecord[],
+  ): Promise<void> => {
+    if (!records.length) return;
+    if (!agentActivityStore.appendAgentActivities) {
+      throw new ApiError(
+        503,
+        "activity_ledger_unavailable",
+        "Authoritative agent activity history is unavailable.",
+      );
+    }
+    try {
+      await agentActivityStore.appendAgentActivities(records);
+    } catch (error) {
+      throw new ApiError(
+        503,
+        "activity_ledger_unavailable",
+        error instanceof Error
+          ? error.message
+          : "Authoritative agent activity history is unavailable.",
+      );
+    }
+  };
+
+  const recordConversationReadResult = async (
+    context: AgentActivityRequestContext,
+    body: unknown,
+  ): Promise<void> => {
+    if (!context.agentId) return;
+    const envelope =
+      body && typeof body === "object" && !Array.isArray(body)
+        ? (body as Record<string, unknown>)
+        : {};
+    const posts = Array.isArray(envelope.posts)
+      ? envelope.posts.flatMap((candidate) => {
+          if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+            return [];
+          }
+          const post = candidate as Record<string, unknown>;
+          return typeof post.id === "string" &&
+            typeof post.meshId === "string" &&
+            typeof post.topicId === "string"
+            ? [{ id: post.id, meshId: post.meshId, topicId: post.topicId }]
+            : [];
+        })
+      : [];
+    const meshId = context.meshId ?? posts[0]?.meshId;
+    if (!meshId || !context.topicId) {
+      throw new ApiError(
+        503,
+        "activity_ledger_unavailable",
+        "The conversation read could not be recorded authoritatively.",
+      );
+    }
+    await appendActivityEvidence(
+      conversationReadActivity({
+        agentId: context.agentId,
+        source: context.source,
+        invocationId: context.invocationId,
+        occurredAt: database.now(),
+        meshId,
+        topicId: context.topicId,
+        posts,
+      }),
+    );
+  };
+
+  const recordFailedActivity = async (
+    context: AgentActivityRequestContext | undefined,
+    failureCode: string,
+  ): Promise<void> => {
+    if (
+      !context?.agentId ||
+      failureCode === "activity_ledger_unavailable" ||
+      !agentActivityStore.appendAgentActivities
+    ) {
+      return;
+    }
+    try {
+      await agentActivityStore.appendAgentActivities([
+        failedAgentActivity({
+          agentId: context.agentId,
+          source: context.source,
+          kind: context.kind,
+          action: context.action,
+          invocationId: context.invocationId,
+          occurredAt: database.now(),
+          failureCode,
+          resourceType: context.resourceType,
+          resourceId: context.resourceId,
+          meshId: context.meshId,
+          topicId: context.topicId,
+        }),
+      ]);
+    } catch {
+      // Preserve the original API error. A failed evidence write is surfaced
+      // operationally by the activity endpoint's unavailable state instead
+      // of replacing the caller's actionable failure code.
+    }
+  };
+
+  const resolveAgentActivity = async (
+    activity: RepositoryAgentActivityRecord,
+    accountId: string,
+  ) => {
+    let post: RepositoryPostRecord | null = null;
+    if (
+      activity.resourceType === "post" &&
+      activity.resourceId &&
+      agentActivityStore.findPostById
+    ) {
+      post = await agentActivityStore.findPostById(activity.resourceId);
+    }
+    const meshId = post?.meshId ?? activity.meshId;
+    const topicId = post?.topicId ?? activity.topicId;
+    const [mesh, membership, role, topic] = await Promise.all([
+      meshId && agentActivityStore.findMeshById
+        ? agentActivityStore.findMeshById(meshId)
+        : Promise.resolve(null),
+      meshId && agentActivityStore.findMeshAgentMembership
+        ? agentActivityStore.findMeshAgentMembership(meshId, activity.agentId)
+        : Promise.resolve(null),
+      meshId && agentActivityStore.findMeshHumanRole
+        ? agentActivityStore.findMeshHumanRole(meshId, accountId)
+        : Promise.resolve(null),
+      topicId && agentActivityStore.findTopicById
+        ? agentActivityStore.findTopicById(topicId)
+        : Promise.resolve(null),
+    ]);
+    const canView = Boolean(
+      mesh &&
+        (mesh.visibility === "public" ||
+          membership?.status === "joined" ||
+          role !== null),
+    );
+    // Ledger rows may describe a failed request, whose mesh/topic pair came
+    // from untrusted request input. Never combine a viewable mesh with a
+    // separately-resolved topic from another mesh: that would turn the
+    // owner-only ledger into a private-topic metadata oracle.
+    const topicMatchesMesh = !topic || topic.meshId === meshId;
+    const context = {
+      meshId,
+      meshName: canView ? (mesh?.name ?? null) : null,
+      meshVisibility: canView ? (mesh?.visibility ?? null) : null,
+      topicId,
+      topicTitle: canView && topicMatchesMesh ? (topic?.title ?? null) : null,
+    };
+    if (!activity.resourceType || !activity.resourceId) {
+      return {
+        id: activity.activityId,
+        kind: activity.kind === "read" ? ("READ" as const) : ("WRITE" as const),
+        source: activity.source,
+        action: activity.action,
+        outcome: activity.outcome,
+        occurredAt: activity.occurredAt,
+        context,
+        content: null,
+        failureCode: activity.failureCode,
+        target: null,
+      };
+    }
+
+    let availability:
+      | "available"
+      | "quarantined"
+      | "removed"
+      | "redacted"
+      | "expired"
+      | "deleted"
+      | "inaccessible"
+      | "unavailable" = "unavailable";
+    let excerpt: string | null = null;
+    let moderationState: RepositoryPostRecord["moderationState"] | null = null;
+    let authorship:
+      | "verified"
+      | "mismatch"
+      | "not_applicable"
+      | "unavailable" = "not_applicable";
+
+    if (!canView && mesh) {
+      availability = "inaccessible";
+      if (activity.kind === "write" && activity.outcome === "succeeded") {
+        authorship = "unavailable";
+      }
+    } else if (activity.resourceType === "post") {
+      if (!post) {
+        availability = "deleted";
+        if (activity.kind === "write" && activity.outcome === "succeeded") {
+          authorship = "unavailable";
+        }
+      } else if (
+        (activity.meshId !== null && post.meshId !== activity.meshId) ||
+        (activity.topicId !== null && post.topicId !== activity.topicId)
+      ) {
+        availability = "unavailable";
+        authorship = "unavailable";
+      } else {
+        moderationState = post.moderationState;
+        if (activity.kind === "write" && activity.outcome === "succeeded") {
+          authorship =
+            post.agentId === activity.agentId ? "verified" : "mismatch";
+        }
+        if (
+          post.expiresAt !== null &&
+          Date.parse(post.expiresAt) <= Date.parse(database.now())
+        ) {
+          availability = "expired";
+        } else if (post.moderationState !== "published") {
+          availability = post.moderationState;
+        } else if (!canView) {
+          availability = "inaccessible";
+        } else {
+          availability = "available";
+          excerpt = safeActivityExcerpt(post.body);
+        }
+      }
+    } else if (activity.resourceType === "topic") {
+      if (!topic) availability = "deleted";
+      else if (!topicMatchesMesh) availability = "unavailable";
+      else if (!canView) availability = "inaccessible";
+      else {
+        availability = "available";
+        excerpt = safeActivityExcerpt(topic.description || topic.title);
+      }
+    } else if (!mesh && (activity.resourceType === "mesh" || meshId)) {
+      availability = "deleted";
+    } else if (canView) {
+      availability = "available";
+    }
+
+    return {
+      id: activity.activityId,
+      kind: activity.kind === "read" ? ("READ" as const) : ("WRITE" as const),
+      source: activity.source,
+      action: activity.action,
+      outcome: activity.outcome,
+      occurredAt: activity.occurredAt,
+      context,
+      content: {
+        id: activity.resourceId,
+        type: activity.resourceType,
+        availability,
+        excerpt,
+        moderationState,
+        authorship,
+        untrusted: true as const,
+      },
+      failureCode: activity.failureCode,
+      target:
+        availability === "available" && meshId && topicId
+          ? {
+              meshId,
+              topicId,
+              postId:
+                activity.resourceType === "post" ? activity.resourceId : null,
+            }
+          : null,
+    };
+  };
+
   const emitEvent = (
     type: string,
     agentId: string | null,
@@ -6175,6 +6530,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     parentPostId: string | null;
     body: string;
     eventType: "post.created" | "reply.created";
+    idempotencyKey: string;
   }) => {
     const agent = currentAgentForCommit(input.principal.agentId);
     enforcePostCapacity(agent);
@@ -6224,6 +6580,36 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       post.moderationState,
       post.moderationReason,
       post.expiresAt,
+    );
+    const activity = postWriteActivity({
+      agentId: input.principal.agentId,
+      source: isWebMcpPrincipal(input.principal) ? "webmcp" : "native",
+      action:
+        input.eventType === "post.created" ? "publish_post" : "reply_to_post",
+      idempotencyKey: input.idempotencyKey,
+      occurredAt: createdAt,
+      postId,
+      meshId: input.meshId,
+      topicId: input.topicId,
+    });
+    db.prepare(
+      `INSERT INTO agent_activity_ledger(
+         id, agent_id, kind, source, action, outcome, resource_type,
+         resource_id, mesh_id, topic_id, failure_code, occurred_at
+       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      activity.activityId,
+      activity.agentId,
+      activity.kind,
+      activity.source,
+      activity.action,
+      activity.outcome,
+      activity.resourceType,
+      activity.resourceId,
+      activity.meshId,
+      activity.topicId,
+      activity.failureCode,
+      activity.occurredAt,
     );
     if (reviewQueued) {
       db.prepare(
@@ -6361,6 +6747,19 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       humanSessionHash: pagePrincipal
         ? pagePrincipal.human.sessionHash
         : undefined,
+      activity: postWriteActivity({
+        agentId: input.principal.agentId,
+        source: pagePrincipal ? "webmcp" : "native",
+        action:
+          input.eventType === "post.created"
+            ? "publish_post"
+            : "reply_to_post",
+        idempotencyKey: input.idempotencyKey,
+        occurredAt: createdAt,
+        postId,
+        meshId: input.meshId,
+        topicId: input.topicId,
+      }),
     };
     const committed = await repository.createPostWithOutbox(repositoryInput);
     const post = projectAuthoritativePost(committed.post);
@@ -6750,6 +7149,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           const result = persistPost({
             principal: input.principal,
             ...input.post,
+            idempotencyKey: input.key,
           });
           return {
             status: result.moderation.state === "quarantined" ? 202 : 201,
@@ -6883,6 +7283,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
   const route = async (
     request: IncomingMessage,
     url: URL,
+    activityContext?: AgentActivityRequestContext,
   ): Promise<RouteResult> => {
     const method = request.method ?? "GET";
     const path = url.pathname;
@@ -8390,6 +8791,121 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       };
     }
 
+    const ownerActivityMatch = matchingPath(
+      path,
+      /^\/v1\/agents\/([^/]+)\/activity$/,
+    );
+    if (method === "GET" && ownerActivityMatch) {
+      const principal = await requireHuman(request, false, {
+        touchSession: false,
+      });
+      enforceExpensiveAccountReadRate(principal.accountId);
+      const agentId = decodeURIComponent(ownerActivityMatch[1]);
+      if (
+        !agentActivityStore.findAgentById ||
+        !agentActivityStore.listAgentActivities ||
+        !agentActivityStore.findMeshById ||
+        !agentActivityStore.findTopicById ||
+        !agentActivityStore.findMeshAgentMembership ||
+        !agentActivityStore.findMeshHumanRole ||
+        !agentActivityStore.findPostById
+      ) {
+        throw new ApiError(
+          503,
+          "activity_ledger_unavailable",
+          "Authoritative agent activity history is unavailable.",
+        );
+      }
+      let ownedAgent: RepositoryAgentInput | null;
+      try {
+        ownedAgent = await agentActivityStore.findAgentById(agentId);
+      } catch (error) {
+        throw new ApiError(
+          503,
+          "activity_ledger_unavailable",
+          error instanceof Error
+            ? error.message
+            : "Authoritative agent activity history is unavailable.",
+        );
+      }
+      // A 404 keeps an authenticated account from probing another owner's
+      // agent IDs or learning whether that agent has any recorded reads.
+      if (!ownedAgent || ownedAgent.ownerAccountId !== principal.accountId) {
+        throw new ApiError(404, "agent_not_found", "Owned agent not found.");
+      }
+      const cursor = parseCursor(url.searchParams.get("after"));
+      const limit = parsePositiveInteger(
+        url.searchParams.get("limit"),
+        20,
+        AGENT_ACTIVITY_PAGE_LIMIT,
+        1,
+      );
+      try {
+        const page = await agentActivityStore.listAgentActivities({
+          agentId,
+          after: cursor
+            ? { occurredAt: cursor.createdAt, id: cursor.id }
+            : undefined,
+          limit,
+        });
+        // Recheck ownership after the page scan, then resolve the current
+        // target state immediately before serialization. This avoids serving
+        // a previously-resolved excerpt after ownership, membership, or
+        // moderation changed while the page was being read.
+        const terminalAgent = await agentActivityStore.findAgentById(agentId);
+        if (
+          !terminalAgent ||
+          terminalAgent.ownerAccountId !== principal.accountId
+        ) {
+          throw new ApiError(
+            404,
+            "agent_not_found",
+            "Owned agent not found.",
+          );
+        }
+        const items = await Promise.all(
+          page.activities.map((activity) =>
+            resolveAgentActivity(activity, principal.accountId),
+          ),
+        );
+        return {
+          body: agentActivityLedgerPageSchema.parse({
+            contractVersion: MESHR_CONTRACT_MAJOR,
+            agentId,
+            items,
+            nextCursor: page.nextAfter
+              ? encodeCursor({
+                  created_at: page.nextAfter.occurredAt,
+                  id: page.nextAfter.id,
+                })
+              : null,
+            coverage: page.recordedSince
+              ? {
+                  status: "partial",
+                  recordedSince: page.recordedSince,
+                  message:
+                    "This is authoritative tool activity from the earliest retained ledger row forward. Earlier activity was not recorded and is not inferred.",
+                }
+              : {
+                  status: "unavailable",
+                  recordedSince: null,
+                  message:
+                    "No authoritative ledger rows exist for this agent. Earlier activity is unavailable and is not inferred from membership, subscriptions, or counts.",
+                },
+          }),
+        };
+      } catch (error) {
+        if (error instanceof ApiError) throw error;
+        throw new ApiError(
+          503,
+          "activity_ledger_unavailable",
+          error instanceof Error
+            ? error.message
+            : "Authoritative agent activity history is unavailable.",
+        );
+      }
+    }
+
     const ownerProfileMatch = matchingPath(
       path,
       /^\/v1\/agents\/([^/]+)\/profile$/,
@@ -9844,6 +10360,196 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           requestedMeshId,
           projection?.activity,
         ),
+      };
+    }
+
+    const humanTopicPostsMatch = matchingPath(
+      path,
+      /^\/v1\/topics\/([^/]+)\/posts$/,
+    );
+    if (method === "GET" && humanTopicPostsMatch) {
+      const principal = await requireHuman(request, false, { touchSession: false });
+      enforceExpensiveAccountReadRate(principal.accountId);
+      const topicId = decodeURIComponent(humanTopicPostsMatch[1]);
+      const notFound = () => new ApiError(404, "topic_not_found", "Conversation not found.");
+      const requestedPostId = url.searchParams.get("postId");
+      if (
+        requestedPostId !== null &&
+        !/^[A-Za-z0-9._:-]{1,128}$/.test(requestedPostId)
+      ) {
+        throw new ApiError(400, "invalid_request", "postId is invalid.");
+      }
+      const readMetadata = async () => {
+        if (repository && (!repository.findTopicById || !repository.findMeshById)) {
+          throw new ApiError(
+            503,
+            "conversation_store_unavailable",
+            "The conversation store cannot verify the current mesh.",
+          );
+        }
+        try {
+          const topic = repository?.findTopicById
+            ? await repository.findTopicById(topicId)
+            : (() => {
+                const row = db.prepare("SELECT mesh_id FROM topics WHERE id = ?").get(topicId) as
+                  | { mesh_id: string }
+                  | undefined;
+                return row ? { meshId: row.mesh_id } : null;
+              })();
+          if (!topic) return null;
+          const mesh = repository?.findMeshById
+            ? await repository.findMeshById(topic.meshId)
+            : (() => {
+                const row = db.prepare(
+                  "SELECT id, visibility, lifecycle FROM meshes WHERE id = ?",
+                ).get(topic.meshId) as
+                  | { id: string; visibility: "public" | "unlisted" | "private"; lifecycle: string }
+                  | undefined;
+                return row ? { meshId: row.id, visibility: row.visibility, lifecycle: row.lifecycle } : null;
+              })();
+          if (!mesh || mesh.lifecycle !== "active") return null;
+          // A partial durable adapter must never fall back to a replica-local
+          // private role. Public visibility remains independently readable.
+          const role = repository && !repository.findMeshHumanRole
+            ? null
+            : await meshRoleForAuthoritatively(principal.accountId, topic.meshId);
+          return { meshId: topic.meshId, public: mesh.visibility === "public", role };
+        } catch (error) {
+          if (error instanceof ApiError) throw error;
+          throw new ApiError(
+            503,
+            "conversation_store_unavailable",
+            error instanceof Error ? error.message : "The conversation store is unavailable.",
+          );
+        }
+      };
+      const initial = await readMetadata();
+      if (!initial || (!initial.public && !initial.role)) throw notFound();
+      const limit = 25;
+      let posts: Array<Record<string, string | null>> | null = null;
+      let authoritativePosts: ReturnType<typeof formatAuthoritativeTopicPosts> | null = null;
+      if (repository?.listPublishedPostsByTopic) {
+        try {
+          authoritativePosts = formatAuthoritativeTopicPosts(
+            await repository.listPublishedPostsByTopic({ topicId, now: database.now(), limit }),
+          );
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "conversation_store_unavailable",
+            error instanceof Error ? error.message : "The conversation store is unavailable.",
+          );
+        }
+      } else {
+        posts = db.prepare(
+          `SELECT recent.*, a.name AS agent_name, a.handle AS agent_handle
+           FROM (
+             SELECT p.* FROM posts p
+             WHERE p.topic_id = ? AND p.moderation_state = 'published'
+               AND (p.expires_at IS NULL OR p.expires_at > ?)
+             ORDER BY p.created_at DESC, p.id DESC LIMIT ?
+           ) recent
+           JOIN agents a ON a.id = recent.agent_id
+           ORDER BY recent.created_at ASC, recent.id ASC`,
+        ).all(topicId, database.now(), limit) as Array<Record<string, string | null>>;
+      }
+      if (requestedPostId) {
+        if (authoritativePosts !== null) {
+          if (!repository?.findPostById) {
+            throw new ApiError(
+              503,
+              "conversation_store_unavailable",
+              "The conversation store cannot resolve the requested post.",
+            );
+          }
+          let exact: RepositoryPostRecord | null;
+          try {
+            exact = await repository.findPostById(requestedPostId);
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "conversation_store_unavailable",
+              error instanceof Error ? error.message : "The conversation store is unavailable.",
+            );
+          }
+          if (
+            !exact ||
+            exact.topicId !== topicId ||
+            exact.moderationState !== "published" ||
+            (exact.expiresAt !== null && Date.parse(exact.expiresAt) <= Date.parse(database.now()))
+          ) {
+            throw new ApiError(404, "post_not_found", "Conversation post not found.");
+          }
+          if (!authoritativePosts?.some((post) => post.id === exact.postId)) {
+            let author: RepositoryAgentInput | null = null;
+            if (repository.findAgentById) {
+              try {
+                author = await repository.findAgentById(exact.agentId);
+              } catch (error) {
+                throw new ApiError(
+                  503,
+                  "conversation_store_unavailable",
+                  error instanceof Error ? error.message : "The conversation store is unavailable.",
+                );
+              }
+            }
+            authoritativePosts = [
+              ...(authoritativePosts ?? []),
+              {
+                id: exact.postId,
+                meshId: exact.meshId,
+                topicId: exact.topicId,
+                agentId: exact.agentId,
+                sessionId: exact.sessionId,
+                parentPostId: exact.parentPostId,
+                body: exact.body,
+                createdAt: exact.createdAt,
+                agent: author
+                  ? { id: author.agentId, name: author.name, handle: author.handle }
+                  : { id: exact.agentId, name: "", handle: "" },
+              },
+            ].sort((left, right) =>
+              left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
+            );
+          }
+        } else {
+          const exact = db.prepare(
+            `SELECT p.*, a.name AS agent_name, a.handle AS agent_handle
+             FROM posts p JOIN agents a ON a.id = p.agent_id
+             WHERE p.id = ? AND p.topic_id = ? AND p.moderation_state = 'published'
+               AND (p.expires_at IS NULL OR p.expires_at > ?)`
+          ).get(requestedPostId, topicId, database.now()) as Record<string, string | null> | undefined;
+          if (!exact) {
+            throw new ApiError(404, "post_not_found", "Conversation post not found.");
+          }
+          if (!(posts ?? []).some((post) => post.id === exact.id)) {
+            posts = [...(posts ?? []), exact].sort((left, right) =>
+              String(left.created_at).localeCompare(String(right.created_at)) ||
+              String(left.id).localeCompare(String(right.id)),
+            );
+          }
+        }
+      }
+      // Recheck after the body query. A role or visibility change that races
+      // a read must not allow the response to disclose retained content.
+      const terminal = await readMetadata();
+      if (!terminal || terminal.meshId !== initial.meshId || (!terminal.public && !terminal.role)) {
+        throw notFound();
+      }
+      if (authoritativePosts) return { body: { posts: authoritativePosts } };
+      return {
+        body: {
+          posts: (posts ?? []).map((row) => ({
+            id: row.id,
+            meshId: row.mesh_id,
+            topicId: row.topic_id,
+            agentId: row.agent_id,
+            parentPostId: row.parent_post_id,
+            body: row.body,
+            createdAt: row.created_at,
+            agent: { id: row.agent_id, name: row.agent_name, handle: row.agent_handle },
+          })),
+        },
       };
     }
 
@@ -15912,8 +16618,99 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       };
     }
 
+    const publicTopicPostsMatch = matchingPath(
+      path,
+      /^\/v1\/public\/topics\/([^/]+)\/posts$/,
+    );
+    if (method === "GET" && publicTopicPostsMatch) {
+      // Bodies are deliberately fetched only after a person opens a
+      // conversation. The topology activity poll remains aggregate-only.
+      enforcePublicDirectoryRate(request);
+      const topicId = decodeURIComponent(publicTopicPostsMatch[1]);
+      let topic: { meshId: string } | null = null;
+      let mesh: { visibility: string; lifecycle: string } | null = null;
+      try {
+        if (repository?.findTopicById) {
+          const durableTopic = await repository.findTopicById(topicId);
+          topic = durableTopic ? { meshId: durableTopic.meshId } : null;
+        } else {
+          const row = db.prepare("SELECT mesh_id FROM topics WHERE id = ?").get(topicId) as
+            | { mesh_id: string }
+            | undefined;
+          topic = row ? { meshId: row.mesh_id } : null;
+        }
+        if (topic && repository?.findMeshById) {
+          const durableMesh = await repository.findMeshById(topic.meshId);
+          mesh = durableMesh
+            ? { visibility: durableMesh.visibility, lifecycle: durableMesh.lifecycle }
+            : null;
+        } else if (topic) {
+          const row = db.prepare(
+            "SELECT visibility, lifecycle FROM meshes WHERE id = ?",
+          ).get(topic.meshId) as { visibility: string; lifecycle: string } | undefined;
+          mesh = row ?? null;
+        }
+      } catch (error) {
+        throw new ApiError(
+          503,
+          "conversation_store_unavailable",
+          error instanceof Error ? error.message : "The public conversation store is unavailable.",
+        );
+      }
+      // Do not distinguish an absent topic from one that is private, removed,
+      // or changing visibility. The public route never widens that boundary.
+      if (!topic || !mesh || mesh.visibility !== "public" || mesh.lifecycle !== "active") {
+        throw new ApiError(404, "topic_not_found", "Public conversation not found.");
+      }
+      const limit = 25;
+      if (repository?.listPublishedPostsByTopic) {
+        try {
+          const page = await repository.listPublishedPostsByTopic({
+            topicId,
+            now: database.now(),
+            limit,
+          });
+          return { body: { posts: formatAuthoritativeTopicPosts(page) } };
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "conversation_store_unavailable",
+            error instanceof Error ? error.message : "The public conversation store is unavailable.",
+          );
+        }
+      }
+      const rows = db.prepare(
+        `SELECT recent.*, a.name AS agent_name, a.handle AS agent_handle
+         FROM (
+           SELECT p.* FROM posts p
+           WHERE p.topic_id = ? AND p.moderation_state = 'published'
+             AND (p.expires_at IS NULL OR p.expires_at > ?)
+           ORDER BY p.created_at DESC, p.id DESC LIMIT ?
+         ) recent
+         JOIN agents a ON a.id = recent.agent_id
+         ORDER BY recent.created_at ASC, recent.id ASC`,
+      ).all(topicId, database.now(), limit) as Array<Record<string, string | null>>;
+      return {
+        body: {
+          posts: rows.map((row) => ({
+            id: row.id,
+            meshId: row.mesh_id,
+            topicId: row.topic_id,
+            agentId: row.agent_id,
+            parentPostId: row.parent_post_id,
+            body: row.body,
+            createdAt: row.created_at,
+            agent: { id: row.agent_id, name: row.agent_name, handle: row.agent_handle },
+          })),
+        },
+      };
+    }
+
     if (path.startsWith("/v1/webmcp/")) {
       const principal = await requireWebMcp(request);
+      if (activityContext?.source === "webmcp") {
+        activityContext.agentId = principal.agentId;
+      }
 
       if (isAgentControlMutation(method, path)) {
         enforceAgentMutationRate(principal.agentId);
@@ -16173,6 +16970,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         enforceExpensiveAccountReadRate(principal.ownerId);
         const topicId = decodeURIComponent(webMcpReadPostsMatch[1]);
         const topic = await webMcpTopicForAccess(principal, topicId);
+        if (activityContext) activityContext.meshId = topic.mesh_id;
         await ensureAttentionMeshAccessAuthoritatively(
           principal.agent,
           principal.agentId,
@@ -16286,6 +17084,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         const key = requireIdempotencyKey(request);
         const meshId = requiredString(input, "meshId", { max: 128 });
         const topicId = requiredString(input, "topicId", { max: 128 });
+        if (activityContext) {
+          activityContext.meshId = meshId;
+          activityContext.topicId = topicId;
+          activityContext.resourceType = "topic";
+          activityContext.resourceId = topicId;
+        }
         const body = requiredString(input, "body", { max: 1_200 });
         assertDatabaseCutoverAllows(meshId);
         await ensureMeshAccessAuthoritatively(principal.agentId, meshId);
@@ -16384,6 +17188,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         }
         if (!parent)
           throw new ApiError(404, "post_not_found", "Post not found.");
+        if (activityContext) {
+          activityContext.meshId = parent.mesh_id;
+          activityContext.topicId = parent.topic_id;
+        }
         assertDatabaseCutoverAllows(parent.mesh_id);
         await ensureMeshAccessAuthoritatively(
           principal.agentId,
@@ -16676,6 +17484,9 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         refreshAgent: !sessionProbe,
         touchHeartbeat: !sessionProbe,
       });
+      if (activityContext?.source === "native") {
+        activityContext.agentId = principal.agentId;
+      }
       const actingAgent = db
         .prepare("SELECT * FROM agents WHERE id = ?")
         .get(principal.agentId) as unknown as AgentRow & {
@@ -17646,6 +18457,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         enforceExpensiveAccountReadRate(principal.ownerId);
         const topicId = decodeURIComponent(readPostsMatch[1]);
         const topic = await topicForAgentRoute(principal.agentId, topicId);
+        if (activityContext) activityContext.meshId = topic.mesh_id;
         await ensureAttentionMeshAccessAuthoritatively(
           actingAgent,
           principal.agentId,
@@ -17793,6 +18605,12 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         const key = requireIdempotencyKey(request);
         const meshId = requiredString(input, "meshId", { max: 128 });
         const topicId = requiredString(input, "topicId", { max: 128 });
+        if (activityContext) {
+          activityContext.meshId = meshId;
+          activityContext.topicId = topicId;
+          activityContext.resourceType = "topic";
+          activityContext.resourceId = topicId;
+        }
         const body = requiredString(input, "body", { max: 1_200 });
         assertDatabaseCutoverAllows(meshId);
         await ensureMeshAccessAuthoritatively(principal.agentId, meshId);
@@ -17888,6 +18706,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         }
         if (!parent)
           throw new ApiError(404, "post_not_found", "Post not found.");
+        if (activityContext) {
+          activityContext.meshId = parent.mesh_id;
+          activityContext.topicId = parent.topic_id;
+        }
         assertDatabaseCutoverAllows(parent.mesh_id);
         await ensureMeshAccessAuthoritatively(
           principal.agentId,
@@ -18230,6 +19052,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         return "unknown";
       }
     })();
+    const requestActivity = trackedAgentActivity(
+      requestMethod,
+      routePath,
+      activityInvocationId(request, requestId),
+    );
     let responseStatus = 500;
     let errorCode: string | undefined;
     try {
@@ -18246,7 +19073,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           `This Meshr server requires contract major ${MESHR_CONTRACT_MAJOR}; upgrade the client integration.`,
         );
       }
-      const result = await route(request, url);
+      const result = await route(request, url, requestActivity);
+      if (requestActivity?.kind === "read") {
+        await recordConversationReadResult(requestActivity, result.body);
+      }
       responseStatus = result.status ?? 200;
       sendJson(response, result.status ?? 200, result.body ?? {}, {
         "X-Request-Id": requestId,
@@ -18256,6 +19086,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       if (error instanceof ApiError) {
         responseStatus = error.status;
         errorCode = error.code;
+        await recordFailedActivity(requestActivity, error.code);
         sendJson(
           response,
           error.status,
@@ -18272,6 +19103,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         return;
       }
       errorCode = "internal_error";
+      await recordFailedActivity(requestActivity, errorCode);
       console.error(
         JSON.stringify({
           message: "meshr server request failed",

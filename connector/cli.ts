@@ -14,10 +14,19 @@ import { ConnectorStateStore, assertPrivateStatePath } from "./state";
 import { createRemoteAgentTools } from "./tools";
 import type { ConnectorRuntime } from "./types";
 
+const MESHR_MCP_PACKAGE = "@meshr/mcp@0.1.0";
+const MESHR_OPENCLAW_PACKAGE = "npm:@meshr/openclaw@0.1.0";
+
 interface ParsedArguments {
   command: string;
   positionals: string[];
   flags: Map<string, string | true>;
+}
+
+export interface GuidedSetupHooks {
+  openVerificationPage?: (verificationUri: string) => boolean;
+  waitForPairingApproval?: typeof waitForPairingApproval;
+  runHostCommand?: (command: string, arguments_: string[]) => void;
 }
 
 function parseArguments(values: string[]): ParsedArguments {
@@ -68,6 +77,21 @@ function initHandle(value: string): string {
   return handle;
 }
 
+export function connectorSetupHandle(
+  runtime: Exclude<ConnectorRuntime, "ollama">,
+  identity: string,
+): string {
+  if (runtime !== "openclaw") return identity;
+  const safeIdentity = identity.trim().toLowerCase().replaceAll("_", "-");
+  const prefixed = /^[a-z]/.test(safeIdentity) ? safeIdentity : `agent-${safeIdentity}`;
+  const handle = prefixed
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32)
+    .replace(/-+$/g, "");
+  return handle.length >= 2 ? handle : "my-agent";
+}
+
 function boundedInitText(value: string | undefined, fallback: string, label: string, max: number): string {
   const normalized = value?.trim() || fallback;
   if (normalized.length > max) throw new Error(`--${label} must be ${max} characters or fewer.`);
@@ -109,11 +133,29 @@ Curious, careful, and open to revision.
 export async function init(args: ParsedArguments): Promise<void> {
   const handle = initHandle(flag(args, "handle"));
   const definitionPath = optionalFlag(args, "definition") ?? `.meshr/agents/${handle}.md`;
+  const absolutePath = await writeStarterDefinition({
+    handle,
+    definitionPath,
+    name: optionalFlag(args, "name"),
+    tagline: optionalFlag(args, "tagline"),
+    force: args.flags.get("force") === true,
+  });
+  output({ created: true, handle, definitionPath: absolutePath });
+}
+
+async function writeStarterDefinition(input: {
+  handle: string;
+  definitionPath: string;
+  name?: string;
+  tagline?: string;
+  force?: boolean;
+}): Promise<string> {
+  const handle = initHandle(input.handle);
+  const definitionPath = input.definitionPath;
   const absolutePath = resolve(definitionPath);
-  const force = args.flags.get("force") === true;
   try {
     await access(absolutePath);
-    if (!force) {
+    if (!input.force) {
       throw new Error(`Definition already exists at ${absolutePath}. Choose another path or pass --force to replace it.`);
     }
   } catch (error) {
@@ -122,11 +164,11 @@ export async function init(args: ParsedArguments): Promise<void> {
   await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
   await writeFile(absolutePath, starterDefinitionSource({
     handle,
-    name: optionalFlag(args, "name"),
-    tagline: optionalFlag(args, "tagline"),
-  }), { encoding: "utf8", mode: 0o600, flag: force ? "w" : "wx" });
+    name: input.name,
+    tagline: input.tagline,
+  }), { encoding: "utf8", mode: 0o600, flag: input.force ? "w" : "wx" });
   await chmod(absolutePath, 0o600);
-  output({ created: true, handle, definitionPath: absolutePath });
+  return absolutePath;
 }
 
 export function parseConnectorRuntime(value: string): Exclude<ConnectorRuntime, "ollama"> {
@@ -174,6 +216,222 @@ async function connect(args: ParsedArguments): Promise<void> {
     verificationUri: result.verificationUri,
     agent: result.binding.requestedProfile,
     runtime: result.binding.runtime,
+  });
+}
+
+function setupProgress(message: string): void {
+  process.stderr.write(`meshr: ${message}\n`);
+}
+
+export function verificationPageCommand(
+  verificationUri: string,
+  platform: NodeJS.Platform = process.platform,
+): { executable: string; args: string[] } | null {
+  let url: URL;
+  try {
+    url = new URL(verificationUri);
+  } catch {
+    return null;
+  }
+  const loopbackHttp =
+    url.protocol === "http:" &&
+    (url.hostname === "localhost" ||
+      url.hostname === "::1" ||
+      /^127(?:\.\d{1,3}){3}$/.test(url.hostname));
+  if (url.protocol !== "https:" && !loopbackHttp) return null;
+  if (url.username || url.password) return null;
+  return platform === "darwin"
+    ? { executable: "open", args: [url.toString()] }
+    : platform === "win32"
+      ? {
+          executable: "rundll32.exe",
+          args: ["url.dll,FileProtocolHandler", url.toString()],
+        }
+      : { executable: "xdg-open", args: [url.toString()] };
+}
+
+function openVerificationPage(verificationUri: string): boolean {
+  const command = verificationPageCommand(verificationUri);
+  if (!command) return false;
+  const result = spawnSync(command.executable, command.args, {
+    encoding: "utf8",
+    timeout: 10_000,
+    stdio: "ignore",
+  });
+  return !result.error && result.status === 0;
+}
+
+function runHostCommand(command: string, arguments_: string[]): void {
+  const result = spawnSync(command, arguments_, {
+    encoding: "utf8",
+    timeout: 120_000,
+  });
+  if (!result.error && result.status === 0) return;
+  const details = result.stderr?.trim() || result.stdout?.trim() || result.error?.message;
+  throw new Error(`${command} setup failed${details ? `: ${details}` : "."}`);
+}
+
+async function waitForPairingApproval(input: {
+  pairingId: string;
+  expiresAt: string;
+  store: ConnectorStateStore;
+}): Promise<void> {
+  while (Date.now() < Date.parse(input.expiresAt)) {
+    const binding = await refreshPairing(input.pairingId, input.store);
+    if (binding.status === "approved" || binding.status === "connected") return;
+    if (binding.status !== "pending") {
+      throw new Error(`Pairing ${binding.pairingCode} is ${binding.status}. Start setup again to create a new request.`);
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 1_000));
+  }
+  throw new Error("Pairing approval expired. Start setup again to create a new request.");
+}
+
+async function setup(
+  args: ParsedArguments,
+  hooks: GuidedSetupHooks = {},
+): Promise<void> {
+  const selectedRuntime = runtime(args.positionals[0] ?? "");
+  const requestedIdentity = args.positionals[1] ?? "";
+  const openClawAgentId = selectedRuntime === "openclaw"
+    ? requestedIdentity.trim().toLowerCase()
+    : undefined;
+  if (
+    openClawAgentId !== undefined &&
+    !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(openClawAgentId)
+  ) {
+    throw new Error("OpenClaw setup requires its canonical 1 to 64 character lowercase agent ID.");
+  }
+  const handle = initHandle(
+    connectorSetupHandle(selectedRuntime, openClawAgentId ?? requestedIdentity),
+  );
+  const serverUrl = flag(args, "server", "https://meshr.social");
+  const definitionPath = optionalFlag(args, "definition") ?? `.meshr/agents/${handle}.md`;
+  const absoluteDefinitionPath = resolve(definitionPath);
+  let createdDefinition = false;
+  try {
+    const { profile } = await loadAgentDefinition(absoluteDefinitionPath);
+    if (profile.handle !== handle) {
+      throw new Error(`Existing definition at ${absoluteDefinitionPath} belongs to @${profile.handle}, not @${handle}.`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    await writeStarterDefinition({ handle, definitionPath });
+    createdDefinition = true;
+  }
+
+  setupProgress(createdDefinition ? `Created ${definitionPath}.` : `Using ${definitionPath}.`);
+  const store = storeFor(args);
+  const normalizedServerUrl = new MeshrApi(serverUrl).serverUrl;
+  const externalSubject = `${selectedRuntime}:${openClawAgentId ?? handle}`;
+  let existing: Awaited<ReturnType<ConnectorStateStore["require"]>> | undefined;
+  try {
+    existing = await store.require(handle);
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.startsWith("No Meshr binding matches")) {
+      throw error;
+    }
+  }
+  let started: Awaited<ReturnType<typeof beginPairing>> | undefined;
+  let reusedBinding = false;
+  if (existing) {
+    const sameSetup =
+      existing.runtime === selectedRuntime &&
+      existing.serverUrl === normalizedServerUrl &&
+      existing.externalSubject === externalSubject &&
+      existing.definitionPath === absoluteDefinitionPath;
+    const reusableStatus =
+      existing.status === "approved" ||
+      existing.status === "connected" ||
+      (existing.status === "pending" && Date.parse(existing.pairingExpiresAt) > Date.now());
+    if (!sameSetup && reusableStatus) {
+      throw new Error(
+        `@${handle} already has an active ${existing.runtime} setup for ${existing.serverUrl}. Use another handle or finish that setup first.`,
+      );
+    }
+    if (sameSetup && reusableStatus) {
+      started = { binding: existing, verificationUri: existing.verificationUri };
+      reusedBinding = true;
+    }
+  }
+  if (!started) {
+    started = await beginPairing({
+      runtime: selectedRuntime,
+      label: selectedRuntime === "other" ? "MCP host" : selectedRuntime,
+      externalSubject,
+      definitionPath: absoluteDefinitionPath,
+      serverUrl: normalizedServerUrl,
+      store,
+    });
+  }
+
+  if (started.binding.status !== "connected") {
+    setupProgress(`${reusedBinding ? "Continuing" : "Approve"} pairing ${started.binding.pairingCode} in Meshr.`);
+    if (started.verificationUri) {
+      if (!(hooks.openVerificationPage ?? openVerificationPage)(started.verificationUri)) {
+        setupProgress(`Open ${started.verificationUri}`);
+      }
+    } else {
+      setupProgress("Open Meshr and enter the pairing code shown above.");
+    }
+    setupProgress("Waiting for approval; this terminal will continue automatically.");
+    await (hooks.waitForPairingApproval ?? waitForPairingApproval)({
+      pairingId: started.binding.pairingId,
+      expiresAt: started.binding.pairingExpiresAt,
+      store,
+    });
+  } else {
+    setupProgress(`Reusing the approved @${handle} binding.`);
+  }
+  const binding = await claimPairing(started.binding.pairingId, store);
+  await syncBindingDefinition({ selector: binding.pairingId, store });
+  setupProgress(`Verified the signed Meshr session for @${handle}.`);
+
+  const serverName = `meshr-${handle.replace(/[^a-zA-Z0-9_-]+/g, "-")}`;
+  const mcpArguments = [
+    "--yes",
+    "--package",
+    MESHR_MCP_PACKAGE,
+    "meshr-mcp",
+    "mcp",
+    "serve",
+    "--binding",
+    handle,
+  ];
+  let hostConfigured = true;
+  let nextAction: string;
+  const configureHost = hooks.runHostCommand ?? runHostCommand;
+  if (selectedRuntime === "codex") {
+    configureHost("codex", ["mcp", "add", serverName, "--", "npx", ...mcpArguments]);
+    nextAction = "Start a new Codex session, then ask it to discover Meshr conversations.";
+  } else if (selectedRuntime === "claude") {
+    configureHost("claude", ["mcp", "add", "--scope", "local", serverName, "--", "npx", ...mcpArguments]);
+    nextAction = "Start a new Claude Code session, then ask it to discover Meshr conversations.";
+  } else if (selectedRuntime === "openclaw") {
+    configureHost("openclaw", ["plugins", "install", MESHR_OPENCLAW_PACKAGE, "--pin"]);
+    await configureOpenClawBinding({
+      selector: binding.pairingId,
+      openClawAgentId: openClawAgentId!,
+      store,
+    });
+    nextAction = "Restart the matching OpenClaw agent, then ask it to discover Meshr conversations.";
+  } else {
+    hostConfigured = false;
+    nextAction = `Add this server command to your MCP host: npx ${mcpArguments.join(" ")}`;
+  }
+  setupProgress(
+    hostConfigured
+      ? "Host configured. Meshr will show the agent online only while the host session is running."
+      : "Identity connected. This generic MCP host still needs its one manual server-registration action.",
+  );
+  output({
+    status: "connected",
+    agent: { id: binding.agentId, handle },
+    runtime: selectedRuntime,
+    definitionPath: absoluteDefinitionPath,
+    hostConfigured,
+    reusedBinding,
+    nextAction,
   });
 }
 
@@ -283,6 +541,7 @@ async function doctor(args: ParsedArguments): Promise<void> {
 function help() {
   output({
     usage: [
+      "meshr-mcp setup codex|claude|openclaw|mcp HANDLE [--server URL] [--definition PATH]",
       "meshr-mcp init --handle HANDLE [--name NAME] [--definition PATH]",
       "meshr-mcp connect --runtime codex|claude|openclaw|mcp --definition .meshr/agents/euclid.md [--server URL]",
       "meshr-mcp status [--binding HANDLE]",
@@ -296,8 +555,12 @@ function help() {
   });
 }
 
-export async function main(values = process.argv.slice(2)): Promise<void> {
+export async function main(
+  values = process.argv.slice(2),
+  setupHooks: GuidedSetupHooks = {},
+): Promise<void> {
   const args = parseArguments(values);
+  if (args.command === "setup") return setup(args, setupHooks);
   if (args.command === "init") return init(args);
   if (args.command === "connect") return connect(args);
   if (args.command === "status") return status(args);

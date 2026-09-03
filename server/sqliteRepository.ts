@@ -53,11 +53,14 @@ import type {
   RepositoryOutboxCompletionResult,
   RepositoryOutboxHealth,
   RepositoryAuditInput,
+  RepositoryAgentActivityRecord,
+  RepositoryAgentActivityPage,
 } from "./repository.ts";
 import type { Clock, RuntimeKind, SocialProvider } from "./types.ts";
 import { publicRuntimeKind } from "./types.ts";
 import { constantTimeStringEqual, hmacSha256 } from "./security.ts";
 import { requireJoinCapableAttentionPolicy } from "./attentionPolicy.ts";
+import type { RepositoryPostInput } from "./firestoreRepository.ts";
 
 const HUMAN_IDLE_SECONDS = 12 * 60 * 60;
 const PAGE_AUTHORITY_GRANT_SECONDS = 60 * 60;
@@ -2061,6 +2064,55 @@ export class SqliteMeshrRepository implements MeshrRepository {
       tags,
       createdAt: row.created_at,
     };
+  }
+
+  async findMeshById(meshId: string): Promise<RepositoryMeshInput | null> {
+    const row = this.db
+      .prepare(
+        `SELECT id, owner_account_id, name, description, visibility,
+                join_policy, lifecycle, created_at, updated_at
+         FROM meshes WHERE id = ?`,
+      )
+      .get(meshId) as
+      | {
+          id: string;
+          owner_account_id: string | null;
+          name: string;
+          description: string;
+          visibility: RepositoryMeshInput["visibility"];
+          join_policy: RepositoryMeshInput["admission"];
+          lifecycle: RepositoryMeshInput["lifecycle"];
+          created_at: string;
+          updated_at: string;
+        }
+      | undefined;
+    return row
+      ? {
+          meshId: row.id,
+          ownerAccountId: row.owner_account_id,
+          name: row.name,
+          description: row.description,
+          visibility: row.visibility,
+          admission: row.join_policy,
+          lifecycle: row.lifecycle,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at,
+        }
+      : null;
+  }
+
+  async findMeshHumanRole(
+    meshId: string,
+    accountId: string,
+  ): Promise<"owner" | "steward" | "observer" | null> {
+    const row = this.db
+      .prepare(
+        "SELECT role FROM mesh_human_roles WHERE mesh_id = ? AND account_id = ?",
+      )
+      .get(meshId, accountId) as
+      | { role: "owner" | "steward" | "observer" }
+      | undefined;
+    return row?.role ?? null;
   }
 
   async listTopicsForAgent(meshId: string, agentId: string): Promise<RepositoryAgentTopic[]> {
@@ -5254,21 +5306,7 @@ export class SqliteMeshrRepository implements MeshrRepository {
     });
   }
 
-  async createPostWithOutbox(input: {
-    postId: string;
-    meshId: string;
-    topicId: string;
-    agentId: string;
-    sessionId: string;
-    parentPostId: string | null;
-    body: string;
-    moderationState: "published" | "quarantined";
-    expiresAt: string;
-    eventType: "post.created" | "reply.created";
-    idempotencyKey: string;
-    requestHash: string;
-    reviewQueued?: boolean;
-  }) {
+  async createPostWithOutbox(input: RepositoryPostInput) {
     const now = this.now();
     return this.database.transaction(() => {
       const existing = this.db
@@ -5354,6 +5392,29 @@ export class SqliteMeshrRepository implements MeshrRepository {
           }),
           now,
         );
+      if (input.activity) {
+        this.db
+          .prepare(
+            `INSERT INTO agent_activity_ledger(
+               id, agent_id, kind, source, action, outcome, resource_type,
+               resource_id, mesh_id, topic_id, failure_code, occurred_at
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            input.activity.activityId,
+            input.activity.agentId,
+            input.activity.kind,
+            input.activity.source,
+            input.activity.action,
+            input.activity.outcome,
+            input.activity.resourceType,
+            input.activity.resourceId,
+            input.activity.meshId,
+            input.activity.topicId,
+            input.activity.failureCode,
+            now,
+          );
+      }
       this.db
         .prepare(
           `INSERT INTO idempotency_records(
@@ -5376,6 +5437,128 @@ export class SqliteMeshrRepository implements MeshrRepository {
         reviewQueued: input.reviewQueued === true || newIdentityReview,
       };
     });
+  }
+
+  async appendAgentActivities(
+    inputs: RepositoryAgentActivityRecord[],
+  ): Promise<{ inserted: number; duplicates: number }> {
+    if (inputs.length > 100) throw new Error("activity_batch_too_large");
+    return this.database.transaction(() => {
+      let inserted = 0;
+      let duplicates = 0;
+      const select = this.db.prepare(
+        `SELECT agent_id, kind, source, action, outcome, resource_type,
+                resource_id, mesh_id, topic_id, failure_code, occurred_at
+         FROM agent_activity_ledger WHERE id = ?`,
+      );
+      const insert = this.db.prepare(
+        `INSERT INTO agent_activity_ledger(
+           id, agent_id, kind, source, action, outcome, resource_type,
+           resource_id, mesh_id, topic_id, failure_code, occurred_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const input of inputs) {
+        const existing = select.get(input.activityId) as
+          | Record<string, string | null>
+          | undefined;
+        const values = [
+          input.agentId,
+          input.kind,
+          input.source,
+          input.action,
+          input.outcome,
+          input.resourceType,
+          input.resourceId,
+          input.meshId,
+          input.topicId,
+          input.failureCode,
+          input.occurredAt,
+        ];
+        if (existing) {
+          const stored = [
+            existing.agent_id,
+            existing.kind,
+            existing.source,
+            existing.action,
+            existing.outcome,
+            existing.resource_type,
+            existing.resource_id,
+            existing.mesh_id,
+            existing.topic_id,
+            existing.failure_code,
+          ];
+          if (!isDeepStrictEqual(stored, values.slice(0, -1))) {
+            throw new Error("activity_id_conflict");
+          }
+          duplicates += 1;
+          continue;
+        }
+        insert.run(input.activityId, ...values);
+        inserted += 1;
+      }
+      return { inserted, duplicates };
+    });
+  }
+
+  async listAgentActivities(input: {
+    agentId: string;
+    after?: { occurredAt: string; id: string };
+    limit: number;
+  }): Promise<RepositoryAgentActivityPage> {
+    const limit = Math.min(Math.max(Math.floor(input.limit), 1), 50);
+    const rows = (input.after
+      ? this.db
+          .prepare(
+            `SELECT * FROM agent_activity_ledger
+             WHERE agent_id = ?
+               AND (occurred_at < ? OR (occurred_at = ? AND id > ?))
+             ORDER BY occurred_at DESC, id ASC LIMIT ?`,
+          )
+          .all(
+            input.agentId,
+            input.after.occurredAt,
+            input.after.occurredAt,
+            input.after.id,
+            limit + 1,
+          )
+      : this.db
+          .prepare(
+            `SELECT * FROM agent_activity_ledger WHERE agent_id = ?
+             ORDER BY occurred_at DESC, id ASC LIMIT ?`,
+          )
+          .all(input.agentId, limit + 1)) as Array<
+      Record<string, string | null>
+    >;
+    const pageRows = rows.slice(0, limit);
+    const earliest = this.db
+      .prepare(
+        `SELECT occurred_at FROM agent_activity_ledger
+         WHERE agent_id = ? ORDER BY occurred_at ASC, id ASC LIMIT 1`,
+      )
+      .get(input.agentId) as { occurred_at: string } | undefined;
+    const activities = pageRows.map((row) => ({
+      activityId: String(row.id),
+      agentId: String(row.agent_id),
+      kind: row.kind as RepositoryAgentActivityRecord["kind"],
+      source: row.source as RepositoryAgentActivityRecord["source"],
+      action: String(row.action),
+      outcome: row.outcome as RepositoryAgentActivityRecord["outcome"],
+      resourceType: row.resource_type as RepositoryAgentActivityRecord["resourceType"],
+      resourceId: row.resource_id,
+      meshId: row.mesh_id,
+      topicId: row.topic_id,
+      failureCode: row.failure_code,
+      occurredAt: String(row.occurred_at),
+    }));
+    const last = pageRows.at(-1);
+    return {
+      activities,
+      nextAfter:
+        rows.length > limit && last
+          ? { occurredAt: String(last.occurred_at), id: String(last.id) }
+          : null,
+      recordedSince: earliest?.occurred_at ?? null,
+    };
   }
 
   async appendEvent(input: RepositoryEventInput): Promise<{ duplicate: boolean }> {

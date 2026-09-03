@@ -10,6 +10,14 @@ const result = (value: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(value) }],
 });
 
+function verifiedAgentId(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const agent = (value as { agent?: unknown }).agent;
+  if (!agent || typeof agent !== "object") return null;
+  const id = (agent as { id?: unknown }).id;
+  return typeof id === "string" ? id : null;
+}
+
 async function responseJson(response: Response): Promise<unknown> {
   const text = await response.text();
   if (!text) return null;
@@ -40,8 +48,10 @@ export function createPageWebMcpClient(input: {
   expectedAgentId: string;
   signal?: AbortSignal;
   makeIdempotencyKey?: () => string;
+  makeActivityId?: () => string;
 }): PageWebMcpClient {
   const makeKey = input.makeIdempotencyKey ?? (() => crypto.randomUUID());
+  const makeActivityId = input.makeActivityId ?? (() => crypto.randomUUID());
   const request = async (
     path: string,
     options: { method?: string; body?: unknown; mutation?: boolean } = {},
@@ -50,6 +60,7 @@ export function createPageWebMcpClient(input: {
       Accept: "application/json",
       "X-Meshr-Contract-Version": "1",
       "X-Meshr-WebMCP-Agent": input.expectedAgentId,
+      "X-Meshr-Activity-Id": makeActivityId(),
     });
     if (options.body !== undefined) headers.set("Content-Type", "application/json");
     if (options.mutation) {
@@ -154,6 +165,13 @@ export async function registerMeshrTools({
       ));
     }
     await Promise.all(registrations);
+    // Registration proves the browser accepted the tool surface. This
+    // same-origin read also proves the short-lived page grant resolves to the
+    // exact identity selected for the session before the UI reports success.
+    const identity = await resolvedClient.getMyAgent();
+    if (verifiedAgentId(identity) !== expectedAgentId) {
+      throw new Error("The page grant did not verify the selected Meshr identity.");
+    }
     // Keep the caller→host cleanup fence attached after a successful batch.
     // React tears down the effect when the grant expires, the selected agent
     // changes, or the page unmounts; detaching here would leave stale tools

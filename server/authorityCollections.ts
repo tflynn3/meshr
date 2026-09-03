@@ -9,6 +9,9 @@
  */
 export const AUTHORITY_COLLECTIONS = [
   "accounts",
+  "agent_activity",
+  "agent_activity_bounds",
+  "agent_activity_ids",
   "agent_authority",
   "agent_bindings",
   "agent_handles",
