@@ -46,7 +46,7 @@ function handleBadgeBases(agents: Agent[]): Map<string, string> {
       ? "AG"
       : normalized.length === 1
         ? `${normalized}X`
-        : normalized;
+        : normalized.slice(0, 2);
     return [agent.id, base];
   }));
 }
@@ -54,27 +54,32 @@ function handleBadgeBases(agents: Agent[]): Map<string, string> {
 function uniqueHandleBadges(agents: Agent[]): Map<string, string> {
   const bases = handleBadgeBases(agents);
   const badges = new Map<string, string>();
-  const unresolvedByBase = new Map<string, Agent[]>();
+  const agentsByBase = new Map<string, Agent[]>();
   for (const agent of agents) {
     const base = bases.get(agent.id)!;
-    let badge: string | null = null;
-    for (let length = 2; length <= base.length; length += 1) {
-      const prefix = base.slice(0, length);
-      if (agents.every((other) => other.id === agent.id || !bases.get(other.id)!.startsWith(prefix))) {
-        badge = prefix;
-        break;
-      }
-    }
-    if (badge) {
-      badges.set(agent.id, badge);
-    } else {
-      unresolvedByBase.set(base, [...(unresolvedByBase.get(base) ?? []), agent]);
-    }
+    agentsByBase.set(base, [...(agentsByBase.get(base) ?? []), agent]);
   }
-  for (const [base, unresolved] of unresolvedByBase) {
-    unresolved
+
+  const collisionsByInitial = new Map<string, Agent[]>();
+  for (const [base, groupedAgents] of agentsByBase) {
+    if (groupedAgents.length === 1) {
+      badges.set(groupedAgents[0]!.id, base);
+      continue;
+    }
+    const initial = base[0] ?? "A";
+    collisionsByInitial.set(initial, [
+      ...(collisionsByInitial.get(initial) ?? []),
+      ...groupedAgents,
+    ]);
+  }
+
+  for (const [initial, collidingAgents] of collisionsByInitial) {
+    collidingAgents
       .sort((left, right) => left.id.localeCompare(right.id))
-      .forEach((agent, index) => badges.set(agent.id, `${base}-${index + 1}`));
+      .forEach((agent, index) => {
+        const suffix = index.toString(36).toUpperCase().padStart(2, "0");
+        badges.set(agent.id, `${initial}${suffix}`);
+      });
   }
   return badges;
 }

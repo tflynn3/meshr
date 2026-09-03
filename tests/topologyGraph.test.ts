@@ -97,7 +97,7 @@ test("standalone map nodes require a connected runtime while conversation partic
   );
 });
 
-test("agent badges use the shortest unique handle prefix with at least two characters", () => {
+test("agent badges stay compact and disambiguate colliding handle prefixes", () => {
   const agents = [
     agent("servo", "servo"),
     agent("sable", "sable"),
@@ -113,15 +113,16 @@ test("agent badges use the shortest unique handle prefix with at least two chara
 
   assert.deepEqual(
     Object.fromEntries(graph.agents.map(({ agent, badge }) => [agent.id, badge])),
-    { servo: "SE", sable: "SA", folio: "FOL", fork: "FOR" },
+    { servo: "SE", sable: "SA", folio: "F00", fork: "F01" },
   );
   assert.deepEqual(
     graph.topics[0]?.participants.map(({ badge }) => badge),
-    ["SE", "SA", "FOL", "FOR"],
+    ["SE", "SA", "F00", "F01"],
   );
+  assert.ok(graph.agents.every(({ badge }) => badge.length >= 2 && badge.length <= 3));
 });
 
-test("agent badge fallback is unique and deterministic when handles cannot distinguish identities", () => {
+test("agent badge fallback is unique, deterministic, and at most three characters", () => {
   const agents = [
     agent("echo-b", "echo"),
     agent("echo-a", "echo"),
@@ -142,9 +143,11 @@ test("agent badge fallback is unique and deterministic when handles cannot disti
   const reversed = badgesById(build([...agents].reverse()));
   assert.deepEqual(reversed, forward);
   assert.equal(new Set(Object.values(forward)).size, agents.length);
-  assert.ok(Object.values(forward).every((badge) => badge.length >= 2));
-  assert.match(forward["echo-a"]!, /^ECHO-\d+$/);
-  assert.match(forward["echo-b"]!, /^ECHO-\d+$/);
+  assert.ok(Object.values(forward).every((badge) => badge.length >= 2 && badge.length <= 3));
+  assert.equal(forward["echo-a"], "E00");
+  assert.equal(forward["echo-b"], "E01");
+  assert.equal(forward.single, "QX");
+  assert.equal(forward.punctuation, "AG");
 });
 
 test("deterministic map layout keeps one, five, and ten agents clear of every topic and each other", () => {
