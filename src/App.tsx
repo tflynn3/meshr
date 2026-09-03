@@ -1629,6 +1629,7 @@ function AgentPortfolio({
   onOpenAgent: (agentId: string) => void;
 }) {
   const webMcpReady = webMcpStatus === "ready" && Boolean(webMcpSession?.enabled && webMcpSession.agent);
+  const hasAgents = agents.length > 0;
   return (
     <main className="portfolio-view">
       <header className="portfolio-header">
@@ -1644,7 +1645,9 @@ function AgentPortfolio({
               {webMcpReady
                 ? `Page tools use @${webMcpSession.agent.handle}`
                 : webMcpStatus === "setup-ready"
-                  ? "Codex can create your first agent"
+                  ? hasAgents
+                    ? "Choose an agent for page tools"
+                    : "Codex can create your first agent"
                 : webMcpStatus === "unsupported"
                   ? "Page tools need a compatible browser"
                   : webMcpStatus === "error"
@@ -1686,7 +1689,9 @@ function AgentPortfolio({
               : webMcpSession?.enabled && webMcpStatus === "error"
                 ? "Page tools need attention"
                 : webMcpStatus === "setup-ready"
-                  ? "Tell Codex what your agent should work on"
+                  ? hasAgents
+                    ? "Choose an agent to follow the signal"
+                    : "Tell Codex what your agent should work on"
                 : webMcpStatus === "registering"
                     ? "Preparing page tools"
                     : agents.length
@@ -1794,7 +1799,7 @@ function AgentCard({
       </section>
       <footer>
         <div>
-          <h3>RUNTIME</h3>
+          <h3>CONNECTED THROUGH</h3>
           <span>
             <RuntimeIcon size={17} />
             {runtime?.label ?? "No native runtime attached"}
@@ -1808,7 +1813,7 @@ function AgentCard({
           <span>
             <ShieldCheck size={17} />
             <span>
-              <strong>Page WebMCP</strong>
+              <strong>Page tools</strong>
               <small>
                 {webMcpEnabled
                   ? webMcpStatus === "ready"
@@ -2068,6 +2073,10 @@ function MeshExperience({
     .map((id) => state.agents.find((agent) => agent.id === id))
     .filter(Boolean) as Agent[];
   const showCodexInvitation = isGuest && portfolio.length === 0;
+  const currentRole = mesh.humanRoleAssignments.find(
+    (assignment) => assignment.ownerId === ownerId,
+  )?.role ?? null;
+  const canConfigureMesh = currentRole === "owner" || currentRole === "steward";
   return (
     <div className={`mesh-experience ${inspectorOpen ? "" : "inspector-closed"}`}>
       <MeshAgentPanel
@@ -2101,7 +2110,7 @@ function MeshExperience({
             <p>{mesh.description}</p>
           </div>
           <button onClick={onOpenGovernance}>
-            <Gear size={18} /> Settings
+            <Gear size={18} /> {canConfigureMesh ? "Settings" : "Mesh details"}
           </button>
         </header>
         <TopologyCanvas
@@ -2164,6 +2173,7 @@ function MeshAgentPanel({
   onSelectAgent: (id: string) => void;
   onAddAgent: () => void;
 }) {
+  const hasPortfolioAgents = portfolio.length > 0;
   return (
     <aside className={`mesh-agent-panel ${portfolio.length === 0 ? "setup-empty" : ""}`} aria-labelledby="mesh-agent-panel-title">
       <header>
@@ -2211,7 +2221,7 @@ function MeshAgentPanel({
       </button>
       <div className="sync-summary">
         <Check size={14} weight="bold" />
-        <span>Profiles synced</span>
+        <span>Profiles saved in Meshr</span>
       </div>
       <div className={`webmcp-status ${webMcpStatus}`} role="status">
         <span />
@@ -2231,7 +2241,9 @@ function MeshAgentPanel({
           </strong>
           <small>
             {webMcpStatus === "setup-ready"
-              ? "Ask Codex to create your agent"
+              ? hasPortfolioAgents
+                ? "Open Your agents to enable page tools"
+                : "Ask Codex to create your agent"
               : webMcpStatus === "disabled"
                 ? "Choose an identity in Your agents"
               : "Bound to the selected agent session"}

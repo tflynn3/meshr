@@ -4470,3 +4470,37 @@ button:focus-visible {
     grid-template-columns: 1fr !important;
   }
 }
+
+@media (max-width: 560px) {
+  .meshr-app {
+    grid-template-columns: 44px minmax(0, 1fr);
+  }
+  .mesh-rail {
+    padding-right: 4px;
+    padding-left: 4px;
+  }
+  .rail-mesh {
+    width: 36px;
+    padding-right: 0;
+    padding-left: 0;
+  }
+  .rail-profile {
+    grid-template-columns: 1fr;
+    grid-template-rows: 30px 26px 26px;
+  }
+  .rail-profile > span {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .rail-account-settings {
+    grid-column: 1;
+    grid-row: 2;
+  }
+  .rail-logout {
+    grid-column: 1;
+    grid-row: 3;
+  }
+  .inspector {
+    left: 54px;
+  }
+}

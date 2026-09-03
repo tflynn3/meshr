@@ -73,6 +73,24 @@ test("changing the selected topic or traffic link remounts its inspector", () =>
   assert.match(appSource, /<ConversationInspector\s+key=\{topic\.id\}/);
 });
 
+test("setup-ready guidance distinguishes existing portfolios from first-agent setup", () => {
+  assert.match(appSource, /const hasAgents = agents\.length > 0/);
+  assert.match(appSource, /hasAgents\s+\? "Choose an agent for page tools"\s+: "Codex can create your first agent"/);
+  assert.match(appSource, /hasAgents\s+\? "Choose an agent to follow the signal"\s+: "Tell Codex what your agent should work on"/);
+  assert.match(appSource, /const hasPortfolioAgents = portfolio\.length > 0/);
+  assert.match(appSource, /hasPortfolioAgents\s+\? "Open Your agents to enable page tools"\s+: "Ask Codex to create your agent"/);
+  assert.doesNotMatch(appSource, /Profiles synced/);
+  assert.match(appSource, /Profiles saved in Meshr/);
+});
+
+test("mesh controls distinguish editable settings from read-only details", () => {
+  assert.match(appSource, /const currentRole = mesh\.humanRoleAssignments\.find\(/);
+  assert.match(appSource, /const canConfigureMesh = currentRole === "owner" \|\| currentRole === "steward"/);
+  assert.match(appSource, /\{canConfigureMesh \? "Settings" : "Mesh details"\}/);
+  assert.match(appSource, /<h3>CONNECTED THROUGH<\/h3>/);
+  assert.match(appSource, /<strong>Page tools<\/strong>/);
+});
+
 test("closing the inspector preserves the medium-width mesh columns", () => {
   const mediumWidthStyles = stylesSource.slice(
     stylesSource.indexOf("@media (max-width: 980px)"),
@@ -132,6 +150,20 @@ test("responsive mesh overlays and floating controls stay inside narrow desktops
     /@media \(max-width: 900px\)[\s\S]*\.guest-codex-invitation\s*\{[^}]*grid-template-columns:\s*1fr/,
   );
   assert.match(narrowMeshStyles, /\.map-key small\s*\{[^}]*display:\s*none/);
+
+  const embeddedBrowserStyles = stylesSource.slice(
+    stylesSource.lastIndexOf("@media (max-width: 560px)"),
+  );
+  assert.match(
+    embeddedBrowserStyles,
+    /\.meshr-app\s*\{[^}]*grid-template-columns:\s*44px minmax\(0, 1fr\)/,
+  );
+  assert.match(embeddedBrowserStyles, /\.rail-mesh\s*\{[^}]*width:\s*36px/);
+  assert.match(embeddedBrowserStyles, /\.inspector\s*\{[^}]*left:\s*54px/);
+  assert.match(
+    embeddedBrowserStyles,
+    /\.rail-profile\s*\{[^}]*grid-template-columns:\s*1fr[^}]*grid-template-rows:\s*30px 26px 26px/,
+  );
 });
 
 test("the mesh rail stays pinned while a compact mesh page scrolls", () => {
