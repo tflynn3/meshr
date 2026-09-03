@@ -261,6 +261,128 @@ test("public conversation reads return only retained published posts from active
   const hidden = await requestJson(baseUrl, "/v1/public/topics/topic-small-discoveries/posts");
   assert.equal(hidden.response.status, 404);
   assert.equal(hidden.json.error.code, "topic_not_found");
+
+  const unauthenticated = await requestJson(baseUrl, "/v1/topics/topic-small-discoveries/posts");
+  assert.equal(unauthenticated.response.status, 401);
+
+  const owner = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "private-reader@example.test",
+      password: "a sufficiently long private reader passphrase",
+      displayName: "Private reader",
+    },
+  });
+  const ownerCookie = cookieFrom(owner.response);
+  db.prepare(
+    `INSERT INTO mesh_human_roles(mesh_id, account_id, role, created_at, updated_at)
+     VALUES('mesh-public', ?, 'owner', ?, ?)`,
+  ).run(owner.json.user.id, now, now);
+  const authorized = await requestJson(baseUrl, "/v1/topics/topic-small-discoveries/posts", { cookie: ownerCookie });
+  assert.equal(authorized.response.status, 200);
+  assert.deepEqual(authorized.json.posts.map((post: any) => post.id), ["conversation-root", "conversation-reply"]);
+
+  const outsider = await requestJson(baseUrl, "/v1/accounts", {
+    method: "POST",
+    body: {
+      email: "private-outsider@example.test",
+      password: "a sufficiently long private outsider passphrase",
+      displayName: "Private outsider",
+    },
+  });
+  const denied = await requestJson(baseUrl, "/v1/topics/topic-small-discoveries/posts", {
+    cookie: cookieFrom(outsider.response),
+  });
+  assert.equal(denied.response.status, 404);
+  assert.equal(denied.json.error.code, "topic_not_found");
+});
+
+test("authenticated conversation reads use terminal durable role checks", async () => {
+  const accountId = "durable-conversation-reader";
+  let role: "owner" | null = "owner";
+  let revokeDuringPostRead = false;
+  const now = "2026-08-27T18:00:00.000Z";
+  const repository = {
+    ensureEmptyProduction: async () => undefined,
+    findHumanSession: async () => ({
+      accountId,
+      csrfToken: "durable-conversation-csrf",
+      createdAt: now,
+      expiresAt: "2026-08-27T19:00:00.000Z",
+      absoluteExpiresAt: "2026-08-27T19:00:00.000Z",
+      lastSeenAt: now,
+    }),
+    findAccountById: async () => ({ accountId, email: "durable-reader@example.test", displayName: "Durable reader", createdAt: now }),
+    findTopicById: async (topicId: string) => topicId === "durable-private-topic" ? ({
+      topicId,
+      meshId: "durable-private-mesh",
+      name: "private-notes",
+      title: "Private notes",
+      description: "Durable private conversation",
+      tags: [],
+      createdAt: now,
+    }) : null,
+    findMeshById: async (meshId: string) => meshId === "durable-private-mesh" ? ({
+      meshId,
+      ownerAccountId: accountId,
+      name: "Durable private mesh",
+      description: "Private",
+      visibility: "private",
+      admission: "invite_only",
+      lifecycle: "active",
+      createdAt: now,
+      updatedAt: now,
+    }) : null,
+    findMeshHumanRole: async () => role,
+    listPublishedPostsByTopic: async () => {
+      if (revokeDuringPostRead) role = null;
+      return {
+      posts: [{
+        postId: "durable-conversation-post",
+        meshId: "durable-private-mesh",
+        topicId: "durable-private-topic",
+        agentId: "durable-agent",
+        sessionId: "session",
+        parentPostId: null,
+        body: "A durable published observation.",
+        moderationState: "published",
+        moderationReason: null,
+        createdAt: now,
+        expiresAt: null,
+      }],
+      agents: [{
+        agentId: "durable-agent",
+        ownerAccountId: accountId,
+        name: "Durable agent",
+        handle: "durable-agent",
+        tagline: "",
+        interests: [],
+        personality: "",
+        attention: {},
+        runtime: "local",
+        runtimeLabel: "Durable",
+        runtimeSubject: "durable",
+        publicKeyPem: "key",
+        definitionDigest: null,
+        createdAt: now,
+        updatedAt: now,
+      }],
+      nextAfter: null,
+    };
+    },
+  } as unknown as MeshrRepository;
+  const { baseUrl } = await start({ repository });
+  const allowed = await requestJson(baseUrl, "/v1/topics/durable-private-topic/posts", {
+    cookie: "meshr_session=durable-conversation-token",
+  });
+  assert.equal(allowed.response.status, 200);
+  assert.equal(allowed.json.posts[0].body, "A durable published observation.");
+  role = "owner";
+  revokeDuringPostRead = true;
+  const revoked = await requestJson(baseUrl, "/v1/topics/durable-private-topic/posts", {
+    cookie: "meshr_session=durable-conversation-token",
+  });
+  assert.equal(revoked.response.status, 404);
 });
 
 test("public auth config exposes cohort-level resident transparency without principal fingerprints", async () => {

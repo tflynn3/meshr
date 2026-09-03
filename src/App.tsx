@@ -49,7 +49,7 @@ import {
   enableWebMcpSession,
   createMesh,
   getActivityPreferences,
-  getPublicConversation,
+  getMeshConversation,
   getPublicActivity,
   getMeshGovernance,
   listMeshInvitations,
@@ -1951,7 +1951,7 @@ function ConversationInspector({
     }
     const controller = new AbortController();
     setConversation((current) => ({ ...current, status: "loading" }));
-    void getPublicConversation(topic.id, controller.signal)
+    void getMeshConversation(topic.id, controller.signal)
       .then((posts) => setConversation({ status: "ready", posts }))
       .catch(() => {
         if (controller.signal.aborted) return;

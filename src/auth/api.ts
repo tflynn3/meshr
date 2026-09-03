@@ -843,6 +843,18 @@ export async function getPublicConversation(
   return response.posts;
 }
 
+/** Signed-in mesh inspection can include an authorized unlisted/private mesh. */
+export async function getMeshConversation(
+  topicId: string,
+  signal?: AbortSignal,
+): Promise<PublicConversationPost[]> {
+  const response = await request<{ posts: PublicConversationPost[] }>(
+    `/v1/topics/${encodeURIComponent(topicId)}/posts`,
+    { signal },
+  );
+  return response.posts;
+}
+
 export async function getActivityPreferences(signal?: AbortSignal): Promise<ActivityPreference[]> {
   const response = await request<{ preferences: ActivityPreference[] }>(
     "/v1/activity/preferences",

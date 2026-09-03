@@ -307,6 +307,7 @@ const isExpensiveAuthenticatedRead = (method: string, path: string): boolean =>
     path === "/v1/webmcp/activity" ||
     /^\/v1\/webmcp\/topics\/[^/]+\/posts$/.test(path) ||
     /^\/v1\/webmcp\/meshes\/[^/]+\/traffic\/[^/]+$/.test(path) ||
+    /^\/v1\/topics\/[^/]+\/posts$/.test(path) ||
     path === "/v1/agent/meshes" ||
     /^\/v1\/agent\/meshes\/[^/]+\/topics$/.test(path) ||
     /^\/v1\/agent\/topics\/[^/]+\/posts$/.test(path));
@@ -9844,6 +9845,112 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           requestedMeshId,
           projection?.activity,
         ),
+      };
+    }
+
+    const humanTopicPostsMatch = matchingPath(
+      path,
+      /^\/v1\/topics\/([^/]+)\/posts$/,
+    );
+    if (method === "GET" && humanTopicPostsMatch) {
+      const principal = await requireHuman(request, false, { touchSession: false });
+      enforceExpensiveAccountReadRate(principal.accountId);
+      const topicId = decodeURIComponent(humanTopicPostsMatch[1]);
+      const notFound = () => new ApiError(404, "topic_not_found", "Conversation not found.");
+      const readMetadata = async () => {
+        if (repository && (!repository.findTopicById || !repository.findMeshById)) {
+          throw new ApiError(
+            503,
+            "conversation_store_unavailable",
+            "The conversation store cannot verify the current mesh.",
+          );
+        }
+        try {
+          const topic = repository?.findTopicById
+            ? await repository.findTopicById(topicId)
+            : (() => {
+                const row = db.prepare("SELECT mesh_id FROM topics WHERE id = ?").get(topicId) as
+                  | { mesh_id: string }
+                  | undefined;
+                return row ? { meshId: row.mesh_id } : null;
+              })();
+          if (!topic) return null;
+          const mesh = repository?.findMeshById
+            ? await repository.findMeshById(topic.meshId)
+            : (() => {
+                const row = db.prepare(
+                  "SELECT id, visibility, lifecycle FROM meshes WHERE id = ?",
+                ).get(topic.meshId) as
+                  | { id: string; visibility: "public" | "unlisted" | "private"; lifecycle: string }
+                  | undefined;
+                return row ? { meshId: row.id, visibility: row.visibility, lifecycle: row.lifecycle } : null;
+              })();
+          if (!mesh || mesh.lifecycle !== "active") return null;
+          // A partial durable adapter must never fall back to a replica-local
+          // private role. Public visibility remains independently readable.
+          const role = repository && !repository.findMeshHumanRole
+            ? null
+            : await meshRoleForAuthoritatively(principal.accountId, topic.meshId);
+          return { meshId: topic.meshId, public: mesh.visibility === "public", role };
+        } catch (error) {
+          if (error instanceof ApiError) throw error;
+          throw new ApiError(
+            503,
+            "conversation_store_unavailable",
+            error instanceof Error ? error.message : "The conversation store is unavailable.",
+          );
+        }
+      };
+      const initial = await readMetadata();
+      if (!initial || (!initial.public && !initial.role)) throw notFound();
+      const limit = 25;
+      let posts: Array<Record<string, string | null>> | null = null;
+      let authoritativePosts: ReturnType<typeof formatAuthoritativeTopicPosts> | null = null;
+      if (repository?.listPublishedPostsByTopic) {
+        try {
+          authoritativePosts = formatAuthoritativeTopicPosts(
+            await repository.listPublishedPostsByTopic({ topicId, now: database.now(), limit }),
+          );
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "conversation_store_unavailable",
+            error instanceof Error ? error.message : "The conversation store is unavailable.",
+          );
+        }
+      } else {
+        posts = db.prepare(
+          `SELECT recent.*, a.name AS agent_name, a.handle AS agent_handle
+           FROM (
+             SELECT p.* FROM posts p
+             WHERE p.topic_id = ? AND p.moderation_state = 'published'
+               AND (p.expires_at IS NULL OR p.expires_at > ?)
+             ORDER BY p.created_at DESC, p.id DESC LIMIT ?
+           ) recent
+           JOIN agents a ON a.id = recent.agent_id
+           ORDER BY recent.created_at ASC, recent.id ASC`,
+        ).all(topicId, database.now(), limit) as Array<Record<string, string | null>>;
+      }
+      // Recheck after the body query. A role or visibility change that races
+      // a read must not allow the response to disclose retained content.
+      const terminal = await readMetadata();
+      if (!terminal || terminal.meshId !== initial.meshId || (!terminal.public && !terminal.role)) {
+        throw notFound();
+      }
+      if (authoritativePosts) return { body: { posts: authoritativePosts } };
+      return {
+        body: {
+          posts: (posts ?? []).map((row) => ({
+            id: row.id,
+            meshId: row.mesh_id,
+            topicId: row.topic_id,
+            agentId: row.agent_id,
+            parentPostId: row.parent_post_id,
+            body: row.body,
+            createdAt: row.created_at,
+            agent: { id: row.agent_id, name: row.agent_name, handle: row.agent_handle },
+          })),
+        },
       };
     }
 
