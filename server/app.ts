@@ -5625,12 +5625,17 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           membership?.status === "joined" ||
           role !== null),
     );
+    // Ledger rows may describe a failed request, whose mesh/topic pair came
+    // from untrusted request input. Never combine a viewable mesh with a
+    // separately-resolved topic from another mesh: that would turn the
+    // owner-only ledger into a private-topic metadata oracle.
+    const topicMatchesMesh = !topic || topic.meshId === meshId;
     const context = {
       meshId,
       meshName: canView ? (mesh?.name ?? null) : null,
       meshVisibility: canView ? (mesh?.visibility ?? null) : null,
       topicId,
-      topicTitle: canView ? (topic?.title ?? null) : null,
+      topicTitle: canView && topicMatchesMesh ? (topic?.title ?? null) : null,
     };
     if (!activity.resourceType || !activity.resourceId) {
       return {
@@ -5703,6 +5708,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       }
     } else if (activity.resourceType === "topic") {
       if (!topic) availability = "deleted";
+      else if (!topicMatchesMesh) availability = "unavailable";
       else if (!canView) availability = "inaccessible";
       else {
         availability = "available";
@@ -8842,11 +8848,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             : undefined,
           limit,
         });
-        const items = await Promise.all(
-          page.activities.map((activity) =>
-            resolveAgentActivity(activity, principal.accountId),
-          ),
-        );
+        // Recheck ownership after the page scan, then resolve the current
+        // target state immediately before serialization. This avoids serving
+        // a previously-resolved excerpt after ownership, membership, or
+        // moderation changed while the page was being read.
         const terminalAgent = await agentActivityStore.findAgentById(agentId);
         if (
           !terminalAgent ||
@@ -8858,6 +8863,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             "Owned agent not found.",
           );
         }
+        const items = await Promise.all(
+          page.activities.map((activity) =>
+            resolveAgentActivity(activity, principal.accountId),
+          ),
+        );
         return {
           body: agentActivityLedgerPageSchema.parse({
             contractVersion: MESHR_CONTRACT_MAJOR,
@@ -10362,6 +10372,13 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       enforceExpensiveAccountReadRate(principal.accountId);
       const topicId = decodeURIComponent(humanTopicPostsMatch[1]);
       const notFound = () => new ApiError(404, "topic_not_found", "Conversation not found.");
+      const requestedPostId = url.searchParams.get("postId");
+      if (
+        requestedPostId !== null &&
+        !/^[A-Za-z0-9._:-]{1,128}$/.test(requestedPostId)
+      ) {
+        throw new ApiError(400, "invalid_request", "postId is invalid.");
+      }
       const readMetadata = async () => {
         if (repository && (!repository.findTopicById || !repository.findMeshById)) {
           throw new ApiError(
@@ -10435,6 +10452,83 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
            JOIN agents a ON a.id = recent.agent_id
            ORDER BY recent.created_at ASC, recent.id ASC`,
         ).all(topicId, database.now(), limit) as Array<Record<string, string | null>>;
+      }
+      if (requestedPostId) {
+        if (authoritativePosts !== null) {
+          if (!repository?.findPostById) {
+            throw new ApiError(
+              503,
+              "conversation_store_unavailable",
+              "The conversation store cannot resolve the requested post.",
+            );
+          }
+          let exact: RepositoryPostRecord | null;
+          try {
+            exact = await repository.findPostById(requestedPostId);
+          } catch (error) {
+            throw new ApiError(
+              503,
+              "conversation_store_unavailable",
+              error instanceof Error ? error.message : "The conversation store is unavailable.",
+            );
+          }
+          if (
+            !exact ||
+            exact.topicId !== topicId ||
+            exact.moderationState !== "published" ||
+            (exact.expiresAt !== null && Date.parse(exact.expiresAt) <= Date.parse(database.now()))
+          ) {
+            throw new ApiError(404, "post_not_found", "Conversation post not found.");
+          }
+          if (!authoritativePosts?.some((post) => post.id === exact.postId)) {
+            let author: RepositoryAgentInput | null = null;
+            if (repository.findAgentById) {
+              try {
+                author = await repository.findAgentById(exact.agentId);
+              } catch (error) {
+                throw new ApiError(
+                  503,
+                  "conversation_store_unavailable",
+                  error instanceof Error ? error.message : "The conversation store is unavailable.",
+                );
+              }
+            }
+            authoritativePosts = [
+              ...(authoritativePosts ?? []),
+              {
+                id: exact.postId,
+                meshId: exact.meshId,
+                topicId: exact.topicId,
+                agentId: exact.agentId,
+                sessionId: exact.sessionId,
+                parentPostId: exact.parentPostId,
+                body: exact.body,
+                createdAt: exact.createdAt,
+                agent: author
+                  ? { id: author.agentId, name: author.name, handle: author.handle }
+                  : { id: exact.agentId, name: "", handle: "" },
+              },
+            ].sort((left, right) =>
+              left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
+            );
+          }
+        } else {
+          const exact = db.prepare(
+            `SELECT p.*, a.name AS agent_name, a.handle AS agent_handle
+             FROM posts p JOIN agents a ON a.id = p.agent_id
+             WHERE p.id = ? AND p.topic_id = ? AND p.moderation_state = 'published'
+               AND (p.expires_at IS NULL OR p.expires_at > ?)`
+          ).get(requestedPostId, topicId, database.now()) as Record<string, string | null> | undefined;
+          if (!exact) {
+            throw new ApiError(404, "post_not_found", "Conversation post not found.");
+          }
+          if (!(posts ?? []).some((post) => post.id === exact.id)) {
+            posts = [...(posts ?? []), exact].sort((left, right) =>
+              String(left.created_at).localeCompare(String(right.created_at)) ||
+              String(left.id).localeCompare(String(right.id)),
+            );
+          }
+        }
       }
       // Recheck after the body query. A role or visibility change that races
       // a read must not allow the response to disclose retained content.

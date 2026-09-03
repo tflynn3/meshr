@@ -282,6 +282,39 @@ test("public conversation reads return only retained published posts from active
   assert.equal(authorized.response.status, 200);
   assert.deepEqual(authorized.json.posts.map((post: any) => post.id), ["conversation-root", "conversation-reply"]);
 
+  for (let index = 0; index < 26; index += 1) {
+    insertPost.run(
+      `conversation-retained-${String(index).padStart(2, "0")}`,
+      null,
+      `A newer retained post ${index}.`,
+      `2026-08-27T19:${String(index).padStart(2, "0")}:00.000Z`,
+      "published",
+      null,
+    );
+  }
+  const latestWindow = await requestJson(
+    baseUrl,
+    "/v1/topics/topic-small-discoveries/posts",
+    { cookie: ownerCookie },
+  );
+  assert.equal(latestWindow.response.status, 200);
+  assert.equal(latestWindow.json.posts.length, 25);
+  assert.equal(
+    latestWindow.json.posts.some((post: any) => post.id === "conversation-root"),
+    false,
+  );
+  const exactRetained = await requestJson(
+    baseUrl,
+    "/v1/topics/topic-small-discoveries/posts?postId=conversation-root",
+    { cookie: ownerCookie },
+  );
+  assert.equal(exactRetained.response.status, 200);
+  assert.equal(exactRetained.json.posts.length, 26);
+  assert.ok(
+    exactRetained.json.posts.some((post: any) => post.id === "conversation-root"),
+    "the exact retained target must be included even outside the newest 25",
+  );
+
   const outsider = await requestJson(baseUrl, "/v1/accounts", {
     method: "POST",
     body: {
@@ -383,6 +416,115 @@ test("authenticated conversation reads use terminal durable role checks", async 
     cookie: "meshr_session=durable-conversation-token",
   });
   assert.equal(revoked.response.status, 404);
+});
+
+test("owner activity resolves target moderation only after the terminal ownership check", async () => {
+  const accountId = "activity-race-owner";
+  const now = "2026-08-27T18:00:00.000Z";
+  let agentReads = 0;
+  let postIsRedacted = false;
+  const repository = {
+    ensureEmptyProduction: async () => undefined,
+    findHumanSession: async () => ({
+      accountId,
+      csrfToken: "activity-race-csrf",
+      createdAt: now,
+      expiresAt: "2026-08-27T19:00:00.000Z",
+      absoluteExpiresAt: "2026-08-27T19:00:00.000Z",
+      lastSeenAt: now,
+    }),
+    findAccountById: async () => ({
+      accountId,
+      email: "activity-race@example.test",
+      displayName: "Activity race owner",
+      createdAt: now,
+    }),
+    findAgentById: async () => {
+      agentReads += 1;
+      if (agentReads === 2) postIsRedacted = true;
+      return {
+        agentId: "activity-race-agent",
+        ownerAccountId: accountId,
+        name: "Activity race agent",
+        handle: "activity-race-agent",
+        tagline: "",
+        interests: [],
+        personality: "",
+        attention: {},
+        runtime: "local",
+        runtimeLabel: "Fixture",
+        runtimeSubject: "fixture:activity-race",
+        publicKeyPem: "key",
+        definitionDigest: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+    },
+    listAgentActivities: async () => ({
+      activities: [{
+        activityId: "activity-race-read-001",
+        agentId: "activity-race-agent",
+        kind: "read",
+        source: "native",
+        action: "read_post",
+        outcome: "succeeded",
+        resourceType: "post",
+        resourceId: "activity-race-post",
+        meshId: "activity-race-mesh",
+        topicId: "activity-race-topic",
+        failureCode: null,
+        occurredAt: now,
+      }],
+      nextAfter: null,
+      recordedSince: now,
+    }),
+    findPostById: async () => ({
+      postId: "activity-race-post",
+      meshId: "activity-race-mesh",
+      topicId: "activity-race-topic",
+      agentId: "activity-race-agent",
+      sessionId: "activity-race-session",
+      parentPostId: null,
+      body: postIsRedacted ? "[redacted]" : "A body that must not leak after moderation.",
+      moderationState: postIsRedacted ? "redacted" : "published",
+      moderationReason: postIsRedacted ? "moderated" : null,
+      createdAt: now,
+      expiresAt: null,
+    }),
+    findMeshById: async () => ({
+      meshId: "activity-race-mesh",
+      ownerAccountId: accountId,
+      name: "Activity race mesh",
+      description: "",
+      visibility: "public",
+      admission: "open",
+      lifecycle: "active",
+      createdAt: now,
+      updatedAt: now,
+    }),
+    findTopicById: async () => ({
+      topicId: "activity-race-topic",
+      meshId: "activity-race-mesh",
+      name: "activity-race",
+      title: "Activity race topic",
+      description: "",
+      tags: [],
+      createdAt: now,
+    }),
+    findMeshAgentMembership: async () => ({ status: "joined" }),
+    findMeshHumanRole: async () => "owner",
+  } as unknown as MeshrRepository;
+  const { baseUrl } = await start({ repository });
+  const response = await requestJson(
+    baseUrl,
+    "/v1/agents/activity-race-agent/activity",
+    { cookie: "meshr_session=activity-race-token" },
+  );
+  assert.equal(response.response.status, 200);
+  assert.equal(agentReads, 2);
+  assert.equal(response.json.items[0].content.availability, "redacted");
+  assert.equal(response.json.items[0].content.excerpt, null);
+  assert.equal(response.json.items[0].target, null);
 });
 
 test("public auth config exposes cohort-level resident transparency without principal fingerprints", async () => {

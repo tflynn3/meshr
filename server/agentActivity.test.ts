@@ -470,3 +470,76 @@ test("an agent with no authoritative rows reports unavailable history without in
   assert.equal(page.json.coverage.recordedSince, null);
   assert.match(page.json.coverage.message, /not inferred/);
 });
+
+test("failed writes cannot splice a private topic into a public ledger context", async () => {
+  const run = await start();
+  const owner = await createOwner(run, "ledger-mismatch-owner");
+  const agent = await connectAgent(run, owner, "ledger-mismatch-agent", {
+    browse: "public",
+    rootPosts: "autonomous",
+    replies: "autonomous",
+  });
+  const now = run.app.database.now();
+  run.app.database.transaction(() => {
+    run.app.database.sqlite
+      .prepare(
+        `INSERT INTO meshes(
+           id, owner_account_id, name, description, visibility, join_policy,
+           lifecycle, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, 'private', 'invite_only', 'active', ?, ?)`,
+      )
+      .run(
+        "mesh-private-ledger",
+        owner.id,
+        "Private ledger mesh",
+        "This description must never reach the activity ledger.",
+        now,
+        now,
+      );
+    run.app.database.sqlite
+      .prepare(
+        `INSERT INTO topics(id, mesh_id, name, title, description, tags_json, created_at)
+         VALUES(?, 'mesh-private-ledger', ?, ?, ?, '[]', ?)`,
+      )
+      .run(
+        "topic-private-ledger",
+        "private-ledger",
+        "Private topic title",
+        "This private topic description must not be exposed.",
+        now,
+      );
+  });
+
+  const failed = await requestJson(run.baseUrl, "/v1/agent/posts", {
+    method: "POST",
+    authorization: agent.authorization,
+    idempotencyKey: "ledger-mismatched-topic-001",
+    activityId: "ledger-mismatched-topic-activity-001",
+    body: {
+      meshId: "mesh-public",
+      topicId: "topic-private-ledger",
+      body: "This failed write references mismatched targets.",
+    },
+  });
+  assert.equal(failed.response.status, 403);
+  assert.equal(failed.json.error.code, "mesh_access_denied");
+
+  const item = (await allLedgerItems(run, owner, agent.id, 50)).find(
+    (entry) =>
+      entry.outcome === "failed" &&
+      entry.failureCode === "mesh_access_denied" &&
+      entry.context.topicId === "topic-private-ledger",
+  );
+  assert.ok(item);
+  assert.equal(item.context.meshId, "mesh-public");
+  assert.equal(item.context.topicId, "topic-private-ledger");
+  assert.equal(item.context.topicTitle, null);
+  assert.equal(item.content.availability, "unavailable");
+  assert.equal(item.content.excerpt, null);
+  assert.equal(item.target, null);
+  assert.equal(JSON.stringify(item).includes("Private topic title"), false);
+  assert.equal(
+    JSON.stringify(item).includes("This private topic description must not be exposed."),
+    false,
+  );
+});
