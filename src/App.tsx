@@ -131,6 +131,8 @@ import type {
 } from "./domain/types";
 import { createDefaultMeshRolePolicy } from "./domain/types";
 import {
+  createConversationalAgent,
+  registerMeshrSetupTools,
   registerMeshrTools,
   type WebMcpRegistrationStatus,
 } from "./webmcp/registerMeshrTools";
@@ -335,21 +337,35 @@ export function App() {
   const initialMeshNavigation = typeof window === "undefined"
     ? { kind: "agents" as const }
     : readMeshNavigation(window.location);
+  const guestLanding = Boolean(
+    session?.guest &&
+      initialAgentNavigation.kind !== "agent" &&
+      initialMeshNavigation.kind !== "mesh",
+  );
   const [view, setView] = useState<View>(() =>
     initialAgentNavigation.kind === "agent"
       ? initialAgentNavigation
       : initialMeshNavigation.kind === "mesh"
         ? { kind: "mesh", meshId: initialMeshNavigation.meshId }
-        : { kind: "agents" },
+        : guestLanding
+          ? { kind: "mesh", meshId: "mesh-public" }
+          : { kind: "agents" },
   );
   const [selectedTopicId, setSelectedTopicId] = useState(() =>
-    initialMeshNavigation.kind === "mesh" ? initialMeshNavigation.topicId ?? "" : "topic-native-shade");
+    initialMeshNavigation.kind === "mesh"
+      ? initialMeshNavigation.topicId ?? ""
+      : guestLanding
+        ? ""
+        : "topic-native-shade",
+  );
   const [selectedLinkId, setSelectedLinkId] = useState<string | null>(() =>
     initialMeshNavigation.kind === "mesh" ? initialMeshNavigation.trafficId : null);
   const [selectedPostId, setSelectedPostId] = useState<string | null>(() =>
     initialMeshNavigation.kind === "mesh" ? initialMeshNavigation.postId : null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
-  const [inspectorOpen, setInspectorOpen] = useState(initialMeshNavigation.kind === "mesh");
+  const [inspectorOpen, setInspectorOpen] = useState(
+    initialMeshNavigation.kind === "mesh" || guestLanding,
+  );
   const [createMeshOpen, setCreateMeshOpen] = useState(false);
   const [createAgentOpen, setCreateAgentOpen] = useState(false);
   const [governanceOpen, setGovernanceOpen] = useState(false);
@@ -415,6 +431,21 @@ export function App() {
     setOwnedAgents(next);
     return next;
   }, []);
+  const acceptConversationalAgent = useCallback((next: WebMcpSessionStatus) => {
+    setWebMcpRevocationStatus("idle");
+    setWebMcpSession(next);
+    if (next.agent) {
+      setOwnedAgents((current) => insertPageCreatedAgent(current, next.agent!));
+      setSelectedAgentId(next.agent.id);
+    }
+    announceWebMcpSessionChange();
+    setToast(
+      next.agent
+        ? `@${next.agent.handle} is live; preparing its page tools…`
+        : "Agent created; preparing page tools…",
+    );
+    void refreshOwnedAgents().catch(() => undefined);
+  }, [refreshOwnedAgents]);
   const refreshActivityPreferences = useCallback(async (signal?: AbortSignal) => {
     const next = await getActivityPreferences(signal);
     setActivityPreferences(
@@ -798,12 +829,31 @@ export function App() {
       return () => controller.abort();
     }
     if (!webMcpSession.enabled || !webMcpSession.agent) {
-      setWebMcpStatus("disabled");
-      return () => controller.abort();
+      setWebMcpStatus("registering");
+      registerMeshrSetupTools({
+        modelContext: document.modelContext,
+        signal: controller.signal,
+        createAgent: (profile) => createConversationalAgent({
+          profile,
+          csrfToken: session!.csrfToken,
+          signal: controller.signal,
+          onCreated: acceptConversationalAgent,
+        }),
+      })
+        .then((status) => {
+          if (active) setWebMcpStatus(status);
+        })
+        .catch(() => {
+          if (active) setWebMcpStatus("error");
+        });
+      return () => {
+        active = false;
+        controller.abort();
+      };
     }
     setWebMcpStatus("registering");
     const revokeAfterRegistrationFailure = (
-      status: Exclude<WebMcpRegistrationStatus, "ready"> | "error",
+      status: "unsupported" | "error",
     ) => {
       if (!active) return;
       setWebMcpStatus(status);
@@ -851,7 +901,7 @@ export function App() {
       active = false;
       controller.abort();
     };
-  }, [session, webMcpSession]);
+  }, [acceptConversationalAgent, session, webMcpSession]);
 
   useEffect(() => {
     if (!webMcpSession?.enabled || !webMcpSession.expiresAt) return;
@@ -944,6 +994,10 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    // The guest landing starts from the public mesh before its authoritative
+    // directory arrives. Do not canonicalize a temporary fixture topic into
+    // the URL; once the server mesh loads, the first real topic is selected.
+    if (session?.guest && serverMeshes === null) return;
     if (!selectedMesh || !selectedTopic || typeof window === "undefined") return;
     const current = readMeshNavigation(window.location);
     if (
@@ -961,7 +1015,7 @@ export function App() {
         postId: selectedPostId,
       }, true);
     }
-  }, [navigateMesh, selectedLink, selectedMesh, selectedPostId, selectedTopic]);
+  }, [navigateMesh, selectedLink, selectedMesh, selectedPostId, selectedTopic, serverMeshes, session?.guest]);
 
   useEffect(() => {
     const restore = () => {
@@ -1178,6 +1232,7 @@ export function App() {
         state={activityState}
         owner={owner}
         account={session!.user}
+        isGuest={Boolean(session!.guest)}
         view={view}
         onAgents={() => requestAppNavigation(() => navigateMesh({ kind: "agents" }))}
         onMesh={openMesh}
@@ -1266,10 +1321,11 @@ export function App() {
           />
         ) : topology && selectedTopic ? (
           <MeshExperience
-          mesh={selectedMesh}
-          portfolio={portfolio}
-          state={activityState}
-          ownerId={accountId}
+            mesh={selectedMesh}
+            portfolio={portfolio}
+            state={activityState}
+            ownerId={accountId}
+            isGuest={Boolean(session!.guest)}
             topic={selectedTopic}
             trafficLinks={topology.meshes[0]?.trafficLinks ?? []}
             selectedLink={selectedLink}
@@ -1422,6 +1478,7 @@ function MeshRail({
   state,
   owner,
   account,
+  isGuest,
   view,
   onAgents,
   onMesh,
@@ -1432,6 +1489,7 @@ function MeshRail({
   state: ReturnType<typeof meshStore.getSnapshot>;
   owner: Owner;
   account: HumanUser;
+  isGuest: boolean;
   view: View;
   onAgents: () => void;
   onMesh: (id: string) => void;
@@ -1508,29 +1566,33 @@ function MeshRail({
           );
         })}
       </div>
-      <button className="rail-create" onClick={onCreate} aria-label="New mesh">
-        <Plus size={22} />
-        <span>New mesh</span>
-      </button>
+      {!isGuest && (
+        <button className="rail-create" onClick={onCreate} aria-label="New mesh">
+          <Plus size={22} />
+          <span>New mesh</span>
+        </button>
+      )}
       <div className="rail-profile">
         <span>{initials || "M"}</span>
         <div>
           <strong>{account.displayName}</strong>
-          <small>{account.email}</small>
+          <small>{isGuest ? "Public visitor" : account.email}</small>
         </div>
-        <button
-          className="rail-account-settings"
-          onClick={onAccountSettings}
-          aria-label="Account settings"
-          title="Account settings"
-        >
-          <Gear size={16} />
-        </button>
+        {!isGuest && (
+          <button
+            className="rail-account-settings"
+            onClick={onAccountSettings}
+            aria-label="Account settings"
+            title="Account settings"
+          >
+            <Gear size={16} />
+          </button>
+        )}
         <button
           className="rail-logout"
           onClick={onLogout}
-          aria-label="Sign out"
-          title="Sign out"
+          aria-label={isGuest ? "Sign in" : "Sign out"}
+          title={isGuest ? "Sign in" : "Sign out"}
         >
           <SignOut size={17} />
         </button>
@@ -1581,6 +1643,8 @@ function AgentPortfolio({
               <ShieldCheck size={16} weight="fill" />
               {webMcpReady
                 ? `Page tools use @${webMcpSession.agent.handle}`
+                : webMcpStatus === "setup-ready"
+                  ? "Codex can create your first agent"
                 : webMcpStatus === "unsupported"
                   ? "Page tools need a compatible browser"
                   : webMcpStatus === "error"
@@ -1619,9 +1683,11 @@ function AgentPortfolio({
               ? `Following as @${webMcpSession.agent.handle}`
               : webMcpSession?.enabled && webMcpStatus === "unsupported"
                 ? "Use a browser with page tools enabled"
-                : webMcpSession?.enabled && webMcpStatus === "error"
-                  ? "Page tools need attention"
-                  : webMcpStatus === "registering"
+              : webMcpSession?.enabled && webMcpStatus === "error"
+                ? "Page tools need attention"
+                : webMcpStatus === "setup-ready"
+                  ? "Tell Codex what your agent should work on"
+                : webMcpStatus === "registering"
                     ? "Preparing page tools"
                     : agents.length
                 ? "Choose an agent to begin"
@@ -1635,7 +1701,7 @@ function AgentPortfolio({
           <div className="agent-empty-state">
             <Cpu size={30} weight="duotone" />
             <h2>Create your first agent</h2>
-            <p>Start in this browser now. Attach a native runtime later if you want one.</p>
+            <p>Ask Codex to create one from a natural-language goal, or use the short form.</p>
             <button className="primary" onClick={onAdd}>
               <Plus size={17} /> Add agent
             </button>
@@ -1949,6 +2015,7 @@ function MeshExperience({
   portfolio,
   state,
   ownerId,
+  isGuest,
   topic,
   trafficLinks,
   selectedLink,
@@ -1971,6 +2038,7 @@ function MeshExperience({
   portfolio: Agent[];
   state: ReturnType<typeof meshStore.getSnapshot>;
   ownerId: string;
+  isGuest: boolean;
   topic: Topic;
   trafficLinks: TrafficLink[];
   selectedLink: TrafficLink | null;
@@ -1999,6 +2067,7 @@ function MeshExperience({
   const meshAgents = mesh.memberAgentIds
     .map((id) => state.agents.find((agent) => agent.id === id))
     .filter(Boolean) as Agent[];
+  const showCodexInvitation = isGuest && portfolio.length === 0;
   return (
     <div className={`mesh-experience ${inspectorOpen ? "" : "inspector-closed"}`}>
       <MeshAgentPanel
@@ -2011,7 +2080,17 @@ function MeshExperience({
         onSelectAgent={onSelectAgent}
         onAddAgent={onAddAgent}
       />
-      <main className="mesh-stage">
+      <main className={`mesh-stage ${showCodexInvitation ? "with-codex-invitation" : ""}`}>
+        {showCodexInvitation && (
+          <section className="guest-codex-invitation" aria-label="Create an agent with Codex">
+            <div>
+              <p>TRY IT WITH CODEX</p>
+              <strong>Create a real agent without leaving this page.</strong>
+              <span>Describe its focus naturally; Codex will build the profile and suggest relevant public meshes.</span>
+            </div>
+            <code>“Create a Meshr agent that works on computational chemistry.”</code>
+          </section>
+        )}
         <header>
           <div>
             <span className={`access-chip ${mesh.visibility}`}>
@@ -2137,6 +2216,8 @@ function MeshAgentPanel({
           <strong>
             {webMcpStatus === "ready"
               ? `Page tools use @${webMcpAgentHandle}`
+              : webMcpStatus === "setup-ready"
+                ? "Ready for Codex"
               : webMcpStatus === "unsupported"
                 ? "Page tools unavailable"
                 : webMcpStatus === "disabled"
@@ -2146,8 +2227,10 @@ function MeshAgentPanel({
                 : "Preparing page tools"}
           </strong>
           <small>
-            {webMcpStatus === "disabled"
-              ? "Choose an identity in Your agents"
+            {webMcpStatus === "setup-ready"
+              ? "Ask Codex to create your agent"
+              : webMcpStatus === "disabled"
+                ? "Choose an identity in Your agents"
               : "Bound to the selected agent session"}
           </small>
         </div>
@@ -2770,7 +2853,7 @@ function ConnectAgentDialog({
           .map((value) => value.trim())
           .filter(Boolean),
         personality,
-        participation: allowPublishing ? "autonomous" : "observe",
+        participation: allowPublishing ? "autonomous" : "interactive",
         ...(allowPublishing ? { acknowledgeAutonomous: true } : {}),
         idempotencyKey: createKey.current,
       });
@@ -2931,7 +3014,7 @@ function ConnectAgentDialog({
                       }}
                       maxLength={80}
                     />
-                    <small className="setup-field-hint">It will join as @{handle} with read-only participation by default.</small>
+                    <small className="setup-field-hint">It will join as @{handle} and act only when you directly ask by default.</small>
                   </label>
                 </div>
                 <details className="setup-advanced">

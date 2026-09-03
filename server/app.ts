@@ -166,6 +166,8 @@ const PAIRING_LOOKUP_ACCOUNT_BURST = 10;
 const PAIRING_LOOKUPS_PER_ACCOUNT_PER_MINUTE = 30;
 const SOCIAL_SESSION_SOURCE_BURST = 10;
 const SOCIAL_SESSIONS_PER_SOURCE_PER_MINUTE = 30;
+const GUEST_SESSION_SOURCE_BURST = 4;
+const GUEST_SESSIONS_PER_SOURCE_PER_MINUTE = 8;
 // A valid provider token is still replayable until it expires. Bound session
 // issuance by both the verified provider subject and its resolved Meshr
 // account so a copied token cannot mint an unbounded number of durable browser
@@ -334,6 +336,7 @@ const isAgentControlMutation = (method: string, path: string): boolean =>
   (method === "POST" && /^\/v1\/webmcp\/posts\/[^/]+\/replies$/.test(path)) ||
   (method === "POST" && /^\/v1\/agent\/posts\/[^/]+\/appeal$/.test(path)) ||
   (method === "POST" && /^\/v1\/agent\/meshes\/[^/]+\/join$/.test(path)) ||
+  (method === "POST" && /^\/v1\/webmcp\/meshes\/[^/]+\/join$/.test(path)) ||
   ((method === "PUT" || method === "DELETE") &&
     /^\/v1\/agent\/topics\/[^/]+\/follow$/.test(path)) ||
   (method === "PUT" && /^\/v1\/webmcp\/topics\/[^/]+\/follow$/.test(path));
@@ -579,6 +582,10 @@ const publicUser = (account: AccountRow) => ({
   displayName: account.display_name,
   createdAt: account.created_at,
 });
+
+const GUEST_EMAIL_SUFFIX = "@guest.meshr.invalid";
+const isGuestAccount = (account: Pick<AccountRow, "email">): boolean =>
+  account.email.toLowerCase().endsWith(GUEST_EMAIL_SUFFIX);
 
 const defaultAttention = {
   browse: "public" as const,
@@ -1840,7 +1847,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         throw new ApiError(
           401,
           "session_superseded",
-          "This runtime session has been superseded by a newer session.",
+          "This agent session has been superseded by a newer session.",
         );
       }
       if (error instanceof Error && error.message === "session_invalid") {
@@ -2603,6 +2610,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
   const socialSessionSourceLimiter = new TokenBucketLimiter(
     SOCIAL_SESSION_SOURCE_BURST,
     SOCIAL_SESSIONS_PER_SOURCE_PER_MINUTE / 60,
+    limiterNow,
+  );
+  const guestSessionSourceLimiter = new TokenBucketLimiter(
+    GUEST_SESSION_SOURCE_BURST,
+    GUEST_SESSIONS_PER_SOURCE_PER_MINUTE / 60,
     limiterNow,
   );
   const socialSessionIdentityLimiter = new TokenBucketLimiter(
@@ -4544,6 +4556,19 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     );
   };
 
+  const requirePageWriteAttention = (
+    agent: AgentRow,
+    field: "rootPosts" | "replies",
+  ): void => {
+    const policy = attentionFor(agent)[field];
+    if (policy === "autonomous" || policy === "draft") return;
+    throw new ApiError(
+      403,
+      "attention_policy_denied",
+      `This agent's ${field} policy does not allow publishing.`,
+    );
+  };
+
   const createHumanSession = async (
     accountId: string,
     socialIdentity?: { provider: SocialProvider; subject: string },
@@ -6378,6 +6403,9 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     sessionId: string;
     authorityEpoch: number;
     runtimeKind: RuntimeKind;
+    authorityKind?: "native" | "page";
+    grantId?: string;
+    humanSessionHash?: string;
     idempotencyKey: string;
     requestId: string;
     requestedAt: string;
@@ -6387,9 +6415,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     requestId?: string;
     duplicate: boolean;
   } | null> => {
-    if (!repository?.joinMeshForAgent) return null;
+    const joinStore = repository ?? localRepository;
+    if (!joinStore?.joinMeshForAgent) return null;
     try {
-      return await repository.joinMeshForAgent(input);
+      return await joinStore.joinMeshForAgent(input);
     } catch (error) {
       if (error instanceof Error && error.message === "invite_required") {
         throw new ApiError(
@@ -6468,7 +6497,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         throw new ApiError(
           401,
           "agent_authentication_failed",
-          "This runtime session is expired or offline.",
+          "This agent session is expired or no longer active.",
         );
       }
       if (
@@ -8149,6 +8178,75 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       };
     }
 
+    if (method === "POST" && path === "/v1/sessions/guest") {
+      enforceEndpointRate(
+        guestSessionSourceLimiter,
+        requestClientKey(request),
+        "guest_session_rate_limited",
+        "Guest session creation is temporarily rate limited. Try again shortly.",
+      );
+      const accountId = database.id("usr");
+      const createdAt = database.now();
+      const guestPasswordHash = await hashPassword(randomToken(32));
+      const account: AccountRow = {
+        id: accountId,
+        email: `visitor-${accountId.slice(4)}${GUEST_EMAIL_SUFFIX}`,
+        display_name: "Visitor",
+        // Guest accounts have no usable password. A product-standard hash of
+        // fresh random material keeps the ordinary account storage contract
+        // intact without creating a second identity model.
+        password_hash: guestPasswordHash,
+        created_at: createdAt,
+      };
+      if (repository) {
+        if (!repository.createPasswordAccount) {
+          throw new ApiError(
+            503,
+            "account_store_unavailable",
+            "The durable account store cannot create a guest workspace.",
+          );
+        }
+        try {
+          await repository.createPasswordAccount({
+            accountId: account.id,
+            email: account.email,
+            displayName: account.display_name,
+            passwordHash: guestPasswordHash,
+            createdAt,
+          });
+        } catch (error) {
+          throw new ApiError(
+            503,
+            "account_store_unavailable",
+            error instanceof Error
+              ? error.message
+              : "The durable guest account store is unavailable.",
+          );
+        }
+      }
+      db.prepare(
+        `INSERT INTO accounts(id, email, display_name, password_hash, created_at)
+         VALUES(?, ?, ?, ?, ?)`,
+      ).run(
+        account.id,
+        account.email,
+        account.display_name,
+        account.password_hash,
+        account.created_at,
+      );
+      const session = await createHumanSession(account.id);
+      return {
+        status: 201,
+        headers: { "Set-Cookie": sessionCookie(session.token, secureCookies) },
+        body: {
+          user: publicUser(account),
+          csrfToken: session.csrfToken,
+          sessionExpiresAt: session.expiresAt,
+          guest: true,
+        },
+      };
+    }
+
     if (method === "POST" && path === "/v1/sessions") {
       if (socialAuthOnly) {
         throw new ApiError(
@@ -8322,7 +8420,11 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           "Sign in is required.",
         );
       return {
-        body: { user: publicUser(account), csrfToken: principal.csrfToken },
+        body: {
+          user: publicUser(account),
+          csrfToken: principal.csrfToken,
+          guest: isGuestAccount(account),
+        },
       };
     }
 
@@ -9579,11 +9681,15 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         const participation = requiredString(createInput, "participation", {
           max: 16,
         });
-        if (participation !== "observe" && participation !== "autonomous") {
+        if (
+          participation !== "observe" &&
+          participation !== "interactive" &&
+          participation !== "autonomous"
+        ) {
           throw new ApiError(
             400,
             "invalid_request",
-            "createAgent.participation must be observe or autonomous.",
+            "createAgent.participation must be observe, interactive, or autonomous.",
           );
         }
         if (
@@ -9614,12 +9720,19 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
                 replies: "autonomous",
                 notes: "Participate autonomously in the public agent commons.",
               }
-            : {
+            : participation === "interactive"
+              ? {
+                  browse: "public",
+                  rootPosts: "draft",
+                  replies: "draft",
+                  notes: "Participate when directly instructed through this page.",
+                }
+              : {
                 browse: "public",
                 rootPosts: "never",
                 replies: "never",
                 notes: "Observe the public agent commons without publishing.",
-              };
+                };
         const profileInput: Record<string, unknown> = { attention };
         for (const field of [
           "name",
@@ -16841,6 +16954,59 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         return { body: boundedModelMeshDirectory(meshes) };
       }
 
+      const webMcpJoinMatch = matchingPath(
+        path,
+        /^\/v1\/webmcp\/meshes\/([^/]+)\/join$/,
+      );
+      if (method === "POST" && webMcpJoinMatch) {
+        requireCsrf(request, principal.human);
+        requireBrowsePolicy(principal.agent);
+        const meshId = decodeURIComponent(webMcpJoinMatch[1]);
+        assertDatabaseCutoverAllows(meshId);
+        const key = requireIdempotencyKey(request);
+        const input = asObject(await readJson(request));
+        for (const field of Object.keys(input)) {
+          if (field !== "invitationToken") {
+            throw new ApiError(400, "invalid_request", `${field} is not allowed.`);
+          }
+        }
+        const invitationTokenHash = input.invitationToken === undefined
+          ? undefined
+          : sha256(requiredString(input, "invitationToken", { min: 16, max: 512 }));
+        const requestedAt = database.now();
+        const requestId = `join_${sha256(`${meshId}:${principal.agentId}:${key}`).slice(0, 40)}`;
+        const joined = await joinMeshForAgentAuthoritatively({
+          meshId,
+          agentId: principal.agentId,
+          ownerAccountId: principal.ownerId,
+          sessionId: principal.sessionId ?? "",
+          authorityEpoch: principal.authorityEpoch ?? 0,
+          runtimeKind: "other",
+          authorityKind: "page",
+          grantId: principal.grant.token_hash,
+          humanSessionHash: principal.human.sessionHash,
+          idempotencyKey: key,
+          requestId,
+          requestedAt,
+          ...(invitationTokenHash ? { invitationTokenHash } : {}),
+        });
+        if (!joined) {
+          throw new ApiError(
+            503,
+            "authorization_store_unavailable",
+            "The mesh authorization store is unavailable.",
+          );
+        }
+        return {
+          status: joined.duplicate ? 200 : joined.status === "pending" ? 202 : 201,
+          body: {
+            meshId,
+            ...(joined.requestId ? { requestId: joined.requestId } : {}),
+            status: joined.status,
+          },
+        };
+      }
+
       if (method === "GET" && path === "/v1/webmcp/activity") {
         let browse = requireBrowsePolicy(principal.agent);
         enforceExpensiveAccountReadRate(principal.ownerId);
@@ -17070,7 +17236,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
 
       if (method === "POST" && path === "/v1/webmcp/posts") {
         requireCsrf(request, principal.human);
-        requireAutonomousAttention(principal.agent, "rootPosts");
+        requirePageWriteAttention(principal.agent, "rootPosts");
         const input = asObject(await readJson(request));
         for (const field of Object.keys(input)) {
           if (!new Set(["meshId", "topicId", "body"]).has(field)) {
@@ -17118,7 +17284,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             ? undefined
             : () => {
                 assertCurrentWebMcpGrant(principal);
-                requireAutonomousAttention(
+                requirePageWriteAttention(
                   currentAgentForCommit(principal.agentId),
                   "rootPosts",
                 );
@@ -17134,7 +17300,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
       );
       if (method === "POST" && webMcpReplyMatch) {
         requireCsrf(request, principal.human);
-        requireAutonomousAttention(principal.agent, "replies");
+        requirePageWriteAttention(principal.agent, "replies");
         const parentId = decodeURIComponent(webMcpReplyMatch[1]);
         const input = asObject(await readJson(request));
         for (const field of Object.keys(input)) {
@@ -17218,7 +17384,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
             ? undefined
             : () => {
                 assertCurrentWebMcpGrant(principal);
-                requireAutonomousAttention(
+                requirePageWriteAttention(
                   currentAgentForCommit(principal.agentId),
                   "replies",
                 );

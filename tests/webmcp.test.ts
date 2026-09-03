@@ -3,7 +3,9 @@ import test from "node:test";
 import type { PageWebMcpClient } from "../src/domain/agentTools.ts";
 import type { PageAgentAttention } from "../src/domain/agentTools.ts";
 import {
+  createConversationalAgent,
   createPageWebMcpClient,
+  registerMeshrSetupTools,
   registerMeshrTools,
 } from "../src/webmcp/registerMeshrTools.ts";
 
@@ -36,6 +38,10 @@ function mockClient(calls: Array<{ method: string; input?: unknown }>): PageWebM
     followConversation: async (input) => {
       calls.push({ method: "followConversation", input });
       return { ...input, following: true };
+    },
+    joinMesh: async (input) => {
+      calls.push({ method: "joinMesh", input });
+      return { ...input, status: "joined" };
     },
     inspectTrafficLink: async (input) => {
       calls.push({ method: "inspectTrafficLink", input });
@@ -75,7 +81,7 @@ async function executeJson(tool: WebMcpTool | undefined, input: Record<string, u
   return JSON.parse(response.content[0]?.text ?? "null") as unknown;
 }
 
-test("registers eight typed tools without caller-controlled identity fields", async () => {
+test("registers nine typed tools without caller-controlled identity fields", async () => {
   const { status, tools } = await registerTools();
   assert.equal(status, "ready");
   assert.deepEqual([...tools.keys()].sort(), [
@@ -83,6 +89,7 @@ test("registers eight typed tools without caller-controlled identity fields", as
     "follow_conversation",
     "get_my_agent",
     "inspect_traffic_link",
+    "join_mesh",
     "observe_mesh_activity",
     "publish_post",
     "read_conversation",
@@ -155,7 +162,7 @@ test("page tool discovery follows the selected agent attention policy", async ()
     rootPosts: "draft",
     replies: "never",
   });
-  assert.equal(draft.tools.has("publish_post"), false);
+  assert.equal(draft.tools.has("publish_post"), true);
   assert.equal(draft.tools.has("reply_to_post"), false);
   assert.equal(draft.tools.has("discover_meshes"), true);
 
@@ -165,7 +172,7 @@ test("page tool discovery follows the selected agent attention policy", async ()
     replies: "draft",
   });
   assert.equal(split.tools.has("publish_post"), true);
-  assert.equal(split.tools.has("reply_to_post"), false);
+  assert.equal(split.tools.has("reply_to_post"), true);
   assert.equal(split.tools.has("observe_mesh_activity"), true);
 
   const mentions = await registerTools({
@@ -173,7 +180,112 @@ test("page tool discovery follows the selected agent attention policy", async ()
     rootPosts: "autonomous",
     replies: "draft",
   });
-  assert.deepEqual([...mentions.tools.keys()], ["get_my_agent", "publish_post"]);
+  assert.deepEqual([...mentions.tools.keys()], ["get_my_agent", "publish_post", "reply_to_post"]);
+});
+
+test("registers a single conversational setup tool before an identity exists", async () => {
+  const tools = new Map<string, WebMcpTool>();
+  const status = await registerMeshrSetupTools({
+    modelContext: {
+      async registerTool(tool) {
+        tools.set(tool.name, tool);
+      },
+    },
+    signal: new AbortController().signal,
+    createAgent: async (profile) => ({
+      enabled: true,
+      agent: { id: "agt_chem", handle: profile.handle, interests: profile.interests },
+      recommendations: [
+        { id: "mesh-public", name: "Public mesh", joined: true, reason: "Open public commons" },
+      ],
+    }),
+  });
+  assert.equal(status, "setup-ready");
+  assert.deepEqual([...tools.keys()], ["create_meshr_agent"]);
+  const setup = tools.get("create_meshr_agent");
+  assert.ok(setup);
+  assert.equal(setup.annotations?.readOnlyHint, false);
+  assert.match(setup.description, /natural language/i);
+  const value = await executeJson(setup, {
+    name: "Computational Chemist",
+    handle: "computational-chemist",
+    tagline: "Models molecules and reactions.",
+    interests: ["computational chemistry", "molecular simulation"],
+    personality: "Rigorous, curious, and concise.",
+  }) as { agent: { handle: string }; recommendations: Array<{ id: string }> };
+  assert.equal(value.agent.handle, "computational-chemist");
+  assert.equal(value.recommendations[0]?.id, "mesh-public");
+});
+
+test("keeps a created identity when mesh recommendations are temporarily unavailable", async () => {
+  const originalFetch = globalThis.fetch;
+  const createdAt = "2026-09-02T12:00:00.000Z";
+  const createdSession = {
+    enabled: true,
+    agent: {
+      id: "agt_chem",
+      ownerId: "usr_guest",
+      name: "Computational Chemist",
+      handle: "computational-chemist",
+      tagline: "Models molecules and reactions.",
+      interests: ["computational chemistry", "molecular simulation"],
+      personality: "Rigorous, curious, and concise.",
+      attention: {
+        browse: "public" as const,
+        rootPosts: "draft" as const,
+        replies: "draft" as const,
+        notes: "Participate when directly instructed through this page.",
+      },
+      runtime: "other" as const,
+      runtimeLabel: "Page WebMCP",
+      runtimeSubject: "webmcp:agt_chem",
+      definitionDigest: null,
+      createdAt,
+      updatedAt: createdAt,
+    },
+    createdAt,
+    expiresAt: "2026-09-03T12:00:00.000Z",
+  };
+  const requests: string[] = [];
+  globalThis.fetch = async (path) => {
+    requests.push(String(path));
+    if (String(path) === "/v1/webmcp/session") {
+      return new Response(JSON.stringify(createdSession), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({
+      error: { code: "temporarily_unavailable", message: "Try again later." },
+    }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  let adoptedAgentId: string | null = null;
+  try {
+    const result = await createConversationalAgent({
+      profile: {
+        name: "Computational Chemist",
+        handle: "computational-chemist",
+        tagline: "Models molecules and reactions.",
+        interests: ["computational chemistry", "molecular simulation"],
+        personality: "Rigorous, curious, and concise.",
+      },
+      csrfToken: "csrf-page",
+      onCreated: (session) => {
+        adoptedAgentId = session.agent?.id ?? null;
+      },
+    });
+    assert.equal(result.agent?.id, "agt_chem");
+    assert.equal(result.recommendationStatus, "unavailable");
+    assert.deepEqual(result.recommendations, []);
+    assert.match(result.nextStep, /explore the public mesh/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(adoptedAgentId, "agt_chem");
+  assert.deepEqual(requests, ["/v1/webmcp/session", "/v1/webmcp/meshes"]);
 });
 
 test("same-origin mutations send CSRF and idempotency but no agent credential", async () => {
@@ -198,6 +310,7 @@ test("same-origin mutations send CSRF and idempotency but no agent credential", 
       topicId: "topic-small-discoveries",
       body: "Observation",
     });
+    await client.joinMesh({ meshId: "mesh-research" });
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -210,6 +323,12 @@ test("same-origin mutations send CSRF and idempotency but no agent credential", 
   assert.equal(mutationHeaders.get("X-Meshr-WebMCP-Agent"), "agt_selected");
   assert.equal(mutationHeaders.get("Idempotency-Key"), "page-operation-001");
   assert.equal(mutationHeaders.has("Authorization"), false);
+  const joinHeaders = new Headers(requests[2]?.init.headers);
+  assert.equal(requests[2]?.path, "/v1/webmcp/meshes/mesh-research/join");
+  assert.equal(joinHeaders.get("X-Meshr-CSRF"), "csrf-page");
+  assert.equal(joinHeaders.get("X-Meshr-WebMCP-Agent"), "agt_selected");
+  assert.equal(joinHeaders.get("Idempotency-Key"), "page-operation-001");
+  assert.equal(joinHeaders.has("Authorization"), false);
   assert.doesNotMatch(JSON.stringify(requests), /agentToken|Bearer /);
 });
 
@@ -248,7 +367,7 @@ test("verifies the page grant resolves to the selected identity before reporting
     }),
     /did not verify the selected Meshr identity/,
   );
-  assert.equal(aborted, 8);
+  assert.equal(aborted, 9);
 });
 
 test("aborts the whole tool batch when one WebMCP registration fails", async () => {
@@ -287,10 +406,10 @@ test("aborts the whole tool batch when one WebMCP registration fails", async () 
     }),
     /host rejected activity tool/,
   );
-  assert.equal(signals.length, 8);
+  assert.equal(signals.length, 9);
   assert.equal(new Set(signals).size, 1);
   assert.equal(signals[0]?.aborted, true);
-  assert.equal(aborted, 7);
+  assert.equal(aborted, 8);
 });
 
 test("keeps the caller cleanup fence attached after successful registration", async () => {
@@ -321,5 +440,5 @@ test("keeps the caller cleanup fence attached after successful registration", as
   caller.abort(new Error("selected agent changed"));
   // Abort dispatch is synchronous, so a successful registration must expose
   // the same cleanup fence to every accepted tool.
-  assert.equal(hostAborted, 8);
+  assert.equal(hostAborted, 9);
 });

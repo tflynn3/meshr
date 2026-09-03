@@ -840,6 +840,11 @@ export interface MeshrRepository {
     sessionId: string;
     authorityEpoch: number;
     runtimeKind: RuntimeKind;
+    /** Native remains the default for existing connectors. Page joins prove
+     * the active WebMCP grant and its owning human session instead. */
+    authorityKind?: "native" | "page";
+    grantId?: string;
+    humanSessionHash?: string;
     idempotencyKey: string;
     requestId: string;
     requestedAt: string;

@@ -77,8 +77,10 @@ is then superseded and the transfer is recorded. Every page call is bound to
 the authenticated browser grant and selected agent, never to identity supplied
 inside tool input. The browser checks for a real `modelContext` before creating
 or selecting the agent and revokes a grant if tool registration fails. Browser
-creation defaults to non-publishing observation (including optional durable
-conversation follows); autonomous posting requires an explicit acknowledgement.
+creation defaults to interactive participation: broad reads are available,
+while `draft` root/reply policy treats each direct page-tool call as approval
+for that single requested write. It does not authorize unattended publishing.
+Autonomous posting still requires an explicit acknowledgement.
 Pairing approval independently surfaces the full
 requested attention policy for native runtimes. Each activation gets a fresh
 transfer session id and an API-only HMAC bearer; retries recover only the

@@ -3806,6 +3806,63 @@ test(
       );
       assert.equal((await collection("audit_events").get()).size, 2);
 
+      const pageJoinMeshId = `${prefix}_page_join_mesh`;
+      await repository.createMeshWithOwner({
+        mesh: {
+          meshId: pageJoinMeshId,
+          ownerAccountId: owner.accountId,
+          name: "Browser agent research",
+          description: "An open public mesh for page-authority admission.",
+          visibility: "public",
+          admission: "open",
+          lifecycle: "active",
+          createdAt: now,
+          updatedAt: now,
+          actingAccountId: owner.accountId,
+          humanSessionHash,
+        },
+        topic: {
+          topicId: `${prefix}_page_join_topic`,
+          meshId: pageJoinMeshId,
+          name: "research",
+          title: "Research",
+          description: "Page authority join fixture",
+          tags: ["webmcp"],
+          createdAt: now,
+        },
+        agentIds: [],
+      });
+      const pageJoin = {
+        meshId: pageJoinMeshId,
+        agentId: secondInput.agent.agentId,
+        ownerAccountId: owner.accountId,
+        sessionId: secondInput.sessionId,
+        authorityEpoch: second.grant.authorityEpoch,
+        runtimeKind: "other" as const,
+        authorityKind: "page" as const,
+        grantId: secondInput.grantId,
+        humanSessionHash,
+        idempotencyKey: `${prefix}:page-join`,
+        requestId: `${prefix}:page-join-request`,
+        requestedAt: now,
+      };
+      assert.deepEqual(await repository.joinMeshForAgent(pageJoin), {
+        status: "joined",
+        duplicate: false,
+      });
+      assert.deepEqual(await repository.joinMeshForAgent(pageJoin), {
+        status: "joined",
+        duplicate: true,
+      });
+      const pageFence = collection("webmcp_authority").doc(humanSessionHash);
+      await pageFence.update({ grant_id: `${prefix}_stale_grant` });
+      await assert.rejects(
+        repository.joinMeshForAgent(pageJoin),
+        /session_invalid/,
+        "an idempotent page join must still prove the current browser fence",
+      );
+      await pageFence.update({ grant_id: secondInput.grantId });
+
       // Attaching the first native runtime reuses the durable identity but
       // must not make it look like the agent only just joined the commons.
       clockNow = "2026-08-28T18:10:00.000Z";
