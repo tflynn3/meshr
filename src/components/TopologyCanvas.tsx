@@ -18,6 +18,8 @@ import {
   Handle,
   Position,
   ReactFlow,
+  useNodesInitialized,
+  useReactFlow,
   type ReactFlowInstance,
   type Edge,
   type EdgeProps,
@@ -26,19 +28,21 @@ import {
 } from "@xyflow/react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { TrafficLink, TrafficProcessor } from "../domain/topology";
-import type { Agent, Topic } from "../domain/types";
+import type { Agent, RuntimeBinding, Topic } from "../domain/types";
+import { buildTopologyGraph, type TopologyParticipant } from "./topologyGraph";
 import { routeTrafficEdge, trafficPorts, visibleTrafficLinks, type TopologyRect } from "./topologyRouting";
 import "@xyflow/react/dist/style.css";
 
 interface ConversationNodeData extends Record<string, unknown> {
   topic: Topic;
-  agents: Agent[];
+  participants: TopologyParticipant[];
   selected: boolean;
   onSelect: (id: string) => void;
 }
 
 interface AgentNodeData extends Record<string, unknown> {
   agent: Agent;
+  badge: string;
   selected: boolean;
   onSelect: (id: string) => void;
 }
@@ -53,6 +57,18 @@ interface TrafficEdgeData extends Record<string, unknown> {
 type ConversationFlowNode = Node<ConversationNodeData, "conversation">;
 type AgentFlowNode = Node<AgentNodeData, "agent">;
 type FlowNode = ConversationFlowNode | AgentFlowNode;
+
+function FitTopologyToNodes({ layoutKey }: { layoutKey: string }) {
+  const nodesInitialized = useNodesInitialized();
+  const { fitView } = useReactFlow<FlowNode, Edge<TrafficEdgeData>>();
+
+  useEffect(() => {
+    if (!nodesInitialized) return;
+    void fitView({ padding: 0.04, duration: 0 });
+  }, [fitView, layoutKey, nodesInitialized]);
+
+  return null;
+}
 
 const topicIcons = [Plant, Drop, ThermometerHot, Images, FlowerLotus];
 const processorIcons: Record<TrafficProcessor, typeof FunnelSimple> = {
@@ -69,27 +85,6 @@ const processorLabels: Record<TrafficProcessor, string> = {
   "trust-check": "trust",
   "reply-path": "reply",
 };
-
-const conversationPositions = [
-  { x: 270, y: 230 },
-  { x: 20, y: 45 },
-  { x: 510, y: 45 },
-  { x: 30, y: 490 },
-  { x: 510, y: 500 },
-];
-
-const agentPositions = [
-  { x: 450, y: 430 },
-  { x: 280, y: 665 },
-  { x: 250, y: 20 },
-  { x: 520, y: 20 },
-  { x: 660, y: 370 },
-  { x: 100, y: 360 },
-  { x: 680, y: 150 },
-  { x: 70, y: 170 },
-  { x: 580, y: 675 },
-  { x: 70, y: 650 },
-];
 
 /**
  * React Flow expects ResizeObserver for its canvas and node lifecycle. A few
@@ -156,26 +151,6 @@ function installResizeObserverFallback() {
 
 installResizeObserverFallback();
 
-/**
- * React Flow normally measures custom nodes with ResizeObserver. Supplying the
- * authored dimensions keeps the topology visible in embedded/browser runtimes
- * that do not provide that API, while also keeping edge anchors deterministic.
- */
-function conversationDimensions(accent: Topic["accent"], selected: boolean) {
-  switch (accent) {
-    case "violet":
-      return { width: 252, height: 232 };
-    case "coral":
-      return { width: 264, height: 230 };
-    case "yellow":
-      return { width: 238, height: 246 };
-    case "blue":
-      return { width: 258, height: 224 };
-    default:
-      return selected ? { width: 270, height: 250 } : { width: 260, height: 240 };
-  }
-}
-
 function nodeHandles(width: number, height: number) {
   const centerY = Math.max(0, height / 2 - 0.5);
   return [
@@ -192,16 +167,22 @@ function ConversationNode({ data }: NodeProps<ConversationFlowNode>) {
     <Icon size={23} weight="duotone" />
     <strong>{data.topic.title}</strong>
     <span>{data.topic.recentActivityCount ? `${data.topic.recentActivityCount} recent` : `${data.topic.activityCount} posts`}</span>
-    <div className="node-agents">{data.agents.slice(0, 4).map((agent) => agent.avatarPath ? <img key={agent.id} src={agent.avatarPath} alt={agent.name} /> : <b key={agent.id} aria-label={agent.name}>{agent.initials}</b>)}{data.topic.participantAgentIds.length > 4 && <i>+{data.topic.participantAgentIds.length - 4}</i>}</div>
+    <div className="node-agents">{data.participants.slice(0, 4).map(({ agent, badge }) => {
+      const identity = `${agent.name} (@${agent.handle})`;
+      return agent.avatarPath
+        ? <img key={agent.id} src={agent.avatarPath} alt={identity} title={identity} />
+        : <b key={agent.id} aria-label={identity} title={identity}>{badge}</b>;
+    })}{data.topic.participantAgentIds.length > 4 && <i>+{data.topic.participantAgentIds.length - 4}</i>}</div>
     <small>{data.topic.description}</small>
   </button>;
 }
 
 function AgentNode({ data }: NodeProps<AgentFlowNode>) {
-  return <button type="button" className={`map-agent nodrag nopan ${data.agent.color} ${data.selected ? "selected" : ""}`} title={data.agent.name} onClick={() => data.onSelect(data.agent.id)} aria-pressed={data.selected} aria-label={`Inspect agent: ${data.agent.name}`}>
+  const identity = `${data.agent.name} (@${data.agent.handle})`;
+  return <button type="button" className={`map-agent nodrag nopan ${data.agent.color} ${data.selected ? "selected" : ""}`} title={identity} onClick={() => data.onSelect(data.agent.id)} aria-pressed={data.selected} aria-label={`Inspect agent: ${identity}`}>
     <Handle type="target" position={Position.Left} className="map-handle" />
     <Handle type="source" position={Position.Right} className="map-handle" />
-    {data.agent.avatarPath ? <img src={data.agent.avatarPath} alt="" /> : <b>{data.agent.initials}</b>}
+    {data.agent.avatarPath ? <img src={data.agent.avatarPath} alt="" /> : <b aria-hidden="true">{data.badge}</b>}
   </button>;
 }
 
@@ -232,6 +213,7 @@ const edgeTypes = { traffic: TrafficEdge };
 export function TopologyCanvas({
   topics,
   agents,
+  runtimeBindings,
   trafficLinks,
   selectedTopicId,
   selectedLinkId,
@@ -242,6 +224,7 @@ export function TopologyCanvas({
 }: {
   topics: Topic[];
   agents: Agent[];
+  runtimeBindings: RuntimeBinding[];
   trafficLinks: TrafficLink[];
   selectedTopicId: string;
   selectedLinkId: string | null;
@@ -277,36 +260,33 @@ export function TopologyCanvas({
     });
     observer.observe(element);
     return () => observer.disconnect();
-  }, []);
+  }, [presentation]);
 
   const { nodes, edges } = useMemo(() => {
-    const visibleTopics = topics.slice(0, 5);
-    const visibleAgents = agents.slice(0, 10);
-    const conversationNodes: ConversationFlowNode[] = visibleTopics.map((topic, index) => {
-      const selected = topic.id === selectedTopicId;
-      const dimensions = conversationDimensions(topic.accent, selected);
+    const graph = buildTopologyGraph({ topics, agents, runtimeBindings, selectedTopicId });
+    const conversationNodes: ConversationFlowNode[] = graph.topics.map(({ topic, participants, selected, rect }) => {
       return {
         id: topic.id,
         type: "conversation",
-        position: conversationPositions[index] ?? { x: 300 + index * 80, y: 200 + index * 65 },
-        width: dimensions.width,
-        height: dimensions.height,
-        handles: nodeHandles(dimensions.width, dimensions.height),
+        position: { x: rect.x, y: rect.y },
+        width: rect.width,
+        height: rect.height,
+        handles: nodeHandles(rect.width, rect.height),
         draggable: false,
         selectable: true,
-        data: { topic, agents: topic.participantAgentIds.map((id) => agents.find((agent) => agent.id === id)).filter(Boolean) as Agent[], selected, onSelect: onSelectTopic },
+        data: { topic, participants, selected, onSelect: onSelectTopic },
       };
     });
-    const agentNodes: AgentFlowNode[] = visibleAgents.map((agent, index) => ({
+    const agentNodes: AgentFlowNode[] = graph.agents.map(({ agent, badge, rect }) => ({
       id: agent.id,
       type: "agent",
-      position: agentPositions[index] ?? { x: 420, y: 340 },
-      width: 58,
-      height: 58,
-      handles: nodeHandles(58, 58),
+      position: { x: rect.x, y: rect.y },
+      width: rect.width,
+      height: rect.height,
+      handles: nodeHandles(rect.width, rect.height),
       draggable: false,
       selectable: false,
-      data: { agent, selected: agent.id === selectedAgentId, onSelect: onSelectAgent },
+      data: { agent, badge, selected: agent.id === selectedAgentId, onSelect: onSelectAgent },
     }));
     const layoutRects: TopologyRect[] = [...conversationNodes, ...agentNodes].map((node) => ({
       id: node.id,
@@ -315,7 +295,7 @@ export function TopologyCanvas({
       width: node.width ?? 58,
       height: node.height ?? 58,
     }));
-    const agentIds = new Set(visibleAgents.map((agent) => agent.id));
+    const agentIds = new Set(graph.agents.map(({ agent }) => agent.id));
     // Topics are not connected by a domain relationship. Only render
     // evidence-backed agent traffic; avoid implying decorative conversation
     // links that do not exist in the projection.
@@ -345,7 +325,7 @@ export function TopologyCanvas({
         })(),
       }));
     return { nodes: [...conversationNodes, ...agentNodes], edges: trafficEdges };
-  }, [agents, onSelectAgent, onSelectLink, onSelectTopic, reducedMotion, selectedAgentId, selectedLinkId, selectedTopicId, topics, trafficLinks]);
+  }, [agents, onSelectAgent, onSelectLink, onSelectTopic, reducedMotion, runtimeBindings, selectedAgentId, selectedLinkId, selectedTopicId, topics, trafficLinks]);
 
   return <section className={`topology-canvas ${presentation}`} aria-label="Mesh topology">
     <div className="topology-view-switch" role="group" aria-label="Topology presentation">
@@ -366,9 +346,8 @@ export function TopologyCanvas({
       fitViewOptions={{ padding: 0.04 }}
       onInit={(instance) => {
         flowRef.current = instance;
-        void instance.fitView({ padding: 0.04, duration: 0 });
       }}
-      minZoom={0.62}
+      minZoom={0.5}
       maxZoom={1.22}
       connectionMode={ConnectionMode.Loose}
       nodesDraggable={false}
@@ -377,6 +356,7 @@ export function TopologyCanvas({
       onEdgeClick={(_, edge) => edge.type === "traffic" && onSelectLink(edge.id)}
       proOptions={{ hideAttribution: true }}
     >
+      <FitTopologyToNodes layoutKey={nodes.map((node) => `${node.id}:${node.position.x}:${node.position.y}:${node.width}:${node.height}`).join("|")} />
       <Background color="#dddcd5" gap={46} size={0.7} />
     </ReactFlow>
     <div className="map-key"><ArrowsClockwise size={13} /><span>Agent reply traffic</span><small>Select a traffic node to inspect activity</small></div>
