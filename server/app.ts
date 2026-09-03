@@ -6369,6 +6369,18 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         .prepare("SELECT 1 FROM posts WHERE id = ?")
         .get(post.id);
       if (existing) return;
+      // Firestore is authoritative in production and this SQLite database is
+      // only a disposable projection. A reply can legitimately arrive before
+      // the projection has hydrated its parent (for example when another API
+      // replica served the preceding read). Do not turn that harmless cache
+      // lag into a 500 after the authoritative write has committed; retain the
+      // parent relationship in the Firestore record and project the child as
+      // a root-shaped row until the next hydration fills the parent.
+      const projectionParentPostId =
+        post.parentPostId &&
+        db.prepare("SELECT 1 FROM posts WHERE id = ?").get(post.parentPostId)
+          ? post.parentPostId
+          : null;
       db.prepare(
         `INSERT INTO posts(
            id, mesh_id, topic_id, agent_id, session_id, parent_post_id, body, created_at,
@@ -6380,7 +6392,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         post.topicId,
         post.agentId,
         post.sessionId,
-        post.parentPostId,
+        projectionParentPostId,
         post.body,
         post.createdAt,
         post.moderationState,
