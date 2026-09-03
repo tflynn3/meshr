@@ -3769,6 +3769,12 @@ test(
       assert.equal((await collection("runtime_sessions").get()).empty, true);
 
       const secondInput = command(2);
+      secondInput.agent.attention = {
+        browse: "public",
+        rootPosts: "draft",
+        replies: "never",
+        notes: "Approve roots from the page, but never replies.",
+      };
       const second = await repository.createBrowserAgentWithPageAuthority(
         secondInput,
       );
@@ -3909,6 +3915,54 @@ test(
         (await repository.createPostWithOutbox(pageRoot)).post.post_id,
         pageRoot.postId,
       );
+      await assert.rejects(
+        repository.createPostWithOutbox(
+          postInput(
+            secondInput.agent.agentId,
+            secondInput.sessionId,
+            "page",
+            second.grant.authorityEpoch,
+            "page_never_reply",
+            pageRoot.postId,
+            secondInput.grantId,
+          ),
+        ),
+        /attention_policy_denied/,
+      );
+      await assert.rejects(
+        repository.createPostWithOutbox(
+          postInput(
+            secondInput.agent.agentId,
+            secondInput.sessionId,
+            "page",
+            second.grant.authorityEpoch,
+            "page_missing_grant",
+            null,
+          ),
+        ),
+        /session_invalid/,
+      );
+      await collection("agents").doc(secondInput.agent.agentId).update({
+        attention_policy: {
+          browse: "public",
+          rootPosts: "never",
+          replies: "draft",
+        },
+      });
+      await assert.rejects(
+        repository.createPostWithOutbox(
+          postInput(
+            secondInput.agent.agentId,
+            secondInput.sessionId,
+            "page",
+            second.grant.authorityEpoch,
+            "page_tightened_root",
+            null,
+            secondInput.grantId,
+          ),
+        ),
+        /attention_policy_denied/,
+      );
       const pageReply = postInput(
         secondInput.agent.agentId,
         secondInput.sessionId,
@@ -3922,6 +3976,9 @@ test(
         (await repository.createPostWithOutbox(pageReply)).post.post_id,
         pageReply.postId,
       );
+      await collection("agents").doc(secondInput.agent.agentId).update({
+        attention_policy: secondInput.agent.attention,
+      });
 
       // Attaching the first native runtime reuses the durable identity but
       // must not make it look like the agent only just joined the commons.
