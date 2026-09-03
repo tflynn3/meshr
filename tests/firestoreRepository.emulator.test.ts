@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { Firestore, Timestamp } from "@google-cloud/firestore";
 import { test } from "node:test";
-import { FirestoreMeshrRepository } from "../server/firestoreRepository.ts";
+import {
+  FirestoreMeshrRepository,
+  type RepositoryPostInput,
+} from "../server/firestoreRepository.ts";
 import {
   MAX_ACTIVITY_PREFERENCES_PER_ACCOUNT,
   type RepositoryActivityProjection,
@@ -3701,9 +3704,9 @@ test(
             personality: "Careful and curious.",
             attention: {
               browse: "public",
-              rootPosts: "never",
-              replies: "never",
-              notes: "Observe without publishing.",
+              rootPosts: "draft",
+              replies: "draft",
+              notes: "Publish only with page approval.",
             },
             runtime: "other" as const,
             runtimeLabel: "Page WebMCP",
@@ -3863,6 +3866,63 @@ test(
       );
       await pageFence.update({ grant_id: secondInput.grantId });
 
+      const postInput = (
+        agentId: string,
+        sessionId: string,
+        authorityKind: "native" | "page",
+        authorityEpoch: number,
+        suffix: string,
+        parentPostId: string | null,
+        grantId?: string,
+      ): RepositoryPostInput => ({
+        postId: `${prefix}_${suffix}`,
+        meshId: "mesh-public",
+        topicId: "topic-small-discoveries",
+        agentId,
+        sessionId,
+        parentPostId,
+        body: `${authorityKind} ${parentPostId ? "reply" : "root"}`,
+        moderationState: "published",
+        expiresAt: "2026-08-29T18:00:00.000Z",
+        eventType: parentPostId ? "reply.created" : "post.created",
+        idempotencyKey: `${prefix}:${suffix}`,
+        requestHash: createHash("sha256")
+          .update(`${prefix}:${suffix}:request`)
+          .digest("hex"),
+        authorityKind,
+        authorityEpoch,
+        ownerAccountId: owner.accountId,
+        ...(authorityKind === "page"
+          ? { grantId, humanSessionHash }
+          : {}),
+      });
+      const pageRoot = postInput(
+        secondInput.agent.agentId,
+        secondInput.sessionId,
+        "page",
+        second.grant.authorityEpoch,
+        "page_draft_root",
+        null,
+        secondInput.grantId,
+      );
+      assert.equal(
+        (await repository.createPostWithOutbox(pageRoot)).post.post_id,
+        pageRoot.postId,
+      );
+      const pageReply = postInput(
+        secondInput.agent.agentId,
+        secondInput.sessionId,
+        "page",
+        second.grant.authorityEpoch,
+        "page_draft_reply",
+        pageRoot.postId,
+        secondInput.grantId,
+      );
+      assert.equal(
+        (await repository.createPostWithOutbox(pageReply)).post.post_id,
+        pageReply.postId,
+      );
+
       // Attaching the first native runtime reuses the durable identity but
       // must not make it look like the agent only just joined the commons.
       clockNow = "2026-08-28T18:10:00.000Z";
@@ -3918,6 +3978,43 @@ test(
           secondInput.agent.agentId,
         ]),
         [firstInput.agent.agentId],
+      );
+      const nativeSessionId = `${prefix}_native_session`;
+      const nativeSession = await repository.startRuntimeSession({
+        agentId: firstInput.agent.agentId,
+        bindingId: nativePairingId,
+        sessionId: nativeSessionId,
+        runtimeKind: "local",
+        tokenHash: createHash("sha256")
+          .update(`${prefix}:native-token`)
+          .digest("hex"),
+        expiresAt: "2026-08-28T19:10:00.000Z",
+      });
+      await assert.rejects(
+        repository.createPostWithOutbox(
+          postInput(
+            firstInput.agent.agentId,
+            nativeSessionId,
+            "native",
+            nativeSession.authorityEpoch,
+            "native_draft_root",
+            null,
+          ),
+        ),
+        /attention_policy_denied/,
+      );
+      await assert.rejects(
+        repository.createPostWithOutbox(
+          postInput(
+            firstInput.agent.agentId,
+            nativeSessionId,
+            "native",
+            nativeSession.authorityEpoch,
+            "native_draft_reply",
+            pageRoot.postId,
+          ),
+        ),
+        /attention_policy_denied/,
       );
 
       await repository.revokeWebMcpGrants(

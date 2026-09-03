@@ -11104,10 +11104,15 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       const attention = agent.get("attention_policy");
       const attentionField =
         input.eventType === "post.created" ? "rootPosts" : "replies";
+      const writePolicy =
+        attention && typeof attention === "object"
+          ? (attention as Record<string, unknown>)[attentionField]
+          : undefined;
+      // An active page grant makes this invocation the approval for a draft
+      // write. Native runtimes still need explicit autonomous authority.
       if (
-        !attention ||
-        typeof attention !== "object" ||
-        (attention as Record<string, unknown>)[attentionField] !== "autonomous"
+        writePolicy !== "autonomous" &&
+        !(input.authorityKind === "page" && writePolicy === "draft")
       ) {
         throw new Error("attention_policy_denied");
       }
