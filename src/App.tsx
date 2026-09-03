@@ -2163,11 +2163,11 @@ function MeshAgentPanel({
   onAddAgent: () => void;
 }) {
   return (
-    <aside className="mesh-agent-panel">
+    <aside className={`mesh-agent-panel ${portfolio.length === 0 ? "setup-empty" : ""}`} aria-labelledby="mesh-agent-panel-title">
       <header>
         <Sparkle size={18} weight="fill" />
         <div>
-          <strong>Agent activity</strong>
+          <strong id="mesh-agent-panel-title">Agent activity</strong>
           <span>{mesh.name}</span>
         </div>
       </header>
@@ -2211,7 +2211,7 @@ function MeshAgentPanel({
         <Check size={14} weight="bold" />
         <span>Profiles synced</span>
       </div>
-      <div className={`webmcp-status ${webMcpStatus}`}>
+      <div className={`webmcp-status ${webMcpStatus}`} role="status">
         <span />
         <div>
           <strong>

@@ -64,3 +64,75 @@ test("topology refits after React Flow has measured a new layout", () => {
   assert.match(topologySource, /<FitTopologyToNodes layoutKey=/);
   assert.match(topologySource, /observer\.disconnect\(\);\n  \}, \[presentation\]\);/);
 });
+
+test("closing the inspector preserves the medium-width mesh columns", () => {
+  const mediumWidthStyles = stylesSource.slice(
+    stylesSource.indexOf("@media (max-width: 980px)"),
+    stylesSource.indexOf("@media (max-width: 720px)"),
+  );
+
+  assert.match(
+    appSource,
+    /className=\{`mesh-experience \$\{inspectorOpen \? "" : "inspector-closed"\}`\}/,
+  );
+  assert.match(
+    appSource,
+    /className="inspector-reopen"[^>]*>Open conversation details<\/button>/,
+  );
+  assert.doesNotMatch(
+    mediumWidthStyles,
+    /\.mesh-experience\.inspector-closed\s*\{[^}]*display:\s*block/,
+    "the closed-inspector state must keep the agent panel and mesh stage in the responsive grid",
+  );
+});
+
+test("the empty agent setup panel is content-sized, scroll-safe, and labelled", () => {
+  assert.match(
+    appSource,
+    /<aside className=\{`mesh-agent-panel \$\{portfolio\.length === 0 \? "setup-empty" : ""\}`\} aria-labelledby="mesh-agent-panel-title">/,
+  );
+  assert.match(appSource, /<strong id="mesh-agent-panel-title">Agent activity<\/strong>/);
+  assert.match(appSource, /className=\{`webmcp-status \$\{webMcpStatus\}`\} role="status"/);
+  assert.match(
+    stylesSource,
+    /\.mesh-agent-panel\.setup-empty\s*\{[^}]*height:\s*auto/,
+  );
+  assert.match(
+    stylesSource,
+    /\.mesh-agent-list\s*\{[^}]*overflow-y:\s*auto/,
+  );
+});
+
+test("responsive mesh overlays and floating controls stay inside narrow desktops", () => {
+  const overlayStyles = stylesSource.slice(
+    stylesSource.indexOf("@media (max-width: 1193px)"),
+    stylesSource.indexOf("@media (max-width: 560px)"),
+  );
+  const narrowMeshStyles = stylesSource.slice(
+    stylesSource.indexOf("@media (max-width: 980px)"),
+    stylesSource.indexOf("@media (max-width: 720px)"),
+  );
+
+  assert.match(
+    overlayStyles,
+    /\.mesh-experience\s*\{[^}]*grid-template-columns:\s*205px minmax\(0, 1fr\)/,
+  );
+  assert.match(overlayStyles, /\.inspector\s*\{[^}]*position:\s*fixed/);
+  assert.match(narrowMeshStyles, /\.inspector-reopen\s*\{[^}]*position:\s*fixed/);
+  assert.match(
+    narrowMeshStyles,
+    /@media \(max-width: 900px\)[\s\S]*\.guest-codex-invitation\s*\{[^}]*grid-template-columns:\s*1fr/,
+  );
+  assert.match(narrowMeshStyles, /\.map-key small\s*\{[^}]*display:\s*none/);
+});
+
+test("the mesh rail stays pinned while a compact mesh page scrolls", () => {
+  assert.match(
+    appSource,
+    /className=\{`meshr-app \$\{view\.kind === "mesh" \? "mesh-open" : "portfolio-open"\}`\}/,
+  );
+  assert.match(
+    stylesSource,
+    /\.mesh-open > \.mesh-rail\s*\{[^}]*position:\s*sticky[^}]*top:\s*0[^}]*height:\s*100dvh/,
+  );
+});
