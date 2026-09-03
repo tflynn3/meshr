@@ -997,6 +997,102 @@ button:focus-visible {
 .control-two-lists strong { display: inline-flex; align-items: center; gap: 7px; color: #48533f; font-size: 11px; }
 .control-two-lists ul { margin: 10px 0 0; padding-left: 17px; color: #6b7068; font-size: 11px; line-height: 1.55; }
 .control-note { margin-top: 16px !important; padding-top: 13px; border-top: 1px solid #ecebe5; }
+.control-panel-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+.control-panel-heading .control-secondary-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}
+.control-profile-success,
+.control-profile-error {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  border-radius: 7px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.control-profile-success { background: #eff5df; color: #526625; }
+.control-profile-error { border: 1px solid #e7beb5; background: #fff2ef; color: #994734; }
+.control-profile-form {
+  padding: 23px;
+  border: 1px solid #d9dfbd;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #f9fbed, #fff 42%);
+}
+.control-profile-form > header {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  align-items: flex-start;
+}
+.control-profile-form h2 { margin: 7px 0 6px; color: #334522; font: 500 26px/1.12 Georgia, "Times New Roman", serif; letter-spacing: -0.45px; }
+.control-profile-form > header p:not(.eyebrow) { max-width: 620px; margin: 0; color: #68715f; font-size: 11px; line-height: 1.5; }
+.control-quiet-button {
+  min-height: 32px;
+  border: 1px solid #d0d4c6;
+  border-radius: 6px;
+  padding: 0 11px;
+  background: #fff;
+  color: #586052;
+  font-size: 10px;
+  font-weight: 700;
+}
+.control-profile-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 13px;
+  margin-top: 22px;
+}
+.control-profile-fields label,
+.control-attention-editor label {
+  display: grid;
+  gap: 5px;
+  color: #4b5446;
+  font-size: 10px;
+  font-weight: 700;
+}
+.control-profile-fields label small { color: #858a80; font-size: 9px; font-weight: 500; }
+.control-profile-fields input,
+.control-profile-fields textarea,
+.control-attention-editor select,
+.control-attention-editor textarea {
+  width: 100%;
+  border: 1px solid #cfd4c5;
+  border-radius: 6px;
+  padding: 8px 9px;
+  background: #fff;
+  color: #30382e;
+  font: inherit;
+  font-size: 11px;
+}
+.control-profile-fields textarea,
+.control-attention-editor textarea { resize: vertical; line-height: 1.45; }
+.control-field-wide { grid-column: 1 / -1; }
+.control-attention-editor {
+  margin: 20px 0 0;
+  padding: 15px;
+  border: 1px solid #dedfd6;
+  border-radius: 9px;
+}
+.control-attention-editor legend { padding: 0 4px; color: #58624e; font-size: 10px; font-weight: 750; }
+.control-attention-editor > div { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.control-attention-editor > label { margin-top: 14px; }
+.control-profile-form > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+  margin-top: 18px;
+}
+.control-profile-form > footer > span { color: #747a70; font-size: 10px; }
+.control-profile-form > footer .control-primary-action { margin: 0; }
+.control-profile-form > footer .control-primary-action:disabled { cursor: not-allowed; opacity: 0.55; }
 .control-session-row,
 .control-activity-list li,
 .control-connection-list li,
@@ -3659,6 +3755,13 @@ button:focus-visible {
   .control-panel {
     padding: 18px;
   }
+  .control-profile-form { padding: 18px; }
+  .control-profile-form > header,
+  .control-profile-form > footer { align-items: stretch; flex-direction: column; }
+  .control-profile-fields,
+  .control-attention-editor > div { grid-template-columns: 1fr; }
+  .control-field-wide { grid-column: auto; }
+  .control-panel-heading { align-items: flex-start; flex-direction: column; }
   .control-tabs button {
     padding: 0 11px;
   }

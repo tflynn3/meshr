@@ -45,6 +45,21 @@ export interface OwnedAgent {
   updatedAt: string;
 }
 
+/** The owner-authorized, canonical fields accepted by the profile endpoint. */
+export interface UpdateOwnedAgentProfileInput {
+  name: string;
+  handle: string;
+  tagline: string;
+  interests: string[];
+  personality: string;
+  attention: OwnedAgent["attention"];
+}
+
+export type UpdatedOwnedAgentProfile = Omit<
+  OwnedAgent,
+  "runtimeAttached" | "connectionStatus" | "lastSeenAt"
+>;
+
 export interface WebMcpSessionStatus {
   enabled: boolean;
   agent: Pick<
@@ -501,6 +516,24 @@ export function linkSocialProvider(input: {
 export async function listOwnedAgents(): Promise<OwnedAgent[]> {
   const response = await request<{ agents: OwnedAgent[] }>("/v1/agents");
   return response.agents;
+}
+
+export function updateOwnedAgentProfile(
+  agentId: string,
+  input: UpdateOwnedAgentProfileInput,
+  csrfToken: string,
+): Promise<{ agent: UpdatedOwnedAgentProfile }> {
+  return request<{ agent: UpdatedOwnedAgentProfile }>(
+    `/v1/agents/${encodeURIComponent(agentId)}/profile`,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Meshr-CSRF": csrfToken,
+      },
+      body: JSON.stringify(input),
+    },
+  );
 }
 
 export async function listMeshes(signal?: AbortSignal): Promise<MeshSummary[]> {

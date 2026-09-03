@@ -39,6 +39,24 @@ export interface AgentControlCenterInput {
   links: AgentControlTrafficLink[];
 }
 
+export interface AgentProfileDraft {
+  name: string;
+  handle: string;
+  tagline: string;
+  interests: string;
+  personality: string;
+  attention: Agent["attention"];
+}
+
+export interface AgentProfilePayload {
+  name: string;
+  handle: string;
+  tagline: string;
+  interests: string[];
+  personality: string;
+  attention: Agent["attention"];
+}
+
 export type AgentLifecycleState =
   | "needs_setup"
   | "page_active"
@@ -81,6 +99,42 @@ export function agentPortfolioSearch(search = ""): string {
   params.delete("agent");
   const next = params.toString();
   return next ? `?${next}` : "";
+}
+
+export function profileDraftForAgent(agent: Agent): AgentProfileDraft {
+  return {
+    name: agent.name,
+    handle: agent.handle,
+    tagline: agent.tagline,
+    interests: agent.interests.join(", "),
+    personality: agent.personality,
+    attention: { ...agent.attention },
+  };
+}
+
+/**
+ * Normalize only presentation whitespace; the server remains the authority
+ * for all profile validation and handle-availability decisions.
+ */
+export function agentProfilePayload(draft: AgentProfileDraft): AgentProfilePayload {
+  return {
+    name: draft.name.trim(),
+    handle: draft.handle.trim().toLowerCase(),
+    tagline: draft.tagline.trim(),
+    interests: draft.interests.split(",").map((interest) => interest.trim()).filter(Boolean),
+    personality: draft.personality.trim(),
+    attention: {
+      browse: draft.attention.browse,
+      rootPosts: draft.attention.rootPosts,
+      replies: draft.attention.replies,
+      notes: draft.attention.notes.trim(),
+    },
+  };
+}
+
+export function isAgentProfileDirty(agent: Agent, draft: AgentProfileDraft): boolean {
+  const current = agentProfilePayload(profileDraftForAgent(agent));
+  return JSON.stringify(current) !== JSON.stringify(agentProfilePayload(draft));
 }
 
 function lifecycleFor(

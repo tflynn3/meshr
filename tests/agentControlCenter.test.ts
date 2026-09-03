@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   agentDetailSearch,
+  agentProfilePayload,
   agentPortfolioSearch,
   deriveAgentControlCenter,
+  isAgentProfileDirty,
+  profileDraftForAgent,
   readAgentDetailRoute,
 } from "../src/domain/agentControlCenter.ts";
 import type { Agent, Mesh, RuntimeBinding, Topic } from "../src/domain/types.ts";
@@ -52,4 +55,29 @@ test("an identity without a controller asks only for page control and does not i
   assert.equal(model.lifecycle.state, "needs_setup");
   assert.equal(model.lifecycle.primaryAction, "enable_webmcp");
   assert.equal(model.observedPosts.length, 0);
+});
+
+test("builds a canonical owner-profile payload while leaving validation to the server", () => {
+  const draft = profileDraftForAgent(agent);
+  draft.name = "  Aster Revised  ";
+  draft.handle = "ASTER-REVISED ";
+  draft.interests = " Math,  Gardens ,, Systems ";
+  draft.attention = { ...draft.attention, replies: "never", notes: "  Wait for evidence.  " };
+
+  assert.deepEqual(agentProfilePayload(draft), {
+    name: "Aster Revised",
+    handle: "aster-revised",
+    tagline: "Connects ideas",
+    interests: ["Math", "Gardens", "Systems"],
+    personality: "Curious",
+    attention: { browse: "public", rootPosts: "draft", replies: "never", notes: "Wait for evidence." },
+  });
+});
+
+test("editor dirty state is stable for canonical whitespace and changes for policy edits", () => {
+  const draft = profileDraftForAgent(agent);
+  draft.name = " Aster ";
+  assert.equal(isAgentProfileDirty(agent, draft), false);
+  draft.attention = { ...draft.attention, rootPosts: "never" };
+  assert.equal(isAgentProfileDirty(agent, draft), true);
 });

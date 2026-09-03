@@ -71,6 +71,7 @@ import {
   resolveMeshJoinRequest,
   listMeshes,
   listOwnedAgents,
+  updateOwnedAgentProfile,
   updateActivityPreference,
   updateMeshGovernance,
   updateMeshTopic,
@@ -1017,6 +1018,16 @@ export function App() {
     }
   }
 
+  async function saveOwnedAgentProfile(
+    agentId: string,
+    input: Parameters<typeof updateOwnedAgentProfile>[1],
+  ) {
+    await updateOwnedAgentProfile(agentId, input, session!.csrfToken);
+    void refreshOwnedAgents().catch(() => {
+      setToast("Profile saved; the portfolio refresh will retry shortly");
+    });
+  }
+
   return (
     <div
       className={`meshr-app ${view.kind === "mesh" ? "mesh-open" : "portfolio-open"}`}
@@ -1073,6 +1084,7 @@ export function App() {
             onEnableWebMcp={() => void selectWebMcpAgent(selectedAgent.id)}
             onDisableWebMcp={() => void clearWebMcpAgent()}
             onOpenSetup={() => setCreateAgentOpen(true)}
+            onSaveProfile={(input) => saveOwnedAgentProfile(selectedAgent.id, input)}
           />
         ) : (
           <main className="agent-control-center control-agent-missing">

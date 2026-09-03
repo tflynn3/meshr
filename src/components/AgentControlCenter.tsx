@@ -6,7 +6,6 @@ import {
   CircleNotch,
   Clock,
   Compass,
-  Cpu,
   Gear,
   GlobeHemisphereWest,
   LinkSimple,
@@ -18,9 +17,13 @@ import {
   WarningCircle,
   X,
 } from "@phosphor-icons/react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import {
+  agentProfilePayload,
   deriveAgentControlCenter,
+  isAgentProfileDirty,
+  profileDraftForAgent,
+  type AgentProfilePayload,
   type AgentControlCenterInput,
 } from "../domain/agentControlCenter";
 import type { Agent } from "../domain/types";
@@ -70,14 +73,21 @@ export function AgentControlCenter({
   onEnableWebMcp,
   onDisableWebMcp,
   onOpenSetup,
+  onSaveProfile,
 }: {
   input: AgentControlCenterInput;
   onClose: () => void;
   onEnableWebMcp: () => void;
   onDisableWebMcp: () => void;
   onOpenSetup: () => void;
+  onSaveProfile: (input: AgentProfilePayload) => Promise<void>;
 }) {
   const [tab, setTab] = useState<DetailTab>("overview");
+  const [editingBehavior, setEditingBehavior] = useState(false);
+  const [profileDraft, setProfileDraft] = useState(() => profileDraftForAgent(input.agent));
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [profileError, setProfileError] = useState("");
+  const [profileSaved, setProfileSaved] = useState(false);
   const model = deriveAgentControlCenter(input);
   const { agent, runtime, webMcp } = input;
   const action = model.lifecycle.primaryAction;
@@ -94,6 +104,46 @@ export function AgentControlCenter({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
+
+  useEffect(() => {
+    if (!editingBehavior) setProfileDraft(profileDraftForAgent(agent));
+  }, [agent, editingBehavior]);
+
+  const profileDirty = isAgentProfileDirty(agent, profileDraft);
+
+  function beginEditingBehavior() {
+    setProfileDraft(profileDraftForAgent(agent));
+    setProfileError("");
+    setProfileSaved(false);
+    setEditingBehavior(true);
+  }
+
+  function cancelEditingBehavior() {
+    setProfileDraft(profileDraftForAgent(agent));
+    setProfileError("");
+    setEditingBehavior(false);
+  }
+
+  async function saveBehavior(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (savingProfile) return;
+    if (!profileDirty) {
+      setEditingBehavior(false);
+      return;
+    }
+    setSavingProfile(true);
+    setProfileError("");
+    setProfileSaved(false);
+    try {
+      await onSaveProfile(agentProfilePayload(profileDraft));
+      setEditingBehavior(false);
+      setProfileSaved(true);
+    } catch (caught) {
+      setProfileError(caught instanceof Error ? caught.message : "Could not save this profile.");
+    } finally {
+      setSavingProfile(false);
+    }
+  }
 
   return (
     <main className="agent-control-center" aria-labelledby="agent-control-title">
@@ -175,29 +225,57 @@ export function AgentControlCenter({
           </div>
         )}
         {tab === "behavior" && (
-          <div className="control-section-grid">
-            <article className="control-panel">
-              <p className="eyebrow">PERSONALITY</p>
-              <h2>How this identity is described</h2>
-              <p>{agent.personality || "No personality text is available from the synced definition."}</p>
-            </article>
-            <article className="control-panel">
-              <p className="eyebrow">ATTENTION POLICY</p>
-              <dl className="control-key-values">
-                <div><dt>Browse</dt><dd>{agent.attention.browse}</dd></div>
-                <div><dt>New posts</dt><dd>{agent.attention.rootPosts}</dd></div>
-                <div><dt>Replies</dt><dd>{agent.attention.replies}</dd></div>
-              </dl>
-              <p className="control-note">{agent.attention.notes || "No additional attention note is available."}</p>
-            </article>
-            <article className="control-panel control-wide-panel">
-              <p className="eyebrow">READS AND SHARES</p>
-              <div className="control-two-lists">
-                <div><strong><BookOpenText size={16} /> Tends to read</strong><ul>{agent.reads.map((item) => <li key={item}>{item}</li>)}</ul></div>
-                <div><strong><Pulse size={16} /> Tends to share</strong><ul>{agent.shares.map((item) => <li key={item}>{item}</li>)}</ul></div>
+          editingBehavior ? (
+            <form className="control-profile-form" onSubmit={(event) => void saveBehavior(event)}>
+              <header>
+                <div><p className="eyebrow">EDIT CANONICAL PROFILE</p><h2>Shape how this identity appears and participates.</h2><p>These edits update Meshr&apos;s owner-approved profile. They do not modify a native definition on another host.</p></div>
+                <button type="button" className="control-quiet-button" onClick={cancelEditingBehavior} disabled={savingProfile}>Cancel</button>
+              </header>
+              <div className="control-profile-fields">
+                <label>Display name<input required value={profileDraft.name} onChange={(event) => setProfileDraft((draft) => ({ ...draft, name: event.target.value }))} maxLength={80} /></label>
+                <label>Handle<input required value={profileDraft.handle} onChange={(event) => setProfileDraft((draft) => ({ ...draft, handle: event.target.value.toLowerCase() }))} minLength={2} maxLength={32} spellCheck={false} /></label>
+                <label className="control-field-wide">Tagline<input value={profileDraft.tagline} onChange={(event) => setProfileDraft((draft) => ({ ...draft, tagline: event.target.value }))} maxLength={180} /></label>
+                <label className="control-field-wide">Interests <small>Separate with commas</small><input value={profileDraft.interests} onChange={(event) => setProfileDraft((draft) => ({ ...draft, interests: event.target.value }))} /></label>
+                <label className="control-field-wide">Voice and temperament<textarea value={profileDraft.personality} onChange={(event) => setProfileDraft((draft) => ({ ...draft, personality: event.target.value }))} maxLength={2_000} rows={4} /></label>
               </div>
-            </article>
-          </div>
+              <fieldset className="control-attention-editor">
+                <legend>Attention policy</legend>
+                <div>
+                  <label>Browse<select value={profileDraft.attention.browse} onChange={(event) => setProfileDraft((draft) => ({ ...draft, attention: { ...draft.attention, browse: event.target.value as typeof draft.attention.browse } }))}><option value="public">Public meshes</option><option value="joined">Joined meshes</option><option value="mentions">Mentions only</option></select></label>
+                  <label>New posts<select value={profileDraft.attention.rootPosts} onChange={(event) => setProfileDraft((draft) => ({ ...draft, attention: { ...draft.attention, rootPosts: event.target.value as typeof draft.attention.rootPosts } }))}><option value="never">Never</option><option value="draft">Draft</option><option value="autonomous">Autonomous</option></select></label>
+                  <label>Replies<select value={profileDraft.attention.replies} onChange={(event) => setProfileDraft((draft) => ({ ...draft, attention: { ...draft.attention, replies: event.target.value as typeof draft.attention.replies } }))}><option value="never">Never</option><option value="draft">Draft</option><option value="autonomous">Autonomous</option></select></label>
+                </div>
+                <label>Attention note<textarea value={profileDraft.attention.notes} onChange={(event) => setProfileDraft((draft) => ({ ...draft, attention: { ...draft.attention, notes: event.target.value } }))} maxLength={2_000} rows={3} /></label>
+              </fieldset>
+              {profileError && <p className="control-profile-error" role="alert">{profileError}</p>}
+              <footer><span>{profileDirty ? "Changes are ready for Meshr to validate." : "No unsaved changes."}</span><button className="control-primary-action" disabled={!profileDirty || savingProfile}>{savingProfile ? "Saving…" : "Save profile"}</button></footer>
+            </form>
+          ) : (
+            <div className="control-section-grid">
+              <article className="control-panel">
+                <p className="eyebrow">PERSONALITY</p>
+                <h2>How this identity is described</h2>
+                <p>{agent.personality || "No personality text is available on this Meshr profile yet."}</p>
+              </article>
+              <article className="control-panel">
+                <p className="eyebrow">ATTENTION POLICY</p>
+                <dl className="control-key-values">
+                  <div><dt>Browse</dt><dd>{agent.attention.browse}</dd></div>
+                  <div><dt>New posts</dt><dd>{agent.attention.rootPosts}</dd></div>
+                  <div><dt>Replies</dt><dd>{agent.attention.replies}</dd></div>
+                </dl>
+                <p className="control-note">{agent.attention.notes || "No additional attention note is available."}</p>
+              </article>
+              <article className="control-panel control-wide-panel">
+                <div className="control-panel-heading"><p className="eyebrow">READS AND SHARES</p><button className="control-secondary-action" onClick={beginEditingBehavior}><Gear size={15} /> Edit profile</button></div>
+                {profileSaved && <p className="control-profile-success" role="status">Profile saved. The portfolio is refreshing its server projection.</p>}
+                <div className="control-two-lists">
+                  <div><strong><BookOpenText size={16} /> Tends to read</strong><ul>{agent.reads.map((item) => <li key={item}>{item}</li>)}</ul></div>
+                  <div><strong><Pulse size={16} /> Tends to share</strong><ul>{agent.shares.map((item) => <li key={item}>{item}</li>)}</ul></div>
+                </div>
+              </article>
+            </div>
+          )
         )}
         {tab === "runtime" && (
           <div className="control-section-grid">
