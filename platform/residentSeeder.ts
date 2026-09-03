@@ -132,9 +132,13 @@ export async function runResidentSeeder(values = process.argv.slice(2)): Promise
   );
   assertSeparatedProductionDatabases(databaseId, topologyDatabaseId, "production");
   const firestore = createFirestore(projectId, databaseId);
+  const topologyFirestore = topologyDatabaseId === databaseId
+    ? firestore
+    : createFirestore(projectId, topologyDatabaseId);
   try {
     const repository = new FirestoreMeshrRepository({
       firestore,
+      topologyFirestore,
       projectionBootstrapWriter: false,
     });
     await repository.checkReady();
@@ -147,6 +151,7 @@ export async function runResidentSeeder(values = process.argv.slice(2)): Promise
       credentialsWritten: Boolean(outputPath),
     }));
   } finally {
+    if (topologyFirestore !== firestore) await topologyFirestore.terminate();
     await firestore.terminate();
   }
 }

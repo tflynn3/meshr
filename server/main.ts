@@ -122,11 +122,11 @@ const app = createMeshrServer({
   publicWebUrl,
   socialAuthOnly,
   identityVerifier:
-    identityProjectId && socialAuthOnly
+    identityProjectId
       ? createIdentityPlatformVerifier(identityProjectId)
       : undefined,
   githubIdentityVerifier:
-    identityProjectId && socialAuthOnly
+    identityProjectId
       ? createGithubIdentityVerifier()
       : undefined,
   webMcpTransfersSession: settings.webMcpTransfersSession,
