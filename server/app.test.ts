@@ -4545,6 +4545,82 @@ test("durable event polling rechecks native session and browse authority after a
   }
 });
 
+test("durable join-request resolution survives a cold local projection", async (t) => {
+  const accountId = "durable-join-owner";
+  const meshId = "durable-approval-mesh";
+  const agentId = "durable-remote-agent";
+  const requestId = "durable-join-request";
+  const now = "2026-08-27T18:00:00.000Z";
+  let status: "pending" | "approved" = "pending";
+  const repository = {
+    ensureEmptyProduction: async () => undefined,
+    findHumanSession: async () => ({
+      accountId,
+      csrfToken: "durable-join-csrf",
+      createdAt: now,
+      expiresAt: "2026-08-27T19:00:00.000Z",
+      absoluteExpiresAt: "2026-08-27T19:00:00.000Z",
+      lastSeenAt: now,
+    }),
+    touchHumanSession: async () => undefined,
+    findAccountById: async () => ({
+      accountId,
+      email: "durable-join-owner@example.test",
+      displayName: "Durable join owner",
+      createdAt: now,
+    }),
+    findMeshHumanRole: async () => "owner",
+    findJoinRequest: async () => {
+      if (status !== "pending") {
+        throw new Error("post-commit read must not be required");
+      }
+      return {
+        requestId,
+        meshId,
+        agentId,
+        requestedByAccountId: "durable-remote-agent-owner",
+        status,
+        createdAt: now,
+        resolvedAt: null,
+      };
+    },
+    resolveJoinRequest: async (input: { decision: "approved" | "denied" }) => {
+      assert.equal(input.decision, "approved");
+      status = "approved";
+      return { agentId, status: "approved" as const };
+    },
+  } as unknown as MeshrRepository;
+  const warnings: unknown[][] = [];
+  const originalWarn = console.warn;
+  console.warn = (...values: unknown[]) => warnings.push(values);
+  t.after(() => {
+    console.warn = originalWarn;
+  });
+  const { baseUrl } = await start({ repository });
+
+  const resolved = await requestJson(
+    baseUrl,
+    `/v1/meshes/${meshId}/join-requests/${requestId}/resolve`,
+    {
+      method: "POST",
+      cookie: "meshr_session=durable-join-token",
+      csrf: "durable-join-csrf",
+      origin: baseUrl,
+      body: { decision: "approved" },
+    },
+  );
+
+  assert.equal(resolved.response.status, 200);
+  assert.deepEqual(resolved.json, {
+    requestId,
+    meshId,
+    agentId,
+    decision: "approved",
+  });
+  assert.equal(status, "approved");
+  assert.match(String(warnings[0]?.[0]), /committed durably.*local projection/i);
+});
+
 test("local join-request resolution rechecks session, role, and admission after a slow body", async () => {
   const { app, baseUrl, clock } = await start();
   const registration = await requestJson(baseUrl, "/v1/accounts", {
