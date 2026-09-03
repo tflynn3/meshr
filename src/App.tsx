@@ -1,4 +1,5 @@
 import {
+  ArrowLeft,
   ArrowRight,
   BellSlash,
   BookOpen,
@@ -90,6 +91,12 @@ import {
   type WebMcpSessionStatus,
 } from "./auth/api";
 import { TopologyCanvas } from "./components/TopologyCanvas";
+import { AgentControlCenter } from "./components/AgentControlCenter";
+import {
+  agentDetailSearch,
+  agentPortfolioSearch,
+  readAgentDetailRoute,
+} from "./domain/agentControlCenter";
 import { applyPublicActivitySnapshot } from "./domain/publicActivity";
 import { projectMeshTopology, type TrafficLink } from "./domain/topology";
 import { connectedAgentId, meshStore } from "./domain/runtime";
@@ -116,7 +123,10 @@ import {
   type WebMcpRegistrationStatus,
 } from "./webmcp/registerMeshrTools";
 
-type View = { kind: "agents" } | { kind: "mesh"; meshId: string };
+type View =
+  | { kind: "agents" }
+  | { kind: "agent"; agentId: string }
+  | { kind: "mesh"; meshId: string };
 const WEBMCP_SESSION_CHANNEL = "meshr.webmcp.session.v1";
 const DURABLE_STATE_REQUIRED = import.meta.env.VITE_DURABLE_STATE === "1";
 
@@ -306,7 +316,9 @@ export function App() {
     meshStore.subscribe,
     meshStore.getSnapshot,
   );
-  const [view, setView] = useState<View>({ kind: "agents" });
+  const [view, setView] = useState<View>(() =>
+    typeof window === "undefined" ? { kind: "agents" } : readAgentDetailRoute(window.location.search),
+  );
   const [selectedTopicId, setSelectedTopicId] = useState("topic-native-shade");
   const [selectedLinkId, setSelectedLinkId] = useState<string | null>(null);
   const [createMeshOpen, setCreateMeshOpen] = useState(false);
@@ -473,6 +485,10 @@ export function App() {
     [accountId, durableState, publicActivity],
   );
   const activityState = appliedPublicActivity?.state ?? durableState;
+  const selectedAgent =
+    view.kind === "agent"
+      ? portfolio.find((agent) => agent.id === view.agentId) ?? null
+      : null;
   const selectedMesh =
     view.kind === "mesh"
       ? (activityState.meshes.find((mesh) => mesh.id === view.meshId) ??
@@ -807,6 +823,12 @@ export function App() {
   }, [webMcpSession]);
 
   useEffect(() => {
+    const onPopState = () => setView(readAgentDetailRoute(window.location.search));
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(""), 2600);
     return () => window.clearTimeout(timer);
@@ -817,6 +839,32 @@ export function App() {
     setView({ kind: "mesh", meshId });
     setSelectedTopicId(firstTopic?.id ?? "");
     setSelectedLinkId(null);
+  }
+
+  function openAgent(agentId: string) {
+    const url = new URL(window.location.href);
+    url.search = agentDetailSearch(agentId, url.search);
+    const currentHistoryState = window.history.state;
+    window.history.pushState(
+      {
+        ...(currentHistoryState && typeof currentHistoryState === "object" ? currentHistoryState : {}),
+        meshrAgentDetail: true,
+      },
+      "",
+      url,
+    );
+    setView({ kind: "agent", agentId });
+  }
+
+  function closeAgent() {
+    if (window.history.state?.meshrAgentDetail) {
+      window.history.back();
+      return;
+    }
+    const url = new URL(window.location.href);
+    url.search = agentPortfolioSearch(url.search);
+    window.history.replaceState(window.history.state, "", url);
+    setView({ kind: "agents" });
   }
 
   async function selectWebMcpAgent(agentId: string) {
@@ -897,7 +945,7 @@ export function App() {
 
   return (
     <div
-      className={`meshr-app ${view.kind === "agents" ? "portfolio-open" : "mesh-open"}`}
+      className={`meshr-app ${view.kind === "mesh" ? "mesh-open" : "portfolio-open"}`}
     >
       <MeshRail
         state={activityState}
@@ -925,7 +973,42 @@ export function App() {
           onClearWebMcp={() => void clearWebMcpAgent()}
           onInvitationAccepted={() => void refreshMeshes().catch(() => setToast("Role accepted; refresh failed"))}
           onAdd={() => setCreateAgentOpen(true)}
+          onOpenAgent={openAgent}
         />
+      ) : view.kind === "agent" ? (
+        selectedAgent ? (
+          <AgentControlCenter
+            input={{
+              agent: selectedAgent,
+              runtime:
+                activityState.runtimeBindings.find(
+                  (binding) => binding.agentId === selectedAgent.id && binding.runtime === "openclaw",
+                ) ?? activityState.runtimeBindings.find((binding) => binding.agentId === selectedAgent.id),
+              webMcp: {
+                enabled: Boolean(webMcpSession?.enabled),
+                agentId: webMcpSession?.agent?.id ?? null,
+                expiresAt: webMcpSession?.expiresAt ?? null,
+                status: webMcpStatus,
+              },
+              meshes: activityState.meshes,
+              topics: activityState.topics,
+              posts: activityState.posts,
+              links: appliedPublicActivity?.trafficLinks ?? [],
+            }}
+            onClose={closeAgent}
+            onEnableWebMcp={() => void selectWebMcpAgent(selectedAgent.id)}
+            onDisableWebMcp={() => void clearWebMcpAgent()}
+            onOpenSetup={() => setCreateAgentOpen(true)}
+          />
+        ) : (
+          <main className="agent-control-center control-agent-missing">
+            <button className="control-back" onClick={closeAgent}>
+              <ArrowLeft size={17} /> <span>All agents</span>
+            </button>
+            <h1>Agent unavailable</h1>
+            <p>This identity is not available in the current portfolio projection.</p>
+          </main>
+        )
       ) : (
         selectedMesh &&
         selectedTopic &&
@@ -1137,6 +1220,7 @@ function AgentPortfolio({
   onClearWebMcp,
   onInvitationAccepted,
   onAdd,
+  onOpenAgent,
 }: {
   agents: Agent[];
   state: ReturnType<typeof meshStore.getSnapshot>;
@@ -1149,6 +1233,7 @@ function AgentPortfolio({
   onClearWebMcp: () => void;
   onInvitationAccepted: () => void;
   onAdd: () => void;
+  onOpenAgent: (agentId: string) => void;
 }) {
   const webMcpReady = webMcpStatus === "ready" && Boolean(webMcpSession?.enabled && webMcpSession.agent);
   return (
@@ -1235,10 +1320,11 @@ function AgentPortfolio({
             webMcpBusy={webMcpBusyAgentId !== null}
             onSelectWebMcp={() => onSelectWebMcp(agent.id)}
             onClearWebMcp={onClearWebMcp}
+            onOpen={() => onOpenAgent(agent.id)}
           />
         ))}
       </section>
-      <PortfolioConversationPreview agents={agents} state={state} />
+      <PortfolioConversationPreview agents={agents} state={state} onOpenAgent={onOpenAgent} />
     </main>
   );
 }
@@ -1251,6 +1337,7 @@ function AgentCard({
   webMcpBusy,
   onSelectWebMcp,
   onClearWebMcp,
+  onOpen,
 }: {
   agent: Agent;
   state: ReturnType<typeof meshStore.getSnapshot>;
@@ -1259,6 +1346,7 @@ function AgentCard({
   webMcpBusy: boolean;
   onSelectWebMcp: () => void;
   onClearWebMcp: () => void;
+  onOpen: () => void;
 }) {
   const runtime =
     state.runtimeBindings.find(
@@ -1276,13 +1364,14 @@ function AgentCard({
   const runtimeActivity = runtimeActivityCopy(runtime);
   return (
     <article className={`agent-card ${agent.color}`}>
-      <header>
+      <button className="agent-card-open" onClick={onOpen} aria-label={`Open ${agent.name} control center`}>
         <AgentAvatar agent={agent} size="large" />
         <div>
           <h2>{agent.name}</h2>
           <p>{agent.tagline}</p>
         </div>
-      </header>
+        <ArrowRight size={18} aria-hidden="true" />
+      </button>
       <section>
         <h3>INTERESTS</h3>
         <div className="interest-tags">
@@ -1476,9 +1565,11 @@ function RoleInvitationInbox({
 function PortfolioConversationPreview({
   agents,
   state,
+  onOpenAgent,
 }: {
   agents: Agent[];
   state: ReturnType<typeof meshStore.getSnapshot>;
+  onOpenAgent: (agentId: string) => void;
 }) {
   const previews = agents
     .map((agent) => {
@@ -1503,14 +1594,19 @@ function PortfolioConversationPreview({
       </header>
       <div>
         {previews.map(({ agent, topic }) => (
-          <article key={agent.id}>
+          <button
+            key={agent.id}
+            className="portfolio-preview-row"
+            onClick={() => onOpenAgent(agent.id)}
+            aria-label={`Open ${agent.name} control center from ${topic!.title}`}
+          >
             <AgentAvatar agent={agent} />
             <div>
               <strong>{topic!.title}</strong>
               <span>{topic!.description}</span>
             </div>
             <Pulse size={17} weight="bold" />
-          </article>
+          </button>
         ))}
       </div>
     </section>
