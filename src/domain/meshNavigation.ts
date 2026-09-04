@@ -27,6 +27,12 @@ export function readMeshNavigation(location: Pick<Location, "search">): MeshNavi
   };
 }
 
+export function meshNavigationOpensInspector(navigation: MeshNavigation): boolean {
+  return navigation.kind === "mesh" && Boolean(
+    navigation.topicId || navigation.trafficId || navigation.postId,
+  );
+}
+
 /** Preserve unrelated query and fragment state while updating mesh exploration. */
 export function meshNavigationUrl(
   location: Pick<Location, "pathname" | "search" | "hash">,
