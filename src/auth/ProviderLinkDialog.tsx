@@ -47,6 +47,11 @@ export function ProviderLinkDialog({
   const [error, setError] = useState("");
 
   useEffect(() => {
+    document.body.classList.add("modal-open");
+    return () => document.body.classList.remove("modal-open");
+  }, []);
+
+  useEffect(() => {
     let active = true;
     void Promise.all([getLinkedProviders(), getAuthConfig()])
       .then(([linked, config]) => {

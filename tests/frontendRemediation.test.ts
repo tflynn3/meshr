@@ -11,6 +11,10 @@ const ledgerSource = readFileSync(
   new URL("../src/components/AgentActivityLedger.tsx", import.meta.url),
   "utf8",
 );
+const providerDialogSource = readFileSync(
+  new URL("../src/auth/ProviderLinkDialog.tsx", import.meta.url),
+  "utf8",
+);
 const stylesSource = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
 
 test("inaccessible deep links remain addressed and render an unavailable state", () => {
@@ -144,6 +148,10 @@ test("responsive mesh overlays and floating controls stay inside narrow desktops
     /\.mesh-experience\s*\{[^}]*grid-template-columns:\s*205px minmax\(0, 1fr\)/,
   );
   assert.match(overlayStyles, /\.inspector\s*\{[^}]*position:\s*fixed/);
+  assert.match(
+    overlayStyles,
+    /\.inspector\s*\{[^}]*left:\s*auto[^}]*width:\s*min\(340px, calc\(100vw - 28px\)\)/,
+  );
   assert.match(narrowMeshStyles, /\.inspector-reopen\s*\{[^}]*position:\s*fixed/);
   assert.match(
     narrowMeshStyles,
@@ -159,11 +167,28 @@ test("responsive mesh overlays and floating controls stay inside narrow desktops
     /\.meshr-app\s*\{[^}]*grid-template-columns:\s*44px minmax\(0, 1fr\)/,
   );
   assert.match(embeddedBrowserStyles, /\.rail-mesh\s*\{[^}]*width:\s*36px/);
-  assert.match(embeddedBrowserStyles, /\.inspector\s*\{[^}]*left:\s*54px/);
+  assert.match(
+    embeddedBrowserStyles,
+    /\.inspector\s*\{[^}]*width:\s*min\(340px, calc\(100vw - 64px\)\)/,
+  );
   assert.match(
     embeddedBrowserStyles,
     /\.rail-profile\s*\{[^}]*grid-template-columns:\s*1fr[^}]*grid-template-rows:\s*30px 26px 26px/,
   );
+});
+
+test("view changes reset stale page offsets and dialogs contain their own scrolling", () => {
+  assert.match(appSource, /const viewScrollKey = view\.kind === "mesh"/);
+  assert.match(
+    appSource,
+    /useLayoutEffect\(\(\) => \{\s*window\.scrollTo\(\{ left: 0, top: 0 \}\);\s*\}, \[viewScrollKey\]\)/,
+  );
+  assert.match(appSource, /document\.body\.classList\.add\("modal-open"\)/);
+  assert.match(providerDialogSource, /document\.body\.classList\.add\("modal-open"\)/);
+  assert.match(stylesSource, /body\.modal-open\s*\{[^}]*overflow:\s*hidden/);
+  assert.match(stylesSource, /\.inspector\s*\{[^}]*overscroll-behavior:\s*contain/);
+  assert.match(stylesSource, /\.modal\s*\{[^}]*overscroll-behavior:\s*contain/);
+  assert.match(stylesSource, /\.account-dialog\s*\{[^}]*overscroll-behavior:\s*contain/);
 });
 
 test("the mesh rail stays pinned while a compact mesh page scrolls", () => {
