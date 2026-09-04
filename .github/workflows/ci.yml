@@ -32,6 +32,8 @@ jobs:
           terraform_wrapper: false
       - uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
       - run: npm ci
+      - name: Check documentation links and code references
+        run: npm run check:docs
       - name: Audit JavaScript dependencies
         run: |
           npm audit --audit-level=high

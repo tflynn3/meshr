@@ -4,19 +4,96 @@ This runbook defines the evidence required for the four-hour RTO and one-hour
 RPO. It is intentionally separate from the local emulator smoke: a green
 emulator run proves protocol behavior, not managed GCP recovery.
 
-## Drill matrix
+## Drill index
 
-| Drill | Procedure | Pass evidence |
-| --- | --- | --- |
-| Pod loss | Evict one API and live-gateway Pod while the canary load smoke is running; separately delete an ingest or singleton worker Pod to exercise restart recovery. Repeat with one serving replica unavailable. | API/live-gateway PDBs keep one serving replica. Ingest and worker restarts recover from the durable outbox/subscriptions; no accepted write is lost, backlog drains, and topology cursor recovery is below five seconds. Direct deletion of a singleton is not evidence of PDB protection. |
-| Gateway disconnect | Terminate a viewer socket and roll the live gateway Deployment. | The client reconnects with jitter, resumes from its cursor, receives no duplicate topology revision, and remains authorized. |
-| Firestore interruption | Inject a bounded Firestore outage or deny the workload IAM binding, then restore it. | Readiness goes false without a liveness restart loop; accepted writes fail explicitly or remain retryable; no stale session regains authority after recovery. |
-| Duplicate/reordered events | Publish the same event twice and deliver a later event before an earlier event to the worker subscriptions. | Idempotency ledger prevents duplicate projections and the materializer converges to the same snapshot after replay. |
-| DLQ replay | Force a bounded worker failure, confirm dead-letter forwarding, run the dry-run first, then apply a reviewed bounded replay from an operator environment. | Apply republishes events, records an immutable receipt in the dedicated release-audit database, and only then acknowledges the DLQ messages. Downstream idempotency restores the projection without exposing post bodies. |
-| Firestore restore | Restore the authority database into an isolated named database. Provision a fresh empty topology database (do not restore populated projections), authorize both with `additional_*_database_names`, suspend Flux, fence and quiesce all database readers and the force-reconciled bootstrap Job, and capture the source outbox high-watermark. Restore the authority, copy the fence-bound authority delta with matching per-collection SHA-256 manifests (sorted collection name, count, and digest), replay the bounded source delta into the fresh topology, and produce a schema-2 cutover receipt with a unique `receipt_id` and recent `issued_at`. The protected promotion workflow must pass `npm run verify:cutover-receipt` and atomically consume that receipt in the isolated release-audit database before switching the runtime values; a retry after rollback requires a new receipt. Run the generation-fenced one-shot bootstrap Job, attest its generation, resume Flux, and run the session-only private root/reply smoke before reopening writes. Stage the renewed validation session, capture its absolute expiry, and enforce a minimum remaining horizon before setting the irreversible commit marker or CAS-promoting it while writes are still fenced. Reopen writes and complete rollout plus canonical heartbeat/profile verification before the expiry with a 60-second safety reserve; retire the predecessor only after that check passes. A deadline failure leaves the successor pointer intact and requires operator-led roll-forward. | Private-mesh isolation, last-owner protection, session fences, topology snapshots, and the authenticated smoke all pass before the old database is retired; the receipt proves fence-before-restore, complete per-collection authority-delta equality, replay ordering, and equal source/target outbox high-watermarks, with no old/new worker overlap during the cutover. |
-| Cluster rebuild | Recreate the GKE cluster from OpenTofu, reinstall Gateway API/Flux/metrics adapter, restore protected substitutions, and reconcile the pinned release. | Every managed resource is observed by its owning controller, Gateway/TLS becomes ready, two replicas are serving, and no resource is accidentally recreated or deleted. |
-| Regional loss | Record the single-region boundary and simulate loss of the region in the disaster plan. | The review records that active-active failover is not a launch feature; RTO/RPO escalation and operator communication are exercised instead of claiming availability that is not provided. |
+| Drill | Required result |
+| --- | --- |
+| Pod loss | Serving replicas remain available and durable work recovers. |
+| Gateway disconnect | Authorized clients resume without duplicate revisions. |
+| Firestore interruption | Readiness fails without a restart loop or stale authority. |
+| Duplicate/reordered events | Idempotent workers converge on one projection. |
+| DLQ replay | A reviewed batch is republished, receipted, then acknowledged. |
+| Firestore restore | Authority and fresh projections cut over under writer fencing. |
+| Cluster rebuild | Controllers reconstruct the pinned release. |
+| Regional loss | Operators exercise the documented single-region escalation. |
 
+### Pod loss
+
+Evict one API and live-gateway Pod while the canary load smoke runs. Separately
+delete an ingest or singleton worker Pod, then repeat with one serving replica
+unavailable. API/live-gateway disruption budgets must keep one replica serving;
+durable outbox/subscription work must drain after restart with no accepted-write
+loss and topology cursor recovery below five seconds. Deleting a singleton does
+not prove disruption-budget behavior.
+
+### Gateway disconnect
+
+Terminate one viewer socket and roll the live-gateway Deployment. The client
+must reconnect with jitter, resume from its cursor, receive no duplicate
+topology revision, and remain authorized.
+
+### Firestore interruption
+
+Inject a bounded outage or temporarily deny the workload IAM binding, then
+restore it. Readiness must go false without a liveness restart loop. Writes must
+fail explicitly or remain retryable, and no stale session may regain authority
+after recovery.
+
+### Duplicate and reordered events
+
+Publish the same event twice and deliver a later event before an earlier one.
+The idempotency ledger must prevent duplicate projections, and replay must
+converge on the same snapshot.
+
+### DLQ replay
+
+Force a bounded worker failure, confirm dead-letter forwarding, review the
+read-only dry-run, then apply only the selected batch from an operator
+environment. Apply must publish the events, write an immutable receipt to the
+release-audit database, and only then acknowledge messages. Downstream
+idempotency must restore the projection without exposing post bodies. The exact
+commands are in [DLQ replay procedure](#dlq-replay-procedure).
+
+### Firestore restore
+
+Restore authority into an isolated named database and provision a fresh, empty
+topology database; never restore populated projections. Explicitly authorize
+both database IDs, suspend Flux, and fence and quiesce every database reader and
+the force-reconciled bootstrap Job. Capture the source outbox high-watermark.
+
+Copy the fence-bound authority delta and require equal per-collection SHA-256
+manifests sorted by collection name, count, and digest. Replay the bounded source
+delta into the fresh topology database. Produce a schema-2 cutover receipt with
+a unique `receipt_id` and recent `issued_at`; the protected workflow must run
+`npm run verify:cutover-receipt` and atomically consume the receipt in the
+isolated release-audit database before runtime values switch. A retry after
+rollback needs a new receipt.
+
+Run the generation-fenced bootstrap Job, attest its generation, resume Flux,
+and run the session-only private root/reply smoke before reopening writes.
+Stage the renewed validation session and enforce enough remaining lifetime to
+complete rollout, heartbeat, and profile verification with a 60-second reserve.
+Retire the predecessor only after that check. A deadline failure keeps the
+successor pointer and requires operator-led roll-forward.
+
+Pass evidence must show private-mesh isolation, last-owner protection, session
+fences, topology snapshots, authenticated smoke, fence-before-restore,
+per-collection equality, replay ordering, equal source/target outbox
+high-watermarks, and no old/new worker overlap.
+
+### Cluster rebuild
+
+Recreate the GKE cluster from OpenTofu, reinstall Gateway API, Flux, and the
+metrics adapter, restore protected substitutions, and reconcile the pinned
+release. Every managed resource must be observed by its owning controller;
+Gateway/TLS must become ready with two serving replicas and no accidental
+resource recreation or deletion.
+
+### Regional loss
+
+Record and simulate the single-region loss plan. The exercise must treat
+active-active failover as unsupported and test the RTO/RPO escalation and
+operator communication instead.
 ## Evidence format
 
 Store a redacted JSON record outside the repository with:

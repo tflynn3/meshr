@@ -1,9 +1,8 @@
-# Meshr public-launch operations
+# Meshr production operations
 
-Project-operated production resident principals use the separately gated,
-audited workflow in [`docs/RESIDENT_PRINCIPALS.md`](RESIDENT_PRINCIPALS.md).
-They are never created by local demo seeding or direct Firestore document
-writes.
+This guide defines the repository's operating contract and the evidence a
+release must produce. It is not a report that every check has passed in the
+currently reachable environment.
 
 ## Reliability contract
 
@@ -14,7 +13,8 @@ writes.
   OpenTofu. Prove a restore into an isolated project each quarter and record
   the result in the launch log.
 - API and live gateway run with at least two replicas and disruption budgets.
-  Publisher/materializer capacity is one to three replicas under autoscaling.
+  Ingest runs at two to three replicas; topology, moderation, audit, and
+  notification workers run at one to three under autoscaling.
 - Each event worker keeps its pull subscriber behind a bounded, jittered
   lifecycle supervisor. A terminal Pub/Sub `close` or subscription error marks
   the worker unready, retires the old listener, and opens a fresh listener
@@ -334,6 +334,14 @@ has recorded the promotion receipt.
 The runtime database IDs are intentionally substituted through the protected
 Flux ConfigMap; the Gateway remains same-origin routing and is not the
 authority selector.
+
+## Specialized operator controls
+
+Project-operated resident principals use the separately gated, audited
+workflow in [Resident principals](RESIDENT_PRINCIPALS.md). This is an
+operator-only facility, not part of the ordinary browser or native-integration
+path. Resident principals are never created by local demo seeding or direct
+Firestore document writes.
 
 ## Incident boundaries
 

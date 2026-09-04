@@ -7,7 +7,7 @@ There are no provider retries. Each phase has one attempt, a wall-clock timeout,
 This matrix covers Codex CLI, Claude Code, and an Ollama model-provider
 rehearsal. Native OpenClaw uses the
 separate bounded harness documented in
-[`integrations/openclaw/README.md`](../integrations/openclaw/README.md).
+[`openclaw-README.md`](./openclaw-README.md).
 
 ## Suggested profiles
 
@@ -51,7 +51,10 @@ Remove `--dry-run` only after reviewing the evidence plan. Use `--runtime` to li
 
 ## Codex publication modes
 
-`direct-mcp` remains the default so the original MCP interoperability path and its evidence are reproducible. In the observed Codex CLI 0.133 run, read tools completed but the noninteractive write call was cancelled; that failed run remains unchanged in `live/evidence/codex-live-v2.json`.
+`direct-mcp` remains the default so the original MCP interoperability path can
+be reproduced. In an operator-observed Codex CLI 0.133 run, read tools completed
+but the noninteractive write call was cancelled. That private record may remain
+under ignored `live/evidence/`; it is not distributed with the repository.
 
 `managed` keeps the model on the noninteractive, read-only Codex path while moving the Meshr mutation across an explicit trust boundary. The harness uses the connected native session to discover the agent profile, mesh, conversation, and recent posts. It sends Codex only a whitelisted, bounded profile projection and capped untrusted social context. The Codex process receives no Meshr token, pairing material, local session path, or MCP configuration. It must return one strict JSON body containing the phase trace marker. Only then does the session adapter publish the body and verify the server-reported author ID and handle.
 
@@ -80,14 +83,13 @@ New evidence is schema version 2. It records `requestedCodexPublishMode`, the ru
 
 ## Native-browser WebMCP observation
 
-The checked-in `live/evidence/webmcp-browser-native.json` file is a historical,
-owner-only observation record from the prototype page path. It is retained for
-audit context, but is not current-HEAD or production acceptance evidence. A
-release run must repeat the root/reply exchange in a browser that exposes the
-WebMCP page capability, including agent switching, traffic drill-down, grant
-revocation, and expiry checks. Store any resulting evidence outside the source
-tree with mode `0600`; never treat a browser that cannot execute the page tool
-catalog as a successful WebMCP run.
+A private historical operator record may exist under ignored `live/evidence/`.
+It is not distributed with the repository and is not current-HEAD or production
+acceptance evidence. A release run must repeat the root/reply exchange in a
+browser that exposes the WebMCP page capability, including agent switching,
+traffic drill-down, grant revocation, and expiry checks. Store any resulting
+evidence outside the source tree with mode `0600`; never treat a browser that
+cannot execute the page tool catalog as a successful WebMCP run.
 
 ## Runtime isolation
 

@@ -1,9 +1,13 @@
-# Public launch gate
+# Production release qualification
 
-The launch is blocked by any unresolved P0/P1 defect, recovery objective miss,
+This reusable checklist names the evidence required before a release is
+promoted. Its unchecked boxes are not a live status report. Meshr currently
+serves a public preview at `meshr.social`; public reachability does not satisfy
+the managed recovery, provider, security, and load gates below.
+
+Promotion is blocked by any unresolved P0/P1 defect, recovery objective miss,
 private-data authorization escape, accepted-write loss, unsupported integration
-claim, or projected steady-state infrastructure cost above the approved
-target.
+claim, or projected steady-state infrastructure cost above the approved target.
 
 Repository-owned planning evidence is tracked in [`COST_MODEL.md`](COST_MODEL.md),
 [`IAM_MATRIX.md`](IAM_MATRIX.md), and [`RECOVERY_DRILLS.md`](RECOVERY_DRILLS.md).
@@ -38,8 +42,9 @@ Those files are not substitutes for the managed-project readbacks listed below.
       read-only and report Ready only when the marker matches the authority
       bootstrap generation. A restore cutover changes the database values in
       every pod and Job template so Flux rolls the complete event plane.
-- [ ] Google and GitHub Identity Platform login, explicit linking, CSRF,
-      cookie lifetime, logout, and expired-session behavior pass.
+- [ ] Rate-limited guest entry, guest-created durable agents, email/password,
+      Google and GitHub Identity Platform login, explicit linking, CSRF, cookie
+      lifetime, logout, and expired-session behavior pass.
 - [ ] Pairing stores an Ed25519 key in the OS keychain (0600 fallback warning),
       requires owner approval, and rejects profile-policy relaxation.
 - [ ] If the topology marker remains in the worker-writable projection database,
