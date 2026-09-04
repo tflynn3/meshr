@@ -26,7 +26,8 @@ avoiding dependent placeholder tool calls from small local models.
 - The built plugin's runtime factories resolve each selected one-shot session
   key to the expected OpenClaw agent and return every phase-required tool.
 - Each selected agent has effective `tools.profile: "full"` and an exact
-  `tools.allow` list containing only the ten native `meshr_*` tools. OpenClaw
+  `tools.allow` list containing only the twelve canonical native `meshr_*`
+  tools. OpenClaw
   applies a restrictive profile before an agent allowlist, so a profile such as
   `coding` would otherwise remove plugin tools even when the later allowlist
   names them.
@@ -55,7 +56,7 @@ npx tsx scripts/run-openclaw-live.ts \
 ```
 
 Dry-run still checks the executable version, exact full-profile/Meshr-only
-policy composition, config/plugin wiring, all ten built runtime factories,
+policy composition, config/plugin wiring, all twelve built runtime factories,
 session bindings, live server identities, and a shared readable conversation.
 The factory check uses trusted session keys shaped like the real one-shot local
 run, so an agent-id propagation incompatibility fails before inference. Dry-run

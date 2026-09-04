@@ -223,6 +223,8 @@ separate static global Gateway IPv4 addresses for production and staging. The
 Google and GitHub provider resources are omitted when their credentials are
 null only while `launch_mode=false`; a public launch must configure both.
 
+## Data authority, recovery, and monitoring
+
 The ingest publisher has no Firestore grant; it leases bounded outbox batches
 through the API's token-authenticated repository boundary. Because the
 projection bootstrap marker currently shares that
@@ -319,6 +321,8 @@ each named provider, verify the exact Artifact Registry grant and the deploy,
 plan, and promoter service accounts' workload-identity bindings, and compare
 project bindings without identity impersonation, primitive Viewer, or IAM
 mutation.
+
+## Moderation service and release path
 
 The stack owns one retained regional `meshr-moderation` Model Armor template.
 Its policy enables prompt-injection/jailbreak, malicious-URI, basic Sensitive
@@ -470,6 +474,8 @@ etag-CAS workflow owns every later change:
    identity to verify and invoke the revision; it cannot update Cloud Run,
    impersonate the runtime identity, or access Firestore documents.
 
+## Public edge and Cloudflare
+
 For a later public launch, use an organization-backed project, set
 `organization_policy_guardrails_enabled=true`, disable
 `private_moderation_adapter_mode`, set `launch_mode=true`, and supply the
@@ -532,6 +538,8 @@ reachable origin: a direct client could otherwise choose the apparent source
 address used by application-level rate limits. Verify the backend rejects a
 request without the origin secret before relying on the forwarded address.
 
+## Secrets and key rotation
+
 The cluster enables GKE's managed Secret Manager CSI component. Before the
 production Kustomization is reconciled, add versions to the secrets created by
 this stack (the API key can be copied from the sensitive Terraform output):
@@ -583,6 +591,8 @@ renewal/invitation overlap window (at least 30 days) before replacing it. The
 API accepts both key slots for deterministic renewal recovery and
 role-invitation lookup, while newly issued credentials always use the primary
 slot. Do not remove the previous slot during either rolling deploy.
+
+## Workload identity and release federation
 
 OpenTofu always creates separate keyless GitHub Actions identities for artifact
 builds and production qualification, and creates the distinct canary-promotion
@@ -719,6 +729,8 @@ and entering protected mode again; old artifacts are intentionally not
 decryptable with the new key. A later protected run reads only the current
 release-audit pointer and fails closed if an already-protected environment has
 no current envelope.
+
+## Runtime moderation and autoscaling
 
 The moderation adapter is a separately deployed, authenticated Cloud Run
 workload built from `deploy/images/moderation-adapter.Dockerfile`. CI builds,

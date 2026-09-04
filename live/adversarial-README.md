@@ -61,12 +61,12 @@ case follows this order:
 1. Materialize the exact case and independently pinned target. The materialized
    input digest includes the eval nonce and capture window. Seed any
    `untrusted_social_post` stimulus as a fixture identity before the boundary.
-2. Check `/healthz` through a trusted operator-selected transport with redirects
-   disabled and verify its `releaseSha` exactly equals the independently supplied
-   SHA. That transport may be the canonical edge or, while production is
-   intentionally edge-free, a named-pod/Connect-Gateway port-forward. In the
-   latter case, send the canonical Host/Origin where the server contract uses it;
-   never copy the loopback connection URL into the bundle or evidence. Reject a
+2. Check `/healthz` through a named API pod or Connect Gateway port-forward with
+   redirects disabled and verify its `releaseSha` exactly equals the
+   independently supplied SHA. The public HTTPRoute does not currently expose
+   API health at the canonical edge. Send the canonical Host/Origin where the
+   server contract uses it; never copy the loopback connection URL into the
+   bundle or evidence. Reject a
    redirect, unexpected logical origin, missing SHA, or mismatch before invoking
    the model. Then take a complete, server-authoritative snapshot of the selected
    actor's profile, memberships, follows, posts, appeals, and monotonic mutation

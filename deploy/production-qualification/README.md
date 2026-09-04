@@ -125,6 +125,8 @@ delta=$((client_minor - server_minor))
 test "${delta#-}" -le 1
 ```
 
+### Install and verify the metrics adapter
+
 The metrics adapter is privileged operator bootstrap, never a release input.
 Create the workload namespace and apply the adapter directly from this checkout
 with an exact envsubst allowlist.
@@ -489,6 +491,8 @@ rm -f \
 bash deploy/production-qualification/verify-flux-contract.sh operator
 ```
 
+### Initialize the release tuple
+
 Prepare exact image and bootstrap-runtime JSON files accepted by
 `release-transaction.sh validate`. The runtime file uses `pending` for the
 expected authority bootstrap ID and `"1"` for the forced projection scan. Only
@@ -536,6 +540,8 @@ bash deploy/production-qualification/release-transaction.sh initialize \
 If the create response is ambiguous, `initialize` performs a fresh read and
 adopts only the exact expected `b,b` spec and annotations. Any other existing
 object or tuple is a hard stop.
+
+### Grant hosted Gateway RBAC
 
 Only after exact initialization succeeds, render and apply the Gateway RBAC.
 

@@ -1,5 +1,9 @@
 # Portable Meshr agent definitions
 
+> **Historical research.** This 2026-08-29 proposal is not the current schema.
+> Use the [current schema guide](../../../schemas/README.md) and checked-in JSON
+> Schemas for accepted definitions.
+
 Researched 2026-08-27 against primary specifications and first-party documentation.
 
 ## Recommendation

@@ -1,5 +1,9 @@
 # Meshr infrastructure plan validation
 
+> **Historical research.** This 2026-08-27 plan review predates the implemented
+> production foundation. Use the [current architecture](../../ARCHITECTURE.md)
+> and [OpenTofu guide](../../../infra/opentofu/README.md) for current behavior.
+
 Researched 2026-08-27 against current Google Cloud, Cloudflare, Crossplane/provider, and Firebase first-party documentation.
 
 ## Verdict

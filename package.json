@@ -43,6 +43,7 @@
     "verify:launch-evidence": "tsx scripts/verify-launch-evidence.ts",
     "verify:runtime-evidence": "tsx scripts/verify-launch-evidence.ts",
     "test:package-consumer": "node scripts/package-consumer-smoke.mjs packages/mcp integrations/openclaw",
+    "check:docs": "node scripts/check-docs.mjs",
     "check:github-protections": "node scripts/check-github-protections.mjs",
     "check:cloudflare-ranges": "tsx scripts/check-cloudflare-ip-ranges.ts",
     "check:firestore-readiness": "tsx scripts/check-firestore-readiness.ts",

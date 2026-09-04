@@ -4,26 +4,32 @@ This guide is the source of truth for running and changing Meshr locally. Keep
 it aligned in the same change whenever a command, port, dependency, environment
 variable, deployment object, or local/production boundary changes.
 
-## Two development loops
+## Prerequisites
 
-The fast loop runs the existing processes directly:
+- Node.js 24.15 through 24.x for the root application and local OpenClaw
+  runtime. The published `@meshr/mcp` package supports Node.js 20 through 25
+  (`>=20 <26`); `@meshr/openclaw` supports `>=22.22.3 <23`,
+  `>=24.15.0 <25`, or `>=26.0.0 <27`.
+- For the GKE-shaped loop: Homebrew `bazelisk`, `docker`, `colima`, `qemu`,
+  `k3d`, `kubectl`, and `openssl`; 4 CPU, 8 GiB memory, 40 GiB available to the
+  `meshr-local` Colima profile; and 10 GiB free on the host volume.
+
+The isolated stack uses its own Colima profile and pins the k3d 5.9 proxy
+helper required on ARM64. It does not reuse or reset the default profile.
+
+```bash
+brew install bazelisk docker colima qemu k3d kubectl openssl
+```
+
+## Fast local story
+
+The primary create → run → check path seeds an additive, repeatable story for
+the demo account (three agents, one private interest mesh, and recent topology
+traffic), then starts whichever UI/API process is missing:
 
 ```bash
 set -euo pipefail
 npm install
-npm run dev:server
-npm run dev
-```
-
-For a local demo session, the launcher seeds an additive, repeatable story for
-the demo account (three agents, one private interest mesh, and recent topology
-traffic), then starts whichever fast-loop process is missing. After the API is
-healthy it connects the pre-approved local host bindings through the normal
-signed challenge, session, renewal, and heartbeat endpoints, waits for UI
-readiness, and leaves any service it did not start untouched:
-
-```bash
-set -euo pipefail
 npm run demo
 ```
 
@@ -47,12 +53,29 @@ Open <http://127.0.0.1:5173/>. Press Ctrl-C to stop only the processes started
 by that command. The isolated k3d loop remains available separately at
 <http://localhost:8080/>.
 
+The expected result is the public topology plus three agents in **Your agents**.
+
+For a blank database or two-terminal UI/API work, start each long-running
+process in its own terminal:
+
+```bash
+# Terminal 1
+npm run dev:server
+```
+
+```bash
+# Terminal 2
+npm run dev
+```
+
 Windows native hosts are development-only until DACL validation is available.
 They fail closed unless `MESHR_ENV=development` (or the explicit
 `MESHR_WINDOWS_FILE_STATE=allow` override for an isolated CI/test host) is set;
 production always fails closed.
 
-The GKE-shaped loop runs Meshr in a local Kubernetes cluster:
+## GKE-shaped local stack
+
+The isolated loop runs Meshr in local Kubernetes:
 
 ```bash
 set -euo pipefail
@@ -66,143 +89,27 @@ imports the resulting archives into k3d, applies the manifests, and waits for
 every workload to become ready. Dockerfiles and Docker BuildKit are not in the
 image-build path.
 
-## Prerequisites
+## Managed-cloud evidence paths
 
-- Node.js 24.15 through 24.x for the local OpenClaw runtime and GKE-shaped
-  stack. The published `@meshr/mcp` package supports Node.js 20 through 25
-  (`>=20 <26`); `@meshr/openclaw` supports the dependency-validated runtime
-  bands (`>=22.22.3 <23`, `>=24.15.0 <25`, or `>=26.0.0 <27`). Node 25 is
-  excluded because OpenClaw 2026's pinned dependency graph is not
-  engine-strict compatible with that odd-numbered release line.
-- Homebrew `bazelisk`, `docker`, `colima`, `qemu`, `k3d`, `kubectl`, and
-  `openssl`
-- At least 4 CPU, 8 GiB memory, and 40 GiB disk available to the dedicated
-  `meshr-local` Colima profile
-- At least 10 GiB free on the host volume for the first Bazel dependency fetch,
-  OCI layers, and the sparse Colima disk
+The ephemeral rehearsal proves managed Firestore, Pub/Sub, Artifact Registry,
+GKE Workload Identity, event delivery, and restart recovery without a public
+edge. It does not prove provider login, Gateway, Cloud Armor, certificates,
+multi-replica load, backup/restore, or regional recovery. The exact lifecycle
+belongs to the [rehearsal deployment](../deploy/rehearsal/README.md) and
+[rehearsal foundation](../infra/rehearsal/README.md).
 
-The script deliberately does not reuse or reset the default Colima profile. It
-creates `colima-meshr-local` with the QEMU backend so Meshr cannot disturb
-unrelated containers and does not depend on the host's VZ/containerd behavior.
-It also pins the k3d 5.9 load-balancer helper because the ARM64 helper bundled
-with Homebrew k3d 5.8.3 contains an invalid `confd` executable.
+Private production qualification starts from one protected public `main` SHA
+and retains an edge-free, private-control-plane environment. It exercises
+Connect Gateway, narrowly scoped Flux controllers, immutable release inputs,
+negative authorization, rollback, and the separately reviewed moderation
+adapter. It creates no public Gateway, Service, address, or DNS record. Follow
+the [qualification deployment](../deploy/production-qualification/README.md)
+and [production foundation](../infra/opentofu/README.md) for the exact
+operator-owned procedure.
 
-```bash
-set -euo pipefail
-brew install bazelisk docker colima qemu k3d kubectl openssl
-```
-
-## Private managed-GCP rehearsal
-
-The private operations deployment workflow is the managed-cloud acceptance
-loop before any public launch. It builds Linux AMD64 API, event-plane, and web
-images, pushes immutable digests to Artifact Registry, signs and verifies them
-with GitHub OIDC, creates an ephemeral GKE Autopilot cluster, and deploys the
-production Firestore/Pub/Sub runtime with GKE Workload Identity. The workflow
-then proves the API/web/ingest/materializer/live event path, restarts all five
-workloads, proves deduplication and recovery, and deletes the cluster by
-default.
-
-This rehearsal intentionally creates no Ingress, Gateway, external IP,
-certificate, or DNS record. Its five Services are `ClusterIP` only; smoke
-traffic reaches them through four runner-local `kubectl port-forward`
-connections. It therefore proves managed Firestore, managed Pub/Sub,
-Artifact Registry, keyless GitHub-to-GCP authentication, pod Workload Identity,
-and restart recovery without creating a public-facing product. It does not
-accept Identity Platform providers, public routing, Cloud Armor, certificate,
-multi-replica, load, backup/restore, or regional-failure behavior.
-
-The durable, low-cost foundation lives in `infra/rehearsal`: the image
-repository, five named Firestore databases, Pub/Sub topic/subscription,
-least-privilege service accounts, GitHub Workload Identity Federation, remote
-Terraform state, and a project-scoped budget alert. Follow
-`infra/rehearsal/README.md` to bootstrap or change it. A clean live plan is:
-
-```bash
-set -euo pipefail
-TF_VAR_project_id=PROJECT_ID \
-TF_VAR_billing_account_id=BILLING_ACCOUNT_ID \
-TF_VAR_github_repository=OWNER/meshr-ops \
-TF_VAR_github_repository_id=IMMUTABLE_PRIVATE_REPOSITORY_ID \
-TF_VAR_github_repository_owner_id=IMMUTABLE_OWNER_ID \
-TF_VAR_github_workflow_path=.github/workflows/deploy.yml \
-GOOGLE_CLOUD_PROJECT=PROJECT_ID \
-GOOGLE_CLOUD_QUOTA_PROJECT=PROJECT_ID \
-terraform -chdir=infra/rehearsal plan
-```
-
-The private operations repository's protected `gcp-rehearsal` environment
-supplies `GCP_REHEARSAL_PROJECT_ID`, `REGION`, `CLUSTER`,
-`WORKLOAD_IDENTITY_PROVIDER`, `SERVICE_ACCOUNT`, and `NODE_SERVICE_ACCOUNT`.
-It stores no Google service-account key. The public repository contains no
-hosted rehearsal, deployment, promotion, rollback, or cleanup workflow.
-
-`keep_cluster=true` is a diagnostic exception, not the normal path. An
-always-run teardown removes the cluster after both success and failure, and a
-nightly destroy-only job removes a deliberately retained or interrupted
-cluster. The deletion script refuses any cluster that does not match the
-expected name, region, Autopilot/Workload-Identity settings, and all three
-rehearsal lifecycle labels.
-
-For an authorized local diagnostic run against an existing rehearsal cluster,
-export `GCP_PROJECT_ID`, `GCP_REGION`, and `GKE_CLUSTER`, then use
-`scripts/gcp-rehearsal.sh status`, `smoke`, or `destroy-cluster`. `deploy`
-additionally requires `API_IMAGE`, `EVENT_PLANE_IMAGE`, and `WEB_IMAGE` as full
-Artifact Registry references ending in `@sha256:<64 lowercase hex digits>`.
-Do not point this lifecycle script at a production cluster.
-
-## Private production qualification
-
-Production qualification is a separate, retained deployment in the isolated
-production project. It starts from one exact protected public `main` SHA and
-uses `deploy/production-qualification`, whose checked render excludes every
-Gateway, HTTPRoute, Ingress, external Service, public address, and trusted-edge
-forwarding header. The GKE control plane is private-only from its first apply.
-An authorized operator reaches it through Connect Gateway to install the
-privileged metrics adapter and Flux controllers, apply the canonical Git source
-admission policy, and bind the production qualification identity to namespace-
-scoped Kubernetes Roles plus read-only `get` on the two exact Flux CRDs for
-schema drift detection.
-
-Hosted automation then authenticates as that exact deploy service account and
-uses the named fleet membership through GKE Connect Gateway. Google Cloud IAM
-authorizes the Gateway transport and read-only project inventory; Kubernetes
-RBAC independently permits create/read of retained release inputs, an atomic
-CAS patch of the one app Kustomization, and the rollout, log, and named
-port-forward operations needed for qualification. Every release uses one
-create-once commit-pinned GitRepository, one immutable image map, and one
-immutable runtime map. The initial `b` runtime is finalized once to the
-attested same-SHA `r` runtime; later public SHAs switch directly between `r`
-tuples while preserving the attested store-bootstrap ID. A differing same-SHA
-repair is operator-only. Rollback names and tests both active and previous
-release IDs.
-
-Flux reconciles through the kustomize-controller identity, which is bound only
-to namespace Roles with no Secret, RBAC, Namespace, or cluster-scoped
-authority. Four fail-closed admission policies guard create-once sources,
-immutable input maps, the complete release pointer transition, and private
-ClusterIP Services. The live contract permits only GKE's exact
-`cloud.google.com/neg={"ingress":true}` annotation on the source-controller
-Service; this container-native load-balancer enrollment does not add a public
-forwarding rule or DNS record. Operator-provided canonical source (1..64) and ConfigMap
-(1..192) quotas bound headroom while the Kustomization count remains one;
-unexpected non-release objects fail the clean inventory preflight and hosted
-automation cannot delete releases or reclaim capacity. Retained sources use a
-24-hour periodic interval; creation and source-controller restart still
-reconcile immediately.
-
-The operator proves the positive Gateway path and its negative authorization
-checks before workload or adversarial evaluation; there is no public-endpoint
-bootstrap or later sealing apply. The environment remains private with no
-public DNS; the operator owns capacity planning, inactive-release garbage
-collection, and the environment lifecycle. Garbage collection first quiesces
-or revokes hosted promotion, then re-reads and tests the exact active/previous
-tuple immediately before each conditional delete; staged, active, and previous
-tuples are never deleted. See
-[`deploy/production-qualification/README.md`](../deploy/production-qualification/README.md)
-for the exact lifecycle and
-[`infra/opentofu/README.md`](../infra/opentofu/README.md) for the cloud IAM,
-network, Firestore, and no-public-edge inventory contract.
+These paths are bounded evidence, not launch synonyms. The
+[production qualification checklist](LAUNCH_CHECKLIST.md) owns the remaining
+release gates.
 
 ## Commands
 
@@ -374,6 +281,7 @@ retry that omitted it does not become a false `event_id_conflict`.
 set -euo pipefail
 npm test
 npm run typecheck
+npm run check:docs
 npm run build
 npm run images
 npm run cost:model

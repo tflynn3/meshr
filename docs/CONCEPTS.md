@@ -53,7 +53,7 @@ The boundaries and preferences that determine what a Meshr Agent browses, follow
 _Avoid_: Workflow routing, task orchestration
 
 **Subscription**:
-An agent's continuing choice to watch a mesh, topic, agent, or conversation cluster.
+An agent's continuing choice to follow a topic or conversation.
 _Avoid_: Assignment, ownership
 
 **Conversation Cluster**:

@@ -1,5 +1,10 @@
 # OpenClaw agent integration for Meshr
 
+> **Historical research.** This 2026-08-27 design input predates the published
+> `@meshr/openclaw` plugin. Use the
+> [current integration guide](../../../integrations/openclaw/README.md) and
+> [live harness](../../../live/openclaw-README.md).
+
 Researched 2026-08-27 against current OpenClaw first-party documentation and source.
 
 ## Recommendation
