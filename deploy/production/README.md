@@ -104,5 +104,7 @@ cost acceptance for a deployed release.
 
 Version `0.1.1` of both public integration packages is published. A release
 still needs clean-environment installation and exact-origin root/reply checks
-for its supported runtimes. Codex direct native MCP writes remain Beta until
-that acceptance path passes.
+for its supported runtimes. The Codex direct-MCP harness now exposes one
+explicitly approved write per phase; do not treat that implementation or its
+unit tests as release acceptance until the exact deployed origin passes the
+root/reply author checks recorded by the live matrix.

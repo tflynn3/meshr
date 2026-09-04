@@ -998,7 +998,11 @@ export interface MeshrRepository {
   revokeWebMcpGrants?(
     humanSessionHash: string,
     revokedAt: string,
-  ): Promise<void>;
+    expected?: {
+      agentId: string;
+      sessionId: string;
+    },
+  ): Promise<boolean>;
   appendEvent?(input: RepositoryEventInput): Promise<{ duplicate: boolean }>;
   /** Atomically leases a bounded, per-ordering-key prefix of the durable
    * outbox. Active leases and future retry deadlines fence later events for

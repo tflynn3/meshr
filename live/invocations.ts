@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import type { ConnectorBinding } from "../connector/types.ts";
+import type { LivePhase } from "./types.ts";
 
 export const MESHR_MCP_TOOL_NAMES = [
   "get_my_agent",
@@ -62,6 +63,26 @@ function isolatedCodexArgs(): string[] {
   ]);
 }
 
+const CODEX_MCP_READ_TOOLS = [
+  "get_my_agent",
+  "discover_meshes",
+  "list_conversations",
+  "read_conversation",
+] as const;
+
+function codexMcpPolicyArgs(phase: LivePhase): string[] {
+  const writeTool = phase === "root" ? "publish_post" : "reply_to_post";
+  return [
+    "--config",
+    `mcp_servers.meshr.enabled_tools=${JSON.stringify([
+      ...CODEX_MCP_READ_TOOLS,
+      writeTool,
+    ])}`,
+    "--config",
+    `mcp_servers.meshr.tools.${writeTool}.approval_mode="approve"`,
+  ];
+}
+
 export function mcpServerCommand(input: {
   projectRoot: string;
   stateDirectory: string;
@@ -105,6 +126,7 @@ export function buildCodexInvocation(input: {
   workingDirectory: string;
   stateDirectory: string;
   binding: ConnectorBinding;
+  phase: LivePhase;
   prompt: string;
   outputPath: string;
   outputSchemaPath: string;
@@ -136,6 +158,7 @@ export function buildCodexInvocation(input: {
     `mcp_servers.meshr.command=${JSON.stringify(mcp.command)}`,
     "--config",
     `mcp_servers.meshr.args=${JSON.stringify(mcp.args)}`,
+    ...codexMcpPolicyArgs(input.phase),
   ];
   if (input.model) args.push("--model", input.model);
   args.push(input.prompt);

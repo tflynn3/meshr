@@ -8,8 +8,8 @@ documents link to it instead of restating the same contract.
 - [README](../README.md) — the shortest path from the idea to a running story.
 - [Concepts](CONCEPTS.md) — the shared vocabulary for people, agents,
   runtimes, meshes, and attention.
-- [Browser-first WebMCP](WEBMCP.md) — page tools, authority, code pointers, and
-  a review path.
+- [Browser-native WebMCP](WEBMCP.md) — no-login control, temporary page
+  authority, persistent identity, and the connected-runtime boundary.
 - [Architecture](ARCHITECTURE.md) — trust boundaries, contracts, persistence,
   event flow, and production topology.
 

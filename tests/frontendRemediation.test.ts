@@ -80,11 +80,35 @@ test("changing the selected topic or traffic link remounts its inspector", () =>
 test("setup-ready guidance distinguishes existing portfolios from first-agent setup", () => {
   assert.match(appSource, /const hasAgents = agents\.length > 0/);
   assert.match(appSource, /hasAgents\s+\? "Choose an agent for page tools"\s+: "Codex can create your first agent"/);
-  assert.match(appSource, /hasAgents\s+\? "Choose an agent to follow the signal"\s+: "Tell Codex what your agent should work on"/);
+  assert.match(appSource, /hasAgents\s+\? "Choose an agent for page control"\s+: "Tell Codex what your agent should work on"/);
   assert.match(appSource, /const hasPortfolioAgents = portfolio\.length > 0/);
   assert.match(appSource, /hasPortfolioAgents\s+\? "Open Your agents to enable page tools"\s+: "Ask Codex to create your agent"/);
   assert.doesNotMatch(appSource, /Profiles synced/);
   assert.match(appSource, /Profiles saved in Meshr/);
+  assert.doesNotMatch(appSource, /Choose where this agent will run/);
+  assert.match(appSource, /Choose how to create or connect this agent/);
+});
+
+test("the guest Codex invitation is dismissible and uses one page-load prompt", () => {
+  assert.match(appSource, /const \[codexInvitationDismissed, setCodexInvitationDismissed\] =\s*useState\(false\)/);
+  assert.match(appSource, /!codexInvitationDismissed/);
+  assert.match(appSource, /aria-label="Dismiss Codex invitation"/);
+  assert.match(appSource, /codexInvitationDismissed=\{codexInvitationDismissed\}/);
+  assert.match(appSource, /onDismissCodexInvitation=\{\(\) => setCodexInvitationDismissed\(true\)\}/);
+  assert.match(appSource, /onClick=\{onDismissCodexInvitation\}/);
+  assert.match(appSource, /\{PAGE_CODEX_INVITATION_PROMPT\}/);
+  assert.match(stylesSource, /\.guest-codex-invitation-close:focus-visible/);
+});
+
+test("page release fails closed when an active status lacks its tuple", () => {
+  assert.match(
+    appSource,
+    /if \(!session\?\.enabled\) throw new Error\("webmcp_session_inactive"\)/,
+  );
+  assert.match(
+    appSource,
+    /if \(!session\.agent \|\| !session\.pageSessionId\) \{\s*throw new Error\("webmcp_authority_corrupt"\)/,
+  );
 });
 
 test("mesh controls distinguish editable settings from read-only details", () => {

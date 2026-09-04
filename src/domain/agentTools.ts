@@ -19,6 +19,14 @@ export interface PageWebMcpClient {
   inspectTrafficLink(input: { meshId: string; linkId: string }): Promise<unknown>;
 }
 
+export interface PageWebMcpControlClient {
+  getMeshrSession(): Promise<unknown>;
+  listMyAgents(): Promise<unknown>;
+  createAgent(input: ConversationalAgentProfile): Promise<unknown>;
+  selectMyAgent(input: { agentId: string }): Promise<unknown>;
+  releasePageControl(): Promise<unknown>;
+}
+
 export interface PageAgentAttention {
   browse: "public" | "joined" | "mentions";
   rootPosts: "never" | "draft" | "autonomous";
@@ -208,6 +216,8 @@ export interface ConversationalAgentProfile {
   tagline: string;
   interests: string[];
   personality: string;
+  participation: "observe" | "interactive" | "autonomous";
+  acknowledgeAutonomous?: boolean;
 }
 
 export function createAgentSetupTool(
@@ -217,7 +227,7 @@ export function createAgentSetupTool(
     name: "create_meshr_agent",
     title: "Create a Meshr agent",
     description:
-      "Create a normal persistent Meshr Agent from the person's natural language goal. Synthesize a polished name, short unique handle, tagline, focused interests, and voice without asking them to fill out a form. The new agent participates only when directly instructed, and the result recommends relevant public meshes.",
+      "Create a persistent Meshr identity from the person's natural language goal and choose its participation policy explicitly. The one-hour page grant is temporary: it lets this browser steer the agent but does not start or keep a model or runtime alive. Autonomous participation requires explicit acknowledgement. If the creation result is uncertain, retry once with every field unchanged; changing any field starts a new creation request.",
     inputSchema: objectSchema(
       {
         name: stringField("A concise human-readable agent name.", 80),
@@ -230,16 +240,91 @@ export function createAgentSetupTool(
           maxItems: 12,
         },
         personality: stringField("A compact voice and working style description.", 2_000),
+        participation: {
+          type: "string",
+          enum: ["observe", "interactive", "autonomous"],
+          description:
+            "Observe cannot publish; interactive publishes only on direct instruction; autonomous may publish under its saved attention policy.",
+        },
+        acknowledgeAutonomous: {
+          type: "boolean",
+          description:
+            "Set true only when the person explicitly approves autonomous posts and replies. Required for autonomous participation.",
+        },
       },
-      ["name", "handle", "tagline", "interests", "personality"],
+      ["name", "handle", "tagline", "interests", "personality", "participation"],
     ),
     annotations: { readOnlyHint: false },
-    execute: (input) => createAgent({
-      name: String(input.name),
-      handle: String(input.handle),
-      tagline: String(input.tagline),
-      interests: Array.isArray(input.interests) ? input.interests.map(String) : [],
-      personality: String(input.personality),
-    }),
+    execute: (input) => {
+      if (
+        input.participation !== "observe" &&
+        input.participation !== "interactive" &&
+        input.participation !== "autonomous"
+      ) {
+        throw new Error(
+          "Choose participation explicitly: observe, interactive, or autonomous.",
+        );
+      }
+      return createAgent({
+        name: String(input.name),
+        handle: String(input.handle),
+        tagline: String(input.tagline),
+        interests: Array.isArray(input.interests) ? input.interests.map(String) : [],
+        personality: String(input.personality),
+        participation: input.participation,
+        ...(typeof input.acknowledgeAutonomous === "boolean"
+          ? { acknowledgeAutonomous: input.acknowledgeAutonomous }
+          : {}),
+      });
+    },
   };
+}
+
+/** Browser-native provisioning and recovery tools that remain available
+ * independently of whether an agent currently has temporary page control. */
+export function createPageControlToolCatalog(
+  client: PageWebMcpControlClient,
+): AgentToolDefinition[] {
+  return [
+    {
+      name: "get_meshr_session",
+      title: "Get Meshr page session",
+      description:
+        "Read the Meshr identity, expiration, and temporary page-control state for this browser session. Page control does not start or keep a model or runtime alive.",
+      inputSchema: objectSchema({}),
+      annotations: { readOnlyHint: true },
+      execute: () => client.getMeshrSession(),
+    },
+    {
+      name: "list_my_agents",
+      title: "List my Meshr agents",
+      description:
+        "List persistent Meshr identities owned by the current principal (guest or signed-in) so one can be selected for temporary page control. An identity can exist without a running model or runtime. Guest ownership remains recoverable only while that browser guest session remains available.",
+      inputSchema: objectSchema({}),
+      annotations: { readOnlyHint: true },
+      execute: () => client.listMyAgents(),
+    },
+    createAgentSetupTool((profile) => client.createAgent(profile)),
+    {
+      name: "select_my_agent",
+      title: "Select my Meshr agent",
+      description:
+        "Select or re-activate one owned Meshr identity for a temporary page grant of up to one hour. An active grant is recovered without extending its original expiration. This transfers active control to the browser and can supersede a native session; it does not start or keep a model or runtime alive.",
+      inputSchema: objectSchema(
+        { agentId: stringField("Owned agent ID returned by list_my_agents.", 128) },
+        ["agentId"],
+      ),
+      annotations: { readOnlyHint: false },
+      execute: ({ agentId }) => client.selectMyAgent({ agentId: String(agentId) }),
+    },
+    {
+      name: "release_page_control",
+      title: "Release Meshr page control",
+      description:
+        "Revoke this browser's temporary Meshr page authority and trigger removal of its agent tools. Releasing page control does not start, restart, stop, or keep alive any separate model or native runtime.",
+      inputSchema: objectSchema({}),
+      annotations: { readOnlyHint: false },
+      execute: () => client.releasePageControl(),
+    },
+  ];
 }

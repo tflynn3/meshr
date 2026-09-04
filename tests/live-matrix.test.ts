@@ -162,6 +162,7 @@ test("Codex plan uses invocation-local MCP overrides and never mutates global co
     workingDirectory: "/tmp/meshr-codex-workspace",
     stateDirectory: "/tmp/meshr-state",
     binding: binding("codex", "theorem", 1),
+    phase: "root",
     prompt,
     outputPath: "/tmp/last-message.json",
     outputSchemaPath: "/tmp/root-output.schema.json",
@@ -177,6 +178,10 @@ test("Codex plan uses invocation-local MCP overrides and never mutates global co
   assert.equal(
     invocation.args[invocation.args.indexOf("--cd") + 1],
     invocation.cwd,
+  );
+  assert.equal(
+    invocation.args[invocation.args.indexOf("--sandbox") + 1],
+    "read-only",
   );
   assert.ok(invocation.args.includes("--ignore-rules"));
   assert.ok(invocation.args.includes("--ephemeral"));
@@ -204,6 +209,74 @@ test("Codex plan uses invocation-local MCP overrides and never mutates global co
   const redacted = redactInvocation(invocation, prompt);
   assert.equal(redacted.args.includes(prompt), false);
   assert.ok(redacted.args.includes("<phase-prompt>"));
+});
+
+test("Codex root phase exposes required reads and only its approved write", () => {
+  const invocation = buildCodexInvocation({
+    executable: "codex",
+    projectRoot,
+    workingDirectory: "/tmp/meshr-codex-root-workspace",
+    stateDirectory: "/tmp/meshr-state",
+    binding: binding("codex", "theorem", 1),
+    phase: "root",
+    prompt: rootPrompt("trace-codex-root"),
+    outputPath: "/tmp/root-last-message.json",
+    outputSchemaPath: "/tmp/root-output.schema.json",
+  });
+  const config = invocation.args.flatMap((value, index, args) =>
+    value === "--config" ? [args[index + 1]!] : [],
+  );
+
+  assert.ok(
+    config.includes(
+      'mcp_servers.meshr.enabled_tools=["get_my_agent","discover_meshes","list_conversations","read_conversation","publish_post"]',
+    ),
+  );
+  assert.ok(
+    config.includes(
+      'mcp_servers.meshr.tools.publish_post.approval_mode="approve"',
+    ),
+  );
+  assert.equal(
+    config.some((value) => value.includes("reply_to_post")),
+    false,
+  );
+});
+
+test("Codex reply phase exposes required reads and only its approved write", () => {
+  const invocation = buildCodexInvocation({
+    executable: "codex",
+    projectRoot,
+    workingDirectory: "/tmp/meshr-codex-reply-workspace",
+    stateDirectory: "/tmp/meshr-state",
+    binding: binding("codex", "tangent", 2),
+    phase: "reply",
+    prompt: replyPrompt("trace-codex-reply", {
+      meshId: "mesh-public",
+      topicId: "topic-small-discoveries",
+      postId: "post-root",
+    }),
+    outputPath: "/tmp/reply-last-message.json",
+    outputSchemaPath: "/tmp/reply-output.schema.json",
+  });
+  const config = invocation.args.flatMap((value, index, args) =>
+    value === "--config" ? [args[index + 1]!] : [],
+  );
+
+  assert.ok(
+    config.includes(
+      'mcp_servers.meshr.enabled_tools=["get_my_agent","discover_meshes","list_conversations","read_conversation","reply_to_post"]',
+    ),
+  );
+  assert.ok(
+    config.includes(
+      'mcp_servers.meshr.tools.reply_to_post.approval_mode="approve"',
+    ),
+  );
+  assert.equal(
+    config.some((value) => value.includes("publish_post")),
+    false,
+  );
 });
 
 test("managed Codex invocation has no binding, credential, or MCP surface", () => {

@@ -164,6 +164,7 @@ async function prepareProcessInvocation(input: {
       workingDirectory: isolation.workingDirectory,
       stateDirectory: input.stateDirectory,
       binding: input.binding,
+      phase: input.phase,
       prompt: input.prompt,
       outputPath: join(
         input.temporaryDirectory,

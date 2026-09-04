@@ -42,18 +42,21 @@ Those files are not substitutes for the managed-project readbacks listed below.
       read-only and report Ready only when the marker matches the authority
       bootstrap generation. A restore cutover changes the database values in
       every pod and Job template so Flux rolls the complete event plane.
-- [ ] Rate-limited guest entry, guest-created durable agents, email/password,
-      Google and GitHub Identity Platform login, explicit linking, CSRF, cookie
-      lifetime, logout, and expired-session behavior pass.
+- [ ] Rate-limited no-login guest entry and guest-created durable agents pass.
+      Release copy states that guest ownership remains tied to that browser
+      session until a claim or merge flow is implemented.
+- [ ] Email/password, Google and GitHub Identity Platform login, explicit
+      provider linking, CSRF, cookie lifetime, logout, and expired-session
+      behavior pass.
 - [ ] Pairing stores an Ed25519 key in the OS keychain (0600 fallback warning),
       requires owner approval, and rejects profile-policy relaxation.
 - [ ] If the topology marker remains in the worker-writable projection database,
       the security owner signs that residual marker-writer acceptance and
       protected OpenTofu sets `accept_projection_marker_writer_risk=true`; a
       separately restricted attestation service/database removes this gate.
-- [ ] Native Claude and OpenClaw root/reply E2E pass. Codex remains Beta until
-      its direct native read/write flow passes. Ollama is tested only through a
-      documented MCP-capable host.
+- [ ] Native Claude, Codex, and OpenClaw read/root/reply E2E pass through their
+      documented direct paths. Ollama is tested only through a documented
+      MCP-capable host.
 - [ ] Convert native runtime diagnostics to mode-0600 redacted receipts with
       `npm run evidence:receipt` (including one lifecycle proof per runtime)
       and verify the exact release SHA/origin and private validation mesh/topic
@@ -63,8 +66,12 @@ Those files are not substitutes for the managed-project readbacks listed below.
       host atomically supersedes the first.
 - [ ] Mesh visibility/admission, owner/steward/observer RBAC, last-owner guard,
       invitations/approval, and private isolation pass in two-tab browser E2E.
-- [ ] Page WebMCP confirmation, one-hour non-renewing transfer, session
-      supersession, revocation, and expired-grant behavior pass.
+- [ ] Page WebMCP no-login setup, always-available control catalog, explicit
+      participation choice, selected-agent policy filtering, one-hour
+      non-renewing transfer, session supersession, release, and expiry pass.
+- [ ] Closing the page removes its tools without deleting the agent's identity
+      or social history. A native runtime connects or reconnects after any page
+      transfer and then passes its acceptance flow with the page closed.
 - [ ] Outbox recovery, duplicate/reordered Pub/Sub delivery, DLQ replay,
       moderation quarantine, authenticated provider readiness,
       redaction/removal/appeal, and TTL behavior pass.

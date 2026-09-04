@@ -6,6 +6,26 @@ export interface HumanUser {
 }
 
 const MESHR_CONTRACT_MAJOR = "1";
+const WEBMCP_SESSION_LOCK = "meshr:webmcp-session";
+
+/** Preserve browser cookie response order across same-origin tabs. The server
+ * remains authoritative; this lock prevents an older fetch response from
+ * overwriting the HttpOnly grant cookie installed by a newer selection. */
+async function withWebMcpSessionLock<T>(
+  operation: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  const locks = globalThis.navigator?.locks;
+  if (!locks) return operation();
+  return locks.request(
+    WEBMCP_SESSION_LOCK,
+    {
+      mode: "exclusive",
+      ...(signal ? { signal } : {}),
+    },
+    operation,
+  );
+}
 
 export interface HumanSession {
   user: HumanUser;
@@ -80,8 +100,16 @@ export interface WebMcpSessionStatus {
     | "createdAt"
     | "updatedAt"
   > | null;
+  /** Opaque page-authority session identifier used to make release
+   * conditional on the exact grant the caller observed. */
+  pageSessionId: string | null;
   createdAt: string | null;
   expiresAt: string | null;
+}
+
+export interface WebMcpSessionExpectation {
+  agentId: string;
+  pageSessionId: string;
 }
 
 export interface PublicActivityTopic {
@@ -529,8 +557,8 @@ export function linkSocialProvider(input: {
   });
 }
 
-export async function listOwnedAgents(): Promise<OwnedAgent[]> {
-  const response = await request<{ agents: OwnedAgent[] }>("/v1/agents");
+export async function listOwnedAgents(signal?: AbortSignal): Promise<OwnedAgent[]> {
+  const response = await request<{ agents: OwnedAgent[] }>("/v1/agents", { signal });
   return response.agents;
 }
 
@@ -925,21 +953,29 @@ export async function updateActivityPreference(
 }
 
 export function getWebMcpSession(signal?: AbortSignal): Promise<WebMcpSessionStatus> {
-  return request<WebMcpSessionStatus>("/v1/webmcp/session", { signal });
+  return withWebMcpSessionLock(
+    () => request<WebMcpSessionStatus>("/v1/webmcp/session", { signal }),
+    signal,
+  );
 }
 
 export function enableWebMcpSession(
   agentId: string,
   csrfToken: string,
+  signal?: AbortSignal,
 ): Promise<WebMcpSessionStatus> {
-  return request<WebMcpSessionStatus>("/v1/webmcp/session", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Meshr-CSRF": csrfToken,
-    },
-    body: JSON.stringify({ agentId }),
-  });
+  return withWebMcpSessionLock(
+    () => request<WebMcpSessionStatus>("/v1/webmcp/session", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Meshr-CSRF": csrfToken,
+      },
+      body: JSON.stringify({ agentId }),
+      signal,
+    }),
+    signal,
+  );
 }
 
 export interface CreateBrowserAgentInput {
@@ -959,27 +995,45 @@ export interface CreateBrowserAgentInput {
 export function createBrowserAgentWithWebMcp(
   input: CreateBrowserAgentInput,
   csrfToken: string,
+  signal?: AbortSignal,
 ): Promise<WebMcpSessionStatus> {
   const { idempotencyKey: suppliedKey, ...createAgent } = input;
   const idempotencyKey = suppliedKey
     ?? globalThis.crypto?.randomUUID?.()
     ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  return request<WebMcpSessionStatus>("/v1/webmcp/session", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Meshr-CSRF": csrfToken,
-      "Idempotency-Key": idempotencyKey,
-    },
-    body: JSON.stringify({ createAgent }),
-  });
+  return withWebMcpSessionLock(
+    () => request<WebMcpSessionStatus>("/v1/webmcp/session", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Meshr-CSRF": csrfToken,
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify({ createAgent }),
+      signal,
+    }),
+    signal,
+  );
 }
 
-export function disableWebMcpSession(csrfToken: string): Promise<WebMcpSessionStatus> {
-  return request<WebMcpSessionStatus>("/v1/webmcp/session", {
-    method: "DELETE",
-    headers: { "X-Meshr-CSRF": csrfToken },
-  });
+export function disableWebMcpSession(
+  csrfToken: string,
+  expected: WebMcpSessionExpectation,
+  signal?: AbortSignal,
+): Promise<WebMcpSessionStatus> {
+  if (!expected) throw new Error("webmcp_authority_corrupt");
+  return withWebMcpSessionLock(
+    () => request<WebMcpSessionStatus>("/v1/webmcp/session/release", {
+      method: "DELETE",
+      headers: {
+        "X-Meshr-CSRF": csrfToken,
+        "X-Meshr-WebMCP-Agent": expected.agentId,
+        "X-Meshr-WebMCP-Session": expected.pageSessionId,
+      },
+      signal,
+    }),
+    signal,
+  );
 }
 
 export async function deleteSession(csrfToken: string): Promise<void> {

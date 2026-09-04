@@ -1160,8 +1160,13 @@ async function main(): Promise<void> {
   expectStatus(page, 201, "page WebMCP transfer");
   const pageState = await request("/v1/webmcp/session");
   expectStatus(pageState, 200, "page WebMCP state read");
-  if (!pageState.body || typeof pageState.body !== "object" || Array.isArray(pageState.body) || pageState.body.enabled !== true) {
+  const pageStateBody = objectBody(pageState.body, "page WebMCP state read");
+  if (pageStateBody.enabled !== true) {
     throw new Error("page WebMCP state did not report an enabled grant.");
+  }
+  const pageSessionId = pageStateBody.pageSessionId;
+  if (typeof pageSessionId !== "string" || !pageSessionId) {
+    throw new Error("page WebMCP state did not return its release precondition.");
   }
   // Exercise a real page-tool endpoint, not only the grant metadata route.
   // This catches a cross-replica hydration regression where the grant exists
@@ -1175,9 +1180,13 @@ async function main(): Promise<void> {
     headers: { authorization: `Bearer ${agentToken}` },
   });
   expectStatus(staleHeartbeat, 401, "superseded native heartbeat rejection");
-  const revoked = await request("/v1/webmcp/session", {
+  const revoked = await request("/v1/webmcp/session/release", {
     method: "DELETE",
-    headers: { "x-meshr-csrf": csrfToken },
+    headers: {
+      "x-meshr-csrf": csrfToken,
+      "x-meshr-webmcp-agent": agentId,
+      "x-meshr-webmcp-session": pageSessionId,
+    },
   });
   expectStatus(revoked, 200, "page WebMCP revocation");
   const revokedTool = await request("/v1/webmcp/profile", {

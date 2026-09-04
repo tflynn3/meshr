@@ -61,6 +61,7 @@ import { publicRuntimeKind } from "./types.ts";
 import { constantTimeStringEqual, hmacSha256 } from "./security.ts";
 import { requireJoinCapableAttentionPolicy } from "./attentionPolicy.ts";
 import type { RepositoryPostInput } from "./firestoreRepository.ts";
+import { nextAuthorityEpoch } from "./authorityEpoch.ts";
 
 const HUMAN_IDLE_SECONDS = 12 * 60 * 60;
 const PAGE_AUTHORITY_GRANT_SECONDS = 60 * 60;
@@ -840,31 +841,55 @@ export class SqliteMeshrRepository implements MeshrRepository {
          WHERE agent_id = ? AND status = 'active' LIMIT 2`,
       ).all(agent.agentId) as Array<{ session_id: string; authority_epoch: number }>;
       const humanGrants = this.db.prepare(
-        `SELECT token_hash, agent_id, session_id, authority_epoch
+        `SELECT token_hash, agent_id, session_id,
+                CAST(authority_epoch AS REAL) AS authority_epoch, expires_at
          FROM webmcp_grants
-         WHERE human_session_hash = ? AND revoked_at IS NULL LIMIT 2`,
+         WHERE human_session_hash = ? AND revoked_at IS NULL LIMIT 3`,
       ).all(input.humanSessionHash) as Array<{
         token_hash: string;
         agent_id: string;
         session_id: string;
         authority_epoch: number;
+        expires_at: string;
       }>;
       const agentGrants = this.db.prepare(
-        `SELECT token_hash, human_session_hash, session_id, authority_epoch
+        `SELECT token_hash, human_session_hash, session_id,
+                CAST(authority_epoch AS REAL) AS authority_epoch, expires_at
          FROM webmcp_grants
-         WHERE agent_id = ? AND revoked_at IS NULL LIMIT 2`,
+         WHERE agent_id = ? AND revoked_at IS NULL LIMIT 3`,
       ).all(agent.agentId) as Array<{
         token_hash: string;
         human_session_hash: string;
         session_id: string;
         authority_epoch: number;
+        expires_at: string;
       }>;
+      const currentHumanGrants = humanGrants.filter((candidate) => {
+        const expiresAt = Date.parse(candidate.expires_at);
+        return !Number.isFinite(expiresAt) || expiresAt > nowMs;
+      });
+      const currentAgentGrants = agentGrants.filter((candidate) => {
+        const expiresAt = Date.parse(candidate.expires_at);
+        return !Number.isFinite(expiresAt) || expiresAt > nowMs;
+      });
+      const priorGrantEpochs = [...humanGrants, ...agentGrants].map((candidate) =>
+        Number(candidate.authority_epoch),
+      );
       if (
         activeSessions.length > 1 ||
-        humanGrants.length > 1 ||
-        agentGrants.length > 1
+        humanGrants.length > 2 ||
+        agentGrants.length > 2 ||
+        currentHumanGrants.length > 1 ||
+        currentAgentGrants.length > 1
       ) {
         throw new Error("agent_authority_corrupt");
+      }
+      if (
+        priorGrantEpochs.some(
+          (epoch) => !Number.isSafeInteger(epoch) || epoch < 1,
+        )
+      ) {
+        throw new Error("webmcp_authority_corrupt");
       }
       const idempotency = this.db.prepare(
         `SELECT request_hash, response_json, expires_at
@@ -955,7 +980,8 @@ export class SqliteMeshrRepository implements MeshrRepository {
             }
           | undefined;
         const authority = this.db.prepare(
-          "SELECT epoch, authority_kind, session_id FROM agent_authority WHERE agent_id = ?",
+          `SELECT CAST(epoch AS REAL) AS epoch, authority_kind, session_id
+           FROM agent_authority WHERE agent_id = ?`,
         ).get(storedAgentId) as
           | { epoch: number; authority_kind: string; session_id: string }
           | undefined;
@@ -981,10 +1007,10 @@ export class SqliteMeshrRepository implements MeshrRepository {
           !Number.isFinite(Date.parse(grantRow.expires_at)) ||
           Date.parse(grantRow.expires_at) <= nowMs ||
           activeSessions.length !== 0 ||
-          humanGrants.length !== 1 ||
-          humanGrants[0]!.token_hash !== storedGrantId ||
-          agentGrants.length !== 1 ||
-          agentGrants[0]!.token_hash !== storedGrantId ||
+          currentHumanGrants.length !== 1 ||
+          currentHumanGrants[0]!.token_hash !== storedGrantId ||
+          currentAgentGrants.length !== 1 ||
+          currentAgentGrants[0]!.token_hash !== storedGrantId ||
           !authority ||
           authority.authority_kind !== "page" ||
           authority.session_id !== storedSessionId ||
@@ -1059,11 +1085,23 @@ export class SqliteMeshrRepository implements MeshrRepository {
       }
 
       const humanFence = this.db.prepare(
-        "SELECT epoch FROM webmcp_authority WHERE human_session_hash = ?",
+        `SELECT CAST(epoch AS REAL) AS epoch
+         FROM webmcp_authority WHERE human_session_hash = ?`,
       ).get(input.humanSessionHash) as { epoch: number } | undefined;
-      if (humanGrants[0]) {
+      const humanFenceEpoch = Number(humanFence?.epoch ?? 0);
+      if (
+        humanFence &&
+        (!Number.isSafeInteger(humanFenceEpoch) || humanFenceEpoch < 1)
+      ) {
+        throw new Error("webmcp_authority_corrupt");
+      }
+      // SQLite does not run TTL, but keeping the same stale/current split as
+      // Firestore makes local conformance tests exercise the production repair
+      // path instead of masking it.
+      if (currentHumanGrants[0]) {
         const previousFence = this.db.prepare(
-          `SELECT epoch, grant_id, agent_id, session_id, revoked_at
+          `SELECT CAST(epoch AS REAL) AS epoch,
+                  grant_id, agent_id, session_id, revoked_at
            FROM webmcp_authority WHERE human_session_hash = ?`,
         ).get(input.humanSessionHash) as
           | {
@@ -1076,22 +1114,33 @@ export class SqliteMeshrRepository implements MeshrRepository {
           | undefined;
         if (
           !previousFence ||
-          previousFence.grant_id !== humanGrants[0].token_hash ||
-          previousFence.agent_id !== humanGrants[0].agent_id ||
-          previousFence.session_id !== humanGrants[0].session_id ||
+          previousFence.grant_id !== currentHumanGrants[0].token_hash ||
+          previousFence.agent_id !== currentHumanGrants[0].agent_id ||
+          previousFence.session_id !== currentHumanGrants[0].session_id ||
           previousFence.revoked_at !== null ||
-          Number(previousFence.epoch) !== Number(humanGrants[0].authority_epoch)
+          Number(previousFence.epoch) !==
+            Number(currentHumanGrants[0].authority_epoch)
         ) {
           throw new Error("webmcp_authority_corrupt");
         }
       }
       const agentFence = this.db.prepare(
-        "SELECT epoch FROM agent_authority WHERE agent_id = ?",
+        `SELECT CAST(epoch AS REAL) AS epoch
+         FROM agent_authority WHERE agent_id = ?`,
       ).get(agent.agentId) as { epoch: number } | undefined;
-      const epoch = Math.max(
-        Number(humanFence?.epoch ?? 0),
-        Number(agentFence?.epoch ?? 0),
-      ) + 1;
+      const agentFenceEpoch = Number(agentFence?.epoch ?? 0);
+      if (
+        agentFence &&
+        (!Number.isSafeInteger(agentFenceEpoch) || agentFenceEpoch < 1)
+      ) {
+        throw new Error("agent_authority_corrupt");
+      }
+      const epoch = nextAuthorityEpoch(
+        "webmcp_authority_corrupt",
+        humanFenceEpoch,
+        agentFenceEpoch,
+        ...priorGrantEpochs,
+      );
 
       this.db.prepare(
         `INSERT INTO agents(
@@ -3548,23 +3597,39 @@ export class SqliteMeshrRepository implements MeshrRepository {
     this.db.prepare("DELETE FROM human_sessions WHERE token_hash = ?").run(tokenHash);
   }
 
-  async revokeWebMcpGrants(humanSessionHash: string, revokedAt: string): Promise<void> {
-    this.database.transaction(() => {
+  async revokeWebMcpGrants(
+    humanSessionHash: string,
+    revokedAt: string,
+    expected?: { agentId: string; sessionId: string },
+  ): Promise<boolean> {
+    return this.database.transaction(() => {
       const session = this.db
         .prepare("SELECT 1 AS present FROM human_sessions WHERE token_hash = ?")
         .get(humanSessionHash) as { present: number } | undefined;
       // Logout removes the human session first in the compatibility path;
       // its foreign-key cascade has already removed grants and the fence.
-      if (!session) return;
-      const activeGrant = this.db
+      if (!session) return expected === undefined;
+      const activeGrants = this.db
         .prepare(
-          `SELECT 1 AS present FROM webmcp_grants
-           WHERE human_session_hash = ? AND revoked_at IS NULL LIMIT 1`,
+          `SELECT token_hash, agent_id, session_id,
+                  CAST(authority_epoch AS REAL) AS authority_epoch
+           FROM webmcp_grants
+           WHERE human_session_hash = ? AND revoked_at IS NULL LIMIT 2`,
         )
-        .get(humanSessionHash);
+        .all(humanSessionHash) as Array<{
+          token_hash: string;
+          agent_id: string;
+          session_id: string;
+          authority_epoch: number;
+        }>;
+      if (activeGrants.length > 1) {
+        throw new Error("webmcp_authority_corrupt");
+      }
+      const activeGrant = activeGrants[0];
       const fence = this.db
         .prepare(
-          `SELECT epoch, grant_id, agent_id, session_id, revoked_at
+          `SELECT CAST(epoch AS REAL) AS epoch,
+                  grant_id, agent_id, session_id, revoked_at
            FROM webmcp_authority WHERE human_session_hash = ?`,
         )
         .get(humanSessionHash) as
@@ -3576,6 +3641,43 @@ export class SqliteMeshrRepository implements MeshrRepository {
             revoked_at: string | null;
           }
         | undefined;
+      const fenceEpoch = Number(fence?.epoch ?? 0);
+      if (
+        fence &&
+        (!Number.isSafeInteger(fenceEpoch) || fenceEpoch < 1)
+      ) {
+        throw new Error("webmcp_authority_corrupt");
+      }
+      if (expected) {
+        if (
+          !activeGrant ||
+          !fence ||
+          fence.revoked_at != null ||
+          fence.grant_id !== activeGrant.token_hash ||
+          fence.agent_id !== activeGrant.agent_id ||
+          fence.session_id !== activeGrant.session_id ||
+          fenceEpoch !== Number(activeGrant.authority_epoch)
+        ) {
+          if (
+            activeGrant &&
+            fence &&
+            fence.revoked_at == null &&
+            (fence.grant_id !== activeGrant.token_hash ||
+              fence.agent_id !== activeGrant.agent_id ||
+              fence.session_id !== activeGrant.session_id ||
+              fenceEpoch !== Number(activeGrant.authority_epoch))
+          ) {
+            throw new Error("webmcp_authority_corrupt");
+          }
+          return false;
+        }
+        if (
+          activeGrant.agent_id !== expected.agentId ||
+          activeGrant.session_id !== expected.sessionId
+        ) {
+          return false;
+        }
+      }
       if (
         !activeGrant &&
         (!fence ||
@@ -3584,7 +3686,7 @@ export class SqliteMeshrRepository implements MeshrRepository {
             fence.agent_id == null &&
             fence.session_id == null))
       ) {
-        return;
+        return true;
       }
       this.db
         .prepare(
@@ -3598,7 +3700,13 @@ export class SqliteMeshrRepository implements MeshrRepository {
          ON CONFLICT(human_session_hash) DO UPDATE SET
            epoch = excluded.epoch, grant_id = NULL, agent_id = NULL, session_id = NULL,
            updated_at = excluded.updated_at, revoked_at = excluded.revoked_at`,
-      ).run(humanSessionHash, (fence?.epoch ?? 0) + 1, revokedAt, revokedAt);
+      ).run(
+        humanSessionHash,
+        nextAuthorityEpoch("webmcp_authority_corrupt", fenceEpoch),
+        revokedAt,
+        revokedAt,
+      );
+      return true;
     });
   }
 
@@ -5036,7 +5144,10 @@ export class SqliteMeshrRepository implements MeshrRepository {
         .get(input.agentId, now);
       if (activePageGrant) throw new Error("page_authority_active");
       const authority = currentAuthority;
-      const epoch = (authority?.epoch ?? 0) + 1;
+      const epoch = nextAuthorityEpoch(
+        "agent_authority_corrupt",
+        Number(authority?.epoch ?? 0),
+      );
       this.db
         .prepare(
           `UPDATE agent_sessions
@@ -5164,14 +5275,16 @@ export class SqliteMeshrRepository implements MeshrRepository {
         .get(input.agentId) as { owner_account_id: string } | undefined;
       const authority = this.db
         .prepare(
-          "SELECT epoch, authority_kind, session_id FROM agent_authority WHERE agent_id = ?",
+          `SELECT CAST(epoch AS REAL) AS epoch, authority_kind, session_id
+           FROM agent_authority WHERE agent_id = ?`,
         )
         .get(input.agentId) as
         | { epoch: number; authority_kind: string; session_id: string }
         | undefined;
       const fence = this.db
         .prepare(
-          `SELECT epoch, grant_id, agent_id, session_id, revoked_at
+          `SELECT CAST(epoch AS REAL) AS epoch,
+                  grant_id, agent_id, session_id, revoked_at
            FROM webmcp_authority WHERE human_session_hash = ?`,
         )
         .get(input.humanSessionHash) as
@@ -5194,32 +5307,68 @@ export class SqliteMeshrRepository implements MeshrRepository {
       }>;
       const humanGrants = this.db
         .prepare(
-          `SELECT token_hash, agent_id, session_id, authority_epoch
+          `SELECT token_hash, agent_id, session_id,
+                  CAST(authority_epoch AS REAL) AS authority_epoch, expires_at
            FROM webmcp_grants
-           WHERE human_session_hash = ? AND revoked_at IS NULL LIMIT 2`,
+           WHERE human_session_hash = ? AND revoked_at IS NULL LIMIT 3`,
         )
         .all(input.humanSessionHash) as Array<{
         token_hash: string;
         agent_id: string;
         session_id: string;
         authority_epoch: number;
+        expires_at: string;
       }>;
       const agentGrants = this.db
         .prepare(
-          `SELECT token_hash, human_session_hash, session_id, authority_epoch
+          `SELECT token_hash, human_session_hash, session_id,
+                  CAST(authority_epoch AS REAL) AS authority_epoch, expires_at
            FROM webmcp_grants
-           WHERE agent_id = ? AND revoked_at IS NULL LIMIT 2`,
+           WHERE agent_id = ? AND revoked_at IS NULL LIMIT 3`,
         )
         .all(input.agentId) as Array<{
         token_hash: string;
         human_session_hash: string;
         session_id: string;
         authority_epoch: number;
+        expires_at: string;
       }>;
+      const currentHumanGrants = humanGrants.filter((candidate) => {
+        const expiresAt = Date.parse(candidate.expires_at);
+        return !Number.isFinite(expiresAt) || expiresAt > nowMs;
+      });
+      const currentAgentGrants = agentGrants.filter((candidate) => {
+        const expiresAt = Date.parse(candidate.expires_at);
+        return !Number.isFinite(expiresAt) || expiresAt > nowMs;
+      });
+      const priorGrantEpochs = [...humanGrants, ...agentGrants].map((candidate) =>
+        Number(candidate.authority_epoch),
+      );
+      const fenceEpoch = Number(fence?.epoch ?? 0);
+      const authorityEpoch = Number(authority?.epoch ?? 0);
       if (
         nativeSessions.length > 1 ||
-        humanGrants.length > 1 ||
-        agentGrants.length > 1
+        humanGrants.length > 2 ||
+        agentGrants.length > 2 ||
+        currentHumanGrants.length > 1 ||
+        currentAgentGrants.length > 1 ||
+        priorGrantEpochs.some(
+          (epoch) => !Number.isSafeInteger(epoch) || epoch < 1,
+        )
+      ) {
+        throw new Error("agent_authority_corrupt");
+      }
+      if (
+        fence &&
+        (!Number.isSafeInteger(fenceEpoch) || fenceEpoch < 1)
+      ) {
+        throw new Error("webmcp_authority_corrupt");
+      }
+      if (
+        authority &&
+        (!Number.isSafeInteger(authorityEpoch) ||
+          authorityEpoch < 1 ||
+          authorityEpoch >= Number.MAX_SAFE_INTEGER)
       ) {
         throw new Error("agent_authority_corrupt");
       }
@@ -5256,30 +5405,43 @@ export class SqliteMeshrRepository implements MeshrRepository {
       }
 
       const currentNative = nativeSessions[0];
-      const currentAgentGrant = agentGrants[0];
-      if (currentNative) {
+      const currentAgentGrant = currentAgentGrants[0];
+      const authorityKind = authority?.authority_kind ?? null;
+      if (authorityKind === "native") {
         if (
           !authority ||
-          authority.authority_kind !== "native" ||
+          !currentNative ||
+          currentAgentGrant ||
           authority.session_id !== currentNative.session_id ||
-          Number(authority.epoch) !== Number(currentNative.authority_epoch) ||
-          currentAgentGrant
+          Number(authority.epoch) !== Number(currentNative.authority_epoch)
         ) {
           throw new Error("agent_authority_corrupt");
         }
-      } else if (currentAgentGrant) {
+      } else if (authorityKind === "page") {
+        if (!authority || currentNative) {
+          throw new Error("agent_authority_corrupt");
+        }
+        // An expired or revoked page grant may leave a harmless page fence on
+        // the agent. Any still-current grant must exactly match that fence.
         if (
-          !authority ||
-          authority.authority_kind !== "page" ||
-          authority.session_id !== currentAgentGrant.session_id ||
-          Number(authority.epoch) !==
-            Number(currentAgentGrant.authority_epoch)
+          currentAgentGrant &&
+          (authority.session_id !== currentAgentGrant.session_id ||
+            Number(authority.epoch) !==
+              Number(currentAgentGrant.authority_epoch))
         ) {
           throw new Error("agent_authority_corrupt");
         }
+      } else if (authorityKind === null) {
+        if (currentNative || currentAgentGrant) {
+          throw new Error("agent_authority_corrupt");
+        }
+      } else {
+        // SQLite's schema currently admits only native/page kinds, but retain
+        // the production fail-closed branch if that storage contract evolves.
+        throw new Error("agent_authority_corrupt");
       }
 
-      const currentHumanGrant = humanGrants[0];
+      const currentHumanGrant = currentHumanGrants[0];
       if (
         currentHumanGrant &&
         (!fence ||
@@ -5291,8 +5453,12 @@ export class SqliteMeshrRepository implements MeshrRepository {
       ) {
         throw new Error("webmcp_authority_corrupt");
       }
-      const epoch =
-        Math.max(Number(fence?.epoch ?? 0), Number(authority?.epoch ?? 0)) + 1;
+      const epoch = nextAuthorityEpoch(
+        "webmcp_authority_corrupt",
+        fenceEpoch,
+        authorityEpoch,
+        ...priorGrantEpochs,
+      );
       this.db
         .prepare(
           `UPDATE agent_sessions

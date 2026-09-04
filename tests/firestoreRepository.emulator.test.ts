@@ -1930,6 +1930,22 @@ test(
       );
       assert.equal(activePageGrant?.tokenHash, pageGrantId);
       assert.equal(activePageGrant?.sessionId, `${prefix}_page_session`);
+      assert.equal(
+        await repository.revokeWebMcpGrants(accountSessionHash, now, {
+          agentId,
+          sessionId: `${prefix}_stale_page_session`,
+        }),
+        false,
+      );
+      assert.equal(
+        (
+          await repository.findActiveWebMcpGrant(
+            accountSessionHash,
+            agentId,
+          )
+        )?.sessionId,
+        `${prefix}_page_session`,
+      );
       await collection("agent_authority")
         .doc(agentId)
         .update({ session_id: `${prefix}_stale_page_session` });
@@ -1944,7 +1960,13 @@ test(
         () => repository.heartbeatRuntimeSession(runtimeSessionId, now),
         /session_invalid/,
       );
-      await repository.revokeWebMcpGrants(accountSessionHash, now);
+      assert.equal(
+        await repository.revokeWebMcpGrants(accountSessionHash, now, {
+          agentId,
+          sessionId: `${prefix}_page_session`,
+        }),
+        true,
+      );
       assert.equal(
         await repository.findActiveWebMcpGrant(accountSessionHash, agentId),
         null,
@@ -1956,9 +1978,12 @@ test(
         .doc("global")
         .get();
       const outboxAfterRevoke = await collection("event_outbox").get();
-      await repository.revokeWebMcpGrants(
-        accountSessionHash,
-        "2026-08-28T18:00:01.000Z",
+      assert.equal(
+        await repository.revokeWebMcpGrants(
+          accountSessionHash,
+          "2026-08-28T18:00:01.000Z",
+        ),
+        true,
       );
       const repeatedFence = await collection("webmcp_authority")
         .doc(accountSessionHash)
@@ -2654,7 +2679,7 @@ test(
         .get();
       const fenceTtl = fence.get("expires_at_ttl");
       assert.ok(fenceTtl instanceof Timestamp);
-      assert.equal(fenceTtl.toDate().toISOString(), grantExpiresAt);
+      assert.equal(fenceTtl.toDate().toISOString(), humanAbsoluteExpiresAt);
 
       const firstRevoke = await repository.revokeAgent(
         agentId,
@@ -4112,6 +4137,320 @@ test(
             .get()
         ).size,
         25,
+      );
+    } finally {
+      for (const candidate of await firestore.listCollections()) {
+        if (candidate.id.startsWith(`${prefix}_`)) {
+          await firestore.recursiveDelete(candidate);
+        }
+      }
+      await firestore.terminate();
+    }
+  },
+);
+
+test(
+  "Firestore repairs expired grant TTL skew and retains the human authority fence",
+  {
+    skip: !process.env.FIRESTORE_EMULATOR_HOST,
+  },
+  async () => {
+    const projectId =
+      process.env.GOOGLE_CLOUD_PROJECT?.trim() || "meshr-emulator";
+    const firestore = new Firestore({ projectId, databaseId: "(default)" });
+    const prefix = `webmcp_ttl_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const collection = (name: string) =>
+      firestore.collection(`${prefix}_${name}`);
+    let clockNow = "2026-09-04T18:00:00.000Z";
+    const absoluteExpiresAt = "2026-09-11T18:00:00.000Z";
+    const repository = new FirestoreMeshrRepository({
+      firestore,
+      collectionPrefix: prefix,
+      clock: { now: () => new Date(clockNow) },
+      invitationPepper: `${prefix}:pepper`,
+    });
+    const humanSessionHash = createHash("sha256")
+      .update(`${prefix}:human-session`)
+      .digest("hex");
+
+    try {
+      await repository.ensureEmptyProduction();
+      const owner = await repository.createSocialAccount({
+        provider: "google",
+        subject: `${prefix}:owner`,
+        email: `${prefix}@example.test`,
+        displayName: "WebMCP TTL Owner",
+      });
+      await repository.createHumanSession({
+        tokenHash: humanSessionHash,
+        accountId: owner.accountId,
+        csrfToken: `${prefix}:csrf`,
+        createdAt: clockNow,
+        expiresAt: "2026-09-04T20:00:00.000Z",
+        absoluteExpiresAt,
+      });
+
+      const command = (ordinal: number, expiresAt: string) => {
+        const agentId = `${prefix}_agent_${ordinal}`;
+        const sessionId = `${prefix}_page_${ordinal}`;
+        return {
+          agent: {
+            agentId,
+            ownerAccountId: owner.accountId,
+            name: `TTL Agent ${ordinal}`,
+            handle: `${prefix.slice(-12)}-ttl-${ordinal}`,
+            tagline: "Exercises Firestore page-authority cleanup skew.",
+            interests: ["WebMCP"],
+            personality: "Careful.",
+            attention: {
+              browse: "public" as const,
+              rootPosts: "draft" as const,
+              replies: "draft" as const,
+              notes: "Act only from the page.",
+            },
+            runtime: "other" as const,
+            runtimeLabel: "Page WebMCP",
+            runtimeSubject: `webmcp:${agentId}`,
+            publicKeyPem: "",
+            definitionDigest: null,
+            createdAt: clockNow,
+            updatedAt: clockNow,
+          },
+          grantId: createHash("sha256")
+            .update(`${prefix}:grant:${ordinal}`)
+            .digest("hex"),
+          humanSessionHash,
+          expiresAt,
+          sessionId,
+          idempotencyKey: `${prefix}:create:${ordinal}`,
+          requestHash: createHash("sha256")
+            .update(`${prefix}:request:${ordinal}`)
+            .digest("hex"),
+          event: {
+            eventId: `${prefix}_event_${ordinal}`,
+            type: "agent.created",
+            meshId: "mesh-public",
+            topicId: null,
+            agentId,
+            sessionId,
+            runtimeKind: null,
+            payload: { agentId, authority: "page_webmcp" },
+            occurredAt: clockNow,
+          },
+          audit: {
+            auditId: `${prefix}_audit_${ordinal}`,
+            actorType: "human" as const,
+            actorId: owner.accountId,
+            sessionId: humanSessionHash,
+            action: "webmcp.agent.created",
+            resourceType: "agent",
+            resourceId: agentId,
+            data: { authority: "page_webmcp" },
+            createdAt: clockNow,
+          },
+        };
+      };
+
+      const fenceRef = collection("webmcp_authority").doc(humanSessionHash);
+      const firstInput = command(1, "2026-09-04T18:30:00.000Z");
+      const first = await repository.createBrowserAgentWithPageAuthority(
+        firstInput,
+      );
+      assert.equal(first.authorityEpoch, 1);
+      assert.equal(
+        (await fenceRef.get())
+          .get("expires_at_ttl")
+          .toDate()
+          .toISOString(),
+        absoluteExpiresAt,
+      );
+
+      // Model the observed production ordering: TTL removes the human fence
+      // while its expired, still-unrevoked grant remains query-visible.
+      clockNow = "2026-09-04T18:31:00.000Z";
+      await fenceRef.delete();
+      const secondInput = command(2, "2026-09-04T19:15:00.000Z");
+      const second = await repository.createBrowserAgentWithPageAuthority(
+        secondInput,
+      );
+      assert.equal(second.authorityEpoch, first.authorityEpoch + 1);
+      assert.equal(
+        (
+          await collection("webmcp_grants").doc(firstInput.grantId).get()
+        ).get("revoked_at"),
+        clockNow,
+      );
+      assert.equal(
+        (await fenceRef.get())
+          .get("expires_at_ttl")
+          .toDate()
+          .toISOString(),
+        absoluteExpiresAt,
+      );
+
+      // A still-current grant retains the original fail-closed invariant.
+      await fenceRef.delete();
+      const blockedCreate = command(3, "2026-09-04T19:20:00.000Z");
+      await assert.rejects(
+        repository.createBrowserAgentWithPageAuthority(blockedCreate),
+        /webmcp_authority_corrupt/,
+      );
+      assert.equal(
+        (await collection("agents").doc(blockedCreate.agent.agentId).get())
+          .exists,
+        false,
+      );
+
+      // The selection path applies the same repair after the surviving grant
+      // expires, and advances from that stale grant's epoch even without its
+      // human fence.
+      clockNow = "2026-09-04T19:16:00.000Z";
+      const exhaustedEpoch = Number.MAX_SAFE_INTEGER;
+      const secondGrantRef = collection("webmcp_grants").doc(
+        secondInput.grantId,
+      );
+      await secondGrantRef.update({ authority_epoch: exhaustedEpoch });
+      await fenceRef.set({
+        contract_version: 1,
+        human_session_hash: humanSessionHash,
+        epoch: exhaustedEpoch,
+        grant_id: secondInput.grantId,
+        agent_id: secondInput.agent.agentId,
+        session_id: secondInput.sessionId,
+        updated_at: clockNow,
+        revoked_at: null,
+        expires_at_ttl: Timestamp.fromDate(new Date(absoluteExpiresAt)),
+      });
+      const unsafeFenceCreate = command(4, "2026-09-04T19:50:00.000Z");
+      await assert.rejects(
+        repository.createBrowserAgentWithPageAuthority(unsafeFenceCreate),
+        /webmcp_authority_corrupt/,
+      );
+      assert.equal(
+        (await collection("agents").doc(unsafeFenceCreate.agent.agentId).get())
+          .exists,
+        false,
+      );
+      await assert.rejects(
+        repository.revokeWebMcpGrants(
+          humanSessionHash,
+          clockNow,
+          {
+            agentId: secondInput.agent.agentId,
+            sessionId: secondInput.sessionId,
+          },
+        ),
+        /webmcp_authority_corrupt/,
+      );
+      assert.equal((await secondGrantRef.get()).get("revoked_at"), null);
+      assert.equal((await fenceRef.get()).get("epoch"), exhaustedEpoch);
+      await fenceRef.delete();
+      await secondGrantRef.update({ authority_epoch: second.authorityEpoch });
+
+      const firstAuthorityRef = collection("agent_authority").doc(
+        firstInput.agent.agentId,
+      );
+      await firstAuthorityRef.set(
+        {
+          epoch: exhaustedEpoch,
+          authority_kind: "page",
+          session_id: firstInput.sessionId,
+          updated_at: clockNow,
+        },
+        { merge: true },
+      );
+      const unsafeAuthorityGrantId = createHash("sha256")
+        .update(`${prefix}:unsafe-agent-authority-grant`)
+        .digest("hex");
+      await assert.rejects(
+        repository.transferPageAuthority({
+          agentId: firstInput.agent.agentId,
+          grantId: unsafeAuthorityGrantId,
+          humanSessionHash,
+          expiresAt: "2026-09-04T19:45:00.000Z",
+          sessionId: `${prefix}_unsafe_agent_authority_page`,
+        }),
+        /agent_authority_corrupt/,
+      );
+      assert.equal(
+        (
+          await collection("webmcp_grants")
+            .doc(unsafeAuthorityGrantId)
+            .get()
+        ).exists,
+        false,
+      );
+
+      // SQLite and Firestore must both fail closed when the durable native
+      // authority points at a runtime session that does not exist.
+      await firstAuthorityRef.set(
+        {
+          epoch: first.authorityEpoch,
+          authority_kind: "native",
+          session_id: `${prefix}_missing_native_session`,
+          updated_at: clockNow,
+        },
+        { merge: true },
+      );
+      await assert.rejects(
+        repository.transferPageAuthority({
+          agentId: firstInput.agent.agentId,
+          grantId: createHash("sha256")
+            .update(`${prefix}:stale-native-grant`)
+            .digest("hex"),
+          humanSessionHash,
+          expiresAt: "2026-09-04T19:45:00.000Z",
+          sessionId: `${prefix}_stale_native_page`,
+        }),
+        /agent_authority_corrupt/,
+      );
+      await firstAuthorityRef.set(
+        {
+          epoch: first.authorityEpoch,
+          authority_kind: "page",
+          session_id: firstInput.sessionId,
+          updated_at: clockNow,
+        },
+        { merge: true },
+      );
+
+      const transferGrantId = createHash("sha256")
+        .update(`${prefix}:transfer-grant`)
+        .digest("hex");
+      const transfer = await repository.transferPageAuthority({
+        agentId: firstInput.agent.agentId,
+        grantId: transferGrantId,
+        humanSessionHash,
+        expiresAt: "2026-09-04T19:45:00.000Z",
+        sessionId: `${prefix}_transfer_page`,
+      });
+      assert.equal(transfer.authorityEpoch, second.authorityEpoch + 1);
+      assert.equal(
+        (
+          await collection("webmcp_grants").doc(secondInput.grantId).get()
+        ).get("revoked_at"),
+        clockNow,
+      );
+      assert.equal(
+        (await fenceRef.get())
+          .get("expires_at_ttl")
+          .toDate()
+          .toISOString(),
+        absoluteExpiresAt,
+      );
+
+      await fenceRef.delete();
+      await assert.rejects(
+        repository.transferPageAuthority({
+          agentId: secondInput.agent.agentId,
+          grantId: createHash("sha256")
+            .update(`${prefix}:blocked-transfer`)
+            .digest("hex"),
+          humanSessionHash,
+          expiresAt: "2026-09-04T19:50:00.000Z",
+          sessionId: `${prefix}_blocked_page`,
+        }),
+        /webmcp_authority_corrupt/,
       );
     } finally {
       for (const candidate of await firestore.listCollections()) {
