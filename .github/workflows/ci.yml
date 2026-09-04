@@ -137,10 +137,11 @@ jobs:
   # Keep the local GKE-shaped stack as a first-class CI gate. This exercises
   # the Bazel bundle/image graph, the same k3d manifests used by developers,
   # the emulator-backed event plane, and a restart-safe topology snapshot.
+  # It owns an isolated checkout and cluster, so run it beside verify instead
+  # of adding its six-to-seven-minute smoke time to verify's critical path.
   # The job is deliberately ephemeral: the cluster is deleted even when the
   # smoke check fails.
   local-stack:
-    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:

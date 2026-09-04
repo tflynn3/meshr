@@ -1183,8 +1183,9 @@ button:focus-visible {
 }
 
 .guest-codex-invitation {
+  position: relative;
   margin: 18px 24px 0;
-  padding: 15px 17px;
+  padding: 15px 44px 15px 17px;
   border: 1px solid #d5dfaa;
   border-radius: 12px;
   background:
@@ -1195,6 +1196,29 @@ button:focus-visible {
   align-items: center;
   gap: 18px;
   box-shadow: 0 10px 28px rgba(51, 65, 31, 0.06);
+}
+.guest-codex-invitation-close {
+  position: absolute;
+  top: 9px;
+  right: 9px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: #71805a;
+  display: grid;
+  place-items: center;
+}
+.guest-codex-invitation-close:hover {
+  border-color: #d2dbaa;
+  background: rgba(255, 255, 255, 0.72);
+  color: #394526;
+}
+.guest-codex-invitation-close:focus-visible {
+  outline: 2px solid #81952d;
+  outline-offset: 2px;
 }
 .guest-codex-invitation div {
   min-width: 0;

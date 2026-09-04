@@ -41,9 +41,11 @@ interface ConnectedAgent {
 
 const running: RunningServer[] = [];
 const grantedAgentByCookie = new Map<string, string>();
+const grantedSessionByCookie = new Map<string, string>();
 
 afterEach(async () => {
   grantedAgentByCookie.clear();
+  grantedSessionByCookie.clear();
   while (running.length) {
     const item = running.pop();
     if (!item) continue;
@@ -159,6 +161,8 @@ async function requestJson(
     authorization?: string;
     idempotencyKey?: string;
     webMcpAgentId?: string | null;
+    webMcpSessionId?: string | null;
+    origin?: string;
   } = {},
 ): Promise<{ response: Response; json: any }> {
   const headers = new Headers({ Accept: "application/json" });
@@ -166,16 +170,35 @@ async function requestJson(
   if (options.cookie) headers.set("Cookie", options.cookie);
   if (options.csrf) headers.set("X-Meshr-CSRF", options.csrf);
   if (options.authorization) headers.set("Authorization", options.authorization);
+  if (options.origin) headers.set("Origin", options.origin);
   if (options.idempotencyKey) headers.set("Idempotency-Key", options.idempotencyKey);
   const pageGrantCookie = options.cookie
     ?.split(/;\s*/)
     .find((cookie) => cookie.startsWith("meshr_webmcp="));
+  const conditionallyReleasingPageControl =
+    (path === "/v1/webmcp/session" ||
+      path === "/v1/webmcp/session/release") &&
+    options.method === "DELETE";
+  const explicitReleasePrecondition =
+    options.webMcpAgentId !== undefined ||
+    options.webMcpSessionId !== undefined;
   const webMcpAgentId =
     options.webMcpAgentId === null
       ? undefined
       : options.webMcpAgentId ??
-        (pageGrantCookie ? grantedAgentByCookie.get(pageGrantCookie) : undefined);
+        ((!conditionallyReleasingPageControl || !explicitReleasePrecondition) && pageGrantCookie
+          ? grantedAgentByCookie.get(pageGrantCookie)
+          : undefined);
   if (webMcpAgentId) headers.set("X-Meshr-WebMCP-Agent", webMcpAgentId);
+  const webMcpSessionId = options.webMcpSessionId === null
+    ? undefined
+    : options.webMcpSessionId ??
+      (conditionallyReleasingPageControl && !explicitReleasePrecondition && pageGrantCookie
+        ? grantedSessionByCookie.get(pageGrantCookie)
+        : undefined);
+  if (webMcpSessionId) {
+    headers.set("X-Meshr-WebMCP-Session", webMcpSessionId);
+  }
   const response = await fetch(`${baseUrl}${path}`, {
     method: options.method ?? "GET",
     headers,
@@ -296,6 +319,9 @@ async function enableGrant(
   });
   const cookie = cookieFrom(enabled.response);
   grantedAgentByCookie.set(cookie, agentId);
+  if (enabled.json?.pageSessionId) {
+    grantedSessionByCookie.set(cookie, enabled.json.pageSessionId);
+  }
   return { cookie, ...enabled };
 }
 
@@ -323,6 +349,9 @@ async function createBrowserAgent(
   const cookie = cookieFrom(created.response);
   if (created.json?.agent?.id) {
     grantedAgentByCookie.set(cookie, created.json.agent.id);
+  }
+  if (created.json?.pageSessionId) {
+    grantedSessionByCookie.set(cookie, created.json.pageSessionId);
   }
   return { cookie, ...created };
 }
@@ -741,6 +770,149 @@ test("a browser-created identity survives page revocation and receives a fresh r
   );
 });
 
+test("guest creation repairs a stale human WebMCP authority fence", async () => {
+  const run = await start();
+  const guest = await requestJson(run.baseUrl, "/v1/sessions/guest", {
+    method: "POST",
+    body: {},
+  });
+  assert.equal(guest.response.status, 201);
+  const owner: OwnerSession = {
+    id: guest.json.user.id,
+    cookie: cookieFrom(guest.response),
+    csrf: guest.json.csrfToken,
+  };
+  const first = await createBrowserAgent(
+    run,
+    owner,
+    {
+      name: "Guest First Agent",
+      handle: "guest-first-agent",
+      participation: "observe",
+    },
+    "guest-first-agent-001",
+  );
+  assert.equal(first.response.status, 201);
+
+  const humanToken = decodeURIComponent(owner.cookie.split("=", 2)[1] ?? "");
+  const humanSessionHash = sha256(humanToken);
+  run.clock.advance(60 * 60_000 + 1);
+  run.app.database.sqlite
+    .prepare("UPDATE human_sessions SET last_seen_at = ? WHERE token_hash = ?")
+    .run(run.app.database.now(), humanSessionHash);
+  const removedFence = run.app.database.sqlite
+    .prepare("DELETE FROM webmcp_authority WHERE human_session_hash = ?")
+    .run(humanSessionHash);
+  assert.equal(removedFence.changes, 1);
+
+  const second = await requestJson(run.baseUrl, "/v1/webmcp/session", {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "guest-second-agent-001",
+    body: {
+      createAgent: {
+        name: "Guest Second Agent",
+        handle: "guest-second-agent",
+        participation: "interactive",
+      },
+    },
+  });
+  assert.equal(second.response.status, 201);
+  assert.equal(second.json.agent.handle, "guest-second-agent");
+
+  const activeGrants = run.app.database.sqlite
+    .prepare(
+      `SELECT token_hash, agent_id, session_id, authority_epoch
+       FROM webmcp_grants
+       WHERE human_session_hash = ? AND revoked_at IS NULL`,
+    )
+    .all(humanSessionHash) as Array<{
+      token_hash: string;
+      agent_id: string;
+      session_id: string;
+      authority_epoch: number;
+    }>;
+  assert.equal(activeGrants.length, 1);
+  assert.equal(activeGrants[0]?.agent_id, second.json.agent.id);
+  const repairedFence = run.app.database.sqlite
+    .prepare(
+      `SELECT grant_id, agent_id, session_id, epoch, revoked_at
+       FROM webmcp_authority WHERE human_session_hash = ?`,
+    )
+    .get(humanSessionHash) as {
+      grant_id: string;
+      agent_id: string;
+      session_id: string;
+      epoch: number;
+      revoked_at: string | null;
+    };
+  assert.deepEqual(
+    {
+      grantId: repairedFence.grant_id,
+      agentId: repairedFence.agent_id,
+      sessionId: repairedFence.session_id,
+      epoch: repairedFence.epoch,
+      revokedAt: repairedFence.revoked_at,
+    },
+    {
+      grantId: activeGrants[0]?.token_hash,
+      agentId: activeGrants[0]?.agent_id,
+      sessionId: activeGrants[0]?.session_id,
+      epoch: activeGrants[0]?.authority_epoch,
+      revokedAt: null,
+    },
+  );
+});
+
+test("guest creation fails closed when a live WebMCP grant loses its fence", async () => {
+  const run = await start();
+  const guest = await requestJson(run.baseUrl, "/v1/sessions/guest", {
+    method: "POST",
+    body: {},
+  });
+  assert.equal(guest.response.status, 201);
+  const owner: OwnerSession = {
+    id: guest.json.user.id,
+    cookie: cookieFrom(guest.response),
+    csrf: guest.json.csrfToken,
+  };
+  const first = await createBrowserAgent(
+    run,
+    owner,
+    {
+      name: "Guest Live Agent",
+      handle: "guest-live-agent",
+      participation: "observe",
+    },
+    "guest-live-agent-001",
+  );
+  assert.equal(first.response.status, 201);
+
+  const humanToken = decodeURIComponent(owner.cookie.split("=", 2)[1] ?? "");
+  const humanSessionHash = sha256(humanToken);
+  run.app.database.sqlite
+    .prepare("DELETE FROM webmcp_authority WHERE human_session_hash = ?")
+    .run(humanSessionHash);
+
+  const second = await requestJson(run.baseUrl, "/v1/webmcp/session", {
+    method: "POST",
+    cookie: owner.cookie,
+    csrf: owner.csrf,
+    idempotencyKey: "guest-live-second-agent-001",
+    body: {
+      createAgent: {
+        name: "Guest Live Second Agent",
+        handle: "guest-live-second-agent",
+        participation: "interactive",
+      },
+    },
+  });
+  assert.equal(second.response.status, 503);
+  assert.equal(second.json.error.code, "durable_store_unavailable");
+  assert.match(second.json.error.message, /webmcp_authority_corrupt/u);
+});
+
 test("the first native attachment reuses a browser identity without inventing a replaced binding", async () => {
   const run = await start();
   const owner = await createOwner(run, "browser-native-attach");
@@ -1116,9 +1288,11 @@ test("a human explicitly grants one owned identity using only HttpOnly cookies",
   assert.deepEqual(empty.json, {
     enabled: false,
     agent: null,
+    pageSessionId: null,
     createdAt: null,
     expiresAt: null,
   });
+  assert.equal(empty.response.headers.get("set-cookie"), null);
 
   const missingCsrf = await requestJson(run.baseUrl, "/v1/webmcp/session", {
     method: "POST",
@@ -1309,7 +1483,7 @@ test("WebMCP revocation is bounded before and after human authentication", async
     );
   }
   assert.equal(
-    authenticatedResponses.slice(0, 5).every(({ response }) => response.status === 200),
+    authenticatedResponses.slice(0, 5).every(({ response }) => response.status === 400),
     true,
   );
   assert.equal(authenticatedResponses.at(-1)?.response.status, 429);
@@ -1337,6 +1511,200 @@ test("page WebMCP state remains readable when transfer fencing is enabled", asyn
   assert.equal(state.response.status, 200);
   assert.equal(state.json.enabled, true);
   assert.equal(state.json.agent.id, agent.id);
+  assert.equal(state.json.pageSessionId, grant.json.pageSessionId);
+});
+
+test("conditional page release cannot revoke a newer cross-tab selection", async () => {
+  const run = await start({ webMcpTransfersSession: true });
+  const owner = await createOwner(run, "webmcp-conditional-release");
+  const first = await connectAgent(run, owner, "release-first", autonomous);
+  const second = await connectAgent(run, owner, "release-second", autonomous);
+
+  const firstGrant = await enableGrant(run, owner, first.id);
+  assert.equal(typeof firstGrant.json.pageSessionId, "string");
+  const secondGrant = await enableGrant(run, owner, second.id);
+  assert.equal(typeof secondGrant.json.pageSessionId, "string");
+  assert.notEqual(secondGrant.json.pageSessionId, firstGrant.json.pageSessionId);
+
+  const headerlessLegacyRelease = await requestJson(
+    run.baseUrl,
+    "/v1/webmcp/session",
+    {
+      method: "DELETE",
+      cookie: combinedCookie(owner, secondGrant.cookie),
+      csrf: owner.csrf,
+      webMcpAgentId: null,
+      webMcpSessionId: null,
+    },
+  );
+  assert.equal(headerlessLegacyRelease.response.status, 400);
+  assert.equal(headerlessLegacyRelease.response.headers.get("set-cookie"), null);
+
+  const incompletePrecondition = await requestJson(
+    run.baseUrl,
+    "/v1/webmcp/session",
+    {
+      method: "DELETE",
+      cookie: combinedCookie(owner, secondGrant.cookie),
+      csrf: owner.csrf,
+      webMcpAgentId: first.id,
+    },
+  );
+  assert.equal(incompletePrecondition.response.status, 400);
+  assert.equal(incompletePrecondition.response.headers.get("set-cookie"), null);
+
+  const staleRelease = await requestJson(run.baseUrl, "/v1/webmcp/session/release", {
+    method: "DELETE",
+    cookie: combinedCookie(owner, secondGrant.cookie),
+    csrf: owner.csrf,
+    webMcpAgentId: first.id,
+    webMcpSessionId: firstGrant.json.pageSessionId,
+  });
+  assert.equal(staleRelease.response.status, 409);
+  assert.equal(staleRelease.json.error.code, "webmcp_session_changed");
+  assert.equal(staleRelease.response.headers.get("set-cookie"), null);
+
+  const stillSelected = await requestJson(run.baseUrl, "/v1/webmcp/profile", {
+    cookie: combinedCookie(owner, secondGrant.cookie),
+  });
+  assert.equal(stillSelected.response.status, 200);
+  assert.equal(stillSelected.json.agent.id, second.id);
+
+  const secondToken = decodeURIComponent(
+    secondGrant.cookie.split("=", 2)[1] ?? "",
+  );
+  const secondTokenHash = sha256(secondToken);
+  const originalEpoch = Number(
+    run.app.database.sqlite
+      .prepare("SELECT authority_epoch FROM webmcp_grants WHERE token_hash = ?")
+      .get(secondTokenHash)?.authority_epoch,
+  );
+  run.app.database.transaction(() => {
+    run.app.database.sqlite
+      .prepare(
+        "UPDATE webmcp_grants SET authority_epoch = ? WHERE token_hash = ?",
+      )
+      .run(Number.MAX_SAFE_INTEGER, secondTokenHash);
+    run.app.database.sqlite
+      .prepare(
+        "UPDATE webmcp_authority SET epoch = ? WHERE human_session_hash = (SELECT human_session_hash FROM webmcp_grants WHERE token_hash = ?)",
+      )
+      .run(Number.MAX_SAFE_INTEGER, secondTokenHash);
+    run.app.database.sqlite
+      .prepare("UPDATE agent_authority SET epoch = ? WHERE agent_id = ?")
+      .run(Number.MAX_SAFE_INTEGER, second.id);
+  });
+  const exhaustedRelease = await requestJson(
+    run.baseUrl,
+    "/v1/webmcp/session/release",
+    {
+      method: "DELETE",
+      cookie: combinedCookie(owner, secondGrant.cookie),
+      csrf: owner.csrf,
+      webMcpAgentId: second.id,
+      webMcpSessionId: secondGrant.json.pageSessionId,
+    },
+  );
+  assert.equal(exhaustedRelease.response.status, 500);
+  assert.equal(exhaustedRelease.json.error.code, "internal_error");
+  assert.equal(exhaustedRelease.response.headers.get("set-cookie"), null);
+  assert.equal(
+    run.app.database.sqlite
+      .prepare("SELECT revoked_at FROM webmcp_grants WHERE token_hash = ?")
+      .get(secondTokenHash)?.revoked_at,
+    null,
+  );
+  assert.equal(
+    run.app.database.sqlite
+      .prepare(
+        "SELECT CAST(epoch AS REAL) AS epoch FROM webmcp_authority WHERE human_session_hash = (SELECT human_session_hash FROM webmcp_grants WHERE token_hash = ?)",
+      )
+      .get(secondTokenHash)?.epoch,
+    Number.MAX_SAFE_INTEGER,
+  );
+  const stillSelectedAfterExhaustion = await requestJson(
+    run.baseUrl,
+    "/v1/webmcp/profile",
+    { cookie: combinedCookie(owner, secondGrant.cookie) },
+  );
+  assert.equal(stillSelectedAfterExhaustion.response.status, 200);
+  assert.equal(stillSelectedAfterExhaustion.json.agent.id, second.id);
+  run.app.database.transaction(() => {
+    run.app.database.sqlite
+      .prepare(
+        "UPDATE webmcp_grants SET authority_epoch = ? WHERE token_hash = ?",
+      )
+      .run(originalEpoch, secondTokenHash);
+    run.app.database.sqlite
+      .prepare(
+        "UPDATE webmcp_authority SET epoch = ? WHERE human_session_hash = (SELECT human_session_hash FROM webmcp_grants WHERE token_hash = ?)",
+      )
+      .run(originalEpoch, secondTokenHash);
+    run.app.database.sqlite
+      .prepare("UPDATE agent_authority SET epoch = ? WHERE agent_id = ?")
+      .run(originalEpoch, second.id);
+  });
+
+  const currentRelease = await requestJson(run.baseUrl, "/v1/webmcp/session/release", {
+    method: "DELETE",
+    cookie: combinedCookie(owner, secondGrant.cookie),
+    csrf: owner.csrf,
+    webMcpAgentId: second.id,
+    webMcpSessionId: secondGrant.json.pageSessionId,
+  });
+  assert.equal(currentRelease.response.status, 200);
+  assert.equal(currentRelease.json.enabled, false);
+  assert.equal(currentRelease.json.pageSessionId, null);
+  assert.equal(currentRelease.response.headers.get("set-cookie"), null);
+  const afterRelease = await requestJson(run.baseUrl, "/v1/webmcp/profile", {
+    cookie: combinedCookie(owner, secondGrant.cookie),
+  });
+  assert.equal(afterRelease.response.status, 401);
+});
+
+test("durable conditional release cleans a stale replica projection after the authoritative match", async () => {
+  const durableCalls: Array<{
+    humanSessionHash: string;
+    expected?: { agentId: string; sessionId: string };
+  }> = [];
+  const run = await start({
+    webMcpTransfersSession: true,
+    repository: {
+      revokeWebMcpGrants: async (humanSessionHash, _revokedAt, expected) => {
+        durableCalls.push({ humanSessionHash, expected });
+        return true;
+      },
+    } as MeshrRepository,
+  });
+  const authority = seedLocalReadAuthority(run, "durable-release-projection");
+
+  const released = await requestJson(run.baseUrl, "/v1/webmcp/session/release", {
+    method: "DELETE",
+    cookie: authority.pageCookie,
+    csrf: "csrf-durable-release-projection",
+    webMcpAgentId: "agent-authoritative-winner",
+    webMcpSessionId: "page-authoritative-winner",
+    origin: run.baseUrl,
+  });
+
+  assert.equal(released.response.status, 200);
+  assert.equal(released.json.enabled, false);
+  assert.deepEqual(durableCalls.map(({ expected }) => expected), [
+    {
+      agentId: "agent-authoritative-winner",
+      sessionId: "page-authoritative-winner",
+    },
+  ]);
+  assert.equal(
+    run.app.database.sqlite
+      .prepare(
+        `SELECT COUNT(*) AS count FROM webmcp_grants
+         WHERE revoked_at IS NULL`,
+      )
+      .get()?.count,
+    0,
+  );
+  assert.equal(released.response.headers.get("set-cookie"), null);
 });
 
 test("transfer grants recover after a lost response and rotate after reactivation", async () => {

@@ -94,6 +94,7 @@ import {
   type CreateBrowserAgentInput,
   type PublicActivitySnapshot,
   type PublicConversationPost,
+  type WebMcpSessionExpectation,
   type WebMcpSessionStatus,
 } from "./auth/api";
 import { TopologyCanvas } from "./components/TopologyCanvas";
@@ -113,6 +114,7 @@ import {
 } from "./domain/meshNavigation";
 import { projectMeshTopology, type TrafficLink } from "./domain/topology";
 import { connectedAgentId, meshStore } from "./domain/runtime";
+import { PAGE_CODEX_INVITATION_PROMPT } from "./domain/codexInvitation";
 import {
   buildAgentSetupCommands,
   browserAgentSetupReducer,
@@ -137,8 +139,9 @@ import type {
 } from "./domain/types";
 import { createDefaultMeshRolePolicy } from "./domain/types";
 import {
-  createConversationalAgent,
-  registerMeshrSetupTools,
+  createWebMcpSessionMutationFence,
+  createPageWebMcpControlClient,
+  registerMeshrControlTools,
   registerMeshrTools,
   type WebMcpRegistrationStatus,
 } from "./webmcp/registerMeshrTools";
@@ -156,10 +159,24 @@ function sameWebMcpSession(
   next: WebMcpSessionStatus,
 ): boolean {
   return current?.enabled === next.enabled
+    && current?.pageSessionId === next.pageSessionId
     && current?.createdAt === next.createdAt
     && current?.expiresAt === next.expiresAt
     && current?.agent?.id === next.agent?.id
     && current?.agent?.updatedAt === next.agent?.updatedAt;
+}
+
+function webMcpSessionExpectation(
+  session: WebMcpSessionStatus | null,
+): WebMcpSessionExpectation {
+  if (!session?.enabled) throw new Error("webmcp_session_inactive");
+  if (!session.agent || !session.pageSessionId) {
+    throw new Error("webmcp_authority_corrupt");
+  }
+  return {
+    agentId: session.agent.id,
+    pageSessionId: session.pageSessionId,
+  };
 }
 
 function announceWebMcpSessionChange() {
@@ -357,6 +374,7 @@ export function App() {
           ? { kind: "mesh", meshId: "mesh-public" }
           : { kind: "agents" },
   );
+  const [codexInvitationDismissed, setCodexInvitationDismissed] = useState(false);
   const viewScrollKey = view.kind === "mesh"
     ? `mesh:${view.meshId}`
     : view.kind === "agent"
@@ -395,6 +413,7 @@ export function App() {
   >({});
   const [webMcpSession, setWebMcpSession] =
     useState<WebMcpSessionStatus | null>(null);
+  const webMcpSessionMutationFence = useRef(createWebMcpSessionMutationFence());
   const [webMcpBusyAgentId, setWebMcpBusyAgentId] = useState<string | null>(null);
   const [pageControlConfirmAgentId, setPageControlConfirmAgentId] = useState<string | null>(null);
   const [pageControlConfirmError, setPageControlConfirmError] = useState("");
@@ -409,6 +428,9 @@ export function App() {
   viewRef.current = view;
   const [webMcpStatus, setWebMcpStatus] = useState<
     WebMcpRegistrationStatus | "disabled" | "registering" | "error"
+  >("registering");
+  const [webMcpControlStatus, setWebMcpControlStatus] = useState<
+    "registering" | "setup-ready" | "unsupported" | "error"
   >("registering");
   // A topology shard can fan out many frames while several agents are
   // posting. Coalesce the resulting snapshot reads so one viewer never turns
@@ -445,7 +467,7 @@ export function App() {
     setOwnedAgents(next);
     return next;
   }, []);
-  const acceptConversationalAgent = useCallback((next: WebMcpSessionStatus) => {
+  const acceptWebMcpSession = useCallback((next: WebMcpSessionStatus) => {
     setWebMcpRevocationStatus("idle");
     setWebMcpSession(next);
     if (next.agent) {
@@ -455,11 +477,41 @@ export function App() {
     announceWebMcpSessionChange();
     setToast(
       next.agent
-        ? `@${next.agent.handle} is live; preparing its page tools…`
-        : "Agent created; preparing page tools…",
+        ? `@${next.agent.handle} has temporary page control; preparing its tools…`
+        : "Temporary page control was released.",
     );
     void refreshOwnedAgents().catch(() => undefined);
   }, [refreshOwnedAgents]);
+  const runWebMcpSessionMutation = useCallback(async <T,>(
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    webMcpSessionMutationFence.current.mutationStarted();
+    try {
+      return await operation();
+    } finally {
+      webMcpSessionMutationFence.current.mutationSettled();
+    }
+  }, []);
+  const adoptWebMcpSessionAfterConflict = useCallback(async (
+    error: unknown,
+  ): Promise<boolean> => {
+    if (
+      !(error instanceof MeshrApiError)
+      || error.code !== "webmcp_session_changed"
+    ) return false;
+    try {
+      const ticket = webMcpSessionMutationFence.current.capture();
+      const current = await getWebMcpSession();
+      if (webMcpSessionMutationFence.current.isCurrent(ticket)) {
+        setWebMcpSession(current);
+        setWebMcpRevocationStatus("idle");
+        announceWebMcpSessionChange();
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
   const refreshActivityPreferences = useCallback(async (signal?: AbortSignal) => {
     const next = await getActivityPreferences(signal);
     setActivityPreferences(
@@ -792,18 +844,27 @@ export function App() {
     const refresh = async () => {
       if (inFlight) return;
       inFlight = true;
+      const ticket = webMcpSessionMutationFence.current.capture();
       try {
         const pageSession = await getWebMcpSession(controller.signal);
-        if (active) {
+        if (
+          active
+          && webMcpSessionMutationFence.current.isCurrent(ticket)
+        ) {
           setWebMcpSession((current) =>
             sameWebMcpSession(current, pageSession) ? current : pageSession,
           );
         }
       } catch {
-        if (!active || !initial) return;
+        if (
+          !active
+          || !initial
+          || !webMcpSessionMutationFence.current.isCurrent(ticket)
+        ) return;
         setWebMcpSession({
           enabled: false,
           agent: null,
+          pageSessionId: null,
           createdAt: null,
           expiresAt: null,
         });
@@ -838,32 +899,80 @@ export function App() {
   useEffect(() => {
     const controller = new AbortController();
     let active = true;
+    setWebMcpControlStatus("registering");
+    registerMeshrControlTools({
+      modelContext: document.modelContext,
+      signal: controller.signal,
+      client: createPageWebMcpControlClient({
+        csrfToken: session!.csrfToken,
+        principalKind: session!.guest ? "guest" : "signed-in",
+        signal: controller.signal,
+        onSessionChanged: acceptWebMcpSession,
+        onMutationStarted: () => {
+          webMcpSessionMutationFence.current.mutationStarted();
+        },
+        onMutationSettled: () => {
+          webMcpSessionMutationFence.current.mutationSettled();
+        },
+      }),
+    })
+      .then((status) => {
+        if (active) setWebMcpControlStatus(status);
+      })
+      .catch(() => {
+        if (active) setWebMcpControlStatus("error");
+      });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [acceptWebMcpSession, session]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+    if (webMcpControlStatus === "registering") {
+      setWebMcpStatus("registering");
+      return () => controller.abort();
+    }
+    if (webMcpControlStatus === "unsupported" || webMcpControlStatus === "error") {
+      setWebMcpStatus(webMcpControlStatus);
+      if (webMcpSession?.enabled && webMcpSession.agent) {
+        setWebMcpRevocationStatus("pending");
+        void runWebMcpSessionMutation(() =>
+          disableWebMcpSession(
+            session!.csrfToken,
+            webMcpSessionExpectation(webMcpSession),
+            undefined,
+          )
+        )
+          .then((next) => {
+            if (!active) return;
+            setWebMcpSession(next);
+            setWebMcpRevocationStatus("confirmed");
+            announceWebMcpSessionChange();
+          })
+          .catch(async (error) => {
+            if (!active) return;
+            if (await adoptWebMcpSessionAfterConflict(error)) {
+              if (active) setToast("Page control changed in another tab; Meshr kept the newer grant.");
+              return;
+            }
+            if (active) setWebMcpRevocationStatus("unconfirmed");
+          });
+      }
+      return () => {
+        active = false;
+        controller.abort();
+      };
+    }
     if (webMcpSession === null) {
       setWebMcpStatus("registering");
       return () => controller.abort();
     }
     if (!webMcpSession.enabled || !webMcpSession.agent) {
-      setWebMcpStatus("registering");
-      registerMeshrSetupTools({
-        modelContext: document.modelContext,
-        signal: controller.signal,
-        createAgent: (profile) => createConversationalAgent({
-          profile,
-          csrfToken: session!.csrfToken,
-          signal: controller.signal,
-          onCreated: acceptConversationalAgent,
-        }),
-      })
-        .then((status) => {
-          if (active) setWebMcpStatus(status);
-        })
-        .catch(() => {
-          if (active) setWebMcpStatus("error");
-        });
-      return () => {
-        active = false;
-        controller.abort();
-      };
+      setWebMcpStatus("setup-ready");
+      return () => controller.abort();
     }
     setWebMcpStatus("registering");
     const revokeAfterRegistrationFailure = (
@@ -879,7 +988,13 @@ export function App() {
       // A browser can expose modelContext but still reject registration or
       // remove support midway through setup. Keep the page grant explicitly
       // unconfirmed until the server acknowledges its revocation.
-      void disableWebMcpSession(session!.csrfToken)
+      void runWebMcpSessionMutation(() =>
+        disableWebMcpSession(
+          session!.csrfToken,
+          webMcpSessionExpectation(webMcpSession),
+          undefined,
+        )
+      )
         .then((next) => {
           if (!active) return;
           setWebMcpSession(next);
@@ -887,8 +1002,14 @@ export function App() {
           announceWebMcpSessionChange();
           setToast("Page tools could not be registered. Page access was revoked.");
         })
-        .catch(() => {
+        .catch(async (error) => {
           if (!active) return;
+          if (await adoptWebMcpSessionAfterConflict(error)) {
+            if (active) {
+              setToast("Page tools changed in another tab; Meshr kept the newer grant.");
+            }
+            return;
+          }
           setWebMcpRevocationStatus("unconfirmed");
           setToast("Page tools failed and page-access revocation is unconfirmed. Retry revocation.");
         });
@@ -915,7 +1036,13 @@ export function App() {
       active = false;
       controller.abort();
     };
-  }, [acceptConversationalAgent, session, webMcpSession]);
+  }, [
+    adoptWebMcpSessionAfterConflict,
+    runWebMcpSessionMutation,
+    session,
+    webMcpControlStatus,
+    webMcpSession,
+  ]);
 
   useEffect(() => {
     if (!webMcpSession?.enabled || !webMcpSession.expiresAt) return;
@@ -924,6 +1051,7 @@ export function App() {
       setWebMcpSession({
         enabled: false,
         agent: null,
+        pageSessionId: null,
         createdAt: null,
         expiresAt: null,
       });
@@ -933,6 +1061,7 @@ export function App() {
       setWebMcpSession({
         enabled: false,
         agent: null,
+        pageSessionId: null,
         createdAt: null,
         expiresAt: null,
       });
@@ -1128,7 +1257,9 @@ export function App() {
     setWebMcpBusyAgentId(agentId);
     setWebMcpRevocationStatus("idle");
     try {
-      const next = await enableWebMcpSession(agentId, session!.csrfToken);
+      const next = await runWebMcpSessionMutation(() =>
+        enableWebMcpSession(agentId, session!.csrfToken)
+      );
       setWebMcpSession(next);
       announceWebMcpSessionChange();
       setToast(
@@ -1156,9 +1287,11 @@ export function App() {
     }
     setWebMcpBusyAgentId("creating");
     try {
-      const next = await createBrowserAgentWithWebMcp(
-        input,
-        session!.csrfToken,
+      const next = await runWebMcpSessionMutation(() =>
+        createBrowserAgentWithWebMcp(
+          input,
+          session!.csrfToken,
+        )
       );
       setWebMcpRevocationStatus("idle");
       setWebMcpSession(next);
@@ -1185,7 +1318,9 @@ export function App() {
     setWebMcpBusyAgentId(agentId);
     setWebMcpRevocationStatus("idle");
     try {
-      const next = await enableWebMcpSession(agentId, session!.csrfToken);
+      const next = await runWebMcpSessionMutation(() =>
+        enableWebMcpSession(agentId, session!.csrfToken)
+      );
       setWebMcpSession(next);
       announceWebMcpSessionChange();
       setToast("Page access restored; verifying tools…");
@@ -1200,12 +1335,22 @@ export function App() {
     setWebMcpBusyAgentId(agentId);
     setWebMcpRevocationStatus("pending");
     try {
-      const next = await disableWebMcpSession(session!.csrfToken);
+      const next = await runWebMcpSessionMutation(() =>
+        disableWebMcpSession(
+          session!.csrfToken,
+          webMcpSessionExpectation(webMcpSession),
+          undefined,
+        )
+      );
       setWebMcpSession(next);
       setWebMcpRevocationStatus("confirmed");
       announceWebMcpSessionChange();
       setToast("Page access was revoked.");
     } catch (error) {
+      if (await adoptWebMcpSessionAfterConflict(error)) {
+        setToast("Page control changed in another tab; Meshr kept the newer grant.");
+        return;
+      }
       setWebMcpRevocationStatus("unconfirmed");
       setToast(error instanceof Error ? error.message : "Page-access revocation is still unconfirmed");
     } finally {
@@ -1216,11 +1361,21 @@ export function App() {
   async function clearWebMcpAgent() {
     setWebMcpBusyAgentId(webMcpSession?.agent?.id ?? "disabled");
     try {
-      setWebMcpSession(await disableWebMcpSession(session!.csrfToken));
+      setWebMcpSession(await runWebMcpSessionMutation(() =>
+        disableWebMcpSession(
+          session!.csrfToken,
+          webMcpSessionExpectation(webMcpSession),
+          undefined,
+        )
+      ));
       setWebMcpRevocationStatus("confirmed");
       announceWebMcpSessionChange();
       setToast("Page tools disabled. You can attach or restart a native runtime separately.");
     } catch (error) {
+      if (await adoptWebMcpSessionAfterConflict(error)) {
+        setToast("Page control changed in another tab; Meshr kept the newer grant.");
+        return;
+      }
       setToast(error instanceof Error ? error.message : "Could not disable page tools");
     } finally {
       setWebMcpBusyAgentId(null);
@@ -1339,6 +1494,7 @@ export function App() {
             state={activityState}
             ownerId={accountId}
             isGuest={Boolean(session!.guest)}
+            codexInvitationDismissed={codexInvitationDismissed}
             topic={selectedTopic}
             trafficLinks={topology.meshes[0]?.trafficLinks ?? []}
             selectedLink={selectedLink}
@@ -1359,6 +1515,7 @@ export function App() {
             onCloseInspector={() => { setInspectorOpen(false); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId: null, trafficId: null, postId: null }); }}
             onOpenGovernance={() => setGovernanceOpen(true)}
             onAddAgent={() => setCreateAgentOpen(true)}
+            onDismissCodexInvitation={() => setCodexInvitationDismissed(true)}
           />
         ) : selectedTopicId ? (
           <UnavailableMeshRoute
@@ -1681,38 +1838,38 @@ function AgentPortfolio({
         aria-labelledby="webmcp-story-title"
       >
         <div className="webmcp-story-copy">
-          <p className="eyebrow">BROWSER AGENT</p>
-          <h2 id="webmcp-story-title">Let a browser agent follow the signal.</h2>
+          <p className="eyebrow">CODEX PAGE TOOLS</p>
+          <h2 id="webmcp-story-title">Explore the mesh with Codex from this page.</h2>
           <p>
             Find the conversation worth opening, inspect the path between two
-            agents, and keep watch as the mesh changes.
+            agents, and save a follow for future activity.
           </p>
         </div>
-        <div className="webmcp-story-flow" aria-label="Map, inspect, and watch">
+        <div className="webmcp-story-flow" aria-label="Map, inspect, and follow">
           <span><Brain size={17} /> Map</span>
           <ArrowRight size={15} />
           <span><SlidersHorizontal size={16} /> Inspect</span>
           <ArrowRight size={15} />
-          <span><Eye size={17} /> Watch</span>
+          <span><Eye size={17} /> Follow</span>
         </div>
         <div className="webmcp-story-state">
           <span className="webmcp-story-indicator" />
           <span>
             {webMcpReady && webMcpSession?.agent
-              ? `Following as @${webMcpSession.agent.handle}`
+              ? `Page control: @${webMcpSession.agent.handle}`
               : webMcpSession?.enabled && webMcpStatus === "unsupported"
                 ? "Use a browser with page tools enabled"
               : webMcpSession?.enabled && webMcpStatus === "error"
                 ? "Page tools need attention"
                 : webMcpStatus === "setup-ready"
                   ? hasAgents
-                    ? "Choose an agent to follow the signal"
+                    ? "Choose an agent for page control"
                     : "Tell Codex what your agent should work on"
                 : webMcpStatus === "registering"
                     ? "Preparing page tools"
                     : agents.length
                 ? "Choose an agent to begin"
-                : "Create a page-controlled agent to begin"}
+                : "Create an identity to begin"}
           </span>
         </div>
       </section>
@@ -2037,6 +2194,7 @@ function MeshExperience({
   state,
   ownerId,
   isGuest,
+  codexInvitationDismissed,
   topic,
   trafficLinks,
   selectedLink,
@@ -2054,12 +2212,14 @@ function MeshExperience({
   onCloseInspector,
   onOpenGovernance,
   onAddAgent,
+  onDismissCodexInvitation,
 }: {
   mesh: Mesh;
   portfolio: Agent[];
   state: ReturnType<typeof meshStore.getSnapshot>;
   ownerId: string;
   isGuest: boolean;
+  codexInvitationDismissed: boolean;
   topic: Topic;
   trafficLinks: TrafficLink[];
   selectedLink: TrafficLink | null;
@@ -2081,6 +2241,7 @@ function MeshExperience({
   onCloseInspector: () => void;
   onOpenGovernance: () => void;
   onAddAgent: () => void;
+  onDismissCodexInvitation: () => void;
 }) {
   const meshTopics = state.topics.filter(
     (candidate) => candidate.meshId === mesh.id,
@@ -2088,7 +2249,7 @@ function MeshExperience({
   const meshAgents = mesh.memberAgentIds
     .map((id) => state.agents.find((agent) => agent.id === id))
     .filter(Boolean) as Agent[];
-  const showCodexInvitation = isGuest && portfolio.length === 0;
+  const showCodexInvitation = isGuest && portfolio.length === 0 && !codexInvitationDismissed;
   const currentRole = mesh.humanRoleAssignments.find(
     (assignment) => assignment.ownerId === ownerId,
   )?.role ?? null;
@@ -2108,12 +2269,21 @@ function MeshExperience({
       <main className={`mesh-stage ${showCodexInvitation ? "with-codex-invitation" : ""}`}>
         {showCodexInvitation && (
           <section className="guest-codex-invitation" aria-label="Create an agent with Codex">
+            <button
+              type="button"
+              className="guest-codex-invitation-close"
+              aria-label="Dismiss Codex invitation"
+              title="Dismiss"
+              onClick={onDismissCodexInvitation}
+            >
+              <X size={14} weight="bold" aria-hidden="true" />
+            </button>
             <div>
               <p>TRY IT WITH CODEX</p>
               <strong>Create a real agent without leaving this page.</strong>
               <span>Describe its focus naturally; Codex will build the profile and suggest relevant public meshes.</span>
             </div>
-            <code>“Create a Meshr agent that works on computational chemistry.”</code>
+            <code>{PAGE_CODEX_INVITATION_PROMPT}</code>
           </section>
         )}
         <header>
@@ -2956,7 +3126,7 @@ function ConnectAgentDialog({
       onClose={closeDialog}
     >
       <div className="runtime-modal">
-        <p className="runtime-tabs-label" id="agent-host-picker-label">Choose where this agent will run</p>
+        <p className="runtime-tabs-label" id="agent-host-picker-label">Choose how to create or connect this agent</p>
         <div className="runtime-tabs" aria-labelledby="agent-host-picker-label" role="group">
           <button
             type="button"
@@ -2969,7 +3139,7 @@ function ConnectAgentDialog({
             <GlobeHemisphereWest size={20} weight="duotone" />
             <span>
               <strong>WebMCP</strong>
-              <small>Start in this page</small>
+              <small>Create and control from this page</small>
             </span>
           </button>
           {agentSetupRuntimes.map((candidate) => {
@@ -3016,8 +3186,9 @@ function ConnectAgentDialog({
                 <GlobeHemisphereWest size={30} weight="duotone" />
                 <strong>Page tools are not available in this browser</strong>
                 <p>
-                  Meshr will not create an identity it cannot connect. Open
-                  this page in a WebMCP-capable browser, or use a native host.
+                  Meshr will not create an identity while it cannot verify page
+                  control. Open this page in a WebMCP-capable browser, or use a
+                  native host.
                 </p>
                 <button type="button" className="primary" onClick={() => setMode("native")}>
                   Use a native host <ArrowRight size={15} />
@@ -3102,10 +3273,11 @@ function ConnectAgentDialog({
                       onChange={(event) => setAllowPublishing(event.target.checked)}
                     />
                     <span>
-                      <strong>Allow autonomous posts and replies</strong>
+                      <strong>Allow autonomous-policy posts and replies</strong>
                       <small>
-                        Off by default. Reading and discovery remain available;
-                        durable publishing requires this explicit acknowledgement.
+                        Off by default. This grants publishing authority when a
+                        connected caller acts; it does not run the page in the
+                        background.
                       </small>
                     </span>
                   </label>
@@ -3123,7 +3295,7 @@ function ConnectAgentDialog({
                 <footer className="modal-actions setup-primary-actions">
                   <button type="button" onClick={closeDialog}>Cancel</button>
                   <button className="primary" type="submit">
-                    Create & connect <ArrowRight size={15} />
+                    Create & grant page control <ArrowRight size={15} />
                   </button>
                 </footer>
               </form>

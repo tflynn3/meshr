@@ -99,6 +99,7 @@ import type {
   RepositoryPostInput,
 } from "./firestoreRepository.ts";
 import { SqliteMeshrRepository } from "./sqliteRepository.ts";
+import { nextAuthorityEpoch } from "./authorityEpoch.ts";
 import { parseEventEnvelope } from "../platform/eventEnvelope.ts";
 import type { ResidentCohortDisclosure } from "./production.ts";
 import { liveSourceAddress } from "../platform/liveConnectionIdentity.ts";
@@ -420,7 +421,8 @@ const isCsrfAuthenticatedHumanControlWrite = (
   // this broader mutation bucket.
   if (
     (method === "DELETE" && path === "/v1/session") ||
-    (method === "DELETE" && path === "/v1/webmcp/session")
+    (method === "DELETE" && path === "/v1/webmcp/session") ||
+    (method === "DELETE" && path === "/v1/webmcp/session/release")
   ) {
     return false;
   }
@@ -2540,7 +2542,10 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
     updatedAt: string,
   ): number => {
     const current = readAuthority(agentId);
-    const epoch = (current?.epoch ?? 0) + 1;
+    const epoch = nextAuthorityEpoch(
+      "agent_authority_corrupt",
+      Number(current?.epoch ?? 0),
+    );
     db.prepare(
       `INSERT INTO agent_authority(agent_id, epoch, authority_kind, session_id, updated_at)
        VALUES(?, ?, ?, ?, ?)
@@ -9619,16 +9624,17 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           body: {
             enabled: false,
             agent: null,
+            pageSessionId: null,
             createdAt: null,
             expiresAt: null,
           },
-          headers: { "Set-Cookie": clearWebMcpCookie(secureCookies) },
         };
       }
       return {
         body: {
           enabled: true,
           agent: agentFromRow(active.agent),
+          pageSessionId: active.grant.session_id,
           createdAt: active.grant.created_at,
           expiresAt: active.grant.expires_at,
         },
@@ -9944,6 +9950,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           body: {
             enabled: true,
             agent: agentFromRepository(created.agent),
+            pageSessionId: created.grant.sessionId,
             createdAt: created.grant.createdAt,
             expiresAt: created.grant.expiresAt,
           },
@@ -10009,6 +10016,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
                 body: {
                   enabled: true,
                   agent: agentFromRow(recovered.agent),
+                  pageSessionId: recovered.grant.session_id,
                   createdAt: recovered.grant.created_at,
                   expiresAt: recovered.grant.expires_at,
                 },
@@ -10071,6 +10079,7 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
           body: {
             enabled: true,
             agent: agentFromRow(agent),
+            pageSessionId: localRecovery.session_id,
             createdAt: localRecovery.created_at,
             expiresAt: localRecovery.expires_at,
           },
@@ -10305,26 +10314,106 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
         body: {
           enabled: true,
           agent: agentFromRow(agent),
+          pageSessionId: transferSessionId,
           createdAt: now,
           expiresAt,
         },
       };
     }
 
-    if (method === "DELETE" && path === "/v1/webmcp/session") {
+    if (
+      method === "DELETE" &&
+      (path === "/v1/webmcp/session" ||
+        path === "/v1/webmcp/session/release")
+    ) {
       enforceWebMcpRevokeSourceRate(request);
       const human = await requireHuman(request, false, { touchSession: false });
       requireCsrf(request, human);
       enforceWebMcpRevokeSessionRate(human);
+      const rawExpectedAgentId =
+        request.headers["x-meshr-webmcp-agent"];
+      const rawExpectedSessionId =
+        request.headers["x-meshr-webmcp-session"];
+      if (
+        rawExpectedAgentId === undefined ||
+        rawExpectedSessionId === undefined
+      ) {
+        throw new ApiError(
+          400,
+          "invalid_request",
+          "X-Meshr-WebMCP-Agent and X-Meshr-WebMCP-Session are required for page release.",
+        );
+      }
+      if (
+        typeof rawExpectedAgentId !== "string" ||
+        typeof rawExpectedSessionId !== "string" ||
+        !/^[A-Za-z0-9._:-]{1,128}$/.test(rawExpectedAgentId.trim()) ||
+        !/^[A-Za-z0-9._:-]{1,128}$/.test(rawExpectedSessionId.trim())
+      ) {
+        throw new ApiError(
+          400,
+          "invalid_request",
+          "The expected WebMCP agent and page session must be valid identifiers.",
+        );
+      }
+      const expected = {
+        agentId: rawExpectedAgentId.trim(),
+        sessionId: rawExpectedSessionId.trim(),
+      };
       const now = database.now();
-      await durableWrite("WebMCP grant revoke", async () => {
-        await repository?.revokeWebMcpGrants?.(human.sessionHash, now);
-      });
-      database.transaction(() => {
-        const activeGrant = db.prepare(
-          `SELECT 1 AS present FROM webmcp_grants
-           WHERE human_session_hash = ? AND revoked_at IS NULL LIMIT 1`,
-        ).get(human.sessionHash);
+      const durableMatched = await durableWrite(
+        "WebMCP grant revoke",
+        async () =>
+          repository?.revokeWebMcpGrants
+            ? repository.revokeWebMcpGrants(
+                human.sessionHash,
+                now,
+                expected,
+              )
+            : true,
+      );
+      if (durableMatched === false) {
+        throw new ApiError(
+          409,
+          "webmcp_session_changed",
+          "Page control changed after this caller observed it; the newer grant remains active.",
+        );
+      }
+      const durableRevokeIsAuthoritative = Boolean(
+        repository?.revokeWebMcpGrants,
+      );
+      const localMatched = database.transaction(() => {
+        // Firestore/adapter state is authoritative when it performed the
+        // conditional compare. A different API replica can legitimately have
+        // an older disposable SQLite projection, so clean that projection
+        // without re-running the expected-tuple decision after the durable
+        // transaction has already committed.
+        if (durableRevokeIsAuthoritative) {
+          db.prepare(
+            `UPDATE webmcp_grants SET revoked_at = ?
+             WHERE human_session_hash = ? AND revoked_at IS NULL`,
+          ).run(now, human.sessionHash);
+          if (webMcpTransfersSession) {
+            db.prepare(
+              "DELETE FROM webmcp_authority WHERE human_session_hash = ?",
+            ).run(human.sessionHash);
+          }
+          return true;
+        }
+        const activeGrants = db.prepare(
+          `SELECT token_hash, agent_id, session_id, authority_epoch
+           FROM webmcp_grants
+           WHERE human_session_hash = ? AND revoked_at IS NULL LIMIT 2`,
+        ).all(human.sessionHash) as Array<{
+          token_hash: string;
+          agent_id: string;
+          session_id: string;
+          authority_epoch: number;
+        }>;
+        if (activeGrants.length > 1) {
+          throw new Error("webmcp_authority_corrupt");
+        }
+        const activeGrant = activeGrants[0];
         const fence = webMcpTransfersSession
           ? (db
               .prepare(
@@ -10341,16 +10430,30 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
                 }
               | undefined)
           : undefined;
+        const fenceEpoch = Number(fence?.epoch ?? 0);
         if (
-          !activeGrant &&
-          (!webMcpTransfersSession ||
-            !fence ||
-            (fence.revoked_at != null &&
-              fence.grant_id == null &&
-              fence.agent_id == null &&
-              fence.session_id == null))
+          fence &&
+          (!Number.isSafeInteger(fenceEpoch) || fenceEpoch < 1)
         ) {
-          return;
+          throw new Error("webmcp_authority_corrupt");
+        }
+        if (!activeGrant) return false;
+        if (webMcpTransfersSession) {
+          if (!fence || fence.revoked_at != null) return false;
+          if (
+            fence.grant_id !== activeGrant.token_hash ||
+            fence.agent_id !== activeGrant.agent_id ||
+            fence.session_id !== activeGrant.session_id ||
+            fenceEpoch !== Number(activeGrant.authority_epoch)
+          ) {
+            throw new Error("webmcp_authority_corrupt");
+          }
+        }
+        if (
+          activeGrant.agent_id !== expected.agentId ||
+          activeGrant.session_id !== expected.sessionId
+        ) {
+          return false;
         }
         db.prepare(
           `UPDATE webmcp_grants SET revoked_at = ?
@@ -10364,12 +10467,33 @@ export function createMeshrServer(options: MeshrServerOptions): MeshrServer {
              ON CONFLICT(human_session_hash) DO UPDATE SET
                epoch = excluded.epoch, grant_id = NULL, agent_id = NULL, session_id = NULL,
                updated_at = excluded.updated_at, revoked_at = excluded.revoked_at`,
-          ).run(human.sessionHash, (fence?.epoch ?? 0) + 1, now, now);
+          ).run(
+            human.sessionHash,
+            nextAuthorityEpoch("webmcp_authority_corrupt", fenceEpoch),
+            now,
+            now,
+          );
         }
+        return true;
       });
+      if (!localMatched) {
+        throw new ApiError(
+          409,
+          "webmcp_session_changed",
+          "Page control changed after this caller observed it; the newer grant remains active.",
+        );
+      }
+      // The revoked bearer is already inert. Never clear the shared cookie
+      // here: an older release response may arrive after another tab has
+      // installed a newer selection.
       return {
-        body: { enabled: false, agent: null, createdAt: null, expiresAt: null },
-        headers: { "Set-Cookie": clearWebMcpCookie(secureCookies) },
+        body: {
+          enabled: false,
+          agent: null,
+          pageSessionId: null,
+          createdAt: null,
+          expiresAt: null,
+        },
       };
     }
 

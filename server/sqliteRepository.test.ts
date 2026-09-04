@@ -469,17 +469,43 @@ test("SQLite adapter matches Firestore transaction boundaries for corrected auth
     const activePageGrant = await repository.findActiveWebMcpGrant(ownerSessionHash, agentId);
     assert.equal(activePageGrant?.tokenHash, pageGrantHash);
     assert.equal(activePageGrant?.sessionId, pageSessionId);
+    assert.equal(
+      await repository.revokeWebMcpGrants(
+        ownerSessionHash,
+        "2026-08-28T18:10:00.500Z",
+        { agentId, sessionId: "sqlite-stale-page-session" },
+      ),
+      false,
+    );
+    assert.equal(
+      (await repository.findActiveWebMcpGrant(ownerSessionHash, agentId))
+        ?.sessionId,
+      pageSessionId,
+    );
     database.sqlite.prepare("UPDATE agent_authority SET session_id = ? WHERE agent_id = ?")
       .run("sqlite-stale-page-session", agentId);
     assert.equal(await repository.findActiveWebMcpGrant(ownerSessionHash, agentId), null);
     database.sqlite.prepare("UPDATE agent_authority SET session_id = ? WHERE agent_id = ?")
       .run(pageSessionId, agentId);
-    await repository.revokeWebMcpGrants(ownerSessionHash, "2026-08-28T18:10:01.000Z");
+    assert.equal(
+      await repository.revokeWebMcpGrants(
+        ownerSessionHash,
+        "2026-08-28T18:10:01.000Z",
+        { agentId, sessionId: pageSessionId },
+      ),
+      true,
+    );
     assert.equal(await repository.findActiveWebMcpGrant(ownerSessionHash, agentId), null);
     const revokedWebMcpEpoch = database.sqlite.prepare(
       "SELECT epoch FROM webmcp_authority WHERE human_session_hash = ?",
     ).get(ownerSessionHash)?.epoch;
-    await repository.revokeWebMcpGrants(ownerSessionHash, "2026-08-28T18:10:02.000Z");
+    assert.equal(
+      await repository.revokeWebMcpGrants(
+        ownerSessionHash,
+        "2026-08-28T18:10:02.000Z",
+      ),
+      true,
+    );
     assert.equal(
       database.sqlite.prepare(
         "SELECT epoch FROM webmcp_authority WHERE human_session_hash = ?",
@@ -722,6 +748,289 @@ test("SQLite adapter matches Firestore transaction boundaries for corrected auth
       database.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE id LIKE 'moderation-race-%-audit'")
         .get()?.count,
       1,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("SQLite repairs expired orphaned page grants but rejects current fence mismatches", async () => {
+  const initialNow = "2026-09-04T18:00:00.000Z";
+  const clock = new MutableClock(new Date(initialNow));
+  const database = new MeshrDatabase({ path: ":memory:", clock });
+  const repository = new SqliteMeshrRepository(database, clock);
+  const humanSessionHash = createHash("sha256")
+    .update("sqlite-webmcp-ttl-race")
+    .digest("hex");
+
+  try {
+    const owner = await repository.createSocialAccount({
+      provider: "google",
+      subject: "sqlite-webmcp-ttl-owner",
+      email: "sqlite-webmcp-ttl@example.test",
+      displayName: "SQLite WebMCP TTL Owner",
+    });
+    await repository.createHumanSession({
+      tokenHash: humanSessionHash,
+      accountId: owner.accountId,
+      csrfToken: "sqlite-webmcp-ttl-csrf",
+      createdAt: initialNow,
+      expiresAt: "2026-09-04T20:00:00.000Z",
+      absoluteExpiresAt: "2026-09-11T18:00:00.000Z",
+    });
+
+    const command = (ordinal: number, expiresAt: string) => {
+      const now = clock.now().toISOString();
+      const agentId = `sqlite-webmcp-ttl-agent-${ordinal}`;
+      const sessionId = `sqlite-webmcp-ttl-page-${ordinal}`;
+      return {
+        agent: {
+          agentId,
+          ownerAccountId: owner.accountId,
+          name: `SQLite TTL Agent ${ordinal}`,
+          handle: `sqlite-ttl-agent-${ordinal}`,
+          tagline: "Exercises page-authority cleanup skew.",
+          interests: ["WebMCP"],
+          personality: "Careful.",
+          attention: {
+            browse: "public" as const,
+            rootPosts: "draft" as const,
+            replies: "draft" as const,
+            notes: "Act only from the page.",
+          },
+          runtime: "other" as const,
+          runtimeLabel: "Page WebMCP",
+          runtimeSubject: `webmcp:${agentId}`,
+          publicKeyPem: "",
+          definitionDigest: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+        grantId: createHash("sha256")
+          .update(`sqlite-webmcp-ttl-grant-${ordinal}`)
+          .digest("hex"),
+        humanSessionHash,
+        expiresAt,
+        sessionId,
+        idempotencyKey: `sqlite-webmcp-ttl-create-${ordinal}`,
+        requestHash: createHash("sha256")
+          .update(`sqlite-webmcp-ttl-request-${ordinal}`)
+          .digest("hex"),
+        event: {
+          eventId: `sqlite-webmcp-ttl-event-${ordinal}`,
+          type: "agent.created",
+          meshId: "mesh-public",
+          topicId: null,
+          agentId,
+          sessionId,
+          runtimeKind: null,
+          payload: { agentId, authority: "page_webmcp" },
+          occurredAt: now,
+        },
+        audit: {
+          auditId: `sqlite-webmcp-ttl-audit-${ordinal}`,
+          actorType: "human" as const,
+          actorId: owner.accountId,
+          sessionId: humanSessionHash,
+          action: "webmcp.agent.created",
+          resourceType: "agent",
+          resourceId: agentId,
+          data: { authority: "page_webmcp" },
+          createdAt: now,
+        },
+      };
+    };
+
+    const firstInput = command(1, "2026-09-04T18:30:00.000Z");
+    const first = await repository.createBrowserAgentWithPageAuthority(firstInput);
+    assert.equal(first.authorityEpoch, 1);
+
+    clock.set("2026-09-04T18:31:00.000Z");
+    database.sqlite
+      .prepare("DELETE FROM webmcp_authority WHERE human_session_hash = ?")
+      .run(humanSessionHash);
+    const secondInput = command(2, "2026-09-04T19:15:00.000Z");
+    const second = await repository.createBrowserAgentWithPageAuthority(secondInput);
+    assert.equal(second.authorityEpoch, first.authorityEpoch + 1);
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT revoked_at FROM webmcp_grants WHERE token_hash = ?")
+        .get(firstInput.grantId)?.revoked_at,
+      "2026-09-04T18:31:00.000Z",
+    );
+
+    // A missing fence is repairable only after its grant expires.
+    database.sqlite
+      .prepare("DELETE FROM webmcp_authority WHERE human_session_hash = ?")
+      .run(humanSessionHash);
+    const blockedCreate = command(3, "2026-09-04T19:20:00.000Z");
+    await assert.rejects(
+      repository.createBrowserAgentWithPageAuthority(blockedCreate),
+      /webmcp_authority_corrupt/,
+    );
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM agents WHERE id = ?")
+        .get(blockedCreate.agent.agentId)?.count,
+      0,
+    );
+
+    clock.set("2026-09-04T19:16:00.000Z");
+    const exhaustedEpoch = Number.MAX_SAFE_INTEGER;
+    database.sqlite
+      .prepare(
+        "UPDATE webmcp_grants SET authority_epoch = ? WHERE token_hash = ?",
+      )
+      .run(exhaustedEpoch, secondInput.grantId);
+    database.sqlite
+      .prepare(
+        `INSERT INTO webmcp_authority(
+           human_session_hash, epoch, grant_id, agent_id, session_id, updated_at, revoked_at
+         ) VALUES(?, ?, ?, ?, ?, ?, NULL)`,
+      )
+      .run(
+        humanSessionHash,
+        exhaustedEpoch,
+        secondInput.grantId,
+        secondInput.agent.agentId,
+        secondInput.sessionId,
+        clock.now().toISOString(),
+      );
+    const unsafeFenceCreate = command(4, "2026-09-04T19:50:00.000Z");
+    await assert.rejects(
+      repository.createBrowserAgentWithPageAuthority(unsafeFenceCreate),
+      /webmcp_authority_corrupt/,
+    );
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM agents WHERE id = ?")
+        .get(unsafeFenceCreate.agent.agentId)?.count,
+      0,
+    );
+    await assert.rejects(
+      repository.revokeWebMcpGrants(
+        humanSessionHash,
+        clock.now().toISOString(),
+        {
+          agentId: secondInput.agent.agentId,
+          sessionId: secondInput.sessionId,
+        },
+      ),
+      /webmcp_authority_corrupt/,
+    );
+    assert.equal(
+      database.sqlite
+        .prepare(
+          "SELECT revoked_at FROM webmcp_grants WHERE token_hash = ?",
+        )
+        .get(secondInput.grantId)?.revoked_at,
+      null,
+    );
+    assert.equal(
+      database.sqlite
+        .prepare(
+          "SELECT CAST(epoch AS REAL) AS epoch FROM webmcp_authority WHERE human_session_hash = ?",
+        )
+        .get(humanSessionHash)?.epoch,
+      exhaustedEpoch,
+    );
+    database.sqlite
+      .prepare("DELETE FROM webmcp_authority WHERE human_session_hash = ?")
+      .run(humanSessionHash);
+    database.sqlite
+      .prepare(
+        "UPDATE webmcp_grants SET authority_epoch = ? WHERE token_hash = ?",
+      )
+      .run(second.authorityEpoch, secondInput.grantId);
+
+    database.sqlite
+      .prepare(
+        `UPDATE agent_authority
+         SET epoch = ?, authority_kind = 'page', session_id = ?
+         WHERE agent_id = ?`,
+      )
+      .run(exhaustedEpoch, firstInput.sessionId, firstInput.agent.agentId);
+    const unsafeAuthorityGrantId = createHash("sha256")
+      .update("sqlite-webmcp-unsafe-agent-authority-grant")
+      .digest("hex");
+    await assert.rejects(
+      repository.transferPageAuthority({
+        agentId: firstInput.agent.agentId,
+        grantId: unsafeAuthorityGrantId,
+        humanSessionHash,
+        expiresAt: "2026-09-04T19:45:00.000Z",
+        sessionId: "sqlite-webmcp-unsafe-agent-authority-page",
+      }),
+      /agent_authority_corrupt/,
+    );
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM webmcp_grants WHERE token_hash = ?")
+        .get(unsafeAuthorityGrantId)?.count,
+      0,
+    );
+
+    database.sqlite
+      .prepare(
+        `UPDATE agent_authority
+         SET epoch = ?, authority_kind = 'native', session_id = 'missing-native-session'
+         WHERE agent_id = ?`,
+      )
+      .run(first.authorityEpoch, firstInput.agent.agentId);
+    await assert.rejects(
+      repository.transferPageAuthority({
+        agentId: firstInput.agent.agentId,
+        grantId: createHash("sha256")
+          .update("sqlite-webmcp-stale-native-grant")
+          .digest("hex"),
+        humanSessionHash,
+        expiresAt: "2026-09-04T19:45:00.000Z",
+        sessionId: "sqlite-webmcp-stale-native-page",
+      }),
+      /agent_authority_corrupt/,
+    );
+    database.sqlite
+      .prepare(
+        `UPDATE agent_authority
+         SET authority_kind = 'page', session_id = ?, epoch = ?
+         WHERE agent_id = ?`,
+      )
+      .run(
+        firstInput.sessionId,
+        first.authorityEpoch,
+        firstInput.agent.agentId,
+      );
+    const transfer = await repository.transferPageAuthority({
+      agentId: firstInput.agent.agentId,
+      grantId: createHash("sha256")
+        .update("sqlite-webmcp-ttl-transfer-grant")
+        .digest("hex"),
+      humanSessionHash,
+      expiresAt: "2026-09-04T19:45:00.000Z",
+      sessionId: "sqlite-webmcp-ttl-transfer-page",
+    });
+    assert.equal(transfer.authorityEpoch, second.authorityEpoch + 1);
+    assert.equal(
+      database.sqlite
+        .prepare("SELECT revoked_at FROM webmcp_grants WHERE token_hash = ?")
+        .get(secondInput.grantId)?.revoked_at,
+      "2026-09-04T19:16:00.000Z",
+    );
+
+    database.sqlite
+      .prepare("DELETE FROM webmcp_authority WHERE human_session_hash = ?")
+      .run(humanSessionHash);
+    await assert.rejects(
+      repository.transferPageAuthority({
+        agentId: secondInput.agent.agentId,
+        grantId: createHash("sha256")
+          .update("sqlite-webmcp-ttl-blocked-transfer")
+          .digest("hex"),
+        humanSessionHash,
+        expiresAt: "2026-09-04T19:50:00.000Z",
+        sessionId: "sqlite-webmcp-ttl-blocked-page",
+      }),
+      /webmcp_authority_corrupt/,
     );
   } finally {
     database.close();

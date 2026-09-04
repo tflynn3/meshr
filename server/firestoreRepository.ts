@@ -85,6 +85,7 @@ import {
   ensureProjectionBootstrap,
   readProjectionBootstrap,
 } from "./projectionBootstrap.ts";
+import { nextAuthorityEpoch } from "./authorityEpoch.ts";
 
 export interface FirestoreRepositoryOptions {
   firestore: Firestore;
@@ -2439,14 +2440,14 @@ export class FirestoreMeshrRepository implements MeshrRepository {
             .collection(this.collection("webmcp_grants"))
             .where("human_session_hash", "==", input.humanSessionHash)
             .where("revoked_at", "==", null)
-            .limit(2),
+            .limit(3),
         ),
         transaction.get(
           this.firestore
             .collection(this.collection("webmcp_grants"))
             .where("agent_id", "==", agent.agentId)
             .where("revoked_at", "==", null)
-            .limit(2),
+            .limit(3),
         ),
         transaction.get(
           this.firestore
@@ -2457,6 +2458,29 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       ]);
 
       const nowMs = Date.parse(now);
+      const expiredHumanGrants = humanGrants.docs.filter((candidate) => {
+        const expiresAt = Date.parse(String(candidate.get("expires_at") ?? ""));
+        return Number.isFinite(expiresAt) && expiresAt <= nowMs;
+      });
+      const currentHumanGrants = humanGrants.docs.filter(
+        (candidate) => !expiredHumanGrants.includes(candidate),
+      );
+      const expiredAgentGrants = agentGrants.docs.filter((candidate) => {
+        const expiresAt = Date.parse(String(candidate.get("expires_at") ?? ""));
+        return Number.isFinite(expiresAt) && expiresAt <= nowMs;
+      });
+      const currentAgentGrants = agentGrants.docs.filter(
+        (candidate) => !expiredAgentGrants.includes(candidate),
+      );
+      const priorGrantEpochs = [...humanGrants.docs, ...agentGrants.docs].map(
+        (candidate) => Number(candidate.get("authority_epoch") ?? -1),
+      );
+      const fenceEpoch = fence.exists
+        ? Number(fence.get("epoch") ?? -1)
+        : 0;
+      const authorityEpoch = authority.exists
+        ? Number(authority.get("epoch") ?? -1)
+        : 0;
       const humanExpiresAt = humanSession.exists
         ? Date.parse(String(humanSession.get("expires_at") ?? ""))
         : NaN;
@@ -2481,8 +2505,28 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       }
       if (
         activeSessions.size > 1 ||
-        humanGrants.size > 1 ||
-        agentGrants.size > 1
+        humanGrants.size > 2 ||
+        agentGrants.size > 2 ||
+        currentHumanGrants.length > 1 ||
+        currentAgentGrants.length > 1
+      ) {
+        throw new Error("agent_authority_corrupt");
+      }
+      if (
+        priorGrantEpochs.some(
+          (epoch) => !Number.isSafeInteger(epoch) || epoch < 1,
+        )
+      ) {
+        throw new Error("webmcp_authority_corrupt");
+      }
+      if (fence.exists && (!Number.isSafeInteger(fenceEpoch) || fenceEpoch < 1)) {
+        throw new Error("webmcp_authority_corrupt");
+      }
+      if (
+        authority.exists &&
+        (!Number.isSafeInteger(authorityEpoch) ||
+          authorityEpoch < 1 ||
+          authorityEpoch >= Number.MAX_SAFE_INTEGER)
       ) {
         throw new Error("agent_authority_corrupt");
       }
@@ -2536,10 +2580,10 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         }
         const epoch = Number(responseRecord.authority_epoch ?? -1);
         const activeGrantMatches =
-          humanGrants.size === 1 &&
-          humanGrants.docs[0]!.id === input.grantId &&
-          agentGrants.size === 1 &&
-          agentGrants.docs[0]!.id === input.grantId &&
+          currentHumanGrants.length === 1 &&
+          currentHumanGrants[0]!.id === input.grantId &&
+          currentAgentGrants.length === 1 &&
+          currentAgentGrants[0]!.id === input.grantId &&
           activeSessions.empty &&
           persistedGrant.grantId === input.grantId &&
           persistedGrant.tokenHash === input.grantId &&
@@ -2615,7 +2659,12 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         throw new Error("agent_authority_corrupt");
       }
       if (!agentGrants.empty) throw new Error("agent_authority_corrupt");
-      const previousHumanGrant = humanGrants.docs[0];
+      // TTL deletion is deliberately non-transactional across collection
+      // groups. An expired grant can therefore remain query-visible after its
+      // human fence has already been deleted. Only a still-current grant must
+      // match the fence; expired grants are stale cleanup state and are revoked
+      // below in the same transaction as the replacement.
+      const previousHumanGrant = currentHumanGrants[0];
       if (
         previousHumanGrant &&
         (!fence.exists ||
@@ -2629,11 +2678,12 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         throw new Error("webmcp_authority_corrupt");
       }
 
-      const epoch =
-        Math.max(
-          Number(fence.exists ? (fence.get("epoch") ?? 0) : 0),
-          Number(authority.exists ? (authority.get("epoch") ?? 0) : 0),
-        ) + 1;
+      const epoch = nextAuthorityEpoch(
+        "webmcp_authority_corrupt",
+        fenceEpoch,
+        authorityEpoch,
+        ...priorGrantEpochs,
+      );
       for (const session of activeSessions.docs) {
         transaction.update(session.ref, {
           status: "superseded",
@@ -2703,7 +2753,13 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           session_id: input.sessionId,
           updated_at: now,
           revoked_at: null,
-          expires_at_ttl: ttlTimestamp(input.expiresAt),
+          // The fence serializes every page transfer for this human session,
+          // so it must outlive individual one-hour grants. Expiring both at the
+          // same instant lets Firestore delete the fence first and strand an
+          // otherwise harmless expired grant.
+          expires_at_ttl: ttlTimestamp(
+            String(humanSession.get("absolute_expires_at")),
+          ),
         },
         { merge: true },
       );
@@ -3319,8 +3375,10 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         {
           contract_version: MESHR_CONTRACT_MAJOR,
           agent_id: agentId,
-          epoch:
-            Number(authority.exists ? (authority.get("epoch") ?? 0) : 0) + 1,
+          epoch: nextAuthorityEpoch(
+            "agent_authority_corrupt",
+            Number(authority.exists ? (authority.get("epoch") ?? 0) : 0),
+          ),
           authority_kind: "revoked",
           session_id: null,
           updated_at: revokedAt,
@@ -7541,13 +7599,17 @@ export class FirestoreMeshrRepository implements MeshrRepository {
   async revokeWebMcpGrants(
     humanSessionHash: string,
     revokedAt: string,
-  ): Promise<void> {
+    expected?: { agentId: string; sessionId: string },
+  ): Promise<boolean> {
     // The fence is read and written in the same transaction as grant
     // revocation. A concurrent transfer therefore retries against the newer
     // epoch instead of creating a grant after this query has completed.
-    await this.firestore.runTransaction(async (transaction) => {
+    return this.firestore.runTransaction(async (transaction) => {
       const fenceRef = this.webMcpAuthorityRef(humanSessionHash);
       const fence = await transaction.get(fenceRef);
+      const humanSession = await transaction.get(
+        this.doc("human_sessions", humanSessionHash),
+      );
       const grants = await transaction.get(
         this.firestore
           .collection(this.collection("webmcp_grants"))
@@ -7556,25 +7618,64 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           .limit(2),
       );
       if (grants.size > 1) throw new Error("webmcp_authority_corrupt");
+      const fenceEpoch = fence.exists
+        ? Number(fence.get("epoch") ?? -1)
+        : 0;
+      if (fence.exists && (!Number.isSafeInteger(fenceEpoch) || fenceEpoch < 1)) {
+        throw new Error("webmcp_authority_corrupt");
+      }
       const fenceAlreadyRevoked =
         !fence.exists ||
         (fence.get("revoked_at") != null &&
           fence.get("grant_id") == null &&
           fence.get("agent_id") == null &&
           fence.get("session_id") == null);
+      const activeGrant = grants.docs[0];
+      if (expected) {
+        if (
+          !activeGrant ||
+          !fence.exists ||
+          fence.get("revoked_at") != null
+        ) {
+          return false;
+        }
+        const activeGrantEpoch = Number(
+          activeGrant.get("authority_epoch") ?? -1,
+        );
+        if (
+          String(fence.get("grant_id") ?? "") !== activeGrant.id ||
+          String(fence.get("agent_id") ?? "") !==
+            String(activeGrant.get("agent_id") ?? "") ||
+          String(fence.get("session_id") ?? "") !==
+            String(activeGrant.get("session_id") ?? "") ||
+          fenceEpoch !== activeGrantEpoch
+        ) {
+          throw new Error("webmcp_authority_corrupt");
+        }
+        if (
+          String(activeGrant.get("agent_id") ?? "") !== expected.agentId ||
+          String(activeGrant.get("session_id") ?? "") !== expected.sessionId
+        ) {
+          return false;
+        }
+      }
       if (grants.empty && fenceAlreadyRevoked) {
         // This read-only transaction still serializes with a concurrent page
         // transfer through fenceRef. Avoid advancing the epoch or emitting a
         // second invalidation when there is no live authority to revoke.
-        return;
+        return true;
       }
-      const activeGrant = grants.docs[0];
       const existingFenceTtl = fence.get("expires_at_ttl");
-      const retentionAt = activeGrant
-        ? String(activeGrant.get("expires_at") ?? revokedAt)
-        : existingFenceTtl instanceof Timestamp
-          ? existingFenceTtl.toDate().toISOString()
-          : revokedAt;
+      const humanAbsoluteExpiresAt = humanSession.exists
+        ? String(humanSession.get("absolute_expires_at") ?? "")
+        : "";
+      const retentionAt = Number.isFinite(Date.parse(humanAbsoluteExpiresAt))
+        ? humanAbsoluteExpiresAt
+        : activeGrant
+          ? String(activeGrant.get("expires_at") ?? revokedAt)
+          : existingFenceTtl instanceof Timestamp
+            ? existingFenceTtl.toDate().toISOString()
+            : revokedAt;
       for (const grant of grants.docs) {
         const grantExpiresAt = String(grant.get("expires_at") ?? revokedAt);
         transaction.update(grant.ref, {
@@ -7582,7 +7683,21 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           expires_at_ttl: ttlTimestamp(grantExpiresAt),
         });
       }
-      const epoch = Number(fence.exists ? (fence.get("epoch") ?? 0) : 0) + 1;
+      const grantEpochs = grants.docs.map((grant) =>
+        Number(grant.get("authority_epoch") ?? -1),
+      );
+      if (
+        grantEpochs.some(
+          (epoch) => !Number.isSafeInteger(epoch) || epoch < 1,
+        )
+      ) {
+        throw new Error("webmcp_authority_corrupt");
+      }
+      const epoch = nextAuthorityEpoch(
+        "webmcp_authority_corrupt",
+        fenceEpoch,
+        ...grantEpochs,
+      );
       transaction.set(
         fenceRef,
         {
@@ -7603,6 +7718,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         revokedAt,
         "webmcp_grants_revoked",
       );
+      return true;
     });
   }
 
@@ -10538,8 +10654,10 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           throw new Error("session_invalid");
         }
       }
-      const epoch =
-        Number(authority.exists ? (authority.get("epoch") ?? 0) : 0) + 1;
+      const epoch = nextAuthorityEpoch(
+        "agent_authority_corrupt",
+        Number(authority.exists ? (authority.get("epoch") ?? 0) : 0),
+      );
       const active = await transaction.get(
         this.firestore
           .collection(this.collection("runtime_sessions"))
@@ -10720,24 +10838,64 @@ export class FirestoreMeshrRepository implements MeshrRepository {
             .collection(this.collection("webmcp_grants"))
             .where("human_session_hash", "==", input.humanSessionHash)
             .where("revoked_at", "==", null)
-            .limit(2),
+            .limit(3),
         ),
         transaction.get(
           this.firestore
             .collection(this.collection("webmcp_grants"))
             .where("agent_id", "==", input.agentId)
             .where("revoked_at", "==", null)
-            .limit(2),
+            .limit(3),
         ),
       ]);
+      const nowMs = Date.parse(now);
+      const expiredHumanGrants = humanGrants.docs.filter((candidate) => {
+        const expiresAt = Date.parse(String(candidate.get("expires_at") ?? ""));
+        return Number.isFinite(expiresAt) && expiresAt <= nowMs;
+      });
+      const currentHumanGrants = humanGrants.docs.filter(
+        (candidate) => !expiredHumanGrants.includes(candidate),
+      );
+      const expiredAgentGrants = agentGrants.docs.filter((candidate) => {
+        const expiresAt = Date.parse(String(candidate.get("expires_at") ?? ""));
+        return Number.isFinite(expiresAt) && expiresAt <= nowMs;
+      });
+      const currentAgentGrants = agentGrants.docs.filter(
+        (candidate) => !expiredAgentGrants.includes(candidate),
+      );
+      const priorGrantEpochs = [
+        ...humanGrants.docs,
+        ...agentGrants.docs,
+      ].map((candidate) => Number(candidate.get("authority_epoch") ?? -1));
+      const fenceEpoch = fence.exists
+        ? Number(fence.get("epoch") ?? -1)
+        : 0;
+      const authorityEpoch = authority.exists
+        ? Number(authority.get("epoch") ?? -1)
+        : 0;
       if (
         nativeSessions.size > 1 ||
-        humanGrants.size > 1 ||
-        agentGrants.size > 1
+        humanGrants.size > 2 ||
+        agentGrants.size > 2 ||
+        currentHumanGrants.length > 1 ||
+        currentAgentGrants.length > 1 ||
+        priorGrantEpochs.some(
+          (epoch) => !Number.isSafeInteger(epoch) || epoch < 1,
+        )
       ) {
         throw new Error("agent_authority_corrupt");
       }
-      const nowMs = Date.parse(now);
+      if (fence.exists && (!Number.isSafeInteger(fenceEpoch) || fenceEpoch < 1)) {
+        throw new Error("webmcp_authority_corrupt");
+      }
+      if (
+        authority.exists &&
+        (!Number.isSafeInteger(authorityEpoch) ||
+          authorityEpoch < 1 ||
+          authorityEpoch >= Number.MAX_SAFE_INTEGER)
+      ) {
+        throw new Error("agent_authority_corrupt");
+      }
       const humanExpiresAt = Date.parse(
         String(humanSession.get("expires_at") ?? ""),
       );
@@ -10766,7 +10924,7 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       if (requestedGrant.exists) throw new Error("grant_already_exists");
 
       const currentNative = nativeSessions.docs[0];
-      const currentAgentGrant = agentGrants.docs[0];
+      const currentAgentGrant = currentAgentGrants[0];
       const authorityKind = authority.exists
         ? String(authority.get("authority_kind") ?? "")
         : null;
@@ -10812,7 +10970,10 @@ export class FirestoreMeshrRepository implements MeshrRepository {
         throw new Error("agent_authority_corrupt");
       }
 
-      const currentHumanGrant = humanGrants.docs[0];
+      // Expired grants can outlive their independently TTL-managed fence. They
+      // no longer authorize a page call, so repair that cleanup skew while
+      // retaining fail-closed matching for every still-current grant.
+      const currentHumanGrant = currentHumanGrants[0];
       if (
         currentHumanGrant &&
         (!fence.exists ||
@@ -10829,11 +10990,12 @@ export class FirestoreMeshrRepository implements MeshrRepository {
       // serialization point for tab races across different agents. The agent
       // epoch may be ahead after a native session or another Human's page
       // grant, so advance from both fences and never reuse an old epoch.
-      const epoch =
-        Math.max(
-          Number(fence.exists ? (fence.get("epoch") ?? 0) : 0),
-          Number(authority.exists ? (authority.get("epoch") ?? 0) : 0),
-        ) + 1;
+      const epoch = nextAuthorityEpoch(
+        "webmcp_authority_corrupt",
+        fenceEpoch,
+        authorityEpoch,
+        ...priorGrantEpochs,
+      );
       for (const previous of nativeSessions.docs) {
         transaction.update(previous.ref, {
           status: "superseded",
@@ -10881,7 +11043,9 @@ export class FirestoreMeshrRepository implements MeshrRepository {
           session_id: sessionId,
           updated_at: now,
           revoked_at: null,
-          expires_at_ttl: ttlTimestamp(input.expiresAt),
+          expires_at_ttl: ttlTimestamp(
+            String(humanSession.get("absolute_expires_at")),
+          ),
         },
         { merge: true },
       );

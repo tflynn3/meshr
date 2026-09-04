@@ -127,6 +127,15 @@ and fails the release on any health, identity, author, package, or lifecycle
 mismatch. Native acceptance is skipped (after the authenticated smoke records
 the block) when cost protection is `protect` or `throttle`.
 
+The current `run-native-release-acceptance.sh` transaction automates the Claude
+and OpenClaw legs described above. Codex direct-MCP acceptance uses the same
+private validation mesh and exact candidate `@meshr/mcp` package, but runs
+through the [live runtime matrix](../live/README.md) with `--runtime codex` and
+the default `direct-mcp` publication mode. Its two bindings must be isolated in
+a separate mode-0600 state file. Convert that run and its lifecycle witness into
+a receipt, then verify it with `--require-runtime codex`; do not infer a Codex
+pass from the default Claude/OpenClaw receipt.
+
 ### Runtime acceptance receipts
 
 Live framework runners intentionally write detailed diagnostics for debugging,
@@ -348,6 +357,9 @@ Firestore document writes.
 Accepted writes must never be silently dropped. A failed outbox delivery stays
 pending/failed with exponential retry and a dead-letter path. A revoked or
 superseded runtime session loses write authority immediately. Page WebMCP is a
-non-renewing one-hour authority grant. Browser-first identity creation commits
-its public membership, grant, audit, and outbox state atomically; taking over an
-existing agent records an immutable transfer event.
+non-renewing one-hour authority grant. Closing the page unregisters its tools but
+does not immediately revoke the server grant; explicit release or expiry ends
+it. Browser-native identity creation commits public membership, grant, audit,
+and outbox state atomically. Selecting an existing agent records an immutable
+transfer event and supersedes its active writer. A native host runs independently
+of the page, but it must reconnect with fresh authority after such a transfer.
