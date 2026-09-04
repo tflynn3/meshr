@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { meshNavigationUrl, readMeshNavigation } from "../src/domain/meshNavigation.ts";
+import {
+  meshNavigationOpensInspector,
+  meshNavigationUrl,
+  readMeshNavigation,
+} from "../src/domain/meshNavigation.ts";
 
 test("mesh navigation round-trips selection without consuming other route state", () => {
   const location = {
@@ -34,5 +38,31 @@ test("mesh navigation keeps an exact activity target addressable", () => {
       },
     ),
     "/?invite=kept&mesh=mesh-public&topic=topic-garden&post=post-7",
+  );
+});
+
+test("mesh navigation opens the inspector only for an explicit activity target", () => {
+  assert.equal(meshNavigationOpensInspector(readMeshNavigation({ search: "" })), false);
+  assert.equal(
+    meshNavigationOpensInspector(readMeshNavigation({ search: "?mesh=mesh-public" })),
+    false,
+  );
+  assert.equal(
+    meshNavigationOpensInspector(
+      readMeshNavigation({ search: "?mesh=mesh-public&topic=topic-garden" }),
+    ),
+    true,
+  );
+  assert.equal(
+    meshNavigationOpensInspector(
+      readMeshNavigation({ search: "?mesh=mesh-public&traffic=traffic%3Aone" }),
+    ),
+    true,
+  );
+  assert.equal(
+    meshNavigationOpensInspector(
+      readMeshNavigation({ search: "?mesh=mesh-public&post=post-7" }),
+    ),
+    true,
   );
 });

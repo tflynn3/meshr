@@ -105,7 +105,12 @@ import {
 } from "./domain/agentControlCenter";
 import { applyPublicActivitySnapshot } from "./domain/publicActivity";
 import { insertPageCreatedAgent } from "./domain/ownedAgentProjection";
-import { meshNavigationUrl, readMeshNavigation, type MeshNavigation } from "./domain/meshNavigation";
+import {
+  meshNavigationOpensInspector,
+  meshNavigationUrl,
+  readMeshNavigation,
+  type MeshNavigation,
+} from "./domain/meshNavigation";
 import { projectMeshTopology, type TrafficLink } from "./domain/topology";
 import { connectedAgentId, meshStore } from "./domain/runtime";
 import {
@@ -372,8 +377,8 @@ export function App() {
   const [selectedPostId, setSelectedPostId] = useState<string | null>(() =>
     initialMeshNavigation.kind === "mesh" ? initialMeshNavigation.postId : null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
-  const [inspectorOpen, setInspectorOpen] = useState(
-    initialMeshNavigation.kind === "mesh" || guestLanding,
+  const [inspectorOpen, setInspectorOpen] = useState(() =>
+    meshNavigationOpensInspector(initialMeshNavigation),
   );
   const [createMeshOpen, setCreateMeshOpen] = useState(false);
   const [createAgentOpen, setCreateAgentOpen] = useState(false);
@@ -1003,11 +1008,11 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    // The guest landing starts from the public mesh before its authoritative
-    // directory arrives. Do not canonicalize a temporary fixture topic into
-    // the URL; once the server mesh loads, the first real topic is selected.
+    // Keep the guest landing's fallback topic local until the visitor opens
+    // an activity target. Bare and mesh-only URLs should show the full map.
     if (session?.guest && serverMeshes === null) return;
     if (!selectedMesh || !selectedTopic || typeof window === "undefined") return;
+    if (!selectedTopicId && !inspectorOpen) return;
     const current = readMeshNavigation(window.location);
     if (
       current.kind !== "mesh" ||
@@ -1024,7 +1029,7 @@ export function App() {
         postId: selectedPostId,
       }, true);
     }
-  }, [navigateMesh, selectedLink, selectedMesh, selectedPostId, selectedTopic, serverMeshes, session?.guest]);
+  }, [inspectorOpen, navigateMesh, selectedLink, selectedMesh, selectedPostId, selectedTopic, selectedTopicId, serverMeshes, session?.guest]);
 
   useEffect(() => {
     const restore = () => {
@@ -1043,7 +1048,7 @@ export function App() {
       setSelectedLinkId(next.kind === "mesh" ? next.trafficId : null);
       setSelectedPostId(next.kind === "mesh" ? next.postId : null);
       setSelectedAgentId(null);
-      setInspectorOpen(next.kind === "mesh");
+      setInspectorOpen(meshNavigationOpensInspector(next));
     };
     const guardBrowserBack = () => {
       if (!behaviorProfileDirtyRef.current || viewRef.current.kind !== "agent") {
@@ -1069,9 +1074,8 @@ export function App() {
 
   function openMesh(meshId: string) {
     requestAppNavigation(() => {
-      const firstTopic = activityState.topics.find((topic) => topic.meshId === meshId);
-      setInspectorOpen(true);
-      navigateMesh({ kind: "mesh", meshId, topicId: firstTopic?.id ?? null, trafficId: null, postId: null });
+      setInspectorOpen(false);
+      navigateMesh({ kind: "mesh", meshId, topicId: null, trafficId: null, postId: null });
     });
   }
 
@@ -1105,7 +1109,7 @@ export function App() {
       setSelectedLinkId(next.kind === "mesh" ? next.trafficId : null);
       setSelectedPostId(next.kind === "mesh" ? next.postId : null);
       setSelectedAgentId(null);
-      setInspectorOpen(next.kind === "mesh");
+      setInspectorOpen(meshNavigationOpensInspector(next));
     });
   }
 
@@ -1348,8 +1352,11 @@ export function App() {
             onSelectTopic={(topicId) => { setInspectorOpen(true); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId, trafficId: null, postId: null }); }}
             onSelectLink={(trafficId) => { setInspectorOpen(true); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId: selectedTopic.id, trafficId, postId: null }); }}
             onSelectAgent={setSelectedAgentId}
-            onOpenInspector={() => setInspectorOpen(true)}
-            onCloseInspector={() => { setInspectorOpen(false); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId: selectedTopic.id, trafficId: null, postId: null }); }}
+            onOpenInspector={() => {
+              setInspectorOpen(true);
+              navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId: selectedTopic.id, trafficId: null, postId: null });
+            }}
+            onCloseInspector={() => { setInspectorOpen(false); navigateMesh({ kind: "mesh", meshId: selectedMesh.id, topicId: null, trafficId: null, postId: null }); }}
             onOpenGovernance={() => setGovernanceOpen(true)}
             onAddAgent={() => setCreateAgentOpen(true)}
           />

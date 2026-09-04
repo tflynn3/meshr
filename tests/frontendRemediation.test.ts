@@ -191,6 +191,23 @@ test("view changes reset stale page offsets and dialogs contain their own scroll
   assert.match(stylesSource, /\.account-dialog\s*\{[^}]*overscroll-behavior:\s*contain/);
 });
 
+test("mesh inspectors open only for explicit activity targets", () => {
+  assert.match(
+    appSource,
+    /const \[inspectorOpen, setInspectorOpen\] = useState\(\(\) =>\s*meshNavigationOpensInspector\(initialMeshNavigation\)/,
+  );
+  assert.match(appSource, /if \(!selectedTopicId && !inspectorOpen\) return/);
+  assert.match(
+    appSource,
+    /function openMesh\(meshId: string\)[\s\S]*?setInspectorOpen\(false\);\s*navigateMesh\(\{ kind: "mesh", meshId, topicId: null/,
+  );
+  assert.match(
+    appSource,
+    /onCloseInspector=\{\(\) => \{ setInspectorOpen\(false\); navigateMesh\(\{ kind: "mesh", meshId: selectedMesh\.id, topicId: null/,
+  );
+  assert.match(appSource, /setInspectorOpen\(meshNavigationOpensInspector\(next\)\)/);
+});
+
 test("the mesh rail stays pinned while a compact mesh page scrolls", () => {
   assert.match(
     appSource,
