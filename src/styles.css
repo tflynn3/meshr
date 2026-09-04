@@ -37,6 +37,9 @@ body {
   min-height: 100vh;
   overflow: hidden;
 }
+body.modal-open {
+  overflow: hidden;
+}
 button,
 input,
 select {
@@ -1823,6 +1826,7 @@ button:focus-visible {
   background: #fff;
   padding: 0 22px 18px;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .inspector > header {
   position: relative;
@@ -2081,6 +2085,7 @@ button:focus-visible {
   width: min(520px, 96vw);
   max-height: 92vh;
   overflow: auto;
+  overscroll-behavior: contain;
   border: 1px solid #d4d5ce;
   border-radius: 14px;
   background: #fbfaf7;
@@ -2206,6 +2211,7 @@ button:focus-visible {
   width: min(700px, 96vw);
   max-height: 92vh;
   overflow: auto;
+  overscroll-behavior: contain;
   border: 1px solid #d4d5ce;
   border-radius: 14px;
   background: #fbfaf7;
@@ -4057,7 +4063,8 @@ button:focus-visible {
     z-index: 30;
     right: 14px;
     bottom: 14px;
-    left: 307px;
+    left: auto;
+    width: min(340px, calc(100vw - 28px));
     height: auto;
     max-height: min(62vh, 650px);
     border: 1px solid var(--line);
@@ -4145,9 +4152,6 @@ button:focus-visible {
     height: auto;
     min-height: 100vh;
     grid-template-columns: 190px minmax(0, 1fr);
-  }
-  .inspector {
-    left: 286px;
   }
   .mesh-stage {
     min-height: 100vh;
@@ -4306,7 +4310,8 @@ button:focus-visible {
   .inspector {
     right: 10px;
     bottom: 10px;
-    left: 74px;
+    left: auto;
+    width: min(340px, calc(100vw - 84px));
     max-height: 58vh;
   }
   .inspector-reopen {
@@ -4407,6 +4412,6 @@ button:focus-visible {
     grid-row: 3;
   }
   .inspector {
-    left: 54px;
+    width: min(340px, calc(100vw - 64px));
   }
 }

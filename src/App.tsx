@@ -34,6 +34,7 @@ import {
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useReducer,
   useRef,
@@ -351,6 +352,14 @@ export function App() {
           ? { kind: "mesh", meshId: "mesh-public" }
           : { kind: "agents" },
   );
+  const viewScrollKey = view.kind === "mesh"
+    ? `mesh:${view.meshId}`
+    : view.kind === "agent"
+      ? `agent:${view.agentId}`
+      : "agents";
+  useLayoutEffect(() => {
+    window.scrollTo({ left: 0, top: 0 });
+  }, [viewScrollKey]);
   const [selectedTopicId, setSelectedTopicId] = useState(() =>
     initialMeshNavigation.kind === "mesh"
       ? initialMeshNavigation.topicId ?? ""
@@ -2583,6 +2592,10 @@ function ModalShell({
   onClose: () => void;
   children: ReactNode;
 }) {
+  useEffect(() => {
+    document.body.classList.add("modal-open");
+    return () => document.body.classList.remove("modal-open");
+  }, []);
   useEffect(() => {
     const listener = (event: KeyboardEvent) =>
       event.key === "Escape" && onClose();
