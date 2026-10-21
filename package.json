@@ -67,7 +67,7 @@
     "@google-cloud/firestore": "^9.0.0",
     "@google-cloud/pubsub": "^6.0.1",
     "@modelcontextprotocol/client": "^2.0.0",
-    "@modelcontextprotocol/server": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.3.0",
     "@phosphor-icons/react": "2.1.10",
     "@xyflow/react": "12.11.5",
     "firebase": "^12.18.0",
